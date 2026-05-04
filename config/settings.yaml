@@ -1,0 +1,49 @@
+app:
+  name: kiwoom-auto-trader-ver1
+  env: local
+  log_level: INFO
+
+broker:
+  provider: kiwoom
+  # true  -> 가짜 MockBroker 사용
+  # false -> 실제 Kiwoom REST API 사용
+  use_mock: false
+  # 키움 모의투자 REST 서버
+  # 실전투자로 바꿀 때는 https://api.kiwoom.com 으로 변경합니다.
+  base_url: https://mockapi.kiwoom.com
+  app_key: ${KIWOOM_APP_KEY}
+  secret_key: ${KIWOOM_SECRET_KEY}
+  account_number: ${KIWOOM_ACCOUNT_NUMBER}
+  is_paper_trading: true
+
+# 첫 버전은 종목 수를 적게 두는 편이 디버깅에 좋습니다.
+targets:
+  symbols:
+    - "001510"
+    - "047040"
+
+trading:
+  poll_interval_seconds: 5
+  balance_refresh_seconds: 180
+  price_refresh_seconds: 300
+  order_cash_per_trade: 200000
+  max_positions: 2
+  allow_multiple_entries_per_symbol_per_day: true
+  force_exit_before_market_close_minutes: 10
+
+strategy:
+  name: breakout
+  breakout_threshold_pct: 1.0
+  take_profit_pct: 2.0
+  stop_loss_pct: 1.5
+  reference_price_type: previous_close
+
+risk:
+  max_daily_loss_amount: 100000
+  max_order_amount: 300000
+  min_cash_buffer: 100000
+
+storage:
+  state_file: data/state.json
+  trade_log_file: logs/trades.csv
+  app_log_file: logs/app.log
