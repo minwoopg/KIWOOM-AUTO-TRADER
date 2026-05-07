@@ -106,6 +106,10 @@ class KiwoomBroker(Broker):
         self.access_token = token
         self.token_expires_at = api_response.body.get("expires_dt")
 
+    def get_token(self) -> str:
+        """WebSocket 로그인에 사용할 접근 토큰을 반환합니다."""
+        return self.access_token or ""
+
     def get_market_price(self, symbol: str) -> MarketPrice:
         """한 종목의 현재 시세를 조회합니다.
 

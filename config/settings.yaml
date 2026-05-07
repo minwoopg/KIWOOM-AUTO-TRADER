@@ -32,7 +32,7 @@ trading:
   force_exit_before_market_close_minutes: 10
   # 매도 후 같은 종목 재매수 차단 시간 (초)
   # 600 = 10분. 너무 짧으면 핑퐁, 너무 길면 기회를 놓침
-  reentry_cooldown_seconds: 600
+  reentry_cooldown_seconds: 200
 
 strategy:
   name: breakout
@@ -60,6 +60,18 @@ risk:
   max_daily_loss_amount: 100000
   max_order_amount: 300000
   min_cash_buffer: 100000
+
+websocket:
+  # false: 기존 방식(수동 종목 등록)으로 동작
+  # true:  조건검색으로 종목 자동 편입/편출
+  enabled: false
+  # 모의투자: wss://mockapi.kiwoom.com:10000/api/dostk/websocket
+  # 실전투자: wss://api.kiwoom.com:10000/api/dostk/websocket
+  url: wss://mockapi.kiwoom.com:10000/api/dostk/websocket
+  # HTS에서 만든 조건검색식 번호 (CNSRLST로 확인 가능)
+  condition_seq: 0
+  # 조건검색으로 편입 가능한 최대 종목 수 (너무 많으면 API 부담)
+  max_symbols: 5
 
 storage:
   state_file: data/state.json

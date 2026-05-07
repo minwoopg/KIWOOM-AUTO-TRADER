@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
+from pathlib import Path
 
 from config.settings import Settings
 from domain.market_regime.classifier import MarketRegimeClassifier
@@ -23,6 +24,7 @@ from domain.models import AccountBalance, MarketRegime, OrderRequest, OrderSide,
 from domain.risk.risk_manager import RiskManager
 from domain.strategy.strategy_router import StrategyRouter
 from infra.broker.base import Broker
+from infra.storage.daily_reporter import DailyReporter
 from infra.storage.logger import AppLogger, TradeCsvLogger
 from infra.storage.state_store import JsonStateStore
 from utils.time_utils import is_near_market_close
@@ -68,6 +70,32 @@ class TradingService:
 
         # HOLD 로그 throttle
         self.last_hold_log_at_by_symbol: dict[str, datetime] = {}
+
+        # 동적 종목 목록 (조건검색 연동 시 갱신)
+        self._dynamic_targets: list[str] | None = None
+
+        # 일일 리포트 생성기
+        self._reporter = DailyReporter(
+            trade_log_file=settings.storage.trade_log_file,
+            report_dir=str(Path(settings.storage.trade_log_file).parent),
+        )
+        # 장세 판단 요약 (리포트용)
+        self._regime_summary: dict[str, str] = {}
+        # 장 마감 리포트가 이미 생성됐는지 여부 (중복 방지)
+        self._report_generated_today: bool = False
+
+    @property
+    def targets(self) -> list[str]:
+        """현재 감시 중인 종목 목록을 반환합니다.
+        조건검색 모드에서는 동적 목록을, 아니면 설정 파일 목록을 사용합니다.
+        """
+        if self._dynamic_targets is not None:
+            return self._dynamic_targets
+        return self.settings.targets
+
+    def update_targets(self, symbols: list[str]) -> None:
+        """조건검색 결과로 종목 목록을 동적으로 갱신합니다."""
+        self._dynamic_targets = symbols
 
     def _get_balance_with_cache(self) -> AccountBalance:
         """계좌 조회를 매번 하지 않고 일정 시간 동안 캐시를 재사용합니다."""
@@ -190,6 +218,8 @@ class TradingService:
                 self.app_logger.info(
                     f"[REGIME] {symbol} | {regime.value} | {reason}"
                 )
+                # 리포트용 장세 요약 갱신
+                self._regime_summary[symbol] = f"{regime.value} ({reason})"
                 return regime, reason
 
             except Exception as exc:
@@ -269,7 +299,7 @@ class TradingService:
         """자동매매 루프를 한 번 실행합니다."""
         balance = self._get_balance_with_cache()
 
-        for i, symbol in enumerate(self.settings.targets):
+        for i, symbol in enumerate(self.targets):
 
             # 두 번째 종목부터는 API 과호출 방지를 위해 잠깐 대기합니다.
             # 키움 ka10001/ka10086 연속 호출 시 429 방지용입니다.
@@ -306,6 +336,11 @@ class TradingService:
 
             for position in latest_balance.positions:
                 self._try_sell(position.symbol, position.quantity)
+
+            # 장 마감 리포트 생성 (하루 1회)
+            if not self._report_generated_today:
+                self._generate_daily_report()
+                self._report_generated_today = True
 
         self.state_store.save(self.state)
 
@@ -397,6 +432,17 @@ class TradingService:
             self.app_logger.warning(
                 f"[FAIL ] {symbol} | 매도 주문 실패 | 사유: {result.message}"
             )
+
+    def _generate_daily_report(self) -> None:
+        """장 마감 후 일일 리포트를 생성하고 로그에 출력합니다."""
+        try:
+            report = self._reporter.generate(regime_summary=self._regime_summary)
+            self.app_logger.info("=" * 45)
+            for line in report.splitlines():
+                self.app_logger.info(line)
+            self.app_logger.info("=" * 45)
+        except Exception as exc:
+            self.app_logger.warning(f"[REPORT] 리포트 생성 실패: {exc}")
 
     def _write_trade_log(
         self,

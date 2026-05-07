@@ -96,6 +96,22 @@ class MarketRegimeConfig:
 
 
 @dataclass(frozen=True)
+class WebSocketConfig:
+    """조건검색 WebSocket 연결 설정입니다.
+
+    enabled       : false면 WebSocket 없이 기존 방식(수동 종목)으로 동작
+    url           : WebSocket 서버 URL
+    condition_seq : 사용할 조건검색식 번호 (HTS에서 확인)
+    max_symbols   : 조건검색으로 편입 가능한 최대 종목 수
+    """
+
+    enabled: bool
+    url: str
+    condition_seq: int
+    max_symbols: int
+
+
+@dataclass(frozen=True)
 class RiskConfig:
     """리스크 관리에 필요한 제한값을 보관합니다."""
 
@@ -125,6 +141,7 @@ class Settings:
     risk: RiskConfig
     market_regime: MarketRegimeConfig
     storage: StorageConfig
+    websocket: WebSocketConfig
 
 
 # 이 함수는 문자열 안의 ${ENV_NAME} 값을 실제 환경변수 값으로 바꿉니다.
@@ -167,4 +184,5 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
         risk=RiskConfig(**raw["risk"]),
         market_regime=MarketRegimeConfig(**raw["market_regime"]),
         storage=StorageConfig(**raw["storage"]),
+        websocket=WebSocketConfig(**raw["websocket"]),
     )

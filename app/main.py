@@ -2,24 +2,16 @@ from __future__ import annotations
 
 """프로그램 시작점.
 
-이 파일을 보면 프로그램 전체 흐름을 가장 빠르게 이해할 수 있습니다.
-실행 순서는 아래와 같습니다.
-1. .env 파일을 읽는다.
-2. settings.yaml을 읽는다.
-3. 브로커를 만든다.
-4. 전략, 리스크 관리자, 서비스 객체를 만든다.
-5. 무한루프를 돌면서 run_once()를 반복 실행한다.
-
-주의:
-- use_mock=true  -> 가짜 MockBroker 사용
-- use_mock=false -> 실제 KiwoomBroker 사용
-
-즉 '키움 모의투자 실연동'을 하려면
-- use_mock: false
-- broker.base_url: https://mockapi.kiwoom.com
-처럼 설정해야 합니다.
+실행 순서:
+1. .env / settings.yaml 로드
+2. 브로커 인증
+3. TradingService 조립
+4. websocket.enabled=true면 ConditionWatcher도 함께 실행
+   - WebSocket 루프와 REST 루프를 asyncio로 병렬 실행
+5. websocket.enabled=false면 기존 방식(수동 종목)으로 동작
 """
 
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -37,17 +29,9 @@ from utils.time_utils import is_market_open
 
 
 def load_dotenv(path: str = ".env") -> None:
-    """`.env` 파일이 있으면 KEY=VALUE 형태를 환경변수로 로드합니다.
-
-    왜 필요한가?
-    - 앱키/시크릿키를 settings.yaml에 직접 적지 않기 위해서입니다.
-    - 민감한 값은 .env 파일에 두고, 코드에서는 환경변수로 읽는 편이 안전합니다.
-    """
-
     dotenv_path = Path(path)
     if not dotenv_path.exists():
         return
-
     for line in dotenv_path.read_text(encoding="utf-8").splitlines():
         if not line or line.strip().startswith("#") or "=" not in line:
             continue
@@ -56,38 +40,16 @@ def load_dotenv(path: str = ".env") -> None:
 
 
 def build_broker(settings: Settings):
-    """설정에 따라 MockBroker 또는 KiwoomBroker를 생성합니다.
-
-    사용 예:
-    - 흐름만 테스트: use_mock=true
-    - 키움 모의투자 실연동: use_mock=false + base_url=mockapi
-    - 키움 실전: use_mock=false + base_url=api
-    """
-
     if settings.broker.use_mock:
         return MockBroker()
     return KiwoomBroker(settings.broker)
 
 
-def main() -> None:
-    """애플리케이션 전체를 조립하고 실행 루프를 시작합니다."""
-
-    load_dotenv()
-    settings = load_settings()
-
-    app_logger = build_app_logger(settings.storage.app_log_file, settings.app.log_level)
-    app_logger.info(f"loaded targets: {settings.targets}")
-
-    trade_logger = TradeCsvLogger(settings.storage.trade_log_file)
-    state_store = JsonStateStore(settings.storage.state_file)
-
-    broker = build_broker(settings)
-    broker.authenticate()
-
-    strategy_router = StrategyRouter(settings.strategy)
+def build_trading_service(settings, broker, app_logger, trade_logger, state_store):
+    strategy_router   = StrategyRouter(settings.strategy)
     regime_classifier = MarketRegimeClassifier(settings.market_regime)
-    risk_manager = RiskManager(settings.trading, settings.risk)
-    trading_service = TradingService(
+    risk_manager      = RiskManager(settings.trading, settings.risk)
+    return TradingService(
         settings=settings,
         broker=broker,
         strategy_router=strategy_router,
@@ -98,36 +60,90 @@ def main() -> None:
         state_store=state_store,
     )
 
-    app_logger.info(
-        "application started",
-        extra={"broker": settings.broker.provider, "use_mock": settings.broker.use_mock},
-    )
 
-    # 무한루프이므로 실제 운영 전에는 종료 조건, 예외 복구 등을 더 넣어야 합니다.
+# ── REST 루프 ────────────────────────────────────────────────────
+
+async def trading_loop(trading_service: TradingService, settings: Settings, app_logger) -> None:
+    """REST API 기반 매매 루프 (asyncio 버전)."""
+    app_logger.info("application started")
+    poll = settings.trading.poll_interval_seconds
+
     while True:
         try:
-            # 실제 키움 브로커일 때는 장중에만 주문 루프를 돌리는 것이 안전합니다.
-            # 다만 MockBroker 는 공부용이라 시간 상관없이 실행하게 둡니다.
             if is_market_open() or settings.broker.use_mock:
                 trading_service.run_once()
+            await asyncio.sleep(poll)
 
-            time.sleep(settings.trading.poll_interval_seconds)
-
-        except KeyboardInterrupt:
+        except asyncio.CancelledError:
             app_logger.info("application stopped by user")
             break
 
         except Exception as exc:
             app_logger.exception("unexpected error: %s", exc)
-
-            error_message = str(exc)
-
-            # 키움 API 요청 제한(429)에 걸리면 더 오래 쉰다.
-            if "http=429" in error_message or "허용된 요청 개수를 초과" in error_message:
+            msg = str(exc)
+            if "http=429" in msg or "허용된 요청 개수를 초과" in msg:
                 app_logger.warning("rate limit detected, backing off for 180 seconds")
-                time.sleep(180)
+                await asyncio.sleep(180)
             else:
-                time.sleep(settings.trading.poll_interval_seconds)
+                await asyncio.sleep(poll)
+
+
+# ── 메인 ────────────────────────────────────────────────────────
+
+async def async_main() -> None:
+    load_dotenv()
+    settings = load_settings()
+
+    app_logger   = build_app_logger(settings.storage.app_log_file, settings.app.log_level)
+    trade_logger = TradeCsvLogger(settings.storage.trade_log_file)
+    state_store  = JsonStateStore(settings.storage.state_file)
+
+    broker = build_broker(settings)
+    broker.authenticate()
+
+    trading_service = build_trading_service(
+        settings, broker, app_logger, trade_logger, state_store
+    )
+
+    # ── WebSocket 조건검색 활성화 여부 ───────────────────────────
+    if settings.websocket.enabled:
+        from infra.websocket.condition_watcher import ConditionWatcher
+
+        def on_symbols_changed(symbols: list[str]) -> None:
+            """조건검색 편입/편출 시 trading_service의 targets를 동적으로 갱신합니다."""
+            limited = symbols[:settings.websocket.max_symbols]
+            trading_service.update_targets(limited)
+            app_logger.info(f"[COND] 종목 목록 갱신: {limited}")
+
+        watcher = ConditionWatcher(
+            config=settings.websocket,
+            token=broker.get_token(),
+            on_symbols_changed=on_symbols_changed,
+        )
+
+        app_logger.info(
+            f"[COND] 조건검색 모드 활성화 "
+            f"(조건식 번호: {settings.websocket.condition_seq})"
+        )
+        app_logger.info(f"loaded targets: 조건검색으로 자동 설정")
+
+        # REST 루프 + WebSocket 루프 동시 실행
+        await asyncio.gather(
+            trading_loop(trading_service, settings, app_logger),
+            watcher.start(),
+        )
+
+    else:
+        # 기존 방식: settings.yaml의 targets 그대로 사용
+        app_logger.info(f"loaded targets: {settings.targets}")
+        await trading_loop(trading_service, settings, app_logger)
+
+
+def main() -> None:
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
