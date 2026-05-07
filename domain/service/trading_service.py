@@ -221,6 +221,7 @@ class TradingService:
         cfg = self.settings.market_regime
 
         rsi = self.regime_classifier._calc_rsi(closes, cfg.rsi_period)
+        rsi_direction = self.regime_classifier._calc_rsi_direction(closes, cfg.rsi_period)
         macd_line, signal_line = self.regime_classifier._calc_macd(
             closes, cfg.macd_fast, cfg.macd_slow, cfg.macd_signal
         )
@@ -233,6 +234,7 @@ class TradingService:
             previous_close=market_price.previous_close,
             timestamp=market_price.timestamp,
             indicator_rsi=rsi,
+            indicator_rsi_direction=rsi_direction,
             indicator_macd=macd_line,
             indicator_macd_signal=signal_line,
             indicator_volume_surge=volume_surge,
@@ -309,6 +311,20 @@ class TradingService:
 
     def _try_buy(self, symbol: str, current_price: int, balance: AccountBalance) -> None:
         """매수 주문 가능 여부를 검사한 뒤 실제 주문을 시도합니다."""
+
+        # ── 재진입 쿨다운 체크 ────────────────────────────────────
+        cooldown_sec = self.settings.trading.reentry_cooldown_seconds
+        last_sold_str = self.state.last_sold_at_by_symbol.get(symbol)
+        if last_sold_str:
+            last_sold_at = datetime.fromisoformat(last_sold_str)
+            elapsed = (datetime.now() - last_sold_at).total_seconds()
+            remaining = int(cooldown_sec - elapsed)
+            if elapsed < cooldown_sec:
+                self.app_logger.info(
+                    f"[COOL ] {symbol} | 매도 후 재진입 쿨다운 중 "
+                    f"({remaining}초 남음 / 총 {cooldown_sec}초)"
+                )
+                return
         quantity = max(1, self.settings.trading.order_cash_per_trade // current_price)
         order = OrderRequest(
             symbol=symbol,
@@ -370,6 +386,9 @@ class TradingService:
             # 주문 성공 후 잔고 캐시 무효화
             self.cached_balance = None
             self.cached_balance_loaded_at = None
+
+            # 매도 시각 기록 → 재진입 쿨다운에 사용
+            self.state.last_sold_at_by_symbol[symbol] = datetime.now().isoformat()
 
             self.app_logger.info(
                 f"[ORDER] {symbol} | 매도 주문 접수 완료 | 수량 {quantity}주 | 주문번호 {result.order_id}"

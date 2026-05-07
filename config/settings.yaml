@@ -23,13 +23,16 @@ targets:
     - "047040"
 
 trading:
-  poll_interval_seconds: 10        # 5 → 10초 (종목 간 1초 딜레이 감안)
+  poll_interval_seconds: 10
   balance_refresh_seconds: 180
   price_refresh_seconds: 300
   order_cash_per_trade: 200000
   max_positions: 2
   allow_multiple_entries_per_symbol_per_day: true
   force_exit_before_market_close_minutes: 10
+  # 매도 후 같은 종목 재매수 차단 시간 (초)
+  # 600 = 10분. 너무 짧으면 핑퐁, 너무 길면 기회를 놓침
+  reentry_cooldown_seconds: 600
 
 strategy:
   name: breakout

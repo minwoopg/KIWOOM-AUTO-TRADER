@@ -55,6 +55,7 @@ class TradingConfig:
     max_positions: int
     allow_multiple_entries_per_symbol_per_day: bool
     force_exit_before_market_close_minutes: int
+    reentry_cooldown_seconds: int
 
 
 @dataclass(frozen=True)

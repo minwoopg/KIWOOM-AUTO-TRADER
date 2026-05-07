@@ -45,9 +45,10 @@ class MarketPrice:
 
     # 일봉 기반 보조 지표 (선택적)
     indicator_rsi: float | None = None
-    indicator_macd: float | None = None        # MACD 라인값
-    indicator_macd_signal: float | None = None # 시그널 라인값
-    indicator_volume_surge: bool = False       # 거래량 급증 여부
+    indicator_rsi_direction: int = 0           # +1 상승, -1 하락, 0 보합
+    indicator_macd: float | None = None
+    indicator_macd_signal: float | None = None
+    indicator_volume_surge: bool = False
 
 
 @dataclass(frozen=True)
@@ -141,3 +142,5 @@ class RuntimeState:
 
     bought_symbols_today: set[str] = field(default_factory=set)
     last_order_id_by_symbol: dict[str, str] = field(default_factory=dict)
+    # 종목별 마지막 매도 시각 (핑퐁 차단용) — ISO 문자열로 저장
+    last_sold_at_by_symbol: dict[str, str] = field(default_factory=dict)

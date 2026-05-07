@@ -38,6 +38,7 @@ class BreakoutStrategy(Strategy):
 
         # 지표값 추출 (없으면 기존 단순 돌파 전략으로 폴백)
         rsi           = market_price.indicator_rsi
+        rsi_direction = market_price.indicator_rsi_direction  # +1 상승, -1 하락, 0 보합
         macd          = market_price.indicator_macd
         macd_signal   = market_price.indicator_macd_signal
         volume_surge  = market_price.indicator_volume_surge
@@ -59,15 +60,23 @@ class BreakoutStrategy(Strategy):
                 return Signal(type=SignalType.HOLD, reason="지표 없음 — 단순 돌파 조건 미충족")
 
             # 3중 필터 조건 평가
-            cond_rsi    = rsi <= 30                      # RSI 과매도 구간
-            cond_macd   = macd > macd_signal             # MACD 골든크로스
-            cond_volume = volume_surge                   # 거래량 급증
+            cond_rsi    = rsi <= 30 and rsi_direction >= 0   # RSI 과매도 + 하락 중 아님
+            cond_macd   = macd > macd_signal                  # MACD 골든크로스
+            cond_volume = volume_surge                         # 거래량 급증
             score = sum([cond_rsi, cond_macd, cond_volume])
 
-            rsi_tag    = f"RSI {rsi:.1f}{'✓' if cond_rsi else '✗'}"
+            rsi_dir_tag = "↑" if rsi_direction > 0 else ("↓" if rsi_direction < 0 else "→")
+            rsi_tag    = f"RSI {rsi:.1f}{rsi_dir_tag}{'✓' if cond_rsi else '✗'}"
             macd_tag   = f"MACD {'골든크로스✓' if cond_macd else '데드크로스✗'}"
             volume_tag = f"거래량 {'급증✓' if cond_volume else '보통✗'}"
             summary    = f"{rsi_tag} | {macd_tag} | {volume_tag}"
+
+            # RSI가 30 이하이지만 아직 하락 중이면 별도 안내
+            if rsi <= 30 and rsi_direction < 0:
+                return Signal(
+                    type=SignalType.HOLD,
+                    reason=f"RSI {rsi:.1f}↓ 과매도 구간이나 아직 하락 중 — 바닥 확인 후 진입 (매수 대기)",
+                )
 
             if score == 3:
                 return Signal(
