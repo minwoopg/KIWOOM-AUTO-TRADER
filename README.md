@@ -1,119 +1,220 @@
-# Kiwoom Auto Trader ver1
+# Kiwoom Auto Trader
 
-파이썬 초보자도 따라가기 쉽도록 **설명형 주석과 docstring**을 많이 넣은 버전입니다.
+키움증권 REST API + WebSocket 기반 주식 자동매매 시스템
 
-## 이 버전에서 달라진 점
-이제 `KiwoomBroker`가 단순 스켈레톤이 아니라, 실제로 아래 API들을 호출하도록 반영되어 있습니다.
+---
 
-- 토큰 발급
-- 현재가 조회
-- 예수금 조회
-- 보유 종목 조회
-- 매수 주문
-- 매도 주문
+## 프로젝트 구조
 
-즉, 사용자가 직접 검증한 키움 REST 모의투자 흐름을 프로젝트 구조 안으로 옮긴 버전입니다.
-
-## 현재 구현 범위
-- 키움증권 **모의투자 REST API 연동**
-- 자바 이식 전제의 레이어 분리 구조
-- 간단한 돌파 전략 1개 포함
-- 상태 저장(JSON), 거래 로그(CSV), 앱 로그(file) 포함
-- MockBroker / KiwoomBroker 둘 다 제공
-
-## 브로커 선택 방식
-### 1) 공부용 가짜 브로커
-`config/settings.yaml` 에서 아래처럼 두면 키움 API를 전혀 호출하지 않습니다.
-
-```yaml
-broker:
-  use_mock: true
+```
+kiwoom-auto-trader-ver1/
+├── app/
+│   └── main.py                    # 진입점 (REST + WebSocket 병렬 실행)
+├── config/
+│   ├── settings.py                # 설정 파싱
+│   └── settings.yaml              # 전체 설정
+├── domain/
+│   ├── models.py                  # 도메인 모델
+│   ├── market_regime/
+│   │   └── classifier.py          # 장세 분류기
+│   ├── risk/
+│   │   └── risk_manager.py        # 리스크 관리
+│   ├── service/
+│   │   └── trading_service.py     # 매매 루프 핵심 서비스
+│   └── strategy/
+│       ├── base.py                # 전략 인터페이스
+│       ├── breakout_strategy.py   # 3중 필터 매매 전략
+│       ├── hold_strategy.py       # 횡보/하락장 관망 전략
+│       └── strategy_router.py     # 장세별 전략 선택
+├── infra/
+│   ├── broker/
+│   │   ├── base.py                # 브로커 인터페이스
+│   │   ├── kiwoom_broker.py       # 키움 REST API 구현
+│   │   └── mock_broker.py         # 테스트용 Mock 브로커
+│   ├── storage/
+│   │   ├── daily_reporter.py      # 일일 리포트 생성
+│   │   ├── logger.py              # 앱/거래 로그
+│   │   └── state_store.py         # 상태 저장 (JSON)
+│   └── websocket/
+│       ├── kiwoom_ws.py           # WebSocket 기본 클라이언트
+│       ├── condition_watcher.py   # 조건검색 구독/편입/편출
+│       └── real_token.py          # 실전 계좌 토큰 발급
+├── utils/
+│   └── time_utils.py              # 장 시간 유틸
+├── logs/                          # 로그 및 리포트 저장
+├── data/                          # 상태 파일 저장
+├── .env                           # 환경변수 (앱키/시크릿키)
+├── requirements.txt
+└── README.md
 ```
 
-### 2) 키움 모의투자 실연동
-아래처럼 두면 실제 키움 모의투자 REST API를 호출합니다.
+---
 
-```yaml
-broker:
-  use_mock: false
-  base_url: https://mockapi.kiwoom.com
+## 환경 설정
+
+### 1. 패키지 설치
+
+```bash
+pip install -r requirements.txt
 ```
 
-### 3) 키움 실전투자
-실전으로 바꿀 때는 URL 을 바꾸고, 앱키/시크릿키도 실전용으로 교체해야 합니다.
-
-```yaml
-broker:
-  use_mock: false
-  base_url: https://api.kiwoom.com
-```
-
-## 중요한 보안 원칙
-- 앱키 / 시크릿키 / 토큰은 채팅창에 붙여넣지 마세요.
-- `.env` 파일에 넣고 코드에서는 환경변수로만 읽는 편이 안전합니다.
-- 실전투자는 반드시 모의투자를 충분히 검증한 뒤에만 진행하세요.
-
-## .env 파일 예시
-프로젝트 루트에 `.env` 파일을 만들고 아래처럼 입력합니다.
+### 2. `.env` 파일 생성
 
 ```env
-KIWOOM_APP_KEY=여기에_앱키
-KIWOOM_SECRET_KEY=여기에_시크릿키
-KIWOOM_ACCOUNT_NUMBER=여기에_계좌번호
+# 모의투자 계좌 (주문용)
+KIWOOM_APP_KEY=모의투자_앱키
+KIWOOM_SECRET_KEY=모의투자_시크릿키
+KIWOOM_ACCOUNT_NUMBER=모의투자_계좌번호
+
+# 실전 계좌 (조건검색 WebSocket 전용)
+KIWOOM_REAL_APP_KEY=실전_앱키
+KIWOOM_REAL_SECRET_KEY=실전_시크릿키
 ```
-
-## 처음 읽는 순서 추천
-1. `docs/detailed_design.md`
-2. `config/settings.yaml`
-3. `app/main.py`
-4. `infra/broker/kiwoom_broker.py`
-5. `domain/service/trading_service.py`
-6. `domain/strategy/breakout_strategy.py`
-
-## 실행 방법
-### 1. 패키지 설치
-```bash
-python -m pip install -r requirements.txt
-```
-
-### 2. 환경변수 파일 준비
-프로젝트 루트에 `.env` 파일 생성
 
 ### 3. 실행
+
 ```bash
-python app/main.py
+python -m app.main
 ```
 
-## 지금 구조에서 자동매매가 돌아가는 원리
-1. `main.py` 가 설정과 브로커를 준비합니다.
-2. `KiwoomBroker.authenticate()` 가 토큰을 발급받습니다.
-3. `TradingService.run_once()` 가 계좌/시세를 조회합니다.
-4. `BreakoutStrategy` 가 BUY / SELL / HOLD 를 판단합니다.
-5. `RiskManager` 가 주문 가능 여부를 검사합니다.
-6. 통과하면 `KiwoomBroker.place_order()` 가 실제 주문을 전송합니다.
-7. 결과는 CSV 와 로그 파일에 남습니다.
+---
 
-## 아직 남은 보강 포인트
-- 장 상태를 더 정교하게 체크하기
-- 주문 후 체결 조회 로직 추가
-- 연속조회(next-key) 자동 처리
-- 종목별 수수료/세금 반영 고도화
-- 손익 집계 자동화
+## 매매 전략
 
-## 주의
-현재 `main.py` 는 매우 단순한 첫 버전입니다.
-즉, 장중에 조건이 맞으면 바로 주문을 시도합니다.
-실제로 굴리기 전에는 반드시 종목 수, 주문 금액, 전략 조건을 아주 보수적으로 두세요.
+### 장세 분류 (1시간마다 갱신)
 
+일봉 데이터 기반으로 4가지 지표를 조합해 장세를 분류합니다.
 
-## ver1.1 변경사항 요약
-- 키움증권 REST API 모의투자 기준으로 자동매매 프로젝트 구조를 정비하였습니다.
-- 토큰 발급, 계좌 조회, 현재가 조회, 예수금 조회, 보유종목 조회를 실제로 검증하였습니다.
-- 모의 매수 주문과 매도 주문 API 호출을 성공적으로 테스트하였습니다.
-- 실행 방식을 python -m app.main 기준으로 통일하여 import 문제를 해결하였습니다.
-- .env 기반 설정 로드를 정리하여 앱키, 시크릿키, 계좌번호를 외부에서 관리하도록 변경하였습니다.
-- 동일 종목 재진입 허용 여부를 설정으로 제어할 수 있도록 정비하였습니다.
-- 주문 성공 후 잔고 캐시를 무효화하도록 수정하여 매도 후 재진입 판단 오류를 줄였습니다.
-- 계좌 조회와 현재가 조회에 캐시 구조를 도입하여 API 호출 빈도를 낮추도록 개선하였습니다.
-- 429 요청 제한 발생 시 백오프 로직을 추가하여 반복 오류를 완화하였습니다.
-- 전략 판단, 주문 성공/실패, 홀딩 사유를 사람이 읽기 쉬운 로그 형태로 개선하였습니다.
+| 지표 | 내용 |
+|---|---|
+| 이동평균 | 5일선 vs 20일선 골든/데드크로스 |
+| RSI | 수치 + 방향(↑상승 / ↓하락 / →보합) |
+| MACD | 골든크로스 / 데드크로스 |
+| 거래량 | 20일 평균 대비 1.5배 이상 급증 여부 |
+
+| 장세 | 조건 | 전략 |
+|---|---|---|
+| BULLISH | MA 상승 + RSI 정상 + MACD 골든크로스 | 3중 필터 매수 전략 |
+| SIDEWAYS | 위 조건 미충족 | 신규 매수 차단, 보유분만 관리 |
+| BEARISH | MA 하락 + RSI 정상 + MACD 데드크로스 | 신규 매수 차단, 손절 우선 |
+| UNKNOWN | 데이터 부족 | 보수적 관망 |
+
+### 매수 조건 (BULLISH일 때, 3중 필터)
+
+```
+① RSI 30 이하 + 상승 중(↑)   → 바닥 확인
+② MACD 골든크로스             → 상승 모멘텀 시작
+③ 거래량 급증                 → 세력 유입 확인
+
+3개 충족 → 강력 매수 (황금시간)
+2개 충족 → 보수적 매수
+1개 이하 → HOLD
+```
+
+### 매도 조건
+
+```
+익절: 평균단가 대비 +2.0%
+손절: 평균단가 대비 -1.5%
+조기 매도: RSI 70 이상 + MACD 데드크로스 (고점 반전 감지)
+장 마감 10분 전: 전량 강제청산
+```
+
+### 리스크 관리
+
+```
+1회 주문 금액   : 20만원
+최대 보유 종목  : 2개
+최소 현금 유지  : 10만원
+일일 최대 손실  : 10만원
+재진입 쿨다운   : 매도 후 10분간 동일 종목 재매수 차단
+```
+
+---
+
+## 조건검색 WebSocket 연동
+
+HTS(영웅문)에서 만든 조건식을 실시간으로 구독합니다.
+
+### 설정 방법
+
+1. 영웅문 → 조건검색 → 조건식 생성 후 저장
+2. `settings.yaml` 수정
+
+```yaml
+websocket:
+  enabled: true
+  url: wss://api.kiwoom.com:10000/api/dostk/websocket
+  condition_seq: 0    # HTS에서 저장한 조건식 번호
+  max_symbols: 5
+```
+
+### 동작 방식
+
+```
+조건 충족 종목 편입(I) → targets에 자동 추가
+조건 이탈 종목 편출(D) → targets에서 자동 제거
+```
+
+> 모의투자 환경에서는 조건검색 WebSocket이 지원되지 않습니다.
+> 조건검색은 실전 계좌로 연결하고, 주문은 모의 계좌로 실행합니다.
+
+---
+
+## 로그 예시
+
+```
+[REGIME] 001510 | BULLISH | MA 상승(5,326>4,274) + RSI 28.3↑ 정상 + MACD 골든크로스(+12.3) + 거래량급증
+[BUY  ] [BULLISH] 001510 | 현재가 5,250원 | 황금시간 3중 조건 모두 충족 — RSI 28.3↑✓ | MACD 골든크로스✓ | 거래량 급증✓
+[ORDER] 001510 | 매수 주문 접수 완료 | 수량 38주 | 주문번호 0081061
+[SELL ] [BULLISH] 001510 | 현재가 5,355원 | 익절 목표 5,355원 도달
+[ORDER] 001510 | 매도 주문 접수 완료 | 수량 38주 | 주문번호 0082145
+[COOL ] 001510 | 매도 후 재진입 쿨다운 중 (599초 남음 / 총 600초)
+[COND ] 편입: 005930 — targets에 추가됩니다
+```
+
+---
+
+## 일일 리포트
+
+장 마감 시 `logs/daily_report_날짜.txt` 자동 생성
+
+```
+=============================================
+  일일 매매 리포트  2026-05-07
+=============================================
+
+[ 매매 요약 ]
+  총 주문 수  : 5건
+  매수        : 3건  (81주)
+  매도        : 2건  (44주)
+  체결 성공   : 4건 / 실패 : 1건
+
+[ 종목별 내역 ]
+  001510  매수 2회(75주) / 매도 1회(38주)
+  047040  매수 1회(6주) / 매도 1회(6주)
+
+[ 장세 판단 ]
+  001510  SIDEWAYS (RSI 76.4↓ MACD +435.5)
+  047040  SIDEWAYS (RSI 63.5↓ MACD +4276.9)
+
+[ 참고 ]
+  실제 손익은 증권사 앱에서 확인하세요.
+=============================================
+```
+
+---
+
+## 사용 API
+
+| API | 설명 |
+|---|---|
+| `/oauth2/token` | 토큰 발급 |
+| `ka10001` | 주식 현재가 조회 |
+| `ka10081` | 주식 일봉 차트 조회 |
+| `ka10171` | 조건검색 목록 조회 (WebSocket) |
+| `ka10172` | 조건검색 일반 조회 (WebSocket) |
+| `ka10173` | 조건검색 실시간 구독 (WebSocket) |
+| `ka10174` | 조건검색 실시간 해제 (WebSocket) |
+
+---
