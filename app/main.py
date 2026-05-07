@@ -25,9 +25,10 @@ import time
 from pathlib import Path
 
 from config.settings import Settings, load_settings
+from domain.market_regime.classifier import MarketRegimeClassifier
 from domain.risk.risk_manager import RiskManager
 from domain.service.trading_service import TradingService
-from domain.strategy.breakout_strategy import BreakoutStrategy
+from domain.strategy.strategy_router import StrategyRouter
 from infra.broker.kiwoom_broker import KiwoomBroker
 from infra.broker.mock_broker import MockBroker
 from infra.storage.logger import TradeCsvLogger, build_app_logger
@@ -83,12 +84,14 @@ def main() -> None:
     broker = build_broker(settings)
     broker.authenticate()
 
-    strategy = BreakoutStrategy(settings.strategy)
+    strategy_router = StrategyRouter(settings.strategy)
+    regime_classifier = MarketRegimeClassifier(settings.market_regime)
     risk_manager = RiskManager(settings.trading, settings.risk)
     trading_service = TradingService(
         settings=settings,
         broker=broker,
-        strategy=strategy,
+        strategy_router=strategy_router,
+        regime_classifier=regime_classifier,
         risk_manager=risk_manager,
         app_logger=app_logger,
         trade_logger=trade_logger,

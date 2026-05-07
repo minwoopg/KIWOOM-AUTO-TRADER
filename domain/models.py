@@ -87,6 +87,37 @@ class Signal:
 
     type: SignalType
     reason: str
+    
+@dataclass(frozen=True)
+class PriceBar:
+    """일봉 하나를 표현하는 객체입니다.
+
+    장세 분류기(MarketRegimeClassifier)가 이동평균, RSI 등을
+    계산할 때 사용합니다.
+    """
+
+    date: str           # 'YYYYMMDD'
+    open_price: int
+    high_price: int
+    low_price: int
+    close_price: int
+    volume: int
+
+
+class MarketRegime(str, Enum):
+    """장세 분류 결과입니다.
+
+    BULLISH  : 상승장 → 돌파 전략 실행
+    SIDEWAYS : 횡보장 → 신규 매수 중단, 기존 보유만 관리
+    BEARISH  : 하락장 → 신규 매수 중단, 손절 우선
+    UNKNOWN  : 데이터 부족 등으로 판단 불가 → 보수적으로 횡보 취급
+    """
+
+    BULLISH = "BULLISH"
+    SIDEWAYS = "SIDEWAYS"
+    BEARISH = "BEARISH"
+    UNKNOWN = "UNKNOWN"
+
 
 
 @dataclass

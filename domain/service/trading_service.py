@@ -17,9 +17,10 @@ from __future__ import annotations
 from datetime import datetime
 
 from config.settings import Settings
-from domain.models import AccountBalance, OrderRequest, OrderSide, Signal, SignalType
+from domain.market_regime.classifier import MarketRegimeClassifier
+from domain.models import AccountBalance, MarketRegime, OrderRequest, OrderSide, Signal, SignalType
 from domain.risk.risk_manager import RiskManager
-from domain.strategy.base import Strategy
+from domain.strategy.strategy_router import StrategyRouter
 from infra.broker.base import Broker
 from infra.storage.logger import AppLogger, TradeCsvLogger
 from infra.storage.state_store import JsonStateStore
@@ -33,7 +34,8 @@ class TradingService:
         self,
         settings: Settings,
         broker: Broker,
-        strategy: Strategy,
+        strategy_router: StrategyRouter,
+        regime_classifier: MarketRegimeClassifier,
         risk_manager: RiskManager,
         app_logger: AppLogger,
         trade_logger: TradeCsvLogger,
@@ -41,7 +43,8 @@ class TradingService:
     ) -> None:
         self.settings = settings
         self.broker = broker
-        self.strategy = strategy
+        self.strategy_router = strategy_router
+        self.regime_classifier = regime_classifier
         self.risk_manager = risk_manager
         self.app_logger = app_logger
         self.trade_logger = trade_logger
@@ -49,14 +52,20 @@ class TradingService:
 
         self.state = self.state_store.load()
 
-        # 캐시용 변수
+        # 계좌/현재가 캐시
         self.cached_balance: AccountBalance | None = None
         self.cached_balance_loaded_at: datetime | None = None
-
         self.cached_market_prices: dict[str, object] = {}
         self.cached_market_price_loaded_at: dict[str, datetime] = {}
-        
-        # HOLD 로그를 종목별로 마지막 언제 출력했는지 저장
+
+        # 일봉 히스토리 캐시 (종목별, 하루 1~2회 갱신)
+        self.cached_daily_bars: dict[str, list] = {}
+        self.cached_daily_bars_loaded_at: dict[str, datetime] = {}
+
+        # 장세 분류 결과 캐시 (일봉과 같은 주기로 갱신)
+        self.cached_regime: dict[str, MarketRegime] = {}
+
+        # HOLD 로그 throttle
         self.last_hold_log_at_by_symbol: dict[str, datetime] = {}
 
     def _get_balance_with_cache(self) -> AccountBalance:
@@ -151,39 +160,73 @@ class TradingService:
         )
         return cached_price
 
-    def _log_signal_decision(self, symbol: str, signal: Signal, current_price: int) -> None:
-        """전략 판단 결과를 사람이 읽기 쉬운 문장으로 로그에 남깁니다.
+    def _get_regime_with_cache(self, symbol: str) -> tuple[MarketRegime, str]:
+        """일봉 히스토리를 가져와 장세를 분류합니다. 결과는 캐시합니다.
 
-        단, HOLD는 너무 자주 찍히면 로그가 과해지므로
-        종목별로 30초에 1번만 출력합니다.
+        일봉 데이터는 자주 바뀌지 않으므로 history_refresh_seconds 주기로만 갱신합니다.
+        기본값 3600초(1시간)로 설정되어 있어 429 부담이 거의 없습니다.
         """
+        now = datetime.now()
+        loaded_at = self.cached_daily_bars_loaded_at.get(symbol)
+        refresh_sec = self.settings.market_regime.history_refresh_seconds
+
+        need_refresh = (
+            loaded_at is None
+            or (now - loaded_at).total_seconds() >= refresh_sec
+        )
+
+        if need_refresh:
+            try:
+                bars = self.broker.get_daily_prices(
+                    symbol, self.settings.market_regime.history_days
+                )
+                self.cached_daily_bars[symbol] = bars
+                self.cached_daily_bars_loaded_at[symbol] = now
+
+                regime, reason = self.regime_classifier.classify(bars)
+                self.cached_regime[symbol] = regime
+
+                self.app_logger.info(
+                    f"[REGIME] {symbol} | {regime.value} | {reason}"
+                )
+                return regime, reason
+
+            except Exception as exc:
+                self.app_logger.warning(
+                    f"[REGIME] {symbol} | 일봉 조회 실패, 캐시 사용 | {exc}"
+                )
+                # 캐시가 있으면 재사용, 없으면 UNKNOWN
+                cached = self.cached_regime.get(symbol, MarketRegime.UNKNOWN)
+                return cached, "일봉 조회 실패 — 직전 장세 판단 유지"
+
+        # 캐시 재사용
+        cached = self.cached_regime.get(symbol, MarketRegime.UNKNOWN)
+        return cached, "(캐시)"
+
+    def _log_signal_decision(self, symbol: str, signal: Signal, current_price: int, regime: MarketRegime) -> None:
+        """전략 판단 결과를 사람이 읽기 쉬운 문장으로 로그에 남깁니다."""
+        regime_tag = f"[{regime.value}]"
+
         if signal.type == SignalType.BUY:
             self.app_logger.info(
-                f"[BUY ] {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
+                f"[BUY ] {regime_tag} {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
             )
             return
 
         if signal.type == SignalType.SELL:
             self.app_logger.info(
-                f"[SELL] {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
+                f"[SELL] {regime_tag} {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
             )
             return
 
         if signal.type == SignalType.HOLD:
             now = datetime.now()
             last_logged_at = self.last_hold_log_at_by_symbol.get(symbol)
-
-            # 이전 HOLD 로그가 없거나, 30초 이상 지났을 때만 출력
             if last_logged_at is None or (now - last_logged_at).total_seconds() >= 30:
                 self.app_logger.info(
-                    f"[HOLD] {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
+                    f"[HOLD] {regime_tag} {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
                 )
                 self.last_hold_log_at_by_symbol[symbol] = now
-            return
-
-        self.app_logger.info(
-            f"[INFO] {symbol} | 현재가 {current_price:,}원 | 판단 결과: {signal.type.value}"
-        )
 
     def run_once(self) -> None:
         """자동매매 루프를 한 번 실행합니다."""
@@ -192,10 +235,14 @@ class TradingService:
         for symbol in self.settings.targets:
             market_price = self._get_market_price_with_cache(symbol)
 
-            position = next((p for p in balance.positions if p.symbol == symbol), None)
-            signal = self.strategy.generate_signal(market_price, position)
+            # ── 장세 분류 → 전략 선택 ───────────────────────────────
+            regime, _ = self._get_regime_with_cache(symbol)
+            strategy = self.strategy_router.select(regime)
 
-            self._log_signal_decision(symbol, signal, market_price.current_price)
+            position = next((p for p in balance.positions if p.symbol == symbol), None)
+            signal = strategy.generate_signal(market_price, position)
+
+            self._log_signal_decision(symbol, signal, market_price.current_price, regime)
 
             if signal.type == SignalType.BUY:
                 self._try_buy(symbol, market_price.current_price, balance)

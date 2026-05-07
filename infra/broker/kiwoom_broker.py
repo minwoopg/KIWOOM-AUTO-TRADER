@@ -26,7 +26,7 @@ from typing import Any
 import requests
 
 from config.settings import BrokerConfig
-from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, OrderSide, Position
+from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, OrderSide, Position, PriceBar
 from infra.broker.base import Broker
 
 
@@ -197,6 +197,54 @@ class KiwoomBroker(Broker):
                 )
 
         return AccountBalance(cash=cash, total_asset=total_asset, positions=positions)
+
+    def get_daily_prices(self, symbol: str, days: int) -> list[PriceBar]:
+        """키움 일봉 API(ka10086)로 종목의 최근 일봉 데이터를 가져옵니다.
+
+        키움 ka10086: 주식일봉조회
+        - stk_cd  : 종목코드
+        - strt_dt : 시작일자 (YYYYMMDD) — 오늘부터 충분히 과거로 설정
+        - end_dt  : 종료일자 (YYYYMMDD) — 오늘 날짜
+
+        응답의 'stk_dt_pole_qry' 리스트를 파싱합니다.
+        키움 응답은 최신 날짜가 앞에 오므로 reverse() 후 반환합니다.
+        """
+        from datetime import date, timedelta
+
+        end_dt = date.today().strftime("%Y%m%d")
+        # days보다 넉넉하게 요청해서 공휴일/주말을 감안합니다
+        start_dt = (date.today() - timedelta(days=days * 2)).strftime("%Y%m%d")
+
+        api_response = self._post(
+            endpoint="/api/dostk/stkinfo",
+            api_id="ka10086",
+            payload={
+                "stk_cd": symbol,
+                "strt_dt": start_dt,
+                "end_dt": end_dt,
+            },
+        )
+
+        raw_bars = api_response.body.get("stk_dt_pole_qry", [])
+        bars: list[PriceBar] = []
+
+        for item in raw_bars:
+            bars.append(
+                PriceBar(
+                    date=str(item.get("dt", "")),
+                    open_price=self._parse_abs_int(item.get("opn_pric")),
+                    high_price=self._parse_abs_int(item.get("hgh_pric")),
+                    low_price=self._parse_abs_int(item.get("low_pric")),
+                    close_price=self._parse_abs_int(item.get("cls_pric")),
+                    volume=self._parse_abs_int(item.get("trde_qty")),
+                )
+            )
+
+        # 키움은 최신 → 과거 순이므로 뒤집어서 과거 → 최신 순으로 반환
+        bars.reverse()
+
+        # 요청한 days 수만큼만 잘라서 반환
+        return bars[-days:] if len(bars) > days else bars
 
     def place_order(self, order: OrderRequest) -> OrderResult:
         """매수 또는 매도 주문을 키움 REST API로 전송합니다.

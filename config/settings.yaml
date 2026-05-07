@@ -38,6 +38,15 @@ strategy:
   stop_loss_pct: 1.5
   reference_price_type: previous_close
 
+market_regime:
+  short_ma_days: 5
+  long_ma_days: 20
+  history_days: 30          # long_ma_days보다 넉넉하게
+  rsi_period: 14
+  rsi_overbought: 80.0      # 80 이상일 때만 상승 신호 차단 (70은 지속 상승장에서 너무 엄격)
+  rsi_oversold: 20.0        # 20 이하일 때만 하락 신호 차단
+  history_refresh_seconds: 3600   # 1시간마다 일봉 갱신
+
 risk:
   max_daily_loss_amount: 100000
   max_order_amount: 300000

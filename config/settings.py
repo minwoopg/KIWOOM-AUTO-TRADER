@@ -55,7 +55,7 @@ class TradingConfig:
     max_positions: int
     allow_multiple_entries_per_symbol_per_day: bool
     force_exit_before_market_close_minutes: int
-
+    
 
 @dataclass(frozen=True)
 class StrategyConfig:
@@ -66,6 +66,29 @@ class StrategyConfig:
     take_profit_pct: float
     stop_loss_pct: float
     reference_price_type: str
+
+
+@dataclass(frozen=True)
+class MarketRegimeConfig:
+    """장세 분류기에 사용할 파라미터를 보관합니다.
+
+    short_ma_days   : 단기 이동평균 기간 (기본 5일)
+    long_ma_days    : 장기 이동평균 기간 (기본 20일)
+    history_days    : 일봉 히스토리 요청 일수 (long_ma_days보다 커야 함)
+    rsi_period      : RSI 계산 기간 (기본 14일)
+    rsi_overbought  : RSI 과매수 기준 (기본 70)
+    rsi_oversold    : RSI 과매도 기준 (기본 30)
+    history_refresh_seconds : 일봉 캐시 갱신 주기 (기본 3600 = 1시간)
+    """
+
+    short_ma_days: int
+    long_ma_days: int
+    history_days: int
+    rsi_period: int
+    rsi_overbought: float
+    rsi_oversold: float
+    history_refresh_seconds: int
+
 
 
 @dataclass(frozen=True)

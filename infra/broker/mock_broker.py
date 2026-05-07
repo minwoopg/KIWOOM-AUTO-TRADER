@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from itertools import count
 
-from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, Position
+from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, Position, PriceBar
 from infra.broker.base import Broker
 
 
@@ -70,3 +70,35 @@ class MockBroker(Broker):
             self._positions.pop(order.symbol, None)
 
         return OrderResult(order_id, order.symbol, order.side, order.quantity, True, "accepted", datetime.now())
+
+    def get_daily_prices(self, symbol: str, days: int) -> list[PriceBar]:
+        """테스트용 가짜 일봉을 생성합니다.
+
+        기준가에서 ±2% 범위의 랜덤 일봉을 days개 만들어 반환합니다.
+        골든크로스 패턴(상승장)을 시뮬레이션하기 위해 완만한 우상향 추세를 넣었습니다.
+        """
+        import random
+
+        base = self._prices.get(symbol, 10000)
+        bars: list[PriceBar] = []
+
+        price = int(base * 0.9)  # 30일 전 시작가를 현재보다 낮게 설정 → 상승장 시뮬레이션
+        for i in range(days):
+            # 완만하게 올라가는 추세 + 약간의 노이즈
+            trend = base * 0.1 / days  # 전체 기간 동안 10% 상승
+            noise = random.uniform(-0.01, 0.013) * price
+            close = int(price + trend + noise)
+            high = int(close * random.uniform(1.002, 1.015))
+            low = int(close * random.uniform(0.985, 0.998))
+            open_p = int(price * random.uniform(0.995, 1.005))
+            bars.append(PriceBar(
+                date=f"2026{(i + 1):04d}",
+                open_price=open_p,
+                high_price=high,
+                low_price=low,
+                close_price=close,
+                volume=random.randint(100_000, 1_000_000),
+            ))
+            price = close
+
+        return bars
