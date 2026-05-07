@@ -14,6 +14,7 @@ from __future__ import annotations
 계좌 정보와 현재가를 일정 시간 동안 캐시해서 재사용합니다.
 """
 
+import time
 from datetime import datetime
 
 from config.settings import Settings
@@ -193,9 +194,9 @@ class TradingService:
 
             except Exception as exc:
                 self.app_logger.warning(
-                    f"[REGIME] {symbol} | 일봉 조회 실패, 캐시 사용 | {exc}"
+                    f"[REGIME] {symbol} | 일봉 조회 실패({type(exc).__name__}) — "
+                    f"{'직전 캐시 유지' if symbol in self.cached_regime else 'UNKNOWN으로 처리'}"
                 )
-                # 캐시가 있으면 재사용, 없으면 UNKNOWN
                 cached = self.cached_regime.get(symbol, MarketRegime.UNKNOWN)
                 return cached, "일봉 조회 실패 — 직전 장세 판단 유지"
 
@@ -232,13 +233,20 @@ class TradingService:
         """자동매매 루프를 한 번 실행합니다."""
         balance = self._get_balance_with_cache()
 
-        for symbol in self.settings.targets:
+        for i, symbol in enumerate(self.settings.targets):
+
+            # 두 번째 종목부터는 API 과호출 방지를 위해 잠깐 대기합니다.
+            # 키움 ka10001/ka10086 연속 호출 시 429 방지용입니다.
+            if i > 0:
+                time.sleep(1.0)
+
+            # 일봉(장세) → 현재가 순서로 호출합니다.
+            # 일봉은 캐시가 있으면 API를 전혀 호출하지 않으므로
+            # 첫 실행 이후에는 부담이 없습니다.
+            regime, _ = self._get_regime_with_cache(symbol)
             market_price = self._get_market_price_with_cache(symbol)
 
-            # ── 장세 분류 → 전략 선택 ───────────────────────────────
-            regime, _ = self._get_regime_with_cache(symbol)
             strategy = self.strategy_router.select(regime)
-
             position = next((p for p in balance.positions if p.symbol == symbol), None)
             signal = strategy.generate_signal(market_price, position)
 

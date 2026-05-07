@@ -23,7 +23,7 @@ targets:
     - "047040"
 
 trading:
-  poll_interval_seconds: 5
+  poll_interval_seconds: 10        # 5 → 10초 (종목 간 1초 딜레이 감안)
   balance_refresh_seconds: 180
   price_refresh_seconds: 300
   order_cash_per_trade: 200000

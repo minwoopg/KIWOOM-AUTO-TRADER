@@ -199,43 +199,41 @@ class KiwoomBroker(Broker):
         return AccountBalance(cash=cash, total_asset=total_asset, positions=positions)
 
     def get_daily_prices(self, symbol: str, days: int) -> list[PriceBar]:
-        """키움 일봉 API(ka10086)로 종목의 최근 일봉 데이터를 가져옵니다.
+        """키움 일봉 API(ka10081)로 종목의 최근 일봉 데이터를 가져옵니다.
 
-        키움 ka10086: 주식일봉조회
-        - stk_cd  : 종목코드
-        - strt_dt : 시작일자 (YYYYMMDD) — 오늘부터 충분히 과거로 설정
-        - end_dt  : 종료일자 (YYYYMMDD) — 오늘 날짜
+        키움 ka10081: 주식일봉차트조회
+        - stk_cd       : 종목코드
+        - base_dt      : 기준일자 (YYYYMMDD) — 오늘 날짜로 설정
+        - upd_stkpc_tp : 수정주가구분 (1 = 수정주가 적용)
 
-        응답의 'stk_dt_pole_qry' 리스트를 파싱합니다.
+        응답의 'stk_dt_pole_chart_qry' 리스트를 파싱합니다.
         키움 응답은 최신 날짜가 앞에 오므로 reverse() 후 반환합니다.
         """
-        from datetime import date, timedelta
+        from datetime import date
 
-        end_dt = date.today().strftime("%Y%m%d")
-        # days보다 넉넉하게 요청해서 공휴일/주말을 감안합니다
-        start_dt = (date.today() - timedelta(days=days * 2)).strftime("%Y%m%d")
+        base_dt = date.today().strftime("%Y%m%d")
 
         api_response = self._post(
-            endpoint="/api/dostk/stkinfo",
-            api_id="ka10086",
+            endpoint="/api/dostk/chart",
+            api_id="ka10081",
             payload={
                 "stk_cd": symbol,
-                "strt_dt": start_dt,
-                "end_dt": end_dt,
+                "base_dt": base_dt,
+                "upd_stkpc_tp": "1",
             },
         )
 
-        raw_bars = api_response.body.get("stk_dt_pole_qry", [])
+        raw_bars = api_response.body.get("stk_dt_pole_chart_qry", [])
         bars: list[PriceBar] = []
 
         for item in raw_bars:
             bars.append(
                 PriceBar(
                     date=str(item.get("dt", "")),
-                    open_price=self._parse_abs_int(item.get("opn_pric")),
-                    high_price=self._parse_abs_int(item.get("hgh_pric")),
+                    open_price=self._parse_abs_int(item.get("open_pric")),
+                    high_price=self._parse_abs_int(item.get("high_pric")),
                     low_price=self._parse_abs_int(item.get("low_pric")),
-                    close_price=self._parse_abs_int(item.get("cls_pric")),
+                    close_price=self._parse_abs_int(item.get("cur_prc")),
                     volume=self._parse_abs_int(item.get("trde_qty")),
                 )
             )
