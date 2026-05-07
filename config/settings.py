@@ -55,7 +55,7 @@ class TradingConfig:
     max_positions: int
     allow_multiple_entries_per_symbol_per_day: bool
     force_exit_before_market_close_minutes: int
-    
+
 
 @dataclass(frozen=True)
 class StrategyConfig:
@@ -90,7 +90,6 @@ class MarketRegimeConfig:
     history_refresh_seconds: int
 
 
-
 @dataclass(frozen=True)
 class RiskConfig:
     """리스크 관리에 필요한 제한값을 보관합니다."""
@@ -119,6 +118,7 @@ class Settings:
     trading: TradingConfig
     strategy: StrategyConfig
     risk: RiskConfig
+    market_regime: MarketRegimeConfig
     storage: StorageConfig
 
 
@@ -160,5 +160,6 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
         trading=TradingConfig(**raw["trading"]),
         strategy=StrategyConfig(**raw["strategy"]),
         risk=RiskConfig(**raw["risk"]),
+        market_regime=MarketRegimeConfig(**raw["market_regime"]),
         storage=StorageConfig(**raw["storage"]),
     )
