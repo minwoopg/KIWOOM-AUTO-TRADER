@@ -100,15 +100,19 @@ class WebSocketConfig:
     """조건검색 WebSocket 연결 설정입니다.
 
     enabled       : false면 WebSocket 없이 기존 방식(수동 종목)으로 동작
-    url           : WebSocket 서버 URL
+    url           : WebSocket 서버 URL (실전: wss://api.kiwoom.com:10000/...)
     condition_seq : 사용할 조건검색식 번호 (HTS에서 확인)
     max_symbols   : 조건검색으로 편입 가능한 최대 종목 수
+    app_key       : 조건검색용 실전 계좌 앱키 (모의투자와 별도)
+    secret_key    : 조건검색용 실전 계좌 시크릿키
     """
 
     enabled: bool
     url: str
     condition_seq: int
     max_symbols: int
+    app_key: str
+    secret_key: str
 
 
 @dataclass(frozen=True)

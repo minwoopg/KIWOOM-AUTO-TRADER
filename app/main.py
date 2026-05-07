@@ -108,16 +108,24 @@ async def async_main() -> None:
     # ── WebSocket 조건검색 활성화 여부 ───────────────────────────
     if settings.websocket.enabled:
         from infra.websocket.condition_watcher import ConditionWatcher
+        from infra.websocket.real_token import fetch_real_token
 
         def on_symbols_changed(symbols: list[str]) -> None:
-            """조건검색 편입/편출 시 trading_service의 targets를 동적으로 갱신합니다."""
             limited = symbols[:settings.websocket.max_symbols]
             trading_service.update_targets(limited)
             app_logger.info(f"[COND] 종목 목록 갱신: {limited}")
 
+        # 조건검색은 실전 계좌 토큰으로 별도 발급
+        app_logger.info("[COND] 실전 계좌 토큰 발급 중...")
+        real_token = fetch_real_token(
+            app_key=settings.websocket.app_key,
+            secret_key=settings.websocket.secret_key,
+        )
+        app_logger.info("[COND] 실전 계좌 토큰 발급 완료")
+
         watcher = ConditionWatcher(
             config=settings.websocket,
-            token=broker.get_token(),
+            token=real_token,
             on_symbols_changed=on_symbols_changed,
         )
 
@@ -125,9 +133,8 @@ async def async_main() -> None:
             f"[COND] 조건검색 모드 활성화 "
             f"(조건식 번호: {settings.websocket.condition_seq})"
         )
-        app_logger.info(f"loaded targets: 조건검색으로 자동 설정")
+        app_logger.info("[COND] 종목은 조건검색으로 자동 설정됩니다")
 
-        # REST 루프 + WebSocket 루프 동시 실행
         await asyncio.gather(
             trading_loop(trading_service, settings, app_logger),
             watcher.start(),
