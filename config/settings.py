@@ -88,6 +88,10 @@ class MarketRegimeConfig:
     rsi_overbought: float
     rsi_oversold: float
     history_refresh_seconds: int
+    macd_fast: int
+    macd_slow: int
+    macd_signal: int
+    volume_surge_ratio: float
 
 
 @dataclass(frozen=True)

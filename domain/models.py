@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Optional, List
 
 
 class SignalType(str, Enum):
@@ -30,13 +30,24 @@ class OrderSide(str, Enum):
 
 @dataclass(frozen=True)
 class MarketPrice:
-    """현재 시세와 기준 가격 정보를 담는 객체입니다."""
+    """현재 시세와 기준 가격 정보를 담는 객체입니다.
+
+    indicator_* 필드는 일봉 기반 지표값으로,
+    TradingService가 classify() 결과와 함께 채워서 전략에 전달합니다.
+    값이 없을 경우 None으로 두면 전략에서 기본 동작(단순 돌파)을 유지합니다.
+    """
 
     symbol: str
     current_price: int
     reference_price: int
     previous_close: int
     timestamp: datetime
+
+    # 일봉 기반 보조 지표 (선택적)
+    indicator_rsi: float | None = None
+    indicator_macd: float | None = None        # MACD 라인값
+    indicator_macd_signal: float | None = None # 시그널 라인값
+    indicator_volume_surge: bool = False       # 거래량 급증 여부
 
 
 @dataclass(frozen=True)
@@ -87,7 +98,8 @@ class Signal:
 
     type: SignalType
     reason: str
-    
+
+
 @dataclass(frozen=True)
 class PriceBar:
     """일봉 하나를 표현하는 객체입니다.
@@ -117,7 +129,6 @@ class MarketRegime(str, Enum):
     SIDEWAYS = "SIDEWAYS"
     BEARISH = "BEARISH"
     UNKNOWN = "UNKNOWN"
-
 
 
 @dataclass

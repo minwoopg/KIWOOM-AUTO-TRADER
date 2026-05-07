@@ -41,11 +41,17 @@ strategy:
 market_regime:
   short_ma_days: 5
   long_ma_days: 20
-  history_days: 30          # long_ma_days보다 넉넉하게
+  history_days: 60
   rsi_period: 14
-  rsi_overbought: 80.0      # 80 이상일 때만 상승 신호 차단 (70은 지속 상승장에서 너무 엄격)
-  rsi_oversold: 20.0        # 20 이하일 때만 하락 신호 차단
-  history_refresh_seconds: 3600   # 1시간마다 일봉 갱신
+  rsi_overbought: 80.0
+  rsi_oversold: 20.0
+  history_refresh_seconds: 3600
+  # MACD 파라미터 (일반적인 표준값)
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  # 거래량 급증 기준: 최근 20일 평균 거래량의 N배 이상이면 급증으로 판단
+  volume_surge_ratio: 1.5
 
 risk:
   max_daily_loss_amount: 100000

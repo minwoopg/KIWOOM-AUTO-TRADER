@@ -194,7 +194,7 @@ class TradingService:
 
             except Exception as exc:
                 self.app_logger.warning(
-                    f"[REGIME] {symbol} | 일봉 조회 실패({type(exc).__name__}) — "
+                    f"[REGIME] {symbol} | 일봉 조회 실패({type(exc).__name__}: {exc}) — "
                     f"{'직전 캐시 유지' if symbol in self.cached_regime else 'UNKNOWN으로 처리'}"
                 )
                 cached = self.cached_regime.get(symbol, MarketRegime.UNKNOWN)
@@ -203,6 +203,40 @@ class TradingService:
         # 캐시 재사용
         cached = self.cached_regime.get(symbol, MarketRegime.UNKNOWN)
         return cached, "(캐시)"
+
+    def _attach_indicators(self, market_price, symbol: str):
+        """캐시된 일봉 데이터로 지표값을 계산해 MarketPrice에 주입합니다.
+
+        추가 API 호출 없이 이미 캐시된 일봉을 재사용합니다.
+        일봉 캐시가 없으면 지표값 없이 그대로 반환합니다.
+        """
+        from domain.models import MarketPrice
+
+        bars = self.cached_daily_bars.get(symbol)
+        if not bars:
+            return market_price
+
+        closes  = [bar.close_price for bar in bars]
+        volumes = [bar.volume for bar in bars]
+        cfg = self.settings.market_regime
+
+        rsi = self.regime_classifier._calc_rsi(closes, cfg.rsi_period)
+        macd_line, signal_line = self.regime_classifier._calc_macd(
+            closes, cfg.macd_fast, cfg.macd_slow, cfg.macd_signal
+        )
+        volume_surge = self.regime_classifier._is_volume_surge(volumes, cfg.volume_surge_ratio)
+
+        return MarketPrice(
+            symbol=market_price.symbol,
+            current_price=market_price.current_price,
+            reference_price=market_price.reference_price,
+            previous_close=market_price.previous_close,
+            timestamp=market_price.timestamp,
+            indicator_rsi=rsi,
+            indicator_macd=macd_line,
+            indicator_macd_signal=signal_line,
+            indicator_volume_surge=volume_surge,
+        )
 
     def _log_signal_decision(self, symbol: str, signal: Signal, current_price: int, regime: MarketRegime) -> None:
         """전략 판단 결과를 사람이 읽기 쉬운 문장으로 로그에 남깁니다."""
@@ -245,6 +279,10 @@ class TradingService:
             # 첫 실행 이후에는 부담이 없습니다.
             regime, _ = self._get_regime_with_cache(symbol)
             market_price = self._get_market_price_with_cache(symbol)
+
+            # 일봉에서 계산한 지표값을 MarketPrice에 주입합니다.
+            # 전략이 RSI/MACD/거래량을 직접 참조할 수 있게 됩니다.
+            market_price = self._attach_indicators(market_price, symbol)
 
             strategy = self.strategy_router.select(regime)
             position = next((p for p in balance.positions if p.symbol == symbol), None)

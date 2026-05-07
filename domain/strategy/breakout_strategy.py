@@ -1,15 +1,23 @@
 from __future__ import annotations
 
-"""단순 돌파 전략.
+"""기술적 지표 기반 매매 전략 (RSI + MACD + 거래량 3중 필터).
 
-이 전략은 아래 규칙으로 동작합니다.
-1. 보유 종목이 없으면:
-   - 기준가 대비 일정 비율 이상 상승했을 때 BUY
-   - 아니면 HOLD
-2. 보유 종목이 있으면:
-   - 평균단가 대비 익절 구간이면 SELL
-   - 평균단가 대비 손절 구간이면 SELL
-   - 아니면 HOLD
+엑셀 자료(기술치수에 의해 매매시기 조사)의 황금시간 조건을 코드로 구현합니다.
+
+매수 조건 (3가지 동시 충족 시):
+    1. RSI 30 이하 (과매도 구간 — 바닥권)
+    2. MACD 골든크로스 (MACD > Signal — 상승 모멘텀 시작)
+    3. 거래량 급증 (평균 대비 1.5배 이상 — 세력 유입 확인)
+    → 바닥권 V자 반등 타점. 3가지 모두 충족해야 매수합니다.
+
+조건 미충족 시 단계별 완화:
+    - 3가지 중 2가지만 충족 → 매수 가능 (보수적 진입)
+    - 1가지만 충족 → HOLD
+
+매도 조건 (익절/손절은 항상 적용):
+    - 익절: 평균단가 대비 +take_profit_pct%
+    - 손절: 평균단가 대비 -stop_loss_pct%
+    + 추가 매도 신호: RSI 70 이상 + MACD 데드크로스 → 고점 반전 감지 시 조기 매도
 """
 
 from config.settings import StrategyConfig
@@ -18,7 +26,7 @@ from domain.strategy.base import Strategy
 
 
 class BreakoutStrategy(Strategy):
-    """기준가 돌파 + 익절/손절 기반의 단순 전략입니다."""
+    """RSI + MACD + 거래량 3중 필터 기반 매매 전략입니다."""
 
     def __init__(self, config: StrategyConfig) -> None:
         self.config = config
@@ -28,55 +36,83 @@ class BreakoutStrategy(Strategy):
 
         current_price = market_price.current_price
 
-        # 보유 중이 아니라면 신규 진입 판단
-        if position is None:
-            reference_price = market_price.reference_price
-            breakout_price = int(reference_price * (1 + self.config.breakout_threshold_pct / 100))
+        # 지표값 추출 (없으면 기존 단순 돌파 전략으로 폴백)
+        rsi           = market_price.indicator_rsi
+        macd          = market_price.indicator_macd
+        macd_signal   = market_price.indicator_macd_signal
+        volume_surge  = market_price.indicator_volume_surge
 
-            if current_price >= breakout_price:
+        has_indicators = rsi is not None and macd is not None and macd_signal is not None
+
+        # ── 미보유 → 매수 판단 ────────────────────────────────────
+        if position is None:
+
+            if not has_indicators:
+                # 지표 없으면 기존 단순 돌파 방식 유지 (안전망)
+                reference_price = market_price.reference_price
+                breakout_price = int(reference_price * (1 + self.config.breakout_threshold_pct / 100))
+                if current_price >= breakout_price:
+                    return Signal(
+                        type=SignalType.BUY,
+                        reason=f"지표 없음 — 단순 돌파 조건 충족 (기준가 {reference_price:,}원 대비 {self.config.breakout_threshold_pct:.1f}% 상승)",
+                    )
+                return Signal(type=SignalType.HOLD, reason="지표 없음 — 단순 돌파 조건 미충족")
+
+            # 3중 필터 조건 평가
+            cond_rsi    = rsi <= 30                      # RSI 과매도 구간
+            cond_macd   = macd > macd_signal             # MACD 골든크로스
+            cond_volume = volume_surge                   # 거래량 급증
+            score = sum([cond_rsi, cond_macd, cond_volume])
+
+            rsi_tag    = f"RSI {rsi:.1f}{'✓' if cond_rsi else '✗'}"
+            macd_tag   = f"MACD {'골든크로스✓' if cond_macd else '데드크로스✗'}"
+            volume_tag = f"거래량 {'급증✓' if cond_volume else '보통✗'}"
+            summary    = f"{rsi_tag} | {macd_tag} | {volume_tag}"
+
+            if score == 3:
                 return Signal(
                     type=SignalType.BUY,
-                    reason=(
-                        f"기준가 {reference_price:,}원 대비 "
-                        f"{self.config.breakout_threshold_pct:.1f}% 돌파 조건을 충족했습니다"
-                    ),
+                    reason=f"황금시간 3중 조건 모두 충족 — {summary}",
+                )
+
+            if score == 2:
+                return Signal(
+                    type=SignalType.BUY,
+                    reason=f"3중 조건 중 2개 충족 — {summary}",
                 )
 
             return Signal(
                 type=SignalType.HOLD,
-                reason=(
-                    f"기준가 {reference_price:,}원 대비 "
-                    f"돌파 기준 {breakout_price:,}원에 아직 도달하지 않아 관망합니다"
-                ),
+                reason=f"매수 조건 {score}/3 충족 — {summary}",
             )
 
-        # 보유 중이라면 익절/손절 판단
-        average_price = position.average_price
+        # ── 보유 중 → 매도 판단 ──────────────────────────────────
+        average_price     = position.average_price
         take_profit_price = int(average_price * (1 + self.config.take_profit_pct / 100))
-        stop_loss_price = int(average_price * (1 - self.config.stop_loss_pct / 100))
+        stop_loss_price   = int(average_price * (1 - self.config.stop_loss_pct / 100))
 
+        # 익절
         if current_price >= take_profit_price:
             return Signal(
                 type=SignalType.SELL,
-                reason=(
-                    f"평균단가 {average_price:,}원 대비 "
-                    f"익절 목표 {take_profit_price:,}원에 도달했습니다"
-                ),
+                reason=f"익절 목표 {take_profit_price:,}원 도달 (평균단가 {average_price:,}원 대비 +{self.config.take_profit_pct:.1f}%)",
             )
 
+        # 손절
         if current_price <= stop_loss_price:
             return Signal(
                 type=SignalType.SELL,
-                reason=(
-                    f"평균단가 {average_price:,}원 대비 "
-                    f"손절 기준 {stop_loss_price:,}원 아래로 내려왔습니다"
-                ),
+                reason=f"손절 기준 {stop_loss_price:,}원 하회 (평균단가 {average_price:,}원 대비 -{self.config.stop_loss_pct:.1f}%)",
+            )
+
+        # 고점 반전 감지 (RSI 과매수 + MACD 데드크로스) → 조기 매도
+        if has_indicators and rsi >= 70 and macd < macd_signal:
+            return Signal(
+                type=SignalType.SELL,
+                reason=f"고점 반전 감지 — RSI {rsi:.1f} 과매수 + MACD 데드크로스 → 조기 차익 실현",
             )
 
         return Signal(
             type=SignalType.HOLD,
-            reason=(
-                f"보유 중이지만 익절 목표 {take_profit_price:,}원과 "
-                f"손절 기준 {stop_loss_price:,}원 사이에 있어 유지합니다"
-            ),
+            reason=f"보유 유지 — 익절 {take_profit_price:,}원 / 손절 {stop_loss_price:,}원 사이",
         )
