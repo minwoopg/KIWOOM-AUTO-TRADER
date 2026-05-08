@@ -16,22 +16,27 @@ broker:
   account_number: ${KIWOOM_ACCOUNT_NUMBER}
   is_paper_trading: true
 
-# 첫 버전은 종목 수를 적게 두는 편이 디버깅에 좋습니다.
+# 단타/스윙 종목을 분리해서 등록합니다.
+# 조건검색 OFF 시 아래 종목을 직접 사용합니다.
 targets:
-  symbols:
+  # 단타 종목: 당일 매수/청산, 익절 +2~3%, 손절 -1.5%
+  day_symbols:
     - "001510"
     - "047040"
+    - "010170"
+  # 스윙 종목: 수일~수주 보유, 익절 +10~15%, 손절 -5%
+  swing_symbols: []
 
 trading:
   poll_interval_seconds: 10
   balance_refresh_seconds: 180
   price_refresh_seconds: 300
   order_cash_per_trade: 200000
-  max_positions: 2
+  max_positions: 5             # 단타 2 + 스윙 3
+  max_day_positions: 2         # 단타 최대 보유 종목
+  max_swing_positions: 3       # 스윙 최대 보유 종목
   allow_multiple_entries_per_symbol_per_day: true
   force_exit_before_market_close_minutes: 10
-  # 매도 후 같은 종목 재매수 차단 시간 (초)
-  # 600 = 10분. 너무 짧으면 핑퐁, 너무 길면 기회를 놓침
   reentry_cooldown_seconds: 600
 
 strategy:
@@ -40,6 +45,15 @@ strategy:
   take_profit_pct: 2.0
   stop_loss_pct: 1.5
   reference_price_type: previous_close
+
+swing:
+  take_profit_pct: 12.0        # 익절 기준 (+12%)
+  stop_loss_pct: 5.0           # 손절 기준 (-5%)
+  weekly_history_weeks: 20     # 주봉 조회 주수
+  weekly_refresh_seconds: 7200 # 주봉 캐시 갱신 주기 (2시간)
+  # 주봉 장세 판단 파라미터
+  short_ma_weeks: 5            # 단기 이동평균 (5주)
+  long_ma_weeks: 20            # 장기 이동평균 (20주)
 
 market_regime:
   short_ma_days: 5

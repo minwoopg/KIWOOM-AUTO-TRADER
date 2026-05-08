@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from itertools import count
 
-from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, Position, PriceBar
+from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, Position, PriceBar, WeeklyBar
 from infra.broker.base import Broker
 
 
@@ -98,6 +98,33 @@ class MockBroker(Broker):
                 low_price=low,
                 close_price=close,
                 volume=random.randint(100_000, 1_000_000),
+            ))
+            price = close
+
+        return bars
+
+    def get_weekly_prices(self, symbol: str, weeks: int) -> list[WeeklyBar]:
+        """테스트용 가짜 주봉을 생성합니다. 완만한 상승 추세로 설정합니다."""
+        import random
+
+        base = self._prices.get(symbol, 10000)
+        bars: list[WeeklyBar] = []
+        price = int(base * 0.85)
+
+        for i in range(weeks):
+            trend = base * 0.15 / weeks
+            noise = random.uniform(-0.015, 0.02) * price
+            close = int(price + trend + noise)
+            high  = int(close * random.uniform(1.005, 1.02))
+            low   = int(close * random.uniform(0.98, 0.995))
+            open_p = int(price * random.uniform(0.99, 1.01))
+            bars.append(WeeklyBar(
+                date=f"2026W{i+1:02d}",
+                open_price=open_p,
+                high_price=high,
+                low_price=low,
+                close_price=close,
+                volume=random.randint(500_000, 5_000_000),
             ))
             price = close
 

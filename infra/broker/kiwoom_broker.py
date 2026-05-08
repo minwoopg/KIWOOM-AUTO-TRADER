@@ -26,7 +26,7 @@ from typing import Any
 import requests
 
 from config.settings import BrokerConfig
-from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, OrderSide, Position, PriceBar
+from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, OrderSide, Position, PriceBar, WeeklyBar
 from infra.broker.base import Broker
 
 
@@ -105,6 +105,44 @@ class KiwoomBroker(Broker):
 
         self.access_token = token
         self.token_expires_at = api_response.body.get("expires_dt")
+
+    def get_weekly_prices(self, symbol: str, weeks: int) -> list[WeeklyBar]:
+        """키움 주봉 API(ka10082)로 종목의 최근 주봉 데이터를 가져옵니다.
+
+        응답 배열 키: stk_stk_pole_chart_qry (일봉과 다름에 주의)
+        키움 응답은 최신 → 과거 순이므로 reverse() 후 반환합니다.
+        """
+        from datetime import date
+
+        base_dt = date.today().strftime("%Y%m%d")
+
+        api_response = self._post(
+            endpoint="/api/dostk/chart",
+            api_id="ka10082",
+            payload={
+                "stk_cd": symbol,
+                "base_dt": base_dt,
+                "upd_stkpc_tp": "1",
+            },
+        )
+
+        raw_bars = api_response.body.get("stk_stk_pole_chart_qry", [])
+        bars: list[WeeklyBar] = []
+
+        for item in raw_bars:
+            bars.append(
+                WeeklyBar(
+                    date=str(item.get("dt", "")),
+                    open_price=self._parse_abs_int(item.get("open_pric")),
+                    high_price=self._parse_abs_int(item.get("high_pric")),
+                    low_price=self._parse_abs_int(item.get("low_pric")),
+                    close_price=self._parse_abs_int(item.get("cur_prc")),
+                    volume=self._parse_abs_int(item.get("trde_qty")),
+                )
+            )
+
+        bars.reverse()
+        return bars[-weeks:] if len(bars) > weeks else bars
 
     def get_token(self) -> str:
         """WebSocket 로그인에 사용할 접근 토큰을 반환합니다."""

@@ -53,6 +53,8 @@ class TradingConfig:
     price_refresh_seconds: int
     order_cash_per_trade: int
     max_positions: int
+    max_day_positions: int
+    max_swing_positions: int
     allow_multiple_entries_per_symbol_per_day: bool
     force_exit_before_market_close_minutes: int
     reentry_cooldown_seconds: int
@@ -60,13 +62,33 @@ class TradingConfig:
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    """전략이 사용할 수치 파라미터를 보관합니다."""
+    """단타 전략 파라미터를 보관합니다."""
 
     name: str
     breakout_threshold_pct: float
     take_profit_pct: float
     stop_loss_pct: float
     reference_price_type: str
+
+
+@dataclass(frozen=True)
+class SwingConfig:
+    """스윙 전략 파라미터를 보관합니다.
+
+    take_profit_pct      : 익절 기준 (기본 12%)
+    stop_loss_pct        : 손절 기준 (기본 5%)
+    weekly_history_weeks : 주봉 조회 주수
+    weekly_refresh_seconds : 주봉 캐시 갱신 주기 (초)
+    short_ma_weeks       : 단기 이동평균 기간 (주)
+    long_ma_weeks        : 장기 이동평균 기간 (주)
+    """
+
+    take_profit_pct: float
+    stop_loss_pct: float
+    weekly_history_weeks: int
+    weekly_refresh_seconds: int
+    short_ma_weeks: int
+    long_ma_weeks: int
 
 
 @dataclass(frozen=True)
@@ -139,22 +161,25 @@ class Settings:
 
     app: AppConfig
     broker: BrokerConfig
-    targets: list[str]
+    day_symbols: list[str]
+    swing_symbols: list[str]
     trading: TradingConfig
     strategy: StrategyConfig
+    swing: SwingConfig
     risk: RiskConfig
     market_regime: MarketRegimeConfig
     storage: StorageConfig
     websocket: WebSocketConfig
 
+    @property
+    def targets(self) -> list[str]:
+        """단타 + 스윙 종목을 합친 전체 감시 목록입니다."""
+        return list(dict.fromkeys(self.day_symbols + self.swing_symbols))
+
 
 # 이 함수는 문자열 안의 ${ENV_NAME} 값을 실제 환경변수 값으로 바꿉니다.
 def _substitute_env(value: Any) -> Any:
-    """환경변수 치환을 재귀적으로 수행합니다.
-
-    dict, list, str를 모두 순회하면서 `${...}` 패턴을 실제 OS 환경변수 값으로 바꿉니다.
-    예를 들어 `${KIWOOM_APP_KEY}`는 실제 `os.environ["KIWOOM_APP_KEY"]` 값으로 치환됩니다.
-    """
+    """환경변수 치환을 재귀적으로 수행합니다."""
 
     if isinstance(value, str):
         def replace(match: re.Match[str]) -> str:
@@ -172,7 +197,6 @@ def _substitute_env(value: Any) -> Any:
     return value
 
 
-# 프로그램 시작 시 가장 먼저 호출되는 설정 로더입니다.
 def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
     """YAML 파일을 읽어서 Settings 객체로 변환합니다."""
 
@@ -182,9 +206,11 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
     return Settings(
         app=AppConfig(**raw["app"]),
         broker=BrokerConfig(**raw["broker"]),
-        targets=raw["targets"]["symbols"],
+        day_symbols=raw["targets"].get("day_symbols", []),
+        swing_symbols=raw["targets"].get("swing_symbols", []),
         trading=TradingConfig(**raw["trading"]),
         strategy=StrategyConfig(**raw["strategy"]),
+        swing=SwingConfig(**raw["swing"]),
         risk=RiskConfig(**raw["risk"]),
         market_regime=MarketRegimeConfig(**raw["market_regime"]),
         storage=StorageConfig(**raw["storage"]),

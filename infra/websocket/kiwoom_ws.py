@@ -78,13 +78,16 @@ class KiwoomWebSocket:
     async def _connect_and_run(self) -> None:
         """실제 WebSocket 연결 및 수신 루프입니다."""
         logger.info(f"[WS] 연결 시도: {self.url}")
-        async with websockets.connect(self.url) as ws:
-            self._ws = ws
-            logger.info("[WS] 연결 성공 — 로그인 패킷 전송")
 
+        ws = await websockets.connect(self.url)
+        self._ws = ws
+
+        try:
+            logger.info("[WS] 연결 성공 — 로그인 패킷 전송")
             await self.send({"trnm": "LOGIN", "token": self.token})
 
-            async for raw in ws:
+            while True:
+                raw = await ws.recv()
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
@@ -93,10 +96,12 @@ class KiwoomWebSocket:
 
                 trnm = msg.get("trnm", "")
 
-                # PING은 그대로 돌려보냄 (연결 유지)
                 if trnm == "PING":
                     await self.send(msg)
                     continue
 
-                # 나머지는 콜백으로 전달
                 await self.on_message(msg)
+
+        finally:
+            await ws.close()
+            self._ws = None

@@ -132,10 +132,11 @@ class ConditionWatcher:
 
         data = msg.get("data", [])
         # jmcode 필드에서 종목코드 추출 ('A005930' → '005930')
+        # 'A'로 시작하는 코드만 일반 주식으로 간주 (ETF, 인버스 등 제외)
         symbols = [
             item["jmcode"].lstrip("A")
             for item in data
-            if "jmcode" in item
+            if "jmcode" in item and item["jmcode"].startswith("A")
         ]
 
         self._symbols = set(symbols)
@@ -154,6 +155,11 @@ class ConditionWatcher:
             raw_code = values.get("9001", "")
             action   = values.get("843", "")   # I=삽입(편입), D=삭제(편출)
             symbol   = raw_code.lstrip("A")
+
+            # 'A'로 시작하지 않으면 ETF/인버스 등으로 간주하고 제외
+            if not raw_code.startswith("A"):
+                logger.info(f"[COND] 제외: {raw_code} — 일반 주식 아님 (ETF/인버스 등)")
+                continue
 
             if not symbol:
                 continue

@@ -48,7 +48,9 @@ class MarketPrice:
     indicator_rsi_direction: int = 0           # +1 상승, -1 하락, 0 보합
     indicator_macd: float | None = None
     indicator_macd_signal: float | None = None
+    indicator_macd_hist_direction: int = 0     # +1 히스토그램 확대, -1 축소, 0 보합
     indicator_volume_surge: bool = False
+    indicator_price_above_ma5: bool = False    # 현재가 > 5일 이동평균
 
 
 @dataclass(frozen=True)
@@ -103,13 +105,25 @@ class Signal:
 
 @dataclass(frozen=True)
 class PriceBar:
-    """일봉 하나를 표현하는 객체입니다.
+    """일봉 하나를 표현하는 객체입니다."""
 
-    장세 분류기(MarketRegimeClassifier)가 이동평균, RSI 등을
-    계산할 때 사용합니다.
+    date: str
+    open_price: int
+    high_price: int
+    low_price: int
+    close_price: int
+    volume: int
+
+
+@dataclass(frozen=True)
+class WeeklyBar:
+    """주봉 하나를 표현하는 객체입니다.
+
+    스윙 전략의 장세 판단에 사용합니다.
+    일봉(PriceBar)과 동일한 구조이며 구분을 위해 별도 클래스로 분리합니다.
     """
 
-    date: str           # 'YYYYMMDD'
+    date: str           # 'YYYYMMDD' (해당 주의 시작일)
     open_price: int
     high_price: int
     low_price: int
