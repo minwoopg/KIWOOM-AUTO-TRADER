@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from itertools import count
 
-from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, Position, PriceBar, WeeklyBar
+from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, Position, PriceBar, WeeklyBar, MinuteBar
 from infra.broker.base import Broker
 
 
@@ -127,5 +127,44 @@ class MockBroker(Broker):
                 volume=random.randint(500_000, 5_000_000),
             ))
             price = close
+
+        return bars
+
+    def get_minute_bars(self, symbol: str, tick_scope: int = 3, count: int = 40) -> list[MinuteBar]:
+        """테스트용 가짜 분봉을 생성합니다.
+
+        눌림목 후 반등 패턴: 전반부 고점에서 눌리고 후반부 반등합니다.
+        """
+        import random
+        from datetime import datetime, timedelta
+
+        base = self._prices.get(symbol, 10000)
+        bars: list[MinuteBar] = []
+        now = datetime.now()
+        acc_vol = 0
+
+        for i in range(count):
+            if i < count // 2:
+                price = int(base * (1.03 - i * 0.003))
+            else:
+                price = int(base * (0.97 + (i - count // 2) * 0.002))
+
+            noise = random.uniform(-0.003, 0.003)
+            close = int(price * (1 + noise))
+            high  = int(close * random.uniform(1.001, 1.008))
+            low   = int(close * random.uniform(0.992, 0.999))
+            vol   = random.randint(5_000, 50_000)
+            acc_vol += vol
+
+            bar_time = now - timedelta(minutes=(count - i) * tick_scope)
+            bars.append(MinuteBar(
+                cntr_tm=bar_time.strftime("%Y%m%d%H%M%S"),
+                open_price=close,
+                high_price=high,
+                low_price=low,
+                close_price=close,
+                volume=vol,
+                acc_volume=acc_vol,
+            ))
 
         return bars

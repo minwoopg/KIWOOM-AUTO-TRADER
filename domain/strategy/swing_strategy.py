@@ -31,7 +31,7 @@ class SwingStrategy(Strategy):
     def __init__(self, config: SwingConfig) -> None:
         self.config = config
 
-    def generate_signal(self, market_price: MarketPrice, position: Position | None) -> Signal:
+    def generate_signal(self, market_price: MarketPrice, position: Position | None, minute_analysis=None) -> Signal:
         """현재 시세와 보유 상태를 보고 BUY / SELL / HOLD 신호를 생성합니다."""
 
         current_price = market_price.current_price

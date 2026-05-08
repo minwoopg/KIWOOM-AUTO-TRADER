@@ -26,7 +26,7 @@ from typing import Any
 import requests
 
 from config.settings import BrokerConfig
-from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, OrderSide, Position, PriceBar, WeeklyBar
+from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, OrderSide, Position, PriceBar, WeeklyBar, MinuteBar
 from infra.broker.base import Broker
 
 
@@ -105,6 +105,48 @@ class KiwoomBroker(Broker):
 
         self.access_token = token
         self.token_expires_at = api_response.body.get("expires_dt")
+
+    def get_minute_bars(self, symbol: str, tick_scope: int = 3, count: int = 40) -> list[MinuteBar]:
+        """키움 분봉 API(ka10080)로 분봉 데이터를 가져옵니다.
+
+        응답 배열 키: stk_min_pole_chart_qry
+        체결시간(cntr_tm): 'YYYYMMDDHHmmSS' 형식
+        가격에 -부호가 붙을 수 있으므로 _parse_abs_int로 처리합니다.
+        """
+        from datetime import date
+
+        base_dt = date.today().strftime("%Y%m%d")
+
+        api_response = self._post(
+            endpoint="/api/dostk/chart",
+            api_id="ka10080",
+            payload={
+                "stk_cd": symbol,
+                "tic_scope": str(tick_scope),
+                "upd_stkpc_tp": "1",
+                "base_dt": base_dt,
+            },
+        )
+
+        raw_bars = api_response.body.get("stk_min_pole_chart_qry", [])
+        bars: list[MinuteBar] = []
+
+        for item in raw_bars[:count]:
+            bars.append(
+                MinuteBar(
+                    cntr_tm=str(item.get("cntr_tm", "")),
+                    open_price=self._parse_abs_int(item.get("open_pric")),
+                    high_price=self._parse_abs_int(item.get("high_pric")),
+                    low_price=self._parse_abs_int(item.get("low_pric")),
+                    close_price=self._parse_abs_int(item.get("cur_prc")),
+                    volume=self._parse_abs_int(item.get("trde_qty")),
+                    acc_volume=self._parse_abs_int(item.get("acc_trde_qty")),
+                )
+            )
+
+        # 키움은 최신 → 과거 순이므로 뒤집어서 과거 → 최신 순으로 반환
+        bars.reverse()
+        return bars
 
     def get_weekly_prices(self, symbol: str, weeks: int) -> list[WeeklyBar]:
         """키움 주봉 API(ka10082)로 종목의 최근 주봉 데이터를 가져옵니다.

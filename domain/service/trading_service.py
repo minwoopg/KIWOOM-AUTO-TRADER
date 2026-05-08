@@ -20,6 +20,7 @@ from pathlib import Path
 
 from config.settings import Settings
 from domain.market_regime.classifier import MarketRegimeClassifier
+from domain.market_regime.minute_analyzer import MinuteAnalyzer, MinuteAnalysis
 from domain.models import AccountBalance, MarketRegime, OrderRequest, OrderSide, Signal, SignalType
 from domain.risk.risk_manager import RiskManager
 from domain.strategy.strategy_router import StrategyRouter
@@ -69,6 +70,10 @@ class TradingService:
         self.cached_weekly_bars: dict[str, list] = {}
         self.cached_weekly_bars_loaded_at: dict[str, datetime] = {}
 
+        # 분봉 캐시 (단타 2차 필터용)
+        self.cached_minute_bars: dict[str, list] = {}
+        self.cached_minute_bars_loaded_at: dict[str, datetime] = {}
+
         # 장세 분류 결과 캐시
         self.cached_regime: dict[str, MarketRegime] = {}
 
@@ -83,6 +88,14 @@ class TradingService:
         self._reporter = DailyReporter(
             trade_log_file=settings.storage.trade_log_file,
             report_dir=str(Path(settings.storage.trade_log_file).parent),
+        )
+        cfg = settings.market_regime
+        self._minute_analyzer = MinuteAnalyzer(
+            min_trading_value=cfg.min_trading_value,
+            pullback_min_pct=cfg.pullback_min_pct,
+            pullback_max_pct=cfg.pullback_max_pct,
+            change_rate_min=cfg.change_rate_min,
+            change_rate_max=cfg.change_rate_max,
         )
         # 장세 판단 요약 (리포트용)
         self._regime_summary: dict[str, str] = {}
@@ -244,6 +257,38 @@ class TradingService:
         cached = self.cached_regime.get(symbol, MarketRegime.UNKNOWN)
         return cached, "(캐시)"
 
+    def _get_minute_analysis(self, symbol: str, prev_close: int) -> MinuteAnalysis | None:
+        """분봉 데이터를 가져와 2차 필터 분석 결과를 반환합니다. 결과는 캐시합니다."""
+        now = datetime.now()
+        loaded_at = self.cached_minute_bars_loaded_at.get(symbol)
+        refresh_sec = self.settings.market_regime.minute_refresh_seconds
+
+        need_refresh = (
+            loaded_at is None
+            or (now - loaded_at).total_seconds() >= refresh_sec
+        )
+
+        if need_refresh:
+            try:
+                cfg = self.settings.market_regime
+                bars = self.broker.get_minute_bars(
+                    symbol,
+                    tick_scope=cfg.minute_tick_scope,
+                    count=cfg.minute_bar_count,
+                )
+                self.cached_minute_bars[symbol] = bars
+                self.cached_minute_bars_loaded_at[symbol] = now
+            except Exception as exc:
+                self.app_logger.warning(f"[MIN] {symbol} | 분봉 조회 실패: {exc}")
+                bars = self.cached_minute_bars.get(symbol, [])
+        else:
+            bars = self.cached_minute_bars.get(symbol, [])
+
+        if not bars:
+            return None
+
+        return self._minute_analyzer.analyze(bars, prev_close)
+
     def _attach_indicators(self, market_price, symbol: str):
         """캐시된 일봉 데이터로 지표값을 계산해 MarketPrice에 주입합니다.
 
@@ -344,10 +389,21 @@ class TradingService:
             market_price = self._get_market_price_with_cache(symbol)
             market_price = self._attach_indicators(market_price, symbol)
 
+            # ── 단타 종목: 분봉 2차 필터 적용 ───────────────────────
+            minute_analysis = None
+            if not is_swing:
+                minute_analysis = self._get_minute_analysis(
+                    symbol, market_price.previous_close
+                )
+                if minute_analysis:
+                    self.app_logger.debug(
+                        f"[MIN ] {symbol} | {minute_analysis.score()}/5 | {minute_analysis.summary()}"
+                    )
+
             # 스윙 종목은 is_swing=True로 SwingStrategy 선택
             strategy = self.strategy_router.select(regime, is_swing=is_swing)
             position = next((p for p in balance.positions if p.symbol == symbol), None)
-            signal   = strategy.generate_signal(market_price, position)
+            signal   = strategy.generate_signal(market_price, position, minute_analysis)
 
             self._log_signal_decision(symbol, signal, market_price.current_price, regime)
 

@@ -115,6 +115,16 @@ class MarketRegimeConfig:
     macd_slow: int
     macd_signal: int
     volume_surge_ratio: float
+    # 분봉 설정
+    minute_tick_scope: int
+    minute_bar_count: int
+    minute_refresh_seconds: int
+    # 2차 필터 기준값
+    min_trading_value: int
+    pullback_min_pct: float
+    pullback_max_pct: float
+    change_rate_min: float
+    change_rate_max: float
 
 
 @dataclass(frozen=True)

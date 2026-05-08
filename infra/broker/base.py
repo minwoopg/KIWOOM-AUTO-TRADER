@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, PriceBar, WeeklyBar
+from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, PriceBar, WeeklyBar, MinuteBar
 
 
 class Broker(ABC):
@@ -45,16 +45,22 @@ class Broker(ABC):
 
     @abstractmethod
     def get_weekly_prices(self, symbol: str, weeks: int) -> list[WeeklyBar]:
-        """한 종목의 주봉 히스토리를 조회합니다.
+        """한 종목의 주봉 히스토리를 조회합니다."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_minute_bars(self, symbol: str, tick_scope: int = 3, count: int = 40) -> list[MinuteBar]:
+        """한 종목의 분봉 데이터를 조회합니다.
 
         Parameters
         ----------
-        symbol : 종목코드 (예: '005930')
-        weeks  : 가져올 주봉 수 (최신 기준 최근 N주)
+        symbol     : 종목코드
+        tick_scope : 분봉 단위 (1/3/5/10/15/30/45/60)
+        count      : 가져올 봉 수 (최신 기준)
 
         Returns
         -------
-        list[WeeklyBar]
-            오래된 날짜가 앞(index 0), 최신이 뒤(index -1)로 정렬됩니다.
+        list[MinuteBar]
+            오래된 시간이 앞(index 0), 최신이 뒤(index -1)로 정렬됩니다.
         """
         raise NotImplementedError

@@ -117,18 +117,31 @@ class PriceBar:
 
 @dataclass(frozen=True)
 class WeeklyBar:
-    """주봉 하나를 표현하는 객체입니다.
+    """주봉 하나를 표현하는 객체입니다."""
 
-    스윙 전략의 장세 판단에 사용합니다.
-    일봉(PriceBar)과 동일한 구조이며 구분을 위해 별도 클래스로 분리합니다.
-    """
-
-    date: str           # 'YYYYMMDD' (해당 주의 시작일)
+    date: str
     open_price: int
     high_price: int
     low_price: int
     close_price: int
     volume: int
+
+
+@dataclass(frozen=True)
+class MinuteBar:
+    """분봉 하나를 표현하는 객체입니다.
+
+    VWAP, 분봉 저점 상승, 눌림목 판단에 사용합니다.
+    cntr_tm: 체결시간 'YYYYMMDDHHmmSS'
+    """
+
+    cntr_tm: str        # 체결시간
+    open_price: int
+    high_price: int
+    low_price: int
+    close_price: int
+    volume: int
+    acc_volume: int     # 누적 거래량 (VWAP 계산용)
 
 
 class MarketRegime(str, Enum):

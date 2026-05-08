@@ -23,7 +23,6 @@ targets:
   day_symbols:
     - "001510"
     - "047040"
-    - "010170"
   # 스윙 종목: 수일~수주 보유, 익절 +10~15%, 손절 -5%
   swing_symbols: []
 
@@ -58,17 +57,25 @@ swing:
 market_regime:
   short_ma_days: 5
   long_ma_days: 20
-  history_days: 30
+  history_days: 50
   rsi_period: 14
   rsi_overbought: 80.0
   rsi_oversold: 20.0
   history_refresh_seconds: 3600
-  # MACD 파라미터 (일반적인 표준값)
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
-  # 거래량 급증 기준: 최근 20일 평균 거래량의 N배 이상이면 급증으로 판단
   volume_surge_ratio: 1.5
+  # 분봉 설정
+  minute_tick_scope: 3          # 3분봉
+  minute_bar_count: 40          # 최근 40봉 (2시간치)
+  minute_refresh_seconds: 180   # 3분마다 갱신
+  # 2차 필터 기준값
+  min_trading_value: 1000000000 # 거래대금 최소 10억
+  pullback_min_pct: -7.0        # 눌림목 최대 -7%
+  pullback_max_pct: -1.0        # 눌림목 최소 -1%
+  change_rate_min: 2.0          # 등락률 최소 +2%
+  change_rate_max: 18.0         # 등락률 최대 +18%
 
 risk:
   max_daily_loss_amount: 100000
