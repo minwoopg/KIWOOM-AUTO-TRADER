@@ -150,9 +150,8 @@ class TradingService:
             )
             return balance
 
-        self.app_logger.info(
+        self.app_logger.debug(
             "account balance loaded from cache",
-            extra={"cash": self.cached_balance.cash, "positions": len(self.cached_balance.positions)},
         )
         return self.cached_balance
 
@@ -208,9 +207,8 @@ class TradingService:
                 return cached_price
 
         # 아직 주기가 안 지났으면 캐시값 재사용
-        self.app_logger.info(
+        self.app_logger.debug(
             "market price loaded from cache",
-            extra={"symbol": symbol, "current_price": cached_price.current_price},
         )
         return cached_price
 
@@ -334,28 +332,99 @@ class TradingService:
             indicator_price_above_ma5=price_above_ma5,
         )
 
-    def _log_signal_decision(self, symbol: str, signal: Signal, current_price: int, regime: MarketRegime) -> None:
-        """전략 판단 결과를 사람이 읽기 쉬운 문장으로 로그에 남깁니다."""
-        regime_tag = f"[{regime.value}]"
+    def _log_signal_decision(
+        self,
+        symbol: str,
+        signal: Signal,
+        current_price: int,
+        regime: MarketRegime,
+        position=None,
+        minute_analysis=None,
+    ) -> None:
+        """전략 판단 결과를 로그에 남깁니다.
 
+        로그 태그 종류:
+            [BUY     ] 매수 신호
+            [SELL    ] 매도 신호
+            [HOLD_POS] 보유 중 유지 (익절/손절 진행상황 표시)
+            [NEAR_TP ] 익절가 근접 경고
+            [NEAR_SL ] 손절가 근접 경고
+            [BLOCK   ] 분봉 필터 차단 (매수 시도했지만 차단)
+            [HOLD    ] 일반 홀딩 (미보유, 장세/조건 미충족)
+        """
+        regime_tag = f"[{regime.value}]"
+        now = datetime.now()
+
+        # ── 매수 신호 ────────────────────────────────────────────
         if signal.type == SignalType.BUY:
             self.app_logger.info(
-                f"[BUY ] {regime_tag} {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
+                f"[BUY     ] {regime_tag} {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
             )
             return
 
+        # ── 매도 신호 ────────────────────────────────────────────
         if signal.type == SignalType.SELL:
             self.app_logger.info(
-                f"[SELL] {regime_tag} {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
+                f"[SELL    ] {regime_tag} {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
             )
             return
 
+        # ── HOLD 처리 ─────────────────────────────────────────────
         if signal.type == SignalType.HOLD:
-            now = datetime.now()
+
+            # 보유 중인 종목 → HOLD_POS로 분리
+            if position is not None:
+                avg = position.average_price
+                tp  = int(avg * (1 + self.settings.strategy.take_profit_pct / 100))
+                sl  = int(avg * (1 - self.settings.strategy.stop_loss_pct / 100))
+                pnl_pct = (current_price - avg) / avg * 100
+                tp_remain = (tp - current_price) / current_price * 100
+                sl_remain = (current_price - sl) / current_price * 100
+
+                # 익절가 2% 이내 근접 경고
+                if 0 < tp_remain <= 2.0:
+                    self.app_logger.info(
+                        f"[NEAR_TP ] {symbol} | 현재가 {current_price:,}원 | "
+                        f"익절 {tp:,}원까지 +{tp_remain:.2f}% 남음 ⚠️"
+                    )
+
+                # 손절가 1% 이내 근접 경고
+                if 0 < sl_remain <= 1.0:
+                    self.app_logger.info(
+                        f"[NEAR_SL ] {symbol} | 현재가 {current_price:,}원 | "
+                        f"손절 {sl:,}원까지 -{sl_remain:.2f}% 남음 ⚠️"
+                    )
+
+                # 보유 종목 상태 로그 (30초마다)
+                last_logged_at = self.last_hold_log_at_by_symbol.get(symbol)
+                if last_logged_at is None or (now - last_logged_at).total_seconds() >= 30:
+                    self.app_logger.info(
+                        f"[HOLD_POS] {symbol} | 현재가 {current_price:,}원 ({pnl_pct:+.1f}%) | "
+                        f"익절 {tp:,}원(+{tp_remain:.1f}% 남음) / 손절 {sl:,}원"
+                    )
+                    self.last_hold_log_at_by_symbol[symbol] = now
+                return
+
+            # 미보유 종목 — 분봉 필터 차단 여부 구분
+            # signal.reason에 "진입 조건 미충족" 또는 "눌림목" 등 차단 사유가 있으면 BLOCK
+            block_keywords = ["진입 조건 미충족", "눌림목 구간", "거래대금 부족"]
+            is_block = any(kw in signal.reason for kw in block_keywords)
+
+            if is_block and minute_analysis is not None:
+                last_logged_at = self.last_hold_log_at_by_symbol.get(symbol)
+                if last_logged_at is None or (now - last_logged_at).total_seconds() >= 30:
+                    self.app_logger.info(
+                        f"[BLOCK   ] {regime_tag} {symbol} | "
+                        f"분봉 {minute_analysis.score()}/5 | {signal.reason}"
+                    )
+                    self.last_hold_log_at_by_symbol[symbol] = now
+                return
+
+            # 일반 HOLD (30초마다)
             last_logged_at = self.last_hold_log_at_by_symbol.get(symbol)
             if last_logged_at is None or (now - last_logged_at).total_seconds() >= 30:
                 self.app_logger.info(
-                    f"[HOLD] {regime_tag} {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
+                    f"[HOLD    ] {regime_tag} {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
                 )
                 self.last_hold_log_at_by_symbol[symbol] = now
 
@@ -387,7 +456,19 @@ class TradingService:
             else:
                 self._unknown_count[symbol] = 0
 
-            market_price = self._get_market_price_with_cache(symbol)
+            # 보유 종목은 캐시를 무시하고 항상 최신 가격을 가져옵니다.
+            # 익절/손절 타이밍을 놓치지 않기 위해 매 루프마다 API 직접 조회합니다.
+            position_check = next((p for p in balance.positions if p.symbol == symbol), None)
+            if position_check is not None:
+                try:
+                    market_price = self.broker.get_market_price(symbol)
+                    self.cached_market_prices[symbol] = market_price
+                    self.cached_market_price_loaded_at[symbol] = datetime.now()
+                except Exception:
+                    market_price = self._get_market_price_with_cache(symbol)
+            else:
+                market_price = self._get_market_price_with_cache(symbol)
+
             market_price = self._attach_indicators(market_price, symbol)
 
             # ── 단타 종목 + BULLISH일 때만 분봉 2차 필터 적용 ──────
@@ -406,30 +487,37 @@ class TradingService:
             position = next((p for p in balance.positions if p.symbol == symbol), None)
             signal   = strategy.generate_signal(market_price, position, minute_analysis)
 
-            self._log_signal_decision(symbol, signal, market_price.current_price, regime)
+            self._log_signal_decision(
+                symbol, signal, market_price.current_price,
+                regime, position, minute_analysis
+            )
 
             if signal.type == SignalType.BUY:
                 self._try_buy(symbol, market_price.current_price, balance, is_swing=is_swing)
             elif signal.type == SignalType.SELL and position is not None:
-                self._try_sell(symbol, position.quantity)
+                self._try_sell(symbol, position.quantity, market_price.current_price)
 
         if is_near_market_close(self.settings.trading.force_exit_before_market_close_minutes):
             self.app_logger.info("near market close: force exit started")
 
-            latest_balance = self.broker.get_account_balance()
-            self.cached_balance = latest_balance
-            self.cached_balance_loaded_at = datetime.now()
+            try:
+                latest_balance = self.broker.get_account_balance()
+                self.cached_balance = latest_balance
+                self.cached_balance_loaded_at = datetime.now()
 
-            for position in latest_balance.positions:
-                # 스윙 종목은 오버나이트 허용 — 강제청산 제외
-                if position.symbol in self.settings.swing_symbols:
-                    self.app_logger.info(
-                        f"[SWING] {position.symbol} | 스윙 종목 — 장 마감 강제청산 제외"
-                    )
-                    continue
-                self._try_sell(position.symbol, position.quantity)
+                for position in latest_balance.positions:
+                    # 스윙 종목은 오버나이트 허용 — 강제청산 제외
+                    if position.symbol in self.settings.swing_symbols:
+                        self.app_logger.info(
+                            f"[SWING] {position.symbol} | 스윙 종목 — 장 마감 강제청산 제외"
+                        )
+                        continue
+                    self._try_sell(position.symbol, position.quantity)
 
-            # 장 마감 리포트 생성 (하루 1회)
+            except Exception as exc:
+                self.app_logger.warning(f"[FORCE_EXIT] 강제청산 중 오류 발생: {exc}")
+
+            # 장 마감 리포트 생성 (하루 1회 — 강제청산 성공 여부와 무관하게 생성)
             if not self._report_generated_today:
                 self._generate_daily_report()
                 self._report_generated_today = True
@@ -498,10 +586,8 @@ class TradingService:
             result.accepted,
             result.message,
             result.order_id,
+            price=current_price,
         )
-
-        if result.accepted:
-            self.state.bought_symbols_today.add(symbol)
             self.state.last_order_id_by_symbol[symbol] = result.order_id
 
             # 주문 성공 후 잔고 캐시 무효화
@@ -516,7 +602,7 @@ class TradingService:
                 f"[FAIL ] {symbol} | 매수 주문 실패 | 사유: {result.message}"
             )
 
-    def _try_sell(self, symbol: str, quantity: int) -> None:
+    def _try_sell(self, symbol: str, quantity: int, current_price: int = 0) -> None:
         """매도 주문을 생성하고 브로커로 전달합니다."""
         order = OrderRequest(symbol=symbol, side=OrderSide.SELL, quantity=quantity)
         result = self.broker.place_order(order)
@@ -528,6 +614,7 @@ class TradingService:
             result.accepted,
             result.message,
             result.order_id,
+            price=current_price,
         )
 
         if result.accepted:
@@ -565,6 +652,7 @@ class TradingService:
         accepted: bool,
         message: str,
         order_id: str,
+        price: int = 0,
     ) -> None:
         """거래 로그 CSV에 한 줄을 추가합니다."""
         self.trade_logger.append(
@@ -573,6 +661,7 @@ class TradingService:
                 "symbol": symbol,
                 "side": side,
                 "quantity": quantity,
+                "price": price,
                 "accepted": accepted,
                 "message": message,
                 "order_id": order_id,

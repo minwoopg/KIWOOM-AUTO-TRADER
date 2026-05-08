@@ -27,22 +27,24 @@ def build_app_logger(log_file: str, level: str = "INFO") -> AppLogger:
     return logger
 
 
+TRADE_FIELDS = ["timestamp", "symbol", "side", "quantity", "price", "accepted", "message", "order_id"]
+
+
 class TradeCsvLogger:
     """주문/체결 결과를 CSV 파일로 남기는 간단한 로거입니다."""
 
     def __init__(self, file_path: str) -> None:
-        """저장 경로를 준비하고 헤더가 없으면 생성합니다."""
-
         self.file_path = Path(file_path)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.file_path.exists():
             with self.file_path.open("w", newline="", encoding="utf-8") as fp:
-                writer = csv.DictWriter(fp, fieldnames=["timestamp", "symbol", "side", "quantity", "accepted", "message", "order_id"])
+                writer = csv.DictWriter(fp, fieldnames=TRADE_FIELDS)
                 writer.writeheader()
 
     def append(self, row: dict[str, Any]) -> None:
         """거래 로그 한 줄을 CSV 파일에 추가합니다."""
-
         with self.file_path.open("a", newline="", encoding="utf-8") as fp:
-            writer = csv.DictWriter(fp, fieldnames=["timestamp", "symbol", "side", "quantity", "accepted", "message", "order_id"])
+            writer = csv.DictWriter(fp, fieldnames=TRADE_FIELDS)
+            # price 필드가 없으면 0으로 채움 (하위 호환)
+            row.setdefault("price", 0)
             writer.writerow(row)

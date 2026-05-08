@@ -25,19 +25,20 @@ targets:
     - "047040"
     - "247540"
     - "010170"
+    - "006260"
   # 스윙 종목: 수일~수주 보유, 익절 +10~15%, 손절 -5%
-  swing_symbols: []
+  swing_symbols: ["006260"]
 
 trading:
   poll_interval_seconds: 10
   balance_refresh_seconds: 180
   price_refresh_seconds: 300
   order_cash_per_trade: 200000
-  max_positions: 5             # 단타 2 + 스윙 3
-  max_day_positions: 2         # 단타 최대 보유 종목
-  max_swing_positions: 3       # 스윙 최대 보유 종목
+  max_positions: 15             # 단타 2 + 스윙 3
+  max_day_positions: 10         # 단타 최대 보유 종목
+  max_swing_positions: 5       # 스윙 최대 보유 종목
   allow_multiple_entries_per_symbol_per_day: true
-  force_exit_before_market_close_minutes: 10
+  force_exit_before_market_close_minutes: 12  # 15:18부터 강제청산 (단일가 진입 전)
   reentry_cooldown_seconds: 600
 
 strategy:

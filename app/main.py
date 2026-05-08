@@ -82,8 +82,14 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
             app_logger.exception("unexpected error: %s", exc)
             msg = str(exc)
             if "http=429" in msg or "허용된 요청 개수를 초과" in msg:
-                app_logger.warning("rate limit detected, backing off for 180 seconds")
-                await asyncio.sleep(180)
+                from utils.time_utils import is_near_market_close
+                # 장 마감 20분 이내면 백오프를 짧게 → 강제청산 타이밍 놓치지 않음
+                if is_near_market_close(20):
+                    app_logger.warning("rate limit detected near market close, backing off for 10 seconds")
+                    await asyncio.sleep(10)
+                else:
+                    app_logger.warning("rate limit detected, backing off for 180 seconds")
+                    await asyncio.sleep(180)
             else:
                 await asyncio.sleep(poll)
 
