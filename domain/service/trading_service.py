@@ -96,6 +96,7 @@ class TradingService:
             pullback_max_pct=cfg.pullback_max_pct,
             change_rate_min=cfg.change_rate_min,
             change_rate_max=cfg.change_rate_max,
+            rebound_min_pct=cfg.rebound_min_pct,
         )
         # 장세 판단 요약 (리포트용)
         self._regime_summary: dict[str, str] = {}
@@ -389,14 +390,14 @@ class TradingService:
             market_price = self._get_market_price_with_cache(symbol)
             market_price = self._attach_indicators(market_price, symbol)
 
-            # ── 단타 종목: 분봉 2차 필터 적용 ───────────────────────
+            # ── 단타 종목 + BULLISH일 때만 분봉 2차 필터 적용 ──────
             minute_analysis = None
-            if not is_swing:
+            if not is_swing and regime == MarketRegime.BULLISH:
                 minute_analysis = self._get_minute_analysis(
                     symbol, market_price.previous_close
                 )
                 if minute_analysis:
-                    self.app_logger.debug(
+                    self.app_logger.info(
                         f"[MIN ] {symbol} | {minute_analysis.score()}/5 | {minute_analysis.summary()}"
                     )
 

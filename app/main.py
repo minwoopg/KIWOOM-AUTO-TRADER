@@ -115,8 +115,9 @@ async def async_main() -> None:
         manual_swing_symbols = settings.swing_symbols
 
         def on_symbols_changed(symbols: list[str]) -> None:
-            # 조건검색 종목은 단타로 분류 (스윙은 수동 등록)
-            combined_day = list(dict.fromkeys(symbols + manual_day_symbols))
+            # 수동 고정 종목을 앞에 두고 조건검색 종목을 뒤에 붙입니다.
+            # max_symbols 제한이 걸려도 수동 종목이 먼저 보장됩니다.
+            combined_day = list(dict.fromkeys(manual_day_symbols + symbols))
             limited_day  = combined_day[:settings.websocket.max_symbols]
             trading_service.update_targets(limited_day, manual_swing_symbols)
             app_logger.info(

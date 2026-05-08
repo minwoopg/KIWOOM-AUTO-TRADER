@@ -125,6 +125,7 @@ class MarketRegimeConfig:
     pullback_max_pct: float
     change_rate_min: float
     change_rate_max: float
+    rebound_min_pct: float
 
 
 @dataclass(frozen=True)

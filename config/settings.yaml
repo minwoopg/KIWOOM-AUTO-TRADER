@@ -23,6 +23,8 @@ targets:
   day_symbols:
     - "001510"
     - "047040"
+    - "247540"
+    - "010170"
   # 스윙 종목: 수일~수주 보유, 익절 +10~15%, 손절 -5%
   swing_symbols: []
 
@@ -76,6 +78,7 @@ market_regime:
   pullback_max_pct: -1.0        # 눌림목 최소 -1%
   change_rate_min: 2.0          # 등락률 최소 +2%
   change_rate_max: 18.0         # 등락률 최대 +18%
+  rebound_min_pct: 2.0          # 당일 저점 대비 반등 최소 +2%
 
 risk:
   max_daily_loss_amount: 100000
@@ -87,7 +90,7 @@ websocket:
   # 실전 서버 URL (조건검색은 실전 계좌로)
   url: wss://api.kiwoom.com:10000/api/dostk/websocket
   condition_seq: 0
-  max_symbols: 5
+  max_symbols: 10
   # 조건검색 전용 실전 계좌 키 (.env에서 로드)
   app_key: ${KIWOOM_REAL_APP_KEY}
   secret_key: ${KIWOOM_REAL_SECRET_KEY}

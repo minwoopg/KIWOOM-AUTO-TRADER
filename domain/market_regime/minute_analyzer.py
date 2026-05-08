@@ -20,17 +20,19 @@ from domain.models import MinuteBar
 class MinuteAnalysis:
     """분봉 분석 결과를 담는 객체입니다."""
 
-    vwap: float                  # 당일 VWAP
-    price_above_vwap: bool       # 현재가 > VWAP
-    low_rising: bool             # 최근 N봉 저점이 높아지는 중
-    pullback_pct: float          # 당일 고가 대비 현재가 하락률 (음수)
-    is_valid_pullback: bool      # 눌림목 구간인가 (-1% ~ -7%)
-    change_rate_pct: float       # 당일 등락률
-    is_valid_change_rate: bool   # 등락률 유효 범위 (+2% ~ +18%)
-    trading_value: int           # 거래대금 (원)
-    is_valid_trading_value: bool # 거래대금 기준 이상
-    day_high: int                # 당일 고가
-    day_low: int                 # 당일 저가
+    vwap: float
+    price_above_vwap: bool
+    low_rising: bool
+    pullback_pct: float
+    is_valid_pullback: bool
+    change_rate_pct: float
+    is_valid_change_rate: bool
+    rebound_pct: float           # 당일 저점 대비 반등률
+    is_valid_rebound: bool       # 반등률 유효 여부 (+2% 이상 + VWAP 위)
+    trading_value: int
+    is_valid_trading_value: bool
+    day_high: int
+    day_low: int
 
     def score(self) -> int:
         """진입 타이밍 점수를 계산합니다 (0~5점)."""
@@ -38,17 +40,20 @@ class MinuteAnalysis:
             self.price_above_vwap,
             self.low_rising,
             self.is_valid_pullback,
-            self.is_valid_change_rate,
+            self.is_valid_change_rate or self.is_valid_rebound,  # 둘 중 하나
             self.is_valid_trading_value,
         ])
 
     def summary(self) -> str:
         """로그용 요약 문자열을 반환합니다."""
+        change_tag = f"등락 {'유효✓' if self.is_valid_change_rate else '무효✗'}({self.change_rate_pct:+.1f}%)"
+        rebound_tag = f"반등 {'유효✓' if self.is_valid_rebound else '무효✗'}({self.rebound_pct:+.1f}%)"
         tags = [
             f"VWAP {'위✓' if self.price_above_vwap else '아래✗'}({self.vwap:,.0f})",
             f"저점 {'상승✓' if self.low_rising else '하락✗'}",
             f"눌림 {'적절✓' if self.is_valid_pullback else '불량✗'}({self.pullback_pct:+.1f}%)",
-            f"등락 {'유효✓' if self.is_valid_change_rate else '무효✗'}({self.change_rate_pct:+.1f}%)",
+            change_tag,
+            rebound_tag,
             f"거래대금 {'충분✓' if self.is_valid_trading_value else '부족✗'}({self.trading_value//100_000_000}억)",
         ]
         return " | ".join(tags)
@@ -59,12 +64,13 @@ class MinuteAnalyzer:
 
     def __init__(
         self,
-        min_trading_value: int = 1_000_000_000,  # 거래대금 최소 10억
-        pullback_min_pct: float = -7.0,           # 눌림목 최대 -7%
-        pullback_max_pct: float = -1.0,           # 눌림목 최소 -1%
-        change_rate_min: float = 2.0,             # 등락률 최소 +2%
-        change_rate_max: float = 18.0,            # 등락률 최대 +18%
-        low_rising_bars: int = 3,                 # 저점 상승 확인할 봉 수
+        min_trading_value: int = 1_000_000_000,
+        pullback_min_pct: float = -7.0,
+        pullback_max_pct: float = -1.0,
+        change_rate_min: float = 2.0,
+        change_rate_max: float = 18.0,
+        low_rising_bars: int = 3,
+        rebound_min_pct: float = 2.0,   # 저점 대비 반등 최소 기준
     ) -> None:
         self.min_trading_value  = min_trading_value
         self.pullback_min_pct   = pullback_min_pct
@@ -72,6 +78,7 @@ class MinuteAnalyzer:
         self.change_rate_min    = change_rate_min
         self.change_rate_max    = change_rate_max
         self.low_rising_bars    = low_rising_bars
+        self.rebound_min_pct    = rebound_min_pct
 
     def analyze(self, bars: list[MinuteBar], prev_close: int) -> MinuteAnalysis | None:
         """분봉 리스트를 분석해서 MinuteAnalysis 결과를 반환합니다.
@@ -120,6 +127,15 @@ class MinuteAnalyzer:
         change_rate_pct = (current_price - prev_close) / prev_close * 100
         is_valid_change_rate = self.change_rate_min <= change_rate_pct <= self.change_rate_max
 
+        # ── 당일 저점 대비 반등률 ─────────────────────────────────
+        # 전일 대비 하락했더라도 당일 저점에서 충분히 반등했고
+        # VWAP 위에 있으면 매수 가능한 반등으로 판단합니다
+        rebound_pct = (current_price - day_low) / day_low * 100 if day_low > 0 else 0.0
+        is_valid_rebound = (
+            rebound_pct >= self.rebound_min_pct
+            and price_above_vwap   # VWAP 위에 있어야 의미있는 반등
+        )
+
         # ── 거래대금 ──────────────────────────────────────────────
         # 누적 거래량 × 현재가로 근사
         trading_value = bars[-1].acc_volume * current_price
@@ -133,6 +149,8 @@ class MinuteAnalyzer:
             is_valid_pullback=is_valid_pullback,
             change_rate_pct=change_rate_pct,
             is_valid_change_rate=is_valid_change_rate,
+            rebound_pct=rebound_pct,
+            is_valid_rebound=is_valid_rebound,
             trading_value=trading_value,
             is_valid_trading_value=is_valid_trading_value,
             day_high=day_high,

@@ -67,23 +67,31 @@ class BreakoutStrategy(Strategy):
 
             # ── [1단계] 분봉 2차 필터 ─────────────────────────────
             if minute_analysis is not None:
-                if not minute_analysis.is_valid_change_rate:
-                    return Signal(
-                        type=SignalType.HOLD,
-                        reason=f"등락률 필터 — {minute_analysis.change_rate_pct:+.1f}% "
-                               f"(유효범위 +{self.config.breakout_threshold_pct:.0f}~18%)",
-                    )
+                # 거래대금 체크
                 if not minute_analysis.is_valid_trading_value:
                     return Signal(
                         type=SignalType.HOLD,
-                        reason=f"거래대금 부족 — {minute_analysis.trading_value//100_000_000}억 "
-                               f"(최소 {self.config.__class__.__name__})",
+                        reason=f"거래대금 부족 — {minute_analysis.trading_value//100_000_000}억",
                     )
+
+                # A조건(상승 중) 또는 B조건(저점 반등) 중 하나라도 충족해야 함
+                pass_change  = minute_analysis.is_valid_change_rate
+                pass_rebound = minute_analysis.is_valid_rebound
+
+                if not pass_change and not pass_rebound:
+                    return Signal(
+                        type=SignalType.HOLD,
+                        reason=(
+                            f"진입 조건 미충족 — "
+                            f"A(등락 {minute_analysis.change_rate_pct:+.1f}%) / "
+                            f"B(반등 {minute_analysis.rebound_pct:+.1f}% VWAP {'위' if minute_analysis.price_above_vwap else '아래'})"
+                        ),
+                    )
+
                 if not minute_analysis.is_valid_pullback:
                     return Signal(
                         type=SignalType.HOLD,
-                        reason=f"눌림목 구간 아님 — 고가 대비 {minute_analysis.pullback_pct:+.1f}% "
-                               f"(유효범위 -1~-7%)",
+                        reason=f"눌림목 구간 아님 — 고가 대비 {minute_analysis.pullback_pct:+.1f}% (유효범위 -1~-7%)",
                     )
 
             # ── [2단계] 일봉 타이밍 점수 (4가지) ─────────────────
