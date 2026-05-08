@@ -14,6 +14,7 @@ from __future__ import annotations
 계좌 정보와 현재가를 일정 시간 동안 캐시해서 재사용합니다.
 """
 
+import asyncio
 import time
 from datetime import datetime
 from pathlib import Path
@@ -358,18 +359,17 @@ class TradingService:
                 )
                 self.last_hold_log_at_by_symbol[symbol] = now
 
-    def run_once(self) -> None:
+    async def run_once(self) -> None:
         """자동매매 루프를 한 번 실행합니다."""
         balance = self._get_balance_with_cache()
 
         for i, symbol in enumerate(self.targets):
 
-            # 비정상 데이터로 자동 제외된 종목은 건너뜁니다
             if symbol in self._excluded_symbols:
                 continue
 
             if i > 0:
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)  # asyncio 환경에서 안전한 딜레이
 
             # 스윙 종목 여부 확인
             is_swing = symbol in self.settings.swing_symbols

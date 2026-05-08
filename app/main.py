@@ -71,10 +71,10 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
     while True:
         try:
             if is_market_open() or settings.broker.use_mock:
-                trading_service.run_once()
+                await trading_service.run_once()
             await asyncio.sleep(poll)
 
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, KeyboardInterrupt):
             app_logger.info("application stopped by user")
             break
 
