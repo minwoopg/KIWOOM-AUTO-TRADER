@@ -55,7 +55,8 @@ class TradingService:
         self.trade_logger = trade_logger
         self.state_store = state_store
 
-        self.state = self.state_store.load()
+        self.state, loaded_highest = self.state_store.load()
+        self._highest_price: dict[str, int] = loaded_highest
 
         # 계좌/현재가 캐시
         self.cached_balance: AccountBalance | None = None
@@ -81,8 +82,7 @@ class TradingService:
         # HOLD 로그 throttle
         self.last_hold_log_at_by_symbol: dict[str, datetime] = {}
 
-        # 보유 종목별 최고가 추적 (트레일링 스탑용)
-        self._highest_price: dict[str, int] = {}
+        # 보유 종목별 최고가 추적 (트레일링 스탑용 — state.json에서 복원)
 
         # 동적 종목 목록 (조건검색 연동 시 갱신)
         self._dynamic_targets: list[str] | None = None
@@ -317,16 +317,6 @@ class TradingService:
         ma5 = self.regime_classifier._calc_ma(closes, 5)
         price_above_ma5 = closes[-1] > ma5
 
-        # RSI Signal선 + 골든크로스 (바닥권 매수용)
-        rsi_signal_val, rsi_signal_cross = self.regime_classifier._calc_rsi_signal(
-            closes, cfg.rsi_period
-        )
-
-        # 거래량 시나리오 A/B (바닥권 매수용)
-        avg_vol_20 = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0
-        vol_exhaustion = avg_vol_20 > 0 and volumes[-1] < avg_vol_20 * 0.7   # A: 매물 고갈
-        vol_buying     = avg_vol_20 > 0 and volumes[-1] > avg_vol_20 * 1.3   # B: 세력 유입
-
         return MarketPrice(
             symbol=market_price.symbol,
             current_price=market_price.current_price,
@@ -335,15 +325,11 @@ class TradingService:
             timestamp=market_price.timestamp,
             indicator_rsi=rsi,
             indicator_rsi_direction=rsi_direction,
-            indicator_rsi_signal=rsi_signal_val,
-            indicator_rsi_signal_cross=rsi_signal_cross,
             indicator_macd=macd_line,
             indicator_macd_signal=signal_line,
             indicator_macd_hist_direction=macd_hist_direction,
             indicator_volume_surge=volume_surge,
             indicator_price_above_ma5=price_above_ma5,
-            indicator_volume_exhaustion=vol_exhaustion,
-            indicator_volume_buying=vol_buying,
         )
 
     def _log_signal_decision(
@@ -481,9 +467,9 @@ class TradingService:
 
             market_price = self._attach_indicators(market_price, symbol)
 
-            # BULLISH 또는 REBOUND일 때 분봉 분석 실행
+            # BULLISH일 때만 분봉 2차 필터 적용
             minute_analysis = None
-            if regime in (MarketRegime.BULLISH, MarketRegime.REBOUND):
+            if regime == MarketRegime.BULLISH:
                 minute_analysis = self._get_minute_analysis(
                     symbol, market_price.previous_close
                 )
@@ -535,7 +521,7 @@ class TradingService:
                 self._generate_daily_report()
                 self._report_generated_today = True
 
-        self.state_store.save(self.state)
+        self.state_store.save(self.state, self._highest_price)
 
     def _try_buy(self, symbol: str, current_price: int, balance: AccountBalance) -> None:
         """매수 주문 가능 여부를 검사한 뒤 실제 주문을 시도합니다."""

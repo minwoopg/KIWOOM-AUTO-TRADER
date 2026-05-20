@@ -31,8 +31,8 @@ targets:
 trading:
   poll_interval_seconds: 10
   balance_refresh_seconds: 180
-  price_refresh_seconds: 300
-  order_cash_per_trade: 200000
+  price_refresh_seconds: 60
+  order_cash_per_trade: 500000
   max_positions: 5
   allow_multiple_entries_per_symbol_per_day: true
   force_exit_before_market_close_minutes: 12
