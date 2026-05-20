@@ -41,6 +41,7 @@ class BreakoutStrategy(Strategy):
         market_price: MarketPrice,
         position: Position | None,
         minute_analysis=None,
+        highest_price: int = 0,
     ) -> Signal:
 
         current_price = market_price.current_price
@@ -48,6 +49,7 @@ class BreakoutStrategy(Strategy):
         macd          = market_price.indicator_macd
         macd_signal   = market_price.indicator_macd_signal
         macd_hist_dir = market_price.indicator_macd_hist_direction
+        rsi_direction = market_price.indicator_rsi_direction
         volume_surge  = market_price.indicator_volume_surge
         above_ma5     = market_price.indicator_price_above_ma5
         has_indicators = macd is not None and macd_signal is not None
@@ -142,29 +144,73 @@ class BreakoutStrategy(Strategy):
             )
 
         # ── 보유 중 → 매도 판단 ──────────────────────────────────
-        average_price     = position.average_price
-        take_profit_price = int(average_price * (1 + self.config.take_profit_pct / 100))
-        stop_loss_price   = int(average_price * (1 - self.config.stop_loss_pct / 100))
+        average_price = position.average_price
+        stop_loss_price = int(average_price * (1 - self.config.stop_loss_pct / 100))
+        safety_net_price = int(average_price * (1 + self.config.take_profit_pct / 100))
 
-        if current_price >= take_profit_price:
-            return Signal(
-                type=SignalType.SELL,
-                reason=f"익절 목표 {take_profit_price:,}원 도달 (+{self.config.take_profit_pct:.1f}%)",
-            )
+        current_pnl_pct = (current_price - average_price) / average_price * 100
 
+        # ① 손절 (최우선)
         if current_price <= stop_loss_price:
             return Signal(
                 type=SignalType.SELL,
-                reason=f"손절 기준 {stop_loss_price:,}원 하회 (-{self.config.stop_loss_pct:.1f}%)",
+                reason=f"손절 — 평균단가 대비 {current_pnl_pct:+.1f}% ({stop_loss_price:,}원 하회)",
             )
 
-        if has_indicators and rsi is not None and rsi >= 70 and macd_hist_dir < 0:
+        # ② 트레일링 스탑
+        # 최소 수익률(trailing_start_pct) 이상 올랐을 때부터 작동
+        trailing_start_price = int(average_price * (1 + self.config.trailing_start_pct / 100))
+        if highest_price >= trailing_start_price and highest_price > 0:
+            trailing_stop_price = int(highest_price * (1 - self.config.trailing_stop_pct / 100))
+            from_high_pct = (current_price - highest_price) / highest_price * 100
+            if current_price <= trailing_stop_price:
+                return Signal(
+                    type=SignalType.SELL,
+                    reason=(
+                        f"트레일링 스탑 — 최고가 {highest_price:,}원 대비 {from_high_pct:.1f}% 하락 "
+                        f"(보유 수익 {current_pnl_pct:+.1f}%)"
+                    ),
+                )
+
+        # ③ 추세 꺾임 감지 (RSI 과매수 + RSI 하락 전환 + MACD 히스토그램 축소)
+        if has_indicators and rsi is not None:
+            trend_reversal = (
+                rsi >= self.config.trend_reversal_rsi   # RSI 과매수 구간
+                and rsi_direction < 0                   # RSI 하락 전환
+                and macd_hist_dir < 0                   # MACD 모멘텀 약화
+            )
+            if trend_reversal:
+                return Signal(
+                    type=SignalType.SELL,
+                    reason=(
+                        f"추세 꺾임 감지 — RSI {rsi:.1f}↓ 과매수 + MACD 히스토그램 축소 "
+                        f"(보유 수익 {current_pnl_pct:+.1f}%)"
+                    ),
+                )
+
+        # ④ 안전망 익절 (급등 시 +15%)
+        if current_price >= safety_net_price:
             return Signal(
                 type=SignalType.SELL,
-                reason=f"모멘텀 소진 — RSI {rsi:.1f} 과매수 + MACD 히스토그램 축소",
+                reason=f"안전망 익절 — 평균단가 대비 +{self.config.take_profit_pct:.0f}% 도달",
+            )
+
+        # 트레일링 스탑 진행 상황 표시
+        if highest_price >= trailing_start_price and highest_price > 0:
+            trailing_stop_price = int(highest_price * (1 - self.config.trailing_stop_pct / 100))
+            return Signal(
+                type=SignalType.HOLD,
+                reason=(
+                    f"트레일링 추적 중 — 최고가 {highest_price:,}원 / "
+                    f"스탑 {trailing_stop_price:,}원 / 현재 {current_pnl_pct:+.1f}%"
+                ),
             )
 
         return Signal(
             type=SignalType.HOLD,
-            reason=f"보유 유지 — 익절 {take_profit_price:,}원 / 손절 {stop_loss_price:,}원",
+            reason=(
+                f"보유 유지 {current_pnl_pct:+.1f}% — "
+                f"트레일링 시작까지 +{self.config.trailing_start_pct:.0f}% 필요 / "
+                f"손절 {stop_loss_price:,}원"
+            ),
         )

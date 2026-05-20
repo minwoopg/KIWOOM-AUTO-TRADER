@@ -1,72 +1,37 @@
 from __future__ import annotations
 
-"""장세 분류기 (Market Regime Classifier).
-
-현재 구현 (3단계):
-- 이동평균 골든크로스/데드크로스 (5일선 vs 20일선)
-- RSI 수치 + 방향(상승 중 / 하락 중) 판단
-- MACD 골든크로스/데드크로스
-- 거래량 급증 여부
-
-RSI 방향 판단이 중요한 이유:
-    RSI 28이라도 아직 하락 중이면 → 더 내려갈 수 있음 → 매수 금지
-    RSI 28이고 상승 중이면       → 바닥 찍고 반등 시작 → 진짜 매수 타점
-
-    엑셀 자료 기준:
-    "30 이하 & 상승 ↑ + 거래량급증 + 골든크로스 → V자 반등 (강력 매수)"
-    "30 이하 & 하락 ↓ + 데드크로스 → 추세 완전 붕괴 (폭락)"
-"""
+"""장세 분류기 — REBOUND 장세 추가 버전."""
 
 from config.settings import MarketRegimeConfig
 from domain.models import MarketRegime, PriceBar
 
 
 class MarketRegimeClassifier:
-    """일봉 데이터를 받아 장세를 분류하는 클래스입니다."""
 
     def __init__(self, config: MarketRegimeConfig) -> None:
         self.config = config
 
     def classify(self, bars: list[PriceBar]) -> tuple[MarketRegime, str]:
-        """장세를 분류하고 (결과, 사유)를 함께 반환합니다."""
-        # MA + RSI 기준 최소 봉수 (MACD 없이도 판단 가능한 수준)
         min_bars = max(self.config.long_ma_days, self.config.rsi_period + 1)
-        # MACD 사용을 위한 최소 봉수
         macd_min_bars = self.config.macd_slow + self.config.macd_signal
         if len(bars) < min_bars:
-            return (
-                MarketRegime.UNKNOWN,
-                f"데이터 부족: {len(bars)}봉 (최소 {min_bars}봉 필요)",
-            )
+            return MarketRegime.UNKNOWN, f"데이터 부족: {len(bars)}봉 (최소 {min_bars}봉 필요)"
 
         closes  = [bar.close_price for bar in bars]
         volumes = [bar.volume for bar in bars]
 
-        # ── 데이터 유효성 검사 ────────────────────────────────────
         valid_closes = [c for c in closes if c > 0]
         if len(valid_closes) < min_bars:
-            return (
-                MarketRegime.UNKNOWN,
-                f"유효하지 않은 일봉 데이터: 종가 0인 봉이 너무 많음",
-            )
+            return MarketRegime.UNKNOWN, "유효하지 않은 일봉 데이터: 종가 0인 봉이 너무 많음"
         if len(set(closes[-5:])) == 1:
-            return (
-                MarketRegime.UNKNOWN,
-                f"유효하지 않은 일봉 데이터: 최근 5일 종가가 모두 동일 ({closes[-1]:,}원)",
-            )
+            return MarketRegime.UNKNOWN, f"유효하지 않은 일봉 데이터: 최근 5일 종가가 모두 동일 ({closes[-1]:,}원)"
 
         rsi_check = self._calc_rsi(closes, self.config.rsi_period)
         if rsi_check == 0.0 or rsi_check == 100.0:
-            return (
-                MarketRegime.UNKNOWN,
-                f"유효하지 않은 일봉 데이터: RSI {rsi_check:.1f} 극단값",
-            )
+            return MarketRegime.UNKNOWN, f"유효하지 않은 일봉 데이터: RSI {rsi_check:.1f} 극단값"
 
-        # ── MACD 사용 가능 여부 판단 ──────────────────────────────
-        # 데이터가 부족하면 MA + RSI만으로 판단 (MACD 없이)
         use_macd = len(bars) >= macd_min_bars
 
-        # ── 이동평균 ──────────────────────────────────────────────
         short_ma = self._calc_ma(closes, self.config.short_ma_days)
         long_ma  = self._calc_ma(closes, self.config.long_ma_days)
         current_price = closes[-1]
@@ -74,43 +39,53 @@ class MarketRegimeClassifier:
         ma_bullish = short_ma > long_ma and current_price > short_ma
         ma_bearish = short_ma < long_ma and current_price < short_ma
 
-        # ── RSI + 방향 ────────────────────────────────────────────
         rsi = self._calc_rsi(closes, self.config.rsi_period)
         rsi_direction = self._calc_rsi_direction(closes, self.config.rsi_period)
-        # direction: +1 = 상승 중, -1 = 하락 중, 0 = 보합
 
-        rsi_overbought  = rsi >= self.config.rsi_overbought
-        rsi_oversold    = rsi <= self.config.rsi_oversold
-        rsi_rising      = rsi_direction > 0
-        rsi_falling     = rsi_direction < 0
+        rsi_overbought = rsi >= self.config.rsi_overbought
+        rsi_oversold   = rsi <= self.config.rsi_oversold
+        rsi_rising     = rsi_direction > 0
+        rsi_falling    = rsi_direction < 0
+        rsi_dir_tag    = "↑" if rsi_rising else ("↓" if rsi_falling else "→")
 
-        rsi_dir_tag = "↑" if rsi_rising else ("↓" if rsi_falling else "→")
-
-        # ── MACD (데이터 충분할 때만) ─────────────────────────────
         if use_macd:
             macd_line, signal_line = self._calc_macd(
-                closes, self.config.macd_fast, self.config.macd_slow, self.config.macd_signal,
+                closes, self.config.macd_fast, self.config.macd_slow, self.config.macd_signal
             )
             macd_golden = macd_line > signal_line
             macd_dead   = macd_line < signal_line
         else:
-            # MACD 데이터 부족 시 MA 방향으로 대체
             macd_golden = ma_bullish
             macd_dead   = ma_bearish
             macd_line   = 0.0
+            signal_line = 0.0
 
-        # ── 거래량 급증 ───────────────────────────────────────────
         volume_surge = self._is_volume_surge(volumes, self.config.volume_surge_ratio)
-        volume_tag = " + 거래량급증" if volume_surge else ""
-        macd_mode  = "" if use_macd else " [MACD부족→MA대체]"
+        volume_tag   = " + 거래량 급증✓" if volume_surge else ""
+        macd_mode    = "" if use_macd else " [MACD 데이터 부족-MA 대체]"
 
-        # ── 최종 판단 ─────────────────────────────────────────────
-        #
-        # 핵심 원칙 (엑셀 자료 기반):
-        #   RSI 과매도(30↓) + 상승 중 + MACD 골든크로스 = 강력 매수 타점
-        #   RSI 과매도(30↓) + 하락 중 + MACD 데드크로스 = 추가 폭락 위험
-        #   RSI 과매수(70↑) + 하락 중 + MACD 데드크로스 = 고점 반전
-        #   RSI 과매수(70↑) + 상승 중 + MACD 골든크로스 = 강력 상승 지속
+        # ── REBOUND 판단 (바닥권 반등 초입) ──────────────────────
+        # 조건: RSI 과매도 + RSI Signal 골든크로스 + MACD 히스토그램 반전
+        if use_macd and rsi_oversold:
+            rsi_signal_val, rsi_signal_cross = self._calc_rsi_signal(closes, self.config.rsi_period)
+
+            # MACD 히스토그램 반전 여부 (음수 구간에서 증가 시작)
+            macd_hist_now  = macd_line - signal_line
+            if len(bars) >= macd_min_bars + 2:
+                macd_prev, sig_prev = self._calc_macd(
+                    closes[:-2], self.config.macd_fast, self.config.macd_slow, self.config.macd_signal
+                )
+                macd_hist_prev = macd_prev - sig_prev
+                hist_reversing = macd_hist_now < 0 and macd_hist_now > macd_hist_prev
+            else:
+                hist_reversing = False
+
+            if rsi_signal_cross == 1 and hist_reversing and not ma_bullish:
+                return MarketRegime.REBOUND, (
+                    f"바닥권 반등 — RSI {rsi:.1f}↑ Signal 골든크로스 "
+                    f"+ MACD 히스토그램 반전({macd_hist_now:+.1f})"
+                    f"{volume_tag}"
+                )
 
         # ── 상승장 판단 ───────────────────────────────────────────
         if ma_bullish and not rsi_overbought and rsi_rising and macd_golden:
@@ -146,49 +121,32 @@ class MarketRegimeClassifier:
                 f"{volume_tag}{macd_mode}"
             )
 
-        # ── RSI 방향에 따른 추가 판단 ─────────────────────────────
-        # MA 상승 + RSI 하락 중 → 모멘텀 약화, 상승 전환 아직 이름
         if ma_bullish and rsi_falling and macd_dead:
             return MarketRegime.SIDEWAYS, (
-                f"MA 상승이나 RSI {rsi:.1f}{rsi_dir_tag} 하락 + MACD 데드크로스 "
-                f"— 모멘텀 약화 중"
+                f"MA 상승이나 RSI {rsi:.1f}{rsi_dir_tag} 하락 + MACD 데드크로스 — 모멘텀 약화 중"
             )
 
-        # MA 하락 + RSI 상승 중 → 반등 시도, 아직 추세 전환 확인 안 됨
         if ma_bearish and rsi_rising and macd_golden:
             return MarketRegime.SIDEWAYS, (
-                f"MA 하락이나 RSI {rsi:.1f}{rsi_dir_tag} 상승 + MACD 골든크로스 "
-                f"— 반등 시도 중"
+                f"MA 하락이나 RSI {rsi:.1f}{rsi_dir_tag} 상승 + MACD 골든크로스 — 반등 시도 중"
             )
 
-        # MA 상승 + MACD 아직 데드크로스
         if ma_bullish and not rsi_overbought and macd_dead:
             return MarketRegime.SIDEWAYS, (
-                f"MA 상승이나 MACD 데드크로스({macd_line:+.1f}) RSI {rsi:.1f}{rsi_dir_tag} "
-                f"— 전환 준비 중"
+                f"MA 상승이나 MACD 데드크로스({macd_line:+.1f}) RSI {rsi:.1f}{rsi_dir_tag} — 전환 준비 중"
             )
 
-        # RSI 극단값 처리
         if rsi_overbought:
-            return MarketRegime.SIDEWAYS, (
-                f"RSI {rsi:.1f}{rsi_dir_tag} 과매수 — 과열 구간, 신규 진입 위험"
-            )
+            return MarketRegime.SIDEWAYS, f"RSI {rsi:.1f}{rsi_dir_tag} 과매수 — 과열 구간"
 
         if rsi_oversold and rsi_falling:
-            return MarketRegime.BEARISH, (
-                f"RSI {rsi:.1f}{rsi_dir_tag} 과매도 + 하락 중 — 추가 하락 가능"
-            )
+            return MarketRegime.BEARISH, f"RSI {rsi:.1f}{rsi_dir_tag} 과매도 + 하락 중 — 추가 하락 가능"
 
         if rsi_oversold and rsi_rising:
-            return MarketRegime.SIDEWAYS, (
-                f"RSI {rsi:.1f}{rsi_dir_tag} 과매도 + 반등 중 — MACD 확인 후 진입 검토"
-            )
+            return MarketRegime.SIDEWAYS, f"RSI {rsi:.1f}{rsi_dir_tag} 과매도 + 반등 중 — MACD 확인 후 진입 검토"
 
-        # 그 외 모든 경우
         return MarketRegime.SIDEWAYS, (
-            f"MA {short_ma:,.0f}/{long_ma:,.0f} "
-            f"RSI {rsi:.1f}{rsi_dir_tag} "
-            f"MACD {macd_line:+.1f} — 추세 불명확"
+            f"MA {short_ma:,.0f}/{long_ma:,.0f} RSI {rsi:.1f}{rsi_dir_tag} MACD {macd_line:+.1f} — 추세 불명확"
         )
 
     # ── 지표 계산 헬퍼 ────────────────────────────────────────────
@@ -214,57 +172,66 @@ class MarketRegimeClassifier:
 
     @classmethod
     def _calc_rsi_direction(cls, closes: list[float], period: int, lookback: int = 3) -> int:
-        """RSI의 방향(기울기)을 판단합니다.
-
-        최근 N일간의 RSI 변화를 보고 방향을 반환합니다.
-        lookback: 비교할 과거 일수 (기본 3일)
-
-        Returns
-        -------
-        +1 : RSI 상승 중 (반등 신호)
-        -1 : RSI 하락 중 (추가 하락 위험)
-         0 : 보합 (방향성 불명확)
-        """
         if len(closes) < period + lookback + 1:
             return 0
-
-        # 현재 RSI와 N일 전 RSI를 비교
         rsi_now  = cls._calc_rsi(closes, period)
         rsi_prev = cls._calc_rsi(closes[:-lookback], period)
-
         diff = rsi_now - rsi_prev
-
-        # 변화폭이 2 이상이어야 방향성 있다고 판단 (노이즈 제거)
         if diff >= 2.0:
-            return 1   # 상승 중
+            return 1
         if diff <= -2.0:
-            return -1  # 하락 중
-        return 0       # 보합
+            return -1
+        return 0
+
+    @classmethod
+    def _calc_rsi_signal(
+        cls, closes: list[float], rsi_period: int, signal_period: int = 9
+    ) -> tuple[float, int]:
+        """RSI Signal선(EMA)과 골든크로스 여부를 반환합니다.
+
+        Returns: (signal_value, cross_direction)
+            cross_direction: +1 골든크로스, -1 데드크로스, 0 보합
+        """
+        needed = rsi_period + signal_period + 2
+        if len(closes) < needed:
+            return 0.0, 0
+
+        # RSI 시리즈 생성 (signal_period + 2개)
+        rsi_series = []
+        for i in range(signal_period + 2):
+            end = len(closes) - (signal_period + 1 - i)
+            if end < rsi_period + 1:
+                rsi_series.append(50.0)
+            else:
+                rsi_series.append(cls._calc_rsi(closes[:end], rsi_period))
+
+        signal_emas = cls._calc_ema(rsi_series, signal_period)
+        if len(signal_emas) < 2:
+            return 0.0, 0
+
+        rsi_now    = cls._calc_rsi(closes, rsi_period)
+        rsi_prev   = cls._calc_rsi(closes[:-1], rsi_period)
+        signal_now  = signal_emas[-1]
+        signal_prev = signal_emas[-2]
+
+        cross = 0
+        if rsi_prev <= signal_prev and rsi_now > signal_now:
+            cross = 1   # 골든크로스
+        elif rsi_prev >= signal_prev and rsi_now < signal_now:
+            cross = -1  # 데드크로스
+
+        return signal_now, cross
 
     @classmethod
     def _calc_macd_hist_direction(
         cls, closes: list[float], fast: int, slow: int, signal_period: int, lookback: int = 2
     ) -> int:
-        """MACD 히스토그램(MACD - Signal)의 방향을 판단합니다.
-
-        현재 히스토그램이 N봉 전보다 크면 확대(+1), 작으면 축소(-1)입니다.
-        히스토그램이 확대 중이면 모멘텀이 강해지는 중입니다.
-
-        Returns
-        -------
-        +1 : 히스토그램 확대 중 (모멘텀 강화)
-        -1 : 히스토그램 축소 중 (모멘텀 약화)
-         0 : 보합
-        """
         if len(closes) < slow + signal_period + lookback:
             return 0
-
-        macd_now,  sig_now  = cls._calc_macd(closes,          fast, slow, signal_period)
+        macd_now,  sig_now  = cls._calc_macd(closes, fast, slow, signal_period)
         macd_prev, sig_prev = cls._calc_macd(closes[:-lookback], fast, slow, signal_period)
-
         hist_now  = macd_now  - sig_now
         hist_prev = macd_prev - sig_prev
-
         if hist_now > hist_prev + 0.1:
             return 1
         if hist_now < hist_prev - 0.1:
@@ -273,7 +240,6 @@ class MarketRegimeClassifier:
 
     @staticmethod
     def _calc_ema(values: list[float], period: int) -> list[float]:
-        """지수 이동평균(EMA) 시리즈를 계산합니다. MACD에 사용됩니다."""
         if len(values) < period:
             return []
         k = 2 / (period + 1)
@@ -290,19 +256,15 @@ class MarketRegimeClassifier:
         slow_emas = cls._calc_ema(closes, slow)
         if not fast_emas or not slow_emas:
             return 0.0, 0.0
-
         diff = len(fast_emas) - len(slow_emas)
         aligned_fast = fast_emas[diff:] if diff > 0 else fast_emas
         aligned_slow = slow_emas[-diff:] if diff < 0 else slow_emas
-
         macd_series = [f - s for f, s in zip(aligned_fast, aligned_slow)]
         if len(macd_series) < signal_period:
             return 0.0, 0.0
-
         signal_emas = cls._calc_ema(macd_series, signal_period)
         if not signal_emas:
             return 0.0, 0.0
-
         return macd_series[-1], signal_emas[-1]
 
     @staticmethod

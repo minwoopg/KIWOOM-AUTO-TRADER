@@ -31,7 +31,7 @@ class SwingStrategy(Strategy):
     def __init__(self, config: SwingConfig) -> None:
         self.config = config
 
-    def generate_signal(self, market_price: MarketPrice, position: Position | None, minute_analysis=None) -> Signal:
+    def generate_signal(self, market_price: MarketPrice, position: Position | None, minute_analysis=None, highest_price: int = 0) -> Signal:
         """현재 시세와 보유 상태를 보고 BUY / SELL / HOLD 신호를 생성합니다."""
 
         current_price = market_price.current_price
@@ -80,34 +80,62 @@ class SwingStrategy(Strategy):
             )
 
         # ── 보유 중 → 매도 판단 ──────────────────────────────────
-        average_price     = position.average_price
-        take_profit_price = int(average_price * (1 + self.config.take_profit_pct / 100))
-        stop_loss_price   = int(average_price * (1 - self.config.stop_loss_pct / 100))
+        average_price    = position.average_price
+        stop_loss_price  = int(average_price * (1 - self.config.stop_loss_pct / 100))
+        safety_net_price = int(average_price * (1 + self.config.take_profit_pct / 100))
+        current_pnl_pct  = (current_price - average_price) / average_price * 100
 
-        current_pct = (current_price - average_price) / average_price * 100
-
-        # 익절
-        if current_price >= take_profit_price:
-            return Signal(
-                type=SignalType.SELL,
-                reason=f"[스윙] 익절 목표 {take_profit_price:,}원 도달 (+{self.config.take_profit_pct:.1f}%)",
-            )
-
-        # 손절
+        # ① 손절 (최우선)
         if current_price <= stop_loss_price:
             return Signal(
                 type=SignalType.SELL,
-                reason=f"[스윙] 손절 기준 {stop_loss_price:,}원 하회 (-{self.config.stop_loss_pct:.1f}%)",
+                reason=f"[스윙] 손절 — 평균단가 대비 {current_pnl_pct:+.1f}% ({stop_loss_price:,}원 하회)",
             )
 
-        # 조기 매도: RSI 과매수 + 모멘텀 소진
-        if has_indicators and rsi is not None and rsi >= 75 and macd_hist_dir < 0:
+        # ② 트레일링 스탑 (스윙은 더 여유있게: +3% 이상부터, -4% 하락 시)
+        trailing_start_price = int(average_price * 1.03)
+        if highest_price >= trailing_start_price and highest_price > 0:
+            trailing_stop_price = int(highest_price * 0.96)
+            from_high_pct = (current_price - highest_price) / highest_price * 100
+            if current_price <= trailing_stop_price:
+                return Signal(
+                    type=SignalType.SELL,
+                    reason=(
+                        f"[스윙] 트레일링 스탑 — 최고가 {highest_price:,}원 대비 {from_high_pct:.1f}% 하락 "
+                        f"(보유 수익 {current_pnl_pct:+.1f}%)"
+                    ),
+                )
+
+        # ③ 추세 꺾임 (RSI 75 이상 + RSI 하락 + MACD 히스토그램 축소)
+        if has_indicators and rsi is not None:
+            if rsi >= 75 and macd_hist_dir < 0:
+                return Signal(
+                    type=SignalType.SELL,
+                    reason=(
+                        f"[스윙] 추세 꺾임 — RSI {rsi:.1f}↓ 과매수 + MACD 히스토그램 축소 "
+                        f"(보유 수익 {current_pnl_pct:+.1f}%)"
+                    ),
+                )
+
+        # ④ 안전망 익절 (+12%)
+        if current_price >= safety_net_price:
             return Signal(
                 type=SignalType.SELL,
-                reason=f"[스윙] 모멘텀 소진 — RSI {rsi:.1f} 과매수 + MACD 축소 → 조기 차익 실현 (현재 {current_pct:+.1f}%)",
+                reason=f"[스윙] 안전망 익절 — 평균단가 대비 +{self.config.take_profit_pct:.0f}% 도달",
+            )
+
+        # 트레일링 진행 상황
+        if highest_price >= trailing_start_price and highest_price > 0:
+            trailing_stop_price = int(highest_price * 0.96)
+            return Signal(
+                type=SignalType.HOLD,
+                reason=(
+                    f"[스윙] 트레일링 추적 중 — 최고가 {highest_price:,}원 / "
+                    f"스탑 {trailing_stop_price:,}원 / 현재 {current_pnl_pct:+.1f}%"
+                ),
             )
 
         return Signal(
             type=SignalType.HOLD,
-            reason=f"[스윙] 보유 유지 {current_pct:+.1f}% — 익절 {take_profit_price:,}원 / 손절 {stop_loss_price:,}원",
+            reason=f"[스윙] 보유 유지 {current_pnl_pct:+.1f}% — 손절 {stop_loss_price:,}원",
         )

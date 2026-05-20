@@ -81,9 +81,11 @@ class TradingService:
         # HOLD 로그 throttle
         self.last_hold_log_at_by_symbol: dict[str, datetime] = {}
 
+        # 보유 종목별 최고가 추적 (트레일링 스탑용)
+        self._highest_price: dict[str, int] = {}
+
         # 동적 종목 목록 (조건검색 연동 시 갱신)
-        self._dynamic_day_symbols: list[str] | None = None
-        self._dynamic_swing_symbols: list[str] | None = None
+        self._dynamic_targets: list[str] | None = None
 
         # 일일 리포트 생성기
         self._reporter = DailyReporter(
@@ -112,15 +114,13 @@ class TradingService:
     @property
     def targets(self) -> list[str]:
         """현재 감시 중인 전체 종목 목록입니다."""
-        day   = self._dynamic_day_symbols   if self._dynamic_day_symbols   is not None else self.settings.day_symbols
-        swing = self._dynamic_swing_symbols if self._dynamic_swing_symbols is not None else self.settings.swing_symbols
-        return list(dict.fromkeys(day + swing))
+        if self._dynamic_targets is not None:
+            return self._dynamic_targets
+        return self.settings.targets
 
-    def update_targets(self, day_symbols: list[str], swing_symbols: list[str] | None = None) -> None:
-        """조건검색 결과로 단타/스윙 종목 목록을 동적으로 갱신합니다."""
-        self._dynamic_day_symbols = day_symbols
-        if swing_symbols is not None:
-            self._dynamic_swing_symbols = swing_symbols
+    def update_targets(self, symbols: list[str]) -> None:
+        """조건검색 결과로 종목 목록을 동적으로 갱신합니다."""
+        self._dynamic_targets = symbols
 
     def _get_balance_with_cache(self) -> AccountBalance:
         """계좌 조회를 매번 하지 않고 일정 시간 동안 캐시를 재사용합니다."""
@@ -317,6 +317,16 @@ class TradingService:
         ma5 = self.regime_classifier._calc_ma(closes, 5)
         price_above_ma5 = closes[-1] > ma5
 
+        # RSI Signal선 + 골든크로스 (바닥권 매수용)
+        rsi_signal_val, rsi_signal_cross = self.regime_classifier._calc_rsi_signal(
+            closes, cfg.rsi_period
+        )
+
+        # 거래량 시나리오 A/B (바닥권 매수용)
+        avg_vol_20 = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0
+        vol_exhaustion = avg_vol_20 > 0 and volumes[-1] < avg_vol_20 * 0.7   # A: 매물 고갈
+        vol_buying     = avg_vol_20 > 0 and volumes[-1] > avg_vol_20 * 1.3   # B: 세력 유입
+
         return MarketPrice(
             symbol=market_price.symbol,
             current_price=market_price.current_price,
@@ -325,11 +335,15 @@ class TradingService:
             timestamp=market_price.timestamp,
             indicator_rsi=rsi,
             indicator_rsi_direction=rsi_direction,
+            indicator_rsi_signal=rsi_signal_val,
+            indicator_rsi_signal_cross=rsi_signal_cross,
             indicator_macd=macd_line,
             indicator_macd_signal=signal_line,
             indicator_macd_hist_direction=macd_hist_direction,
             indicator_volume_surge=volume_surge,
             indicator_price_above_ma5=price_above_ma5,
+            indicator_volume_exhaustion=vol_exhaustion,
+            indicator_volume_buying=vol_buying,
         )
 
     def _log_signal_decision(
@@ -438,10 +452,7 @@ class TradingService:
                 continue
 
             if i > 0:
-                await asyncio.sleep(1.0)  # asyncio 환경에서 안전한 딜레이
-
-            # 스윙 종목 여부 확인
-            is_swing = symbol in self.settings.swing_symbols
+                await asyncio.sleep(1.0)
 
             regime, _ = self._get_regime_with_cache(symbol)
 
@@ -456,8 +467,7 @@ class TradingService:
             else:
                 self._unknown_count[symbol] = 0
 
-            # 보유 종목은 캐시를 무시하고 항상 최신 가격을 가져옵니다.
-            # 익절/손절 타이밍을 놓치지 않기 위해 매 루프마다 API 직접 조회합니다.
+            # 보유 종목은 캐시 무시하고 항상 최신 가격 조회
             position_check = next((p for p in balance.positions if p.symbol == symbol), None)
             if position_check is not None:
                 try:
@@ -471,9 +481,9 @@ class TradingService:
 
             market_price = self._attach_indicators(market_price, symbol)
 
-            # ── 단타 종목 + BULLISH일 때만 분봉 2차 필터 적용 ──────
+            # BULLISH 또는 REBOUND일 때 분봉 분석 실행
             minute_analysis = None
-            if not is_swing and regime == MarketRegime.BULLISH:
+            if regime in (MarketRegime.BULLISH, MarketRegime.REBOUND):
                 minute_analysis = self._get_minute_analysis(
                     symbol, market_price.previous_close
                 )
@@ -482,10 +492,19 @@ class TradingService:
                         f"[MIN ] {symbol} | {minute_analysis.score()}/5 | {minute_analysis.summary()}"
                     )
 
-            # 스윙 종목은 is_swing=True로 SwingStrategy 선택
-            strategy = self.strategy_router.select(regime, is_swing=is_swing)
+            strategy = self.strategy_router.select(regime)
             position = next((p for p in balance.positions if p.symbol == symbol), None)
-            signal   = strategy.generate_signal(market_price, position, minute_analysis)
+
+            # 보유 중인 경우 최고가 갱신
+            if position is not None:
+                current = market_price.current_price
+                if current > self._highest_price.get(symbol, 0):
+                    self._highest_price[symbol] = current
+            else:
+                self._highest_price.pop(symbol, None)
+
+            highest_price = self._highest_price.get(symbol, 0)
+            signal = strategy.generate_signal(market_price, position, minute_analysis, highest_price)
 
             self._log_signal_decision(
                 symbol, signal, market_price.current_price,
@@ -493,7 +512,7 @@ class TradingService:
             )
 
             if signal.type == SignalType.BUY:
-                self._try_buy(symbol, market_price.current_price, balance, is_swing=is_swing)
+                self._try_buy(symbol, market_price.current_price, balance)
             elif signal.type == SignalType.SELL and position is not None:
                 self._try_sell(symbol, position.quantity, market_price.current_price)
 
@@ -506,12 +525,6 @@ class TradingService:
                 self.cached_balance_loaded_at = datetime.now()
 
                 for position in latest_balance.positions:
-                    # 스윙 종목은 오버나이트 허용 — 강제청산 제외
-                    if position.symbol in self.settings.swing_symbols:
-                        self.app_logger.info(
-                            f"[SWING] {position.symbol} | 스윙 종목 — 장 마감 강제청산 제외"
-                        )
-                        continue
                     self._try_sell(position.symbol, position.quantity)
 
             except Exception as exc:
@@ -524,7 +537,7 @@ class TradingService:
 
         self.state_store.save(self.state)
 
-    def _try_buy(self, symbol: str, current_price: int, balance: AccountBalance, is_swing: bool = False) -> None:
+    def _try_buy(self, symbol: str, current_price: int, balance: AccountBalance) -> None:
         """매수 주문 가능 여부를 검사한 뒤 실제 주문을 시도합니다."""
 
         # ── 재진입 쿨다운 체크 ────────────────────────────────────
@@ -541,26 +554,14 @@ class TradingService:
                 )
                 return
 
-        # ── 단타/스윙 포지션 수 체크 ─────────────────────────────
-        mode_label = "스윙" if is_swing else "단타"
-        held_symbols = {p.symbol for p in balance.positions}
-        if is_swing:
-            swing_held = len([s for s in held_symbols if s in self.settings.swing_symbols])
-            if swing_held >= self.settings.trading.max_swing_positions:
-                self.app_logger.info(
-                    f"[BLOCK] {symbol} | [{mode_label}] 최대 보유 종목 수 초과 "
-                    f"({swing_held}/{self.settings.trading.max_swing_positions})"
-                )
-                return
-        else:
-            day_held = len([s for s in held_symbols if s in self.settings.day_symbols or
-                           s not in self.settings.swing_symbols])
-            if day_held >= self.settings.trading.max_day_positions:
-                self.app_logger.info(
-                    f"[BLOCK] {symbol} | [{mode_label}] 최대 보유 종목 수 초과 "
-                    f"({day_held}/{self.settings.trading.max_day_positions})"
-                )
-                return
+        # ── 최대 보유 종목 수 체크 ────────────────────────────────
+        held_count = len(balance.positions)
+        if held_count >= self.settings.trading.max_positions:
+            self.app_logger.info(
+                f"[BLOCK] {symbol} | 최대 보유 종목 수 초과 "
+                f"({held_count}/{self.settings.trading.max_positions})"
+            )
+            return
         quantity = max(1, self.settings.trading.order_cash_per_trade // current_price)
         order = OrderRequest(
             symbol=symbol,
@@ -588,6 +589,9 @@ class TradingService:
             result.order_id,
             price=current_price,
         )
+
+        if result.accepted:
+            self.state.bought_symbols_today.add(symbol)
             self.state.last_order_id_by_symbol[symbol] = result.order_id
 
             # 주문 성공 후 잔고 캐시 무효화

@@ -20,6 +20,7 @@ class Strategy(ABC):
         market_price: MarketPrice,
         position: Position | None,
         minute_analysis=None,
+        highest_price: int = 0,
     ) -> Signal:
         """현재 시세와 보유 포지션을 보고 BUY/SELL/HOLD를 결정합니다.
 
@@ -28,5 +29,6 @@ class Strategy(ABC):
         market_price     : 현재가 및 일봉 기반 지표
         position         : 보유 포지션 (미보유 시 None)
         minute_analysis  : 분봉 분석 결과 (단타 전용, 없으면 None)
+        highest_price    : 보유 중 기록한 최고가 (트레일링 스탑용)
         """
         raise NotImplementedError

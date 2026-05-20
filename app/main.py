@@ -46,7 +46,7 @@ def build_broker(settings: Settings):
 
 
 def build_trading_service(settings, broker, app_logger, trade_logger, state_store):
-    strategy_router   = StrategyRouter(settings.strategy, settings.swing)
+    strategy_router   = StrategyRouter(settings.strategy)
     regime_classifier = MarketRegimeClassifier(settings.market_regime)
     risk_manager      = RiskManager(settings.trading, settings.risk)
     return TradingService(
@@ -117,18 +117,14 @@ async def async_main() -> None:
         from infra.websocket.real_token import fetch_real_token
 
         # 수동 고정 종목 (settings.yaml의 targets)
-        manual_day_symbols   = settings.day_symbols
-        manual_swing_symbols = settings.swing_symbols
+        manual_symbols = settings.targets
 
         def on_symbols_changed(symbols: list[str]) -> None:
-            # 수동 고정 종목을 앞에 두고 조건검색 종목을 뒤에 붙입니다.
-            # max_symbols 제한이 걸려도 수동 종목이 먼저 보장됩니다.
-            combined_day = list(dict.fromkeys(manual_day_symbols + symbols))
-            limited_day  = combined_day[:settings.websocket.max_symbols]
-            trading_service.update_targets(limited_day, manual_swing_symbols)
-            app_logger.info(
-                f"[COND] 단타 종목 갱신: {limited_day} / 스윙 종목: {manual_swing_symbols}"
-            )
+            # 수동 종목을 앞에 두고 조건검색 종목을 뒤에 붙입니다.
+            combined = list(dict.fromkeys(manual_symbols + symbols))
+            limited  = combined[:settings.websocket.max_symbols]
+            trading_service.update_targets(limited)
+            app_logger.info(f"[COND] 종목 목록 갱신: {limited}")
 
         # 조건검색은 실전 계좌 토큰으로 별도 발급
         app_logger.info("[COND] 실전 계좌 토큰 발급 중...")

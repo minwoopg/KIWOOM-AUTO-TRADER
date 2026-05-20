@@ -16,46 +16,37 @@ broker:
   account_number: ${KIWOOM_ACCOUNT_NUMBER}
   is_paper_trading: true
 
-# 단타/스윙 종목을 분리해서 등록합니다.
-# 조건검색 OFF 시 아래 종목을 직접 사용합니다.
+# 감시할 종목 목록 (조건검색 OFF 시 사용)
 targets:
-  # 단타 종목: 당일 매수/청산, 익절 +2~3%, 손절 -1.5%
-  day_symbols:
+  symbols:
+    - "001510"
+    - "047040"
     - "001510"
     - "047040"
     - "247540"
     - "010170"
     - "006260"
-  # 스윙 종목: 수일~수주 보유, 익절 +10~15%, 손절 -5%
-  swing_symbols: ["006260"]
-
+    - "005930"
+    
 trading:
   poll_interval_seconds: 10
   balance_refresh_seconds: 180
   price_refresh_seconds: 300
   order_cash_per_trade: 200000
-  max_positions: 15             # 단타 2 + 스윙 3
-  max_day_positions: 10         # 단타 최대 보유 종목
-  max_swing_positions: 5       # 스윙 최대 보유 종목
+  max_positions: 5
   allow_multiple_entries_per_symbol_per_day: true
-  force_exit_before_market_close_minutes: 12  # 15:18부터 강제청산 (단일가 진입 전)
+  force_exit_before_market_close_minutes: 12
   reentry_cooldown_seconds: 600
 
 strategy:
   name: breakout
   breakout_threshold_pct: 1.0
-  take_profit_pct: 2.0
-  stop_loss_pct: 1.5
+  take_profit_pct: 15.0          # 안전망 익절 (+15%)
+  stop_loss_pct: 1.5             # 손절 기준
   reference_price_type: previous_close
-
-swing:
-  take_profit_pct: 12.0        # 익절 기준 (+12%)
-  stop_loss_pct: 5.0           # 손절 기준 (-5%)
-  weekly_history_weeks: 20     # 주봉 조회 주수
-  weekly_refresh_seconds: 7200 # 주봉 캐시 갱신 주기 (2시간)
-  # 주봉 장세 판단 파라미터
-  short_ma_weeks: 5            # 단기 이동평균 (5주)
-  long_ma_weeks: 20            # 장기 이동평균 (20주)
+  trailing_stop_pct: 2.0         # 최고가 대비 -2% 하락 시 매도
+  trailing_start_pct: 1.0        # 최소 +1% 이상 올랐을 때부터 트레일링 시작
+  trend_reversal_rsi: 70.0       # 추세 꺾임 감지 RSI 기준
 
 market_regime:
   short_ma_days: 5
@@ -69,17 +60,15 @@ market_regime:
   macd_slow: 26
   macd_signal: 9
   volume_surge_ratio: 1.5
-  # 분봉 설정
-  minute_tick_scope: 3          # 3분봉
-  minute_bar_count: 40          # 최근 40봉 (2시간치)
-  minute_refresh_seconds: 180   # 3분마다 갱신
-  # 2차 필터 기준값
-  min_trading_value: 1000000000 # 거래대금 최소 10억
-  pullback_min_pct: -7.0        # 눌림목 최대 -7%
-  pullback_max_pct: -1.0        # 눌림목 최소 -1%
-  change_rate_min: 2.0          # 등락률 최소 +2%
-  change_rate_max: 18.0         # 등락률 최대 +18%
-  rebound_min_pct: 2.0          # 당일 저점 대비 반등 최소 +2%
+  minute_tick_scope: 3
+  minute_bar_count: 40
+  minute_refresh_seconds: 180
+  min_trading_value: 1000000000
+  pullback_min_pct: -7.0
+  pullback_max_pct: -1.0
+  change_rate_min: 2.0
+  change_rate_max: 18.0
+  rebound_min_pct: 2.0
 
 risk:
   max_daily_loss_amount: 100000
@@ -88,11 +77,9 @@ risk:
 
 websocket:
   enabled: true
-  # 실전 서버 URL (조건검색은 실전 계좌로)
   url: wss://api.kiwoom.com:10000/api/dostk/websocket
   condition_seq: 0
   max_symbols: 10
-  # 조건검색 전용 실전 계좌 키 (.env에서 로드)
   app_key: ${KIWOOM_REAL_APP_KEY}
   secret_key: ${KIWOOM_REAL_SECRET_KEY}
 
