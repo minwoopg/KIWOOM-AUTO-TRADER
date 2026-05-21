@@ -72,7 +72,7 @@ market_regime:
 
 risk:
   max_daily_loss_amount: 100000
-  max_order_amount: 300000
+  max_order_amount: 1500000
   min_cash_buffer: 100000
 
 websocket:
