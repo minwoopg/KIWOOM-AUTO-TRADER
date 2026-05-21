@@ -76,25 +76,47 @@ class BreakoutStrategy(Strategy):
                         reason=f"거래대금 부족 — {minute_analysis.trading_value//100_000_000}억",
                     )
 
-                # A조건(상승 중) 또는 B조건(저점 반등) 중 하나라도 충족해야 함
-                pass_change  = minute_analysis.is_valid_change_rate
-                pass_rebound = minute_analysis.is_valid_rebound
+                # A/B/C 조건 판단
+                pass_change   = minute_analysis.is_valid_change_rate   # A: 상승 돌파
+                pass_rebound  = minute_analysis.is_valid_rebound        # B: 저점 반등
+                pass_pulldown = minute_analysis.is_valid_pulldown       # C: 눌림목
 
-                if not pass_change and not pass_rebound:
+                if not pass_change and not pass_rebound and not pass_pulldown:
                     return Signal(
                         type=SignalType.HOLD,
                         reason=(
                             f"진입 조건 미충족 — "
                             f"A(등락 {minute_analysis.change_rate_pct:+.1f}%) / "
-                            f"B(반등 {minute_analysis.rebound_pct:+.1f}% VWAP {'위' if minute_analysis.price_above_vwap else '아래'})"
+                            f"B(반등 {minute_analysis.rebound_pct:+.1f}% VWAP {'위' if minute_analysis.price_above_vwap else '아래'}) / "
+                            f"C(눌림목 MA5>MA20:{'✓' if minute_analysis.ma5_above_ma20 else '✗'})"
                         ),
                     )
 
-                if not minute_analysis.is_valid_pullback:
-                    return Signal(
-                        type=SignalType.HOLD,
-                        reason=f"눌림목 구간 아님 — 고가 대비 {minute_analysis.pullback_pct:+.1f}% (유효범위 -1~-7%)",
-                    )
+                # ── 눌림목 조건 — 모드별로 다르게 적용 ──────────────
+                # A(상승 돌파): 고가 대비 -2% 이내면 통과 (강한 종목은 고가 근처에서 매수)
+                # B(저점 반등): 눌림목 조건 없음 (이미 저점에서 반등 확인)
+                # C(눌림목):   고가 대비 -1%~-7% 유지
+                if pass_change and not pass_pulldown:
+                    # A조건 — 고가 대비 -2% 이내 허용
+                    if minute_analysis.pullback_pct < -2.0:
+                        return Signal(
+                            type=SignalType.HOLD,
+                            reason=(
+                                f"[A] 상승 돌파 — 고가에서 너무 밀림 "
+                                f"({minute_analysis.pullback_pct:+.1f}%, 허용 -2% 이내)"
+                            ),
+                        )
+                elif pass_pulldown and not pass_change and not pass_rebound:
+                    # C조건 — 기존 눌림목 -1%~-7% 엄격 적용
+                    if not minute_analysis.is_valid_pullback:
+                        return Signal(
+                            type=SignalType.HOLD,
+                            reason=(
+                                f"[C] 눌림목 — 고가 대비 {minute_analysis.pullback_pct:+.1f}% "
+                                f"(유효범위 -1%~-7%)"
+                            ),
+                        )
+                # B조건(저점 반등)은 눌림목 체크 없음
 
             # ── [2단계] 일봉 타이밍 점수 (4가지) ─────────────────
             cond_macd_cross = macd > macd_signal
