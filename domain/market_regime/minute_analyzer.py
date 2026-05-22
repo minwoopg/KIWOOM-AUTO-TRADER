@@ -10,6 +10,7 @@ from __future__ import annotations
     - 당일 고가 대비 현재가 위치 (눌림목 구간 확인)
     - 당일 등락률
     - 거래대금 (거래량 × 가격)
+    - 조건 C: 상승 추세 중 눌림목 (MA5>MA20 + 등락률 -1%~-8%)
 """
 
 from dataclasses import dataclass
@@ -28,11 +29,13 @@ class MinuteAnalysis:
     change_rate_pct: float
     is_valid_change_rate: bool
     rebound_pct: float           # 당일 저점 대비 반등률
-    is_valid_rebound: bool       # 반등률 유효 여부 (+2% 이상 + VWAP 위)
+    is_valid_rebound: bool       # B조건: 반등률 유효 여부 (+2% 이상 + VWAP 위)
     trading_value: int
     is_valid_trading_value: bool
     day_high: int
     day_low: int
+    is_valid_pulldown: bool      # C조건: 상승 추세 중 눌림목 (-1%~-8% + MA5>MA20)
+    ma5_above_ma20: bool         # MA5 > MA20 여부 (상승 추세 확인용)
 
     def score(self) -> int:
         """진입 타이밍 점수를 계산합니다 (0~5점)."""
@@ -40,20 +43,22 @@ class MinuteAnalysis:
             self.price_above_vwap,
             self.low_rising,
             self.is_valid_pullback,
-            self.is_valid_change_rate or self.is_valid_rebound,  # 둘 중 하나
+            self.is_valid_change_rate or self.is_valid_rebound or self.is_valid_pulldown,
             self.is_valid_trading_value,
         ])
 
     def summary(self) -> str:
         """로그용 요약 문자열을 반환합니다."""
-        change_tag = f"등락 {'유효✓' if self.is_valid_change_rate else '무효✗'}({self.change_rate_pct:+.1f}%)"
-        rebound_tag = f"반등 {'유효✓' if self.is_valid_rebound else '무효✗'}({self.rebound_pct:+.1f}%)"
+        change_tag   = f"등락 {'유효✓' if self.is_valid_change_rate else '무효✗'}({self.change_rate_pct:+.1f}%)"
+        rebound_tag  = f"반등 {'유효✓' if self.is_valid_rebound else '무효✗'}({self.rebound_pct:+.1f}%)"
+        pulldown_tag = f"눌림목C {'유효✓' if self.is_valid_pulldown else '무효✗'}(MA5>MA20:{'✓' if self.ma5_above_ma20 else '✗'})"
         tags = [
             f"VWAP {'위✓' if self.price_above_vwap else '아래✗'}({self.vwap:,.0f})",
             f"저점 {'상승✓' if self.low_rising else '하락✗'}",
             f"눌림 {'적절✓' if self.is_valid_pullback else '불량✗'}({self.pullback_pct:+.1f}%)",
             change_tag,
             rebound_tag,
+            pulldown_tag,
             f"거래대금 {'충분✓' if self.is_valid_trading_value else '부족✗'}({self.trading_value//100_000_000}억)",
         ]
         return " | ".join(tags)
@@ -70,7 +75,7 @@ class MinuteAnalyzer:
         change_rate_min: float = 2.0,
         change_rate_max: float = 18.0,
         low_rising_bars: int = 3,
-        rebound_min_pct: float = 2.0,   # 저점 대비 반등 최소 기준
+        rebound_min_pct: float = 2.0,
     ) -> None:
         self.min_trading_value  = min_trading_value
         self.pullback_min_pct   = pullback_min_pct
@@ -79,19 +84,11 @@ class MinuteAnalyzer:
         self.change_rate_max    = change_rate_max
         self.low_rising_bars    = low_rising_bars
         self.rebound_min_pct    = rebound_min_pct
+        # 조건 C: 상승 추세 중 눌림목
+        self.pulldown_min_pct   = -8.0   # 당일 등락률 하한
+        self.pulldown_max_pct   = -1.0   # 당일 등락률 상한
 
     def analyze(self, bars: list[MinuteBar], prev_close: int) -> MinuteAnalysis | None:
-        """분봉 리스트를 분석해서 MinuteAnalysis 결과를 반환합니다.
-
-        Parameters
-        ----------
-        bars       : 분봉 리스트 (과거 → 최신 순)
-        prev_close : 전일 종가 (등락률 계산용)
-
-        Returns
-        -------
-        MinuteAnalysis or None (데이터 부족 시)
-        """
         if len(bars) < self.low_rising_bars + 1:
             return None
 
@@ -100,8 +97,6 @@ class MinuteAnalyzer:
             return None
 
         # ── VWAP 계산 ─────────────────────────────────────────────
-        # VWAP = Σ(전형가 × 거래량) / Σ거래량
-        # 전형가 = (고가 + 저가 + 종가) / 3
         total_pv = sum(
             ((b.high_price + b.low_price + b.close_price) / 3) * b.volume
             for b in bars
@@ -114,12 +109,11 @@ class MinuteAnalyzer:
         day_high = max(b.high_price for b in bars)
         day_low  = min(b.low_price  for b in bars)
 
-        # ── 눌림목 계산 (당일 고가 대비 현재가 위치) ──────────────
+        # ── 눌림목 계산 ───────────────────────────────────────────
         pullback_pct = (current_price - day_high) / day_high * 100
         is_valid_pullback = self.pullback_min_pct <= pullback_pct <= self.pullback_max_pct
 
         # ── 분봉 저점 상승 여부 ───────────────────────────────────
-        # 최근 N봉의 저점이 계속 높아지고 있으면 반등 신호
         recent_lows = [bars[-(i+1)].low_price for i in range(self.low_rising_bars)]
         low_rising = all(recent_lows[i] > recent_lows[i+1] for i in range(len(recent_lows)-1))
 
@@ -127,19 +121,28 @@ class MinuteAnalyzer:
         change_rate_pct = (current_price - prev_close) / prev_close * 100
         is_valid_change_rate = self.change_rate_min <= change_rate_pct <= self.change_rate_max
 
-        # ── 당일 저점 대비 반등률 ─────────────────────────────────
-        # 전일 대비 하락했더라도 당일 저점에서 충분히 반등했고
-        # VWAP 위에 있으면 매수 가능한 반등으로 판단합니다
+        # ── B조건: 당일 저점 대비 반등률 ─────────────────────────
         rebound_pct = (current_price - day_low) / day_low * 100 if day_low > 0 else 0.0
         is_valid_rebound = (
             rebound_pct >= self.rebound_min_pct
-            and price_above_vwap   # VWAP 위에 있어야 의미있는 반등
+            and price_above_vwap
         )
 
         # ── 거래대금 ──────────────────────────────────────────────
-        # 누적 거래량 × 현재가로 근사
         trading_value = bars[-1].acc_volume * current_price
         is_valid_trading_value = trading_value >= self.min_trading_value
+
+        # ── C조건: 상승 추세 중 눌림목 ───────────────────────────
+        closes = [b.close_price for b in bars if b.close_price > 0]
+        ma5  = sum(closes[-5:])  / min(5,  len(closes)) if closes else 0
+        ma20 = sum(closes[-20:]) / min(20, len(closes)) if closes else 0
+        ma5_above_ma20 = ma5 > ma20
+
+        is_valid_pulldown = (
+            self.pulldown_min_pct <= change_rate_pct <= self.pulldown_max_pct
+            and ma5_above_ma20
+            and price_above_vwap
+        )
 
         return MinuteAnalysis(
             vwap=vwap,
@@ -155,4 +158,6 @@ class MinuteAnalyzer:
             is_valid_trading_value=is_valid_trading_value,
             day_high=day_high,
             day_low=day_low,
+            is_valid_pulldown=is_valid_pulldown,
+            ma5_above_ma20=ma5_above_ma20,
         )

@@ -55,7 +55,7 @@ class TradingService:
         self.trade_logger = trade_logger
         self.state_store = state_store
 
-        self.state = self.state_store.load()
+        self.state, loaded_highest = self.state_store.load()
 
         # 계좌/현재가 캐시
         self.cached_balance: AccountBalance | None = None
@@ -82,7 +82,7 @@ class TradingService:
         self.last_hold_log_at_by_symbol: dict[str, datetime] = {}
 
         # 보유 종목별 최고가 추적 (트레일링 스탑용)
-        self._highest_price: dict[str, int] = {}
+        self._highest_price: dict[str, int] = loaded_highest
 
         # 동적 종목 목록 (조건검색 연동 시 갱신)
         self._dynamic_targets: list[str] | None = None
@@ -467,9 +467,9 @@ class TradingService:
 
             market_price = self._attach_indicators(market_price, symbol)
 
-            # BULLISH / NEUTRAL / REBOUND일 때 분봉 분석 실행
+            # BULLISH일 때만 분봉 2차 필터 적용
             minute_analysis = None
-            if regime in (MarketRegime.BULLISH, MarketRegime.NEUTRAL, MarketRegime.REBOUND):
+            if regime == MarketRegime.BULLISH:
                 minute_analysis = self._get_minute_analysis(
                     symbol, market_price.previous_close
                 )
@@ -521,7 +521,7 @@ class TradingService:
                 self._generate_daily_report()
                 self._report_generated_today = True
 
-        self.state_store.save(self.state)
+        self.state_store.save(self.state, self._highest_price)
 
     def _try_buy(self, symbol: str, current_price: int, balance: AccountBalance) -> None:
         """매수 주문 가능 여부를 검사한 뒤 실제 주문을 시도합니다."""
@@ -540,8 +540,14 @@ class TradingService:
                 )
                 return
 
-        # ── 최대 보유 종목 수 체크 ────────────────────────────────
-        held_count = len(balance.positions)
+        # ── 최대 보유 종목 수 체크 (실시간 잔고로 확인) ──────────
+        # 캐시 잔고를 쓰면 같은 루프에서 여러 종목이 동시에 매수될 수 있음
+        # 반드시 API에서 직접 최신 잔고를 가져와서 체크
+        try:
+            live_balance = self.broker.get_account_balance()
+        except Exception:
+            live_balance = balance  # API 실패 시 캐시 사용
+        held_count = len(live_balance.positions)
         if held_count >= self.settings.trading.max_positions:
             self.app_logger.info(
                 f"[BLOCK] {symbol} | 최대 보유 종목 수 초과 "

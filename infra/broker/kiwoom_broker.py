@@ -129,8 +129,17 @@ class KiwoomBroker(Broker):
         )
 
         raw_bars = api_response.body.get("stk_min_pole_chart_qry", [])
-        bars: list[MinuteBar] = []
 
+        # 빈 응답이면 응답 body 키를 로그에 남겨 원인 파악
+        if not raw_bars:
+            import logging
+            logging.getLogger("app").error(
+                f"[MIN] 분봉 빈 응답 — body 키: {list(api_response.body.keys())} | "
+                f"return_msg: {api_response.body.get('return_msg', '없음')}"
+            )
+            return []
+
+        bars: list[MinuteBar] = []
         for item in raw_bars[:count]:
             bars.append(
                 MinuteBar(
