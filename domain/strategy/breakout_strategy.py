@@ -58,14 +58,8 @@ class BreakoutStrategy(Strategy):
         if position is None:
 
             if not has_indicators:
-                reference_price = market_price.reference_price
-                breakout_price  = int(reference_price * (1 + self.config.breakout_threshold_pct / 100))
-                if current_price >= breakout_price:
-                    return Signal(
-                        type=SignalType.BUY,
-                        reason=f"지표 없음 — 단순 돌파 충족 (+{self.config.breakout_threshold_pct:.1f}%)",
-                    )
-                return Signal(type=SignalType.HOLD, reason="지표 없음 — 단순 돌파 미충족")
+                # 일봉 지표가 없으면 매수하지 않음 (ver1.1 fallback 제거)
+                return Signal(type=SignalType.HOLD, reason="지표 없음 — 일봉 데이터 대기 중")
 
             # ── [1단계] 분봉 2차 필터 ─────────────────────────────
             if minute_analysis is not None:

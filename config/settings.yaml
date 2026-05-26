@@ -19,14 +19,12 @@ broker:
 # 감시할 종목 목록 (조건검색 OFF 시 사용)
 targets:
   symbols:
-    - "001510"
-    - "047040"
-    - "001510"
     - "047040"
     - "247540"
     - "010170"
     - "006260"
     - "005930"
+    - "080220"
     
 trading:
   poll_interval_seconds: 10
@@ -63,9 +61,9 @@ market_regime:
   minute_tick_scope: 3
   minute_bar_count: 40
   minute_refresh_seconds: 180
-  min_trading_value: 50000000000  # 500억 이상 (소형주 필터링)
+  min_trading_value: 50000000000  # 500억 이상
   pullback_min_pct: -7.0
-  pullback_max_pct: -1.0
+  pullback_max_pct: -0.3   # 완화: 고가 대비 -0.3% 이내까지 허용
   change_rate_min: 2.0
   change_rate_max: 18.0
   rebound_min_pct: 2.0

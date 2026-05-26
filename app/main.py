@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -98,6 +99,12 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
 
 async def async_main() -> None:
     load_dotenv()
+
+    # 구버전 .pyc 캐시가 남아 AttributeError를 일으키는 것을 방지합니다.
+    # 업데이트 후 첫 실행 시 자동으로 재컴파일됩니다.
+    for cache_dir in Path(".").rglob("__pycache__"):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
     settings = load_settings()
 
     app_logger   = build_app_logger(settings.storage.app_log_file, settings.app.log_level)
@@ -120,10 +127,15 @@ async def async_main() -> None:
         manual_symbols = settings.targets
 
         def on_symbols_changed(symbols: list[str]) -> None:
-            # 수동 종목을 앞에 두고 조건검색 종목을 뒤에 붙입니다.
-            combined = list(dict.fromkeys(manual_symbols + symbols))
+            # 자동 제외된 종목은 재편입 차단
+            excluded = trading_service.get_excluded_symbols()
+            filtered = [s for s in symbols if s not in excluded]
+            combined = list(dict.fromkeys(manual_symbols + filtered))
             limited  = combined[:settings.websocket.max_symbols]
             trading_service.update_targets(limited)
+            blocked = excluded & set(symbols)
+            if blocked:
+                app_logger.info(f"[COND] 제외 종목 재편입 차단: {blocked}")
             app_logger.info(f"[COND] 종목 목록 갱신: {limited}")
 
         # 조건검색은 실전 계좌 토큰으로 별도 발급

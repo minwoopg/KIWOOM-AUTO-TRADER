@@ -23,7 +23,7 @@ class JsonStateStore:
         if not self.path.exists():
             return RuntimeState(), {}
 
-        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
         state = RuntimeState(
             bought_symbols_today=set(raw.get("bought_symbols_today", [])),
             last_order_id_by_symbol=raw.get("last_order_id_by_symbol", {}),

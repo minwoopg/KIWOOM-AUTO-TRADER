@@ -108,6 +108,7 @@ class TradingService:
 
         # UNKNOWN 연속 횟수 카운터 (비정상 종목 자동 제외용)
         self._unknown_count: dict[str, int] = {}
+        self._low_volume_count: dict[str, int] = {}   # 거래대금 부족 카운트
         # 자동 제외된 종목 목록
         self._excluded_symbols: set[str] = set()
 
@@ -121,6 +122,10 @@ class TradingService:
     def update_targets(self, symbols: list[str]) -> None:
         """조건검색 결과로 종목 목록을 동적으로 갱신합니다."""
         self._dynamic_targets = symbols
+
+    def get_excluded_symbols(self) -> set[str]:
+        """자동 제외된 종목 목록을 반환합니다."""
+        return self._excluded_symbols.copy()
 
     def _get_balance_with_cache(self) -> AccountBalance:
         """계좌 조회를 매번 하지 않고 일정 시간 동안 캐시를 재사용합니다."""
@@ -212,12 +217,26 @@ class TradingService:
         )
         return cached_price
 
-    def _get_regime_with_cache(self, symbol: str) -> tuple[MarketRegime, str]:
+    def _get_regime_with_cache(self, symbol: str, current_price: int = 0, prev_close: int = 0) -> tuple[MarketRegime, str]:
         """일봉 히스토리를 가져와 장세를 분류합니다. 결과는 캐시합니다.
 
         일봉 데이터는 자주 바뀌지 않으므로 history_refresh_seconds 주기로만 갱신합니다.
         기본값 3600초(1시간)로 설정되어 있어 429 부담이 거의 없습니다.
         """
+        # ── 당일 등락률 기반 장세 보정 ───────────────────────────
+        if current_price > 0 and prev_close > 0:
+            change_rate = (current_price - prev_close) / prev_close * 100
+            if change_rate >= 2.0:
+                reason = f"당일 급등 {change_rate:+.1f}% — BULLISH 강제 적용"
+                self.app_logger.info(f"[REGIME] {symbol} | BULLISH | {reason}")
+                self._regime_summary[symbol] = f"BULLISH ({reason})"
+                return MarketRegime.BULLISH, reason
+            elif change_rate <= -2.0:
+                reason = f"당일 급락 {change_rate:+.1f}% — NEUTRAL 강제 적용"
+                self.app_logger.info(f"[REGIME] {symbol} | NEUTRAL | {reason}")
+                self._regime_summary[symbol] = f"NEUTRAL ({reason})"
+                return MarketRegime.NEUTRAL, reason
+
         now = datetime.now()
         loaded_at = self.cached_daily_bars_loaded_at.get(symbol)
         refresh_sec = self.settings.market_regime.history_refresh_seconds
@@ -440,67 +459,95 @@ class TradingService:
             if i > 0:
                 await asyncio.sleep(1.0)
 
-            regime, _ = self._get_regime_with_cache(symbol)
-
-            if regime == MarketRegime.UNKNOWN:
-                self._unknown_count[symbol] = self._unknown_count.get(symbol, 0) + 1
-                if self._unknown_count[symbol] >= 3:
-                    self._excluded_symbols.add(symbol)
-                    self.app_logger.warning(
-                        f"[EXCL] {symbol} | UNKNOWN 3회 연속 — 감시 대상에서 제외합니다"
-                    )
-                    continue
-            else:
-                self._unknown_count[symbol] = 0
-
-            # 보유 종목은 캐시 무시하고 항상 최신 가격 조회
-            position_check = next((p for p in balance.positions if p.symbol == symbol), None)
-            if position_check is not None:
-                try:
-                    market_price = self.broker.get_market_price(symbol)
-                    self.cached_market_prices[symbol] = market_price
-                    self.cached_market_price_loaded_at[symbol] = datetime.now()
-                except Exception:
+            try:
+                position_check = next((p for p in balance.positions if p.symbol == symbol), None)
+                if position_check is not None:
+                    try:
+                        market_price = self.broker.get_market_price(symbol)
+                        self.cached_market_prices[symbol] = market_price
+                        self.cached_market_price_loaded_at[symbol] = datetime.now()
+                    except Exception:
+                        market_price = self._get_market_price_with_cache(symbol)
+                else:
                     market_price = self._get_market_price_with_cache(symbol)
-            else:
-                market_price = self._get_market_price_with_cache(symbol)
-
-            market_price = self._attach_indicators(market_price, symbol)
-
-            # BULLISH일 때만 분봉 2차 필터 적용
-            minute_analysis = None
-            if regime == MarketRegime.BULLISH:
-                minute_analysis = self._get_minute_analysis(
-                    symbol, market_price.previous_close
+    
+                market_price = self._attach_indicators(market_price, symbol)
+    
+                # 장세 판단 — 현재가/전일 종가 전달해서 당일 급등/급락 감지
+                regime, _ = self._get_regime_with_cache(
+                    symbol,
+                    current_price=market_price.current_price,
+                    prev_close=market_price.previous_close,
                 )
-                if minute_analysis:
-                    self.app_logger.info(
-                        f"[MIN ] {symbol} | {minute_analysis.score()}/5 | {minute_analysis.summary()}"
+    
+                if regime == MarketRegime.UNKNOWN:
+                    self._unknown_count[symbol] = self._unknown_count.get(symbol, 0) + 1
+                    if self._unknown_count[symbol] >= 3:
+                        self._excluded_symbols.add(symbol)
+                        self.app_logger.warning(
+                            f"[EXCL] {symbol} | UNKNOWN 3회 연속 — 감시 대상에서 제외합니다"
+                        )
+                        continue
+                else:
+                    self._unknown_count[symbol] = 0
+    
+                # BULLISH일 때만 분봉 2차 필터 적용
+                minute_analysis = None
+                if regime in (MarketRegime.BULLISH, MarketRegime.NEUTRAL, MarketRegime.REBOUND):
+                    minute_analysis = self._get_minute_analysis(
+                        symbol, market_price.previous_close
                     )
+                    if minute_analysis:
+                        self.app_logger.info(
+                            f"[MIN ] {symbol} | {minute_analysis.score()}/5 | {minute_analysis.summary()}"
+                        )
+    
+                strategy = self.strategy_router.select(regime)
+                position = next((p for p in balance.positions if p.symbol == symbol), None)
+    
+                # 보유 중인 경우 최고가 갱신
+                if position is not None:
+                    current = market_price.current_price
+                    if current > self._highest_price.get(symbol, 0):
+                        self._highest_price[symbol] = current
+                else:
+                    self._highest_price.pop(symbol, None)
+    
+                highest_price = self._highest_price.get(symbol, 0)
+                signal = strategy.generate_signal(market_price, position, minute_analysis, highest_price)
+    
+                self._log_signal_decision(
+                    symbol, signal, market_price.current_price,
+                    regime, position, minute_analysis
+                )
+    
+                # 거래대금 부족 3회 연속이면 자동 제외
+                if (
+                    signal.type == SignalType.HOLD
+                    and minute_analysis is not None
+                    and not minute_analysis.is_valid_trading_value
+                ):
+                    self._low_volume_count[symbol] = self._low_volume_count.get(symbol, 0) + 1
+                    if self._low_volume_count[symbol] >= 3:
+                        self._excluded_symbols.add(symbol)
+                        self.app_logger.warning(
+                            f"[EXCL] {symbol} | 거래대금 부족 3회 연속 "
+                            f"({minute_analysis.trading_value//100_000_000}억) — 감시 대상에서 제외합니다"
+                        )
+                else:
+                    # 거래대금 충분하면 카운트 초기화
+                    self._low_volume_count[symbol] = 0
+    
+                if signal.type == SignalType.BUY:
+                    self._try_buy(symbol, market_price.current_price, balance)
+                elif signal.type == SignalType.SELL and position is not None:
+                    self._try_sell(symbol, position.quantity, market_price.current_price)
 
-            strategy = self.strategy_router.select(regime)
-            position = next((p for p in balance.positions if p.symbol == symbol), None)
-
-            # 보유 중인 경우 최고가 갱신
-            if position is not None:
-                current = market_price.current_price
-                if current > self._highest_price.get(symbol, 0):
-                    self._highest_price[symbol] = current
-            else:
-                self._highest_price.pop(symbol, None)
-
-            highest_price = self._highest_price.get(symbol, 0)
-            signal = strategy.generate_signal(market_price, position, minute_analysis, highest_price)
-
-            self._log_signal_decision(
-                symbol, signal, market_price.current_price,
-                regime, position, minute_analysis
-            )
-
-            if signal.type == SignalType.BUY:
-                self._try_buy(symbol, market_price.current_price, balance)
-            elif signal.type == SignalType.SELL and position is not None:
-                self._try_sell(symbol, position.quantity, market_price.current_price)
+            except Exception as exc:
+                self.app_logger.exception(
+                    f"[ERROR] {symbol} | 종목 처리 중 예외 발생, 다음 종목으로 계속합니다: {exc}"
+                )
+                continue
 
         if is_near_market_close(self.settings.trading.force_exit_before_market_close_minutes):
             self.app_logger.info("near market close: force exit started")
@@ -510,8 +557,32 @@ class TradingService:
                 self.cached_balance = latest_balance
                 self.cached_balance_loaded_at = datetime.now()
 
-                for position in latest_balance.positions:
-                    self._try_sell(position.symbol, position.quantity)
+                api_positions = {p.symbol: p for p in latest_balance.positions}
+
+                # 키움 모의투자는 당일 체결 종목을 잔고 API에 즉시 반영하지 않을 수 있습니다.
+                # 캐시된 포지션을 보조 수단으로 활용하여 누락 없이 청산합니다.
+                cached_positions = {
+                    p.symbol: p
+                    for p in (self.cached_balance.positions if self.cached_balance else [])
+                }
+                merged = {**cached_positions, **api_positions}  # API 결과 우선
+
+                if not merged:
+                    self.app_logger.info("[FORCE_EXIT] 청산할 보유 종목이 없습니다.")
+                else:
+                    for symbol, position in merged.items():
+                        # 현재가를 조회하여 price=0 기록을 방지합니다.
+                        try:
+                            mp = self.broker.get_market_price(symbol)
+                            current_price = mp.current_price
+                        except Exception:
+                            current_price = self.cached_market_prices.get(symbol)
+                            current_price = current_price.current_price if current_price else 0
+
+                        self.app_logger.info(
+                            f"[FORCE_EXIT] {symbol} | {position.quantity}주 | 현재가 {current_price:,}원"
+                        )
+                        self._try_sell(symbol, position.quantity, current_price)
 
             except Exception as exc:
                 self.app_logger.warning(f"[FORCE_EXIT] 강제청산 중 오류 발생: {exc}")
@@ -540,13 +611,11 @@ class TradingService:
                 )
                 return
 
-        # ── 최대 보유 종목 수 체크 (실시간 잔고로 확인) ──────────
-        # 캐시 잔고를 쓰면 같은 루프에서 여러 종목이 동시에 매수될 수 있음
-        # 반드시 API에서 직접 최신 잔고를 가져와서 체크
+        # ── 최대 보유 종목 수 체크 ────────────────────────────────
         try:
             live_balance = self.broker.get_account_balance()
         except Exception:
-            live_balance = balance  # API 실패 시 캐시 사용
+            live_balance = balance
         held_count = len(live_balance.positions)
         if held_count >= self.settings.trading.max_positions:
             self.app_logger.info(
