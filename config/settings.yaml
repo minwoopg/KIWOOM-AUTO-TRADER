@@ -80,9 +80,17 @@ market_regime:
   rebound_min_pct: 2.0
 
 risk:
-  max_daily_loss_amount: 100000
+  max_daily_loss_amount: 100000  # 일일 손실 한도 (원)
+  max_consecutive_losses: 3      # 연속 손절 허용 횟수 (0=비활성)
   max_order_amount: 600000
   min_cash_buffer: 100000
+
+entry_watch:
+  enabled: false                 # true로 변경 시 entry watch 청산 활성화
+  watch_minutes: 5               # 매수 후 관찰 시간 (분)
+  min_profit_pct: 0.5            # 관찰 기간 중 최소 달성 수익률 (%)
+  fail_cut_pct: -1.0             # 이 손실 이하면 즉시 청산 (%)
+  fail_on_vwap_break: true       # VWAP 이탈 시 청산 여부
 
 websocket:
   enabled: true

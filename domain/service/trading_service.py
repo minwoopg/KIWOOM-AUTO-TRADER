@@ -28,6 +28,7 @@ from domain.strategy.strategy_router import StrategyRouter
 from infra.broker.base import Broker
 from infra.storage.daily_reporter import DailyReporter
 from infra.storage.logger import AppLogger, TradeCsvLogger, SignalCsvLogger
+from infra.storage.skip_reason import classify_skip_reason, SkipReason
 from infra.storage.state_store import JsonStateStore
 from utils.time_utils import is_near_market_close
 
@@ -517,11 +518,14 @@ class TradingService:
                 strategy = self.strategy_router.select(regime)
                 position = next((p for p in balance.positions if p.symbol == symbol), None)
     
-                # 보유 중인 경우 최고가 갱신
+                # 보유 중인 경우 최고가 갱신 (트레일링 스탑 + entry watch 공용)
                 if position is not None:
                     current = market_price.current_price
                     if current > self._highest_price.get(symbol, 0):
                         self._highest_price[symbol] = current
+                    # entry watch용 peak_price 갱신
+                    if current > self.state.peak_price_by_symbol.get(symbol, 0):
+                        self.state.peak_price_by_symbol[symbol] = current
                 else:
                     self._highest_price.pop(symbol, None)
     
@@ -860,7 +864,7 @@ class TradingService:
             "regime":    regime.value if regime else "",
             "score":     score,
             "signal":    signal.type.value,
-            "skip_reason": "" if signal.type.value == "BUY" else signal.reason[:120],
+            "skip_reason": classify_skip_reason(signal.reason, signal.type.value),
         }
         if minute_analysis is not None:
             ma = minute_analysis

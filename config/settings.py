@@ -109,8 +109,19 @@ class WebSocketConfig:
 @dataclass(frozen=True)
 class RiskConfig:
     max_daily_loss_amount: int
+    max_consecutive_losses: int
     max_order_amount: int
     min_cash_buffer: int
+
+
+@dataclass(frozen=True)
+class EntryWatchConfig:
+    """매수 후 실패한 V자를 빠르게 정리하는 entry watch 설정입니다."""
+    enabled: bool
+    watch_minutes: int
+    min_profit_pct: float
+    fail_cut_pct: float
+    fail_on_vwap_break: bool
 
 
 @dataclass(frozen=True)
