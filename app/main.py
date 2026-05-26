@@ -24,7 +24,7 @@ from domain.service.trading_service import TradingService
 from domain.strategy.strategy_router import StrategyRouter
 from infra.broker.kiwoom_broker import KiwoomBroker
 from infra.broker.mock_broker import MockBroker
-from infra.storage.logger import TradeCsvLogger, build_app_logger
+from infra.storage.logger import TradeCsvLogger, SignalCsvLogger, build_app_logger
 from infra.storage.state_store import JsonStateStore
 from utils.time_utils import is_market_open
 
@@ -46,7 +46,7 @@ def build_broker(settings: Settings):
     return KiwoomBroker(settings.broker)
 
 
-def build_trading_service(settings, broker, app_logger, trade_logger, state_store):
+def build_trading_service(settings, broker, app_logger, trade_logger, signal_logger, state_store):
     strategy_router   = StrategyRouter(settings.strategy)
     regime_classifier = MarketRegimeClassifier(settings.market_regime)
     risk_manager      = RiskManager(settings.trading, settings.risk)
@@ -58,6 +58,7 @@ def build_trading_service(settings, broker, app_logger, trade_logger, state_stor
         risk_manager=risk_manager,
         app_logger=app_logger,
         trade_logger=trade_logger,
+        signal_logger=signal_logger,
         state_store=state_store,
     )
 
@@ -108,14 +109,15 @@ async def async_main() -> None:
     settings = load_settings()
 
     app_logger   = build_app_logger(settings.storage.app_log_file, settings.app.log_level)
-    trade_logger = TradeCsvLogger(settings.storage.trade_log_file)
-    state_store  = JsonStateStore(settings.storage.state_file)
+    trade_logger  = TradeCsvLogger(settings.storage.trade_log_file)
+    signal_logger = SignalCsvLogger(settings.storage.signal_log_file)
+    state_store   = JsonStateStore(settings.storage.state_file)
 
     broker = build_broker(settings)
     broker.authenticate()
 
     trading_service = build_trading_service(
-        settings, broker, app_logger, trade_logger, state_store
+        settings, broker, app_logger, trade_logger, signal_logger, state_store
     )
 
     # ── WebSocket 조건검색 활성화 여부 ───────────────────────────

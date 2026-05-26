@@ -95,4 +95,5 @@ websocket:
 storage:
   state_file: data/state.json
   trade_log_file: logs/trades.csv
+  signal_log_file: logs/signal_log.csv
   app_log_file: logs/app.log

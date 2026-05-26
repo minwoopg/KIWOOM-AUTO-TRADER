@@ -27,7 +27,7 @@ from domain.risk.risk_manager import RiskManager
 from domain.strategy.strategy_router import StrategyRouter
 from infra.broker.base import Broker
 from infra.storage.daily_reporter import DailyReporter
-from infra.storage.logger import AppLogger, TradeCsvLogger
+from infra.storage.logger import AppLogger, TradeCsvLogger, SignalCsvLogger
 from infra.storage.state_store import JsonStateStore
 from utils.time_utils import is_near_market_close
 
@@ -44,6 +44,7 @@ class TradingService:
         risk_manager: RiskManager,
         app_logger: AppLogger,
         trade_logger: TradeCsvLogger,
+        signal_logger: SignalCsvLogger,
         state_store: JsonStateStore,
     ) -> None:
         self.settings = settings
@@ -53,6 +54,7 @@ class TradingService:
         self.risk_manager = risk_manager
         self.app_logger = app_logger
         self.trade_logger = trade_logger
+        self.signal_logger = signal_logger
         self.state_store = state_store
 
         self.state, loaded_highest = self.state_store.load()
@@ -548,10 +550,26 @@ class TradingService:
                     # 거래대금 충분하면 카운트 초기화
                     self._low_volume_count[symbol] = 0
     
+                # ── 시그널 로그 기록 (BUY/HOLD 불문 전체) ──────────
+                self._write_signal_log(
+                    symbol=symbol,
+                    price=market_price.current_price,
+                    regime=regime,
+                    signal=signal,
+                    minute_analysis=minute_analysis,
+                )
+
                 if signal.type == SignalType.BUY:
-                    self._try_buy(symbol, market_price.current_price, balance)
+                    self._try_buy(
+                        symbol, market_price.current_price, balance,
+                        signal=signal, regime=regime,
+                        minute_analysis=minute_analysis,
+                    )
                 elif signal.type == SignalType.SELL and position is not None:
-                    self._try_sell(symbol, position.quantity, market_price.current_price)
+                    self._try_sell(
+                        symbol, position.quantity, market_price.current_price,
+                        exit_reason=signal.reason,
+                    )
 
             except Exception as exc:
                 self.app_logger.exception(
@@ -592,7 +610,10 @@ class TradingService:
                         self.app_logger.info(
                             f"[FORCE_EXIT] {symbol} | {position.quantity}주 | 현재가 {current_price:,}원"
                         )
-                        self._try_sell(symbol, position.quantity, current_price)
+                        self._try_sell(
+                            symbol, position.quantity, current_price,
+                            exit_reason="FORCE_EXIT",
+                        )
 
             except Exception as exc:
                 self.app_logger.warning(f"[FORCE_EXIT] 강제청산 중 오류 발생: {exc}")
@@ -604,7 +625,15 @@ class TradingService:
 
         self.state_store.save(self.state, self._highest_price)
 
-    def _try_buy(self, symbol: str, current_price: int, balance: AccountBalance) -> None:
+    def _try_buy(
+        self,
+        symbol: str,
+        current_price: int,
+        balance: AccountBalance,
+        signal=None,
+        regime=None,
+        minute_analysis=None,
+    ) -> None:
         """매수 주문 가능 여부를 검사한 뒤 실제 주문을 시도합니다."""
 
         # ── 재진입 쿨다운 체크 ────────────────────────────────────
@@ -651,6 +680,11 @@ class TradingService:
 
         result = self.broker.place_order(order)
 
+        # ── 매수 컨텍스트 구성 ────────────────────────────────────
+        ctx = self._build_trade_context(
+            side="BUY", signal=signal, regime=regime,
+            minute_analysis=minute_analysis, current_price=current_price,
+        )
         self._write_trade_log(
             order.symbol,
             order.side.value,
@@ -659,9 +693,12 @@ class TradingService:
             result.message,
             result.order_id,
             price=current_price,
+            context=ctx,
         )
 
         if result.accepted:
+            # 매수 시각 기록 → entry_watch 용
+            self.state.entry_time_by_symbol[symbol] = datetime.now().isoformat()
             self.state.bought_symbols_today.add(symbol)
             self.state.last_order_id_by_symbol[symbol] = result.order_id
 
@@ -677,10 +714,26 @@ class TradingService:
                 f"[FAIL ] {symbol} | 매수 주문 실패 | 사유: {result.message}"
             )
 
-    def _try_sell(self, symbol: str, quantity: int, current_price: int = 0) -> None:
+    def _try_sell(
+        self,
+        symbol: str,
+        quantity: int,
+        current_price: int = 0,
+        exit_reason: str = "",
+    ) -> None:
         """매도 주문을 생성하고 브로커로 전달합니다."""
         order = OrderRequest(symbol=symbol, side=OrderSide.SELL, quantity=quantity)
         result = self.broker.place_order(order)
+
+        # 보유 시간 계산
+        hold_minutes = ""
+        entry_time_str = self.state.entry_time_by_symbol.get(symbol, "")
+        if entry_time_str:
+            try:
+                entry_dt = datetime.fromisoformat(entry_time_str)
+                hold_minutes = round((datetime.now() - entry_dt).total_seconds() / 60, 1)
+            except ValueError:
+                pass
 
         self._write_trade_log(
             order.symbol,
@@ -690,6 +743,7 @@ class TradingService:
             result.message,
             result.order_id,
             price=current_price,
+            context={"exit_reason": exit_reason, "hold_minutes": hold_minutes},
         )
 
         if result.accepted:
@@ -699,6 +753,7 @@ class TradingService:
 
             # 매도 시각 기록 → 재진입 쿨다운에 사용
             self.state.last_sold_at_by_symbol[symbol] = datetime.now().isoformat()
+            self.state.entry_time_by_symbol.pop(symbol, None)
 
             self.app_logger.info(
                 f"[ORDER] {symbol} | 매도 주문 접수 완료 | 수량 {quantity}주 | 주문번호 {result.order_id}"
@@ -719,6 +774,39 @@ class TradingService:
         except Exception as exc:
             self.app_logger.warning(f"[REPORT] 리포트 생성 실패: {exc}")
 
+    def _build_trade_context(
+        self,
+        side: str,
+        signal=None,
+        regime=None,
+        minute_analysis=None,
+        current_price: int = 0,
+    ) -> dict:
+        """trades.csv 컨텍스트 필드를 구성합니다."""
+        ctx: dict = {}
+        if side != "BUY" or signal is None:
+            return ctx
+        ctx["entry_strategy"] = self.settings.strategy.name
+        ctx["market_regime"] = regime.value if regime else ""
+        # 점수 파싱 (signal.reason에 'N/8' 형태로 포함)
+        import re
+        m = re.search(r'(\d+)/8', signal.reason)
+        ctx["entry_score"] = m.group(1) if m else ""
+        ctx["entry_reason"] = signal.reason[:120]
+        if minute_analysis is not None:
+            ma = minute_analysis
+            ctx["is_v_rebound"]          = ma.is_v_rebound
+            ctx["is_pulldown_recovery"]   = ma.is_pulldown_recovery
+            ctx["v_drop_pct"]             = round(ma.v_drop_pct, 2)
+            ctx["v_rise_pct"]             = round(ma.v_rise_pct, 2)
+            ctx["v_low_age"]              = ma.v_bottom_k
+            ctx["current_vs_vwap_pct"]    = round(
+                (current_price - ma.vwap) / ma.vwap * 100, 2
+            ) if ma.vwap > 0 else ""
+            ctx["volume_ratio"]           = round(ma.v_volume_ratio, 2)
+            ctx["bar_amount"]             = ma.trading_value
+        return ctx
+
     def _write_trade_log(
         self,
         symbol: str,
@@ -728,17 +816,70 @@ class TradingService:
         message: str,
         order_id: str,
         price: int = 0,
+        context: dict | None = None,
     ) -> None:
         """거래 로그 CSV에 한 줄을 추가합니다."""
-        self.trade_logger.append(
-            {
-                "timestamp": datetime.now().isoformat(),
-                "symbol": symbol,
-                "side": side,
-                "quantity": quantity,
-                "price": price,
-                "accepted": accepted,
-                "message": message,
-                "order_id": order_id,
-            }
-        )
+        row = {
+            "timestamp": datetime.now().isoformat(),
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "price": price,
+            "accepted": accepted,
+            "message": message,
+            "order_id": order_id,
+        }
+        if context:
+            row.update(context)
+        self.trade_logger.append(row)
+
+    def _write_signal_log(
+        self,
+        symbol: str,
+        price: int,
+        regime,
+        signal,
+        minute_analysis=None,
+    ) -> None:
+        """시그널 판단 결과를 signal_log.csv에 기록합니다.
+
+        BUY뿐 아니라 HOLD/SKIP도 모두 기록합니다.
+        """
+        import re
+        m = re.search(r'(\d+)/8', signal.reason)
+        score = m.group(1) if m else ""
+
+        patterns = []
+        row: dict = {
+            "timestamp": datetime.now().isoformat(),
+            "symbol":    symbol,
+            "price":     price,
+            "regime":    regime.value if regime else "",
+            "score":     score,
+            "signal":    signal.type.value,
+            "skip_reason": "" if signal.type.value == "BUY" else signal.reason[:120],
+        }
+        if minute_analysis is not None:
+            ma = minute_analysis
+            if ma.is_v_rebound:          patterns.append("V")
+            if ma.is_pulldown_recovery:  patterns.append("PR")
+            if ma.is_valid_change_rate:  patterns.append("A")
+            if ma.is_valid_rebound:      patterns.append("B")
+            if ma.is_valid_pulldown:     patterns.append("C")
+            row.update({
+                "detected_patterns":   "/".join(patterns) if patterns else "-",
+                "is_v_rebound":        ma.is_v_rebound,
+                "is_pulldown_recovery": ma.is_pulldown_recovery,
+                "v_drop_pct":          round(ma.v_drop_pct, 2),
+                "v_rise_pct":          round(ma.v_rise_pct, 2),
+                "v_low_age":           ma.v_bottom_k,
+                "current_vs_vwap_pct": round(
+                    (price - ma.vwap) / ma.vwap * 100, 2
+                ) if ma.vwap > 0 else "",
+                "volume_ratio":        round(ma.v_volume_ratio, 2),
+                "bar_amount":          ma.trading_value,
+                "ma5_above_ma20":      ma.ma5_above_ma20,
+            })
+        else:
+            row["detected_patterns"] = "-"
+        self.signal_logger.append(row)

@@ -175,3 +175,5 @@ class RuntimeState:
     last_order_id_by_symbol: dict[str, str] = field(default_factory=dict)
     # 종목별 마지막 매도 시각 (핑퐁 차단용) — ISO 문자열로 저장
     last_sold_at_by_symbol: dict[str, str] = field(default_factory=dict)
+    # 종목별 매수 진입 시각 (hold_minutes 계산용) — ISO 문자열로 저장
+    entry_time_by_symbol: dict[str, str] = field(default_factory=dict)

@@ -117,6 +117,7 @@ class RiskConfig:
 class StorageConfig:
     state_file: str
     trade_log_file: str
+    signal_log_file: str
     app_log_file: str
 
 
