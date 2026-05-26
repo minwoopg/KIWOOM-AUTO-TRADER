@@ -121,7 +121,7 @@ class NeutralStrategy(Strategy):
                 f"VWAP {'위✓' if cond_above_vwap else '아래✗'}",
                 f"저점 {'상승✓' if cond_low_rising else '하락✗'}",
                 v_label,
-                f"저점spike {'✓' if cond_v_spike else '✗'}",
+                f"반등spike {'✓' if cond_v_spike else '✗'}",
             ]
             summary = " | ".join(tags)
 

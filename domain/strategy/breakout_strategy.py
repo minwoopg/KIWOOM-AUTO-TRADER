@@ -133,7 +133,9 @@ class BreakoutStrategy(Strategy):
                 minute_analysis.is_pulldown_recovery
                 if minute_analysis else False
             )
-            cond_v_spike    = minute_analysis.v_bottom_spike if minute_analysis else False
+            # v_bottom_spike는 저점 투매 확인용 보조 지표 → 로그에만 기록
+            # rebound_volume_spike는 반등봉 매수세 유입 확인 → 점수 반영
+            cond_v_spike    = minute_analysis.rebound_volume_spike if minute_analysis else False
 
             score = sum([
                 cond_macd_cross, cond_macd_accel,
@@ -156,7 +158,7 @@ class BreakoutStrategy(Strategy):
                 f"VWAP {'위✓' if cond_above_vwap else '아래✗'}",
                 f"저점 {'상승✓' if cond_low_rising else '하락✗'}",
                 v_label,
-                f"저점spike {'✓' if cond_v_spike else '✗'}",
+                f"반등spike {'✓' if cond_v_spike else '✗'}",
             ]
             summary = " | ".join(tags)
 

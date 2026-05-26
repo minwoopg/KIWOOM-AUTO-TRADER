@@ -805,6 +805,9 @@ class TradingService:
             ) if ma.vwap > 0 else ""
             ctx["volume_ratio"]           = round(ma.v_volume_ratio, 2)
             ctx["bar_amount"]             = ma.trading_value
+            ctx["rebound_volume_spike"]   = ma.rebound_volume_spike
+            ctx["v_bottom_spike"]         = ma.v_bottom_spike
+            ctx["upside_to_recent_high_pct"] = ma.upside_to_recent_high_pct
         return ctx
 
     def _write_trade_log(
@@ -878,6 +881,9 @@ class TradingService:
                 ) if ma.vwap > 0 else "",
                 "volume_ratio":        round(ma.v_volume_ratio, 2),
                 "bar_amount":          ma.trading_value,
+                "rebound_volume_spike": ma.rebound_volume_spike,
+                "v_bottom_spike":       ma.v_bottom_spike,
+                "upside_to_recent_high_pct": ma.upside_to_recent_high_pct,
                 "ma5_above_ma20":      ma.ma5_above_ma20,
             })
         else:

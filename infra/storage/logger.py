@@ -45,6 +45,9 @@ TRADE_FIELDS = [
     "current_vs_vwap_pct",   # 현재가 vs VWAP (%)
     "volume_ratio",          # 반등 구간 거래량 비율
     "bar_amount",            # 현재봉 거래대금 (원)
+    "rebound_volume_spike",  # 반등봉 거래량 급등 여부 (매수세 유입 핵심)
+    "v_bottom_spike",        # 저점봉 거래량 급등 여부 (투매 확인 보조)
+    "upside_to_recent_high_pct",  # 현재가→최근 고점 상승 여력 (%)
     "exit_reason",           # 매도 사유 (손절/트레일링/추세꺾임/강제청산 등)
     "hold_minutes",          # 보유 시간 (분)
 ]
@@ -92,6 +95,9 @@ SIGNAL_FIELDS = [
     "current_vs_vwap_pct",
     "volume_ratio",
     "bar_amount",
+    "rebound_volume_spike",
+    "v_bottom_spike",
+    "upside_to_recent_high_pct",
     "ma5_above_ma20",
 ]
 

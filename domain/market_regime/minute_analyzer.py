@@ -45,8 +45,10 @@ class MinuteAnalysis:
     v_drop_pct: float           # 고점→저점 낙폭 (%)
     v_rise_pct: float           # 저점→현재 반등폭 (%)
     v_volume_ratio: float       # 반등 구간 / 하락 구간 거래량 비율
-    v_bottom_spike: bool        # 저점봉 순간 거래량 급등 여부
+    v_bottom_spike: bool        # 저점봉 순간 거래량 급등 여부 (투매 확인용 보조)
     v_ma5_rising: bool          # MA5 기울기 상승 여부
+    rebound_volume_spike: bool  # 현재 반등봉 거래량 급등 여부 (매수세 유입 핵심 지표)
+    upside_to_recent_high_pct: float  # 현재가→최근 고점까지 상승 여력 (%)
 
     # ── 눌림목 재상승 ────────────────────────────────────────────
     is_pulldown_recovery: bool  # 눌림목 후 재상승 여부
@@ -69,7 +71,9 @@ class MinuteAnalysis:
             f"V자 {'✓' if self.is_v_rebound else '✗'}"
             f"(낙폭{self.v_drop_pct:+.1f}% 반등{self.v_rise_pct:+.1f}%"
             f" 거래량x{self.v_volume_ratio:.1f} spike:{'✓' if self.v_bottom_spike else '✗'}"
-            f" MA5상승:{'✓' if self.v_ma5_rising else '✗'} {self.v_bottom_k}봉전)"
+            f" 반등spike:{'✓' if self.rebound_volume_spike else '✗'}"
+            f" MA5상승:{'✓' if self.v_ma5_rising else '✗'} {self.v_bottom_k}봉전"
+            f" 여력{self.upside_to_recent_high_pct:+.1f}%)"
         )
         pr_tag = (
             f"눌림재상승 {'✓' if self.is_pulldown_recovery else '✗'}"
@@ -345,6 +349,22 @@ class MinuteAnalyzer:
             self._detect_v_rebound(bars, current_price, vwap, ma5_above_ma20, ma5_rising)
         )
 
+        # ── 반등봉 거래량 spike (현재봉 거래량 vs 당일 평균) ────
+        # 저점봉 spike(투매 확인)와 달리 반등봉 spike는 매수세 유입을 확인하는 핵심 지표
+        avg_daily_vol = sum(b.volume for b in bars) / len(bars) if bars else 1
+        rebound_volume_spike = (
+            bars[-1].volume > avg_daily_vol * 2.0  # 당일 평균의 2배 이상
+        )
+
+        # ── 최근 고점까지 상승 여력 ─────────────────────────────
+        # 차단 조건으로 쓰지 않고 로그 기록용으로만 사용
+        # 데이터 축적 후 필터화 여부 결정 예정
+        recent_high = max(b.high_price for b in bars[-30:]) if len(bars) >= 30 else day_high
+        upside_to_recent_high_pct = (
+            (recent_high - current_price) / current_price * 100
+            if current_price > 0 else 0.0
+        )
+
         # ── 눌림목 재상승 감지 (MA5>MA20 상태에서만) ────────────
         is_pr, pr_low_turning, pr_volume_expanding = (
             self._detect_pulldown_recovery(bars, ma5_above_ma20)
@@ -373,6 +393,8 @@ class MinuteAnalyzer:
             v_volume_ratio=v_vol_ratio,
             v_bottom_spike=v_bottom_spike,
             v_ma5_rising=ma5_rising,
+            rebound_volume_spike=rebound_volume_spike,
+            upside_to_recent_high_pct=round(upside_to_recent_high_pct, 2),
             is_pulldown_recovery=is_pr,
             pr_low_turning=pr_low_turning,
             pr_volume_expanding=pr_volume_expanding,
