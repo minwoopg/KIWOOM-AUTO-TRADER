@@ -70,19 +70,23 @@ class BreakoutStrategy(Strategy):
                         reason=f"거래대금 부족 — {minute_analysis.trading_value//100_000_000}억",
                     )
 
-                # A/B/C 조건 판단
+                # A/B/C/V/PR 조건 판단
                 pass_change   = minute_analysis.is_valid_change_rate   # A: 상승 돌파
                 pass_rebound  = minute_analysis.is_valid_rebound        # B: 저점 반등
                 pass_pulldown = minute_analysis.is_valid_pulldown       # C: 눌림목
+                pass_v        = minute_analysis.is_v_rebound            # V: V자 반등
+                pass_pr       = minute_analysis.is_pulldown_recovery    # PR: 눌림목 재상승
 
-                if not pass_change and not pass_rebound and not pass_pulldown:
+                if not any([pass_change, pass_rebound, pass_pulldown, pass_v, pass_pr]):
                     return Signal(
                         type=SignalType.HOLD,
                         reason=(
                             f"진입 조건 미충족 — "
                             f"A(등락 {minute_analysis.change_rate_pct:+.1f}%) / "
                             f"B(반등 {minute_analysis.rebound_pct:+.1f}% VWAP {'위' if minute_analysis.price_above_vwap else '아래'}) / "
-                            f"C(눌림목 MA5>MA20:{'✓' if minute_analysis.ma5_above_ma20 else '✗'})"
+                            f"C(눌림목 MA5>MA20:{'✓' if minute_analysis.ma5_above_ma20 else '✗'}) / "
+                            f"V(낙폭{minute_analysis.v_drop_pct:+.1f}% 반등{minute_analysis.v_rise_pct:+.1f}%) / "
+                            f"PR(저점전환:{'✓' if minute_analysis.pr_low_turning else '✗'})"
                         ),
                     )
 
@@ -118,16 +122,32 @@ class BreakoutStrategy(Strategy):
             cond_volume     = volume_surge
             cond_above_ma5  = above_ma5
 
-            # ── [3단계] 분봉 타이밍 점수 (2가지) ─────────────────
+            # ── [3단계] 분봉 타이밍 점수 (4가지, V/PR은 elif로 중복 방지) ─
             cond_above_vwap = minute_analysis.price_above_vwap if minute_analysis else False
             cond_low_rising = minute_analysis.low_rising       if minute_analysis else False
+            # V자와 PR은 같은 현상의 다른 해석 → 중복 점수 방지 (elif)
+            cond_v_or_pr    = (
+                minute_analysis.is_v_rebound
+                if minute_analysis else False
+            ) or (
+                minute_analysis.is_pulldown_recovery
+                if minute_analysis else False
+            )
+            cond_v_spike    = minute_analysis.v_bottom_spike if minute_analysis else False
 
             score = sum([
                 cond_macd_cross, cond_macd_accel,
                 cond_volume, cond_above_ma5,
                 cond_above_vwap, cond_low_rising,
+                cond_v_or_pr,   # V자 또는 PR (중복 불가)
+                cond_v_spike,   # 저점 순간 거래량 spike
             ])
 
+            v_label = (
+                'V자✓' if (minute_analysis and minute_analysis.is_v_rebound) else
+                'PR✓'  if (minute_analysis and minute_analysis.is_pulldown_recovery) else
+                'V/PR✗'
+            )
             tags = [
                 f"MACD {'골든✓' if cond_macd_cross else '데드✗'}",
                 f"모멘텀 {'가속✓' if cond_macd_accel else '둔화✗'}",
@@ -135,23 +155,25 @@ class BreakoutStrategy(Strategy):
                 f"MA5 {'위✓' if cond_above_ma5 else '아래✗'}",
                 f"VWAP {'위✓' if cond_above_vwap else '아래✗'}",
                 f"저점 {'상승✓' if cond_low_rising else '하락✗'}",
+                v_label,
+                f"저점spike {'✓' if cond_v_spike else '✗'}",
             ]
             summary = " | ".join(tags)
 
-            if score >= 4:
+            if score >= 5:
                 return Signal(
                     type=SignalType.BUY,
-                    reason=f"최적 타점 {score}/6 — {summary}",
+                    reason=f"최적 타점 {score}/8 — {summary}",
+                )
+            if score == 4:
+                return Signal(
+                    type=SignalType.BUY,
+                    reason=f"강한 진입 {score}/8 — {summary}",
                 )
             if score == 3:
                 return Signal(
                     type=SignalType.BUY,
-                    reason=f"강한 진입 {score}/6 — {summary}",
-                )
-            if score == 2:
-                return Signal(
-                    type=SignalType.BUY,
-                    reason=f"보수적 진입 {score}/6 — {summary}",
+                    reason=f"보수적 진입 {score}/8 — {summary}",
                 )
 
             return Signal(

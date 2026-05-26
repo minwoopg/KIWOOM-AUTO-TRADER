@@ -59,11 +59,13 @@ class NeutralStrategy(Strategy):
                     reason=f"[중립] 거래대금 부족 — {minute_analysis.trading_value//100_000_000}억",
                 )
 
-            # B/C 조건만 허용 (A 상승 돌파 제외)
-            pass_rebound  = minute_analysis.is_valid_rebound   # B: 저점 반등
-            pass_pulldown = minute_analysis.is_valid_pulldown  # C: 눌림목
+            # B/C/V/PR 조건 허용 (A 상승 돌파 제외)
+            pass_rebound  = minute_analysis.is_valid_rebound        # B: 저점 반등
+            pass_pulldown = minute_analysis.is_valid_pulldown       # C: 눌림목
+            pass_v        = minute_analysis.is_v_rebound            # V: V자 반등
+            pass_pr       = minute_analysis.is_pulldown_recovery    # PR: 눌림목 재상승
 
-            if not pass_rebound and not pass_pulldown:
+            if not any([pass_rebound, pass_pulldown, pass_v, pass_pr]):
                 return Signal(
                     type=SignalType.HOLD,
                     reason=(
@@ -94,14 +96,23 @@ class NeutralStrategy(Strategy):
             cond_above_ma5  = above_ma5
             cond_above_vwap = minute_analysis.price_above_vwap
             cond_low_rising = minute_analysis.low_rising
+            cond_v_or_pr    = minute_analysis.is_v_rebound or minute_analysis.is_pulldown_recovery
+            cond_v_spike    = minute_analysis.v_bottom_spike
 
             score = sum([
                 cond_macd_cross, cond_macd_accel,
                 cond_volume, cond_above_ma5,
                 cond_above_vwap, cond_low_rising,
+                cond_v_or_pr,
+                cond_v_spike,
             ])
 
-            mode = "B반등" if pass_rebound else "C눌림목"
+            v_label = (
+                'V자✓' if pass_v else
+                'PR✓'  if pass_pr else
+                'V/PR✗'
+            )
+            mode = v_label if (pass_v or pass_pr) else ("B반등" if pass_rebound else "C눌림목")
             tags = [
                 f"MACD {'골든✓' if cond_macd_cross else '데드✗'}",
                 f"모멘텀 {'가속✓' if cond_macd_accel else '둔화✗'}",
@@ -109,19 +120,21 @@ class NeutralStrategy(Strategy):
                 f"MA5 {'위✓' if cond_above_ma5 else '아래✗'}",
                 f"VWAP {'위✓' if cond_above_vwap else '아래✗'}",
                 f"저점 {'상승✓' if cond_low_rising else '하락✗'}",
+                v_label,
+                f"저점spike {'✓' if cond_v_spike else '✗'}",
             ]
             summary = " | ".join(tags)
 
-            # NEUTRAL은 3점 이상만 허용
-            if score >= 3:
+            # NEUTRAL은 4점 이상만 허용 (8점 체계)
+            if score >= 4:
                 return Signal(
                     type=SignalType.BUY,
-                    reason=f"[중립][{mode}] 진입 {score}/6 — {summary}",
+                    reason=f"[중립][{mode}] 진입 {score}/8 — {summary}",
                 )
 
             return Signal(
                 type=SignalType.HOLD,
-                reason=f"[중립][{mode}] 점수 부족 {score}/6 (최소 3점) — {summary}",
+                reason=f"[중립][{mode}] 점수 부족 {score}/8 (최소 4점) — {summary}",
             )
 
         # ── 보유 중 → 매도 판단 (BULLISH와 동일) ─────────────────

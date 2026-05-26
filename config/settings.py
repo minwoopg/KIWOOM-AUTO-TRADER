@@ -81,6 +81,17 @@ class MarketRegimeConfig:
     change_rate_min: float
     change_rate_max: float
     rebound_min_pct: float
+    # V자 반등 감지 파라미터
+    v_bottom_lookback: int
+    v_low_min_age: int
+    v_low_max_age: int
+    v_drop_threshold_pct: float
+    v_rebound_threshold_pct: float
+    v_max_rebound_pct: float
+    v_volume_ratio: float
+    v_min_bar_amount: int
+    v_bottom_spike_ratio: float
+    v_ma5_slope_bars: int
 
 
 @dataclass(frozen=True)

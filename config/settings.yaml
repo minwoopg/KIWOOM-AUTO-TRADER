@@ -58,9 +58,20 @@ market_regime:
   macd_slow: 26
   macd_signal: 9
   volume_surge_ratio: 1.5
-  minute_tick_scope: 3
-  minute_bar_count: 40
-  minute_refresh_seconds: 180
+  minute_tick_scope: 1
+  minute_bar_count: 60
+  minute_refresh_seconds: 60
+  # V자 반등 감지 파라미터
+  v_bottom_lookback: 30
+  v_low_min_age: 1
+  v_low_max_age: 5
+  v_drop_threshold_pct: -3.0
+  v_rebound_threshold_pct: 2.0
+  v_max_rebound_pct: 6.0
+  v_volume_ratio: 1.5
+  v_min_bar_amount: 30000000
+  v_bottom_spike_ratio: 1.5
+  v_ma5_slope_bars: 3
   min_trading_value: 50000000000  # 500억 이상
   pullback_min_pct: -7.0
   pullback_max_pct: -0.3   # 완화: 고가 대비 -0.3% 이내까지 허용
