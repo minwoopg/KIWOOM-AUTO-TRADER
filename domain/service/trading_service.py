@@ -30,7 +30,7 @@ from infra.storage.daily_reporter import DailyReporter
 from infra.storage.logger import AppLogger, TradeCsvLogger, SignalCsvLogger
 from infra.storage.skip_reason import classify_skip_reason, SkipReason
 from infra.storage.state_store import JsonStateStore
-from utils.time_utils import is_near_market_close
+from utils.time_utils import is_market_open
 
 
 class TradingService:
@@ -579,51 +579,13 @@ class TradingService:
                 )
                 continue
 
-        if is_near_market_close(self.settings.trading.force_exit_before_market_close_minutes):
-            self.app_logger.info("near market close: force exit started")
+        # ── 일일 리포트 생성 (15:30 이후 하루 1회) ──────────
+        now = datetime.now()
+        if now.hour == 15 and now.minute >= 30 and not self._report_generated_today:
+            self._generate_daily_report()
+            self._report_generated_today = True
+            self.app_logger.info("[REPORT] 일일 리포트 생성 완료")
 
-            try:
-                latest_balance = self.broker.get_account_balance()
-                self.cached_balance = latest_balance
-                self.cached_balance_loaded_at = datetime.now()
-
-                api_positions = {p.symbol: p for p in latest_balance.positions}
-
-                # 키움 모의투자는 당일 체결 종목을 잔고 API에 즉시 반영하지 않을 수 있습니다.
-                # 캐시된 포지션을 보조 수단으로 활용하여 누락 없이 청산합니다.
-                cached_positions = {
-                    p.symbol: p
-                    for p in (self.cached_balance.positions if self.cached_balance else [])
-                }
-                merged = {**cached_positions, **api_positions}  # API 결과 우선
-
-                if not merged:
-                    self.app_logger.info("[FORCE_EXIT] 청산할 보유 종목이 없습니다.")
-                else:
-                    for symbol, position in merged.items():
-                        # 현재가를 조회하여 price=0 기록을 방지합니다.
-                        try:
-                            mp = self.broker.get_market_price(symbol)
-                            current_price = mp.current_price
-                        except Exception:
-                            current_price = self.cached_market_prices.get(symbol)
-                            current_price = current_price.current_price if current_price else 0
-
-                        self.app_logger.info(
-                            f"[FORCE_EXIT] {symbol} | {position.quantity}주 | 현재가 {current_price:,}원"
-                        )
-                        self._try_sell(
-                            symbol, position.quantity, current_price,
-                            exit_reason="FORCE_EXIT",
-                        )
-
-            except Exception as exc:
-                self.app_logger.warning(f"[FORCE_EXIT] 강제청산 중 오류 발생: {exc}")
-
-            # 장 마감 리포트 생성 (하루 1회 — 강제청산 성공 여부와 무관하게 생성)
-            if not self._report_generated_today:
-                self._generate_daily_report()
-                self._report_generated_today = True
 
         self.state_store.save(self.state, self._highest_price)
 

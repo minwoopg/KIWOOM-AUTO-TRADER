@@ -27,6 +27,20 @@ def is_market_open() -> bool:
     return MARKET_OPEN <= current <= MARKET_CLOSE
 
 
+def seconds_until_market_open() -> float:
+    """장 시작(09:00)까지 남은 초를 반환합니다.
+
+    장이 이미 열렸거나 지났으면 0을 반환합니다.
+    """
+    current = now_local()
+    open_dt = current.replace(
+        hour=MARKET_OPEN.hour, minute=MARKET_OPEN.minute,
+        second=0, microsecond=0
+    )
+    remaining = (open_dt - current).total_seconds()
+    return max(remaining, 0.0)
+
+
 def is_near_market_close(minutes_before_close: int) -> bool:
     """장 마감 직전 강제 청산 시점을 판단합니다."""
 

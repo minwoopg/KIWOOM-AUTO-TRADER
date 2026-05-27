@@ -26,7 +26,7 @@ from infra.broker.kiwoom_broker import KiwoomBroker
 from infra.broker.mock_broker import MockBroker
 from infra.storage.logger import TradeCsvLogger, SignalCsvLogger, build_app_logger
 from infra.storage.state_store import JsonStateStore
-from utils.time_utils import is_market_open
+from utils.time_utils import is_market_open, seconds_until_market_open
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -49,7 +49,7 @@ def build_broker(settings: Settings):
 def build_trading_service(settings, broker, app_logger, trade_logger, signal_logger, state_store):
     strategy_router   = StrategyRouter(settings.strategy)
     regime_classifier = MarketRegimeClassifier(settings.market_regime)
-    risk_manager      = RiskManager(settings.trading, settings.risk)
+    risk_manager      = RiskManager(settings.trading, settings.risk, settings.storage.trade_log_file)
     return TradingService(
         settings=settings,
         broker=broker,
@@ -67,7 +67,19 @@ def build_trading_service(settings, broker, app_logger, trade_logger, signal_log
 
 async def trading_loop(trading_service: TradingService, settings: Settings, app_logger) -> None:
     """REST API 기반 매매 루프 (asyncio 버전)."""
-    app_logger.info("application started")
+
+    # ── 장 시작 전 대기 ──────────────────────────────────────
+    wait_sec = seconds_until_market_open()
+    if wait_sec > 0:
+        wait_min = int(wait_sec // 60)
+        app_logger.info(
+            f"application ready — 장 시작까지 {wait_min}분 대기 중 (09:00 시작)"
+        )
+        await asyncio.sleep(wait_sec)
+        app_logger.info("장 시작 — 매매 루프 시작")
+    else:
+        app_logger.info("application started (장중 실행)")
+
     poll = settings.trading.poll_interval_seconds
 
     while True:
@@ -84,14 +96,8 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
             app_logger.exception("unexpected error: %s", exc)
             msg = str(exc)
             if "http=429" in msg or "허용된 요청 개수를 초과" in msg:
-                from utils.time_utils import is_near_market_close
-                # 장 마감 20분 이내면 백오프를 짧게 → 강제청산 타이밍 놓치지 않음
-                if is_near_market_close(20):
-                    app_logger.warning("rate limit detected near market close, backing off for 10 seconds")
-                    await asyncio.sleep(10)
-                else:
-                    app_logger.warning("rate limit detected, backing off for 180 seconds")
-                    await asyncio.sleep(180)
+                app_logger.warning("rate limit detected, backing off for 180 seconds")
+                await asyncio.sleep(180)
             else:
                 await asyncio.sleep(poll)
 
@@ -111,7 +117,7 @@ async def async_main() -> None:
     app_logger   = build_app_logger(settings.storage.app_log_file, settings.app.log_level)
     trade_logger  = TradeCsvLogger(settings.storage.trade_log_file)
     signal_logger = SignalCsvLogger(settings.storage.signal_log_file)
-    state_store   = JsonStateStore(settings.storage.state_file)
+    state_store  = JsonStateStore(settings.storage.state_file)
 
     broker = build_broker(settings)
     broker.authenticate()
