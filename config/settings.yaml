@@ -25,12 +25,13 @@ targets:
     - "006260"
     - "005930"
     - "080220"
+    - "000660"
     
 trading:
   poll_interval_seconds: 10
   balance_refresh_seconds: 180
   price_refresh_seconds: 60
-  order_cash_per_trade: 500000
+  order_cash_per_trade: 2500000
   max_positions: 5
   allow_multiple_entries_per_symbol_per_day: true
   force_exit_before_market_close_minutes: 12
@@ -82,7 +83,7 @@ market_regime:
 risk:
   max_daily_loss_amount: 100000  # 일일 손실 한도 (원)
   max_consecutive_losses: 3      # 연속 손절 허용 횟수 (0=비활성)
-  max_order_amount: 600000
+  max_order_amount: 3000000
   min_cash_buffer: 100000
 
 entry_watch:

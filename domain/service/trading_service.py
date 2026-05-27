@@ -236,20 +236,6 @@ class TradingService:
         일봉 데이터는 자주 바뀌지 않으므로 history_refresh_seconds 주기로만 갱신합니다.
         기본값 3600초(1시간)로 설정되어 있어 429 부담이 거의 없습니다.
         """
-        # ── 당일 등락률 기반 장세 보정 ───────────────────────────
-        if current_price > 0 and prev_close > 0:
-            change_rate = (current_price - prev_close) / prev_close * 100
-            if change_rate >= 2.0:
-                reason = f"당일 급등 {change_rate:+.1f}% — BULLISH 강제 적용"
-                self.app_logger.info(f"[REGIME] {symbol} | BULLISH | {reason}")
-                self._regime_summary[symbol] = f"BULLISH ({reason})"
-                return MarketRegime.BULLISH, reason
-            elif change_rate <= -2.0:
-                reason = f"당일 급락 {change_rate:+.1f}% — NEUTRAL 강제 적용"
-                self.app_logger.info(f"[REGIME] {symbol} | NEUTRAL | {reason}")
-                self._regime_summary[symbol] = f"NEUTRAL ({reason})"
-                return MarketRegime.NEUTRAL, reason
-
         now = datetime.now()
         loaded_at = self.cached_daily_bars_loaded_at.get(symbol)
         refresh_sec = self.settings.market_regime.history_refresh_seconds
@@ -273,17 +259,29 @@ class TradingService:
                 self.app_logger.info(
                     f"[REGIME] {symbol} | {regime.value} | {reason}"
                 )
-                # 리포트용 장세 요약 갱신
                 self._regime_summary[symbol] = f"{regime.value} ({reason})"
-                return regime, reason
 
             except Exception as exc:
                 self.app_logger.warning(
                     f"[REGIME] {symbol} | 일봉 조회 실패({type(exc).__name__}: {exc}) — "
                     f"{'직전 캐시 유지' if symbol in self.cached_regime else 'UNKNOWN으로 처리'}"
                 )
-                cached = self.cached_regime.get(symbol, MarketRegime.UNKNOWN)
-                return cached, "일봉 조회 실패 — 직전 장세 판단 유지"
+
+        # ── 당일 등락률 기반 장세 보정 ───────────────────────────
+        # 일봉 로드와 분리: 일봉 데이터는 항상 로드하되,
+        # 당일 급등락 시에는 일봉 분류 결과를 보정해서 반환합니다.
+        if current_price > 0 and prev_close > 0:
+            change_rate = (current_price - prev_close) / prev_close * 100
+            if change_rate >= 2.0:
+                reason = f"당일 급등 {change_rate:+.1f}% — BULLISH 강제 적용"
+                self.app_logger.info(f"[REGIME] {symbol} | BULLISH | {reason}")
+                self._regime_summary[symbol] = f"BULLISH ({reason})"
+                return MarketRegime.BULLISH, reason
+            elif change_rate <= -2.0:
+                reason = f"당일 급락 {change_rate:+.1f}% — NEUTRAL 강제 적용"
+                self.app_logger.info(f"[REGIME] {symbol} | NEUTRAL | {reason}")
+                self._regime_summary[symbol] = f"NEUTRAL ({reason})"
+                return MarketRegime.NEUTRAL, reason
 
         # 캐시 재사용
         cached = self.cached_regime.get(symbol, MarketRegime.UNKNOWN)
