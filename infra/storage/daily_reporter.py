@@ -9,7 +9,8 @@ trades.csv를 읽어서 당일 매매 내역을 분석하고
 """
 
 import csv
-from collections import defaultdict
+import sys
+from collections import defaultdict, Counter
 from datetime import date, datetime
 from pathlib import Path
 
@@ -20,8 +21,14 @@ DAYS_KO = ["월", "화", "수", "목", "금", "토", "일"]
 class DailyReporter:
     """당일 trades.csv를 분석해 일일 리포트를 생성합니다."""
 
-    def __init__(self, trade_log_file: str, report_dir: str = "logs") -> None:
-        self.trade_log_file = Path(trade_log_file)
+    def __init__(
+        self,
+        trade_log_file: str,
+        report_dir: str = "logs",
+        signal_log_file: str = "logs/signal_log.csv",
+    ) -> None:
+        self.trade_log_file  = Path(trade_log_file)
+        self.signal_log_file = Path(signal_log_file)
         self.report_dir = Path(report_dir)
         self.report_dir.mkdir(parents=True, exist_ok=True)
 
@@ -34,9 +41,14 @@ class DailyReporter:
         trades = self._load_trades(target_date)
         report = self._build_report(target_date, trades, regime_summary or {})
 
+        # ── 분석 섹션 추가 ─────────────────────────────────
+        signal_section = self._build_signal_analysis(target_date)
+        trade_section  = self._build_trade_analysis(target_date)
+        full_report = report + "\n\n" + signal_section + "\n\n" + trade_section
+
         report_file = self.report_dir / f"daily_report_{target_date.strftime('%Y%m%d')}.txt"
-        report_file.write_text(report, encoding="utf-8")
-        return report
+        report_file.write_text(full_report, encoding="utf-8")
+        return full_report
 
     # ── 내부 메서드 ──────────────────────────────────────────────
 
@@ -191,4 +203,170 @@ class DailyReporter:
         lines.append("  정확한 손익은 증권사 앱에서 확인하세요.")
         lines.append(sep)
 
+        return "\n".join(lines)
+
+    # ── 분석 섹션 ────────────────────────────────────────────────
+
+    def _safe_float(self, v) -> float | None:
+        try:
+            f = float(v)
+            return f if f != 0.0 else None
+        except (ValueError, TypeError):
+            return None
+
+    def _safe_bool(self, v) -> bool | None:
+        s = str(v).lower()
+        if s == "true":  return True
+        if s == "false": return False
+        return None
+
+    def _load_signal_rows(self, target_date: date) -> list[dict]:
+        if not self.signal_log_file.exists():
+            return []
+        rows = []
+        with self.signal_log_file.open(encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                try:
+                    ts = datetime.fromisoformat(r["timestamp"]).date()
+                    if ts == target_date:
+                        rows.append(r)
+                except (ValueError, KeyError):
+                    continue
+        return rows
+
+    def _pct(self, n: int, total: int) -> str:
+        return f"{n/total*100:.1f}%" if total > 0 else "0.0%"
+
+    def _build_signal_analysis(self, target_date: date) -> str:
+        rows  = self._load_signal_rows(target_date)
+        sep   = "─" * 50
+        lines = [sep, "  📊 시그널 분석", sep]
+
+        if not rows:
+            lines.append("  signal_log.csv 데이터 없음")
+            lines.append(sep)
+            return "\n".join(lines)
+
+        total     = len(rows)
+        buy_rows  = [r for r in rows if r.get("signal") == "BUY"]
+        hold_rows = [r for r in rows if r.get("signal") != "BUY"]
+
+        lines.append(f"  전체 판단: {total:,}건  │  BUY: {len(buy_rows)}건 ({self._pct(len(buy_rows),total)})  │  SKIP: {len(hold_rows)}건")
+
+        # skip_reason 분포
+        lines.append("")
+        lines.append("  [ skip_reason 분포 ]")
+        for reason, cnt in Counter(r.get("skip_reason","") for r in hold_rows).most_common():
+            lines.append(f"    {(reason or '(없음)'):<38} {cnt:>4}건  {self._pct(cnt, len(hold_rows))}")
+
+        # 패턴 분포
+        lines.append("")
+        lines.append("  [ 감지 패턴 ]")
+        for pat, cnt in Counter(r.get("detected_patterns","-") for r in rows).most_common():
+            bc = sum(1 for r in rows if r.get("detected_patterns")==pat and r.get("signal")=="BUY")
+            lines.append(f"    {(pat or '-'):<38} {cnt:>4}건  → BUY {bc}건")
+
+        # V자 분석
+        v_rows = [r for r in rows if self._safe_bool(r.get("is_v_rebound")) is True]
+        lines.append("")
+        lines.append(f"  [ V자 반등 ]  감지 {len(v_rows)}건 / 전체 {total}건 ({self._pct(len(v_rows),total)})")
+        if v_rows:
+            v_buy = [r for r in v_rows if r.get("signal") == "BUY"]
+            ages  = [self._safe_float(r.get("v_low_age")) for r in v_rows]
+            ages  = [x for x in ages if x is not None]
+            drops = [self._safe_float(r.get("v_drop_pct")) for r in v_rows]
+            drops = [x for x in drops if x is not None]
+            lines.append(f"    V자 → BUY: {len(v_buy)}건  평균 저점나이: {sum(ages)/len(ages):.1f}봉  평균 낙폭: {sum(drops)/len(drops):+.2f}%")
+
+        # v_low_age > 5 누락 분포
+        age_gt5 = sum(1 for r in rows
+                      if (a := self._safe_float(r.get("v_low_age"))) is not None and a > 5)
+        lines.append(f"  [ v_low_age > 5봉 건수 (현재 탐색 제외) ]  {age_gt5}건 ({self._pct(age_gt5, total)})")
+
+        lines.append(sep)
+        return "\n".join(lines)
+
+    def _build_trade_analysis(self, target_date: date) -> str:
+        if not self.trade_log_file.exists():
+            return ""
+
+        rows = []
+        with self.trade_log_file.open(encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                try:
+                    ts = datetime.fromisoformat(r["timestamp"]).date()
+                    if ts == target_date:
+                        rows.append(r)
+                except (ValueError, KeyError):
+                    continue
+
+        sep   = "─" * 50
+        lines = [sep, "  📈 매매 분석", sep]
+
+        accepted = [r for r in rows if str(r.get("accepted","")).lower() == "true"]
+        buys     = [r for r in accepted if r.get("side") == "BUY"]
+        sells    = [r for r in accepted if r.get("side") == "SELL"]
+
+        # BUY-SELL 페어링
+        from collections import defaultdict as dd
+        sym_buys  = dd(list)
+        sym_sells = dd(list)
+        for r in accepted:
+            (sym_buys if r.get("side")=="BUY" else sym_sells)[r["symbol"]].append(r)
+
+        pairs = []
+        for sym, sl in sym_sells.items():
+            bl = list(sym_buys.get(sym, []))
+            for sell in sl:
+                if not bl: break
+                buy = bl.pop(0)
+                bp  = int(buy.get("price",0) or 0)
+                sp  = int(sell.get("price",0) or 0)
+                qty = int(sell.get("quantity",0) or 0)
+                if bp <= 0 or sp <= 0: continue
+                pnl_pct = (sp - bp) / bp * 100
+                pairs.append({
+                    "symbol":      sym,
+                    "pnl_pct":     pnl_pct,
+                    "pnl_amount":  (sp - bp) * qty,
+                    "win":         pnl_pct > 0,
+                    "exit_reason": sell.get("exit_reason",""),
+                    "hold_min":    self._safe_float(sell.get("hold_minutes")),
+                    "is_v":        self._safe_bool(buy.get("is_v_rebound")),
+                    "score":       buy.get("entry_score",""),
+                })
+
+        if not pairs:
+            lines.append("  매매 쌍 없음 (미청산 포지션은 다음날 집계됩니다)")
+            lines.append(sep)
+            return "\n".join(lines)
+
+        wins = [p for p in pairs if p["win"]]
+        lines.append(f"  승률: {len(wins)}/{len(pairs)} ({self._pct(len(wins),len(pairs))})")
+        lines.append(f"  평균 수익률: {sum(p['pnl_pct'] for p in pairs)/len(pairs):+.2f}%")
+        holds = [p["hold_min"] for p in pairs if p["hold_min"]]
+        if holds:
+            lines.append(f"  평균 보유: {sum(holds)/len(holds):.1f}분")
+
+        # exit_reason별
+        lines.append("")
+        lines.append("  [ exit_reason별 ]")
+        er_grp = {}
+        for p in pairs:
+            er_grp.setdefault(p["exit_reason"] or "(없음)", []).append(p)
+        for er, grp in sorted(er_grp.items(), key=lambda x: -len(x[1])):
+            w   = sum(1 for p in grp if p["win"])
+            avg = sum(p["pnl_pct"] for p in grp) / len(grp)
+            lines.append(f"    {er[:36]:<38} {len(grp)}건  승률 {self._pct(w,len(grp))}  {avg:+.2f}%")
+
+        # 거래 목록
+        lines.append("")
+        lines.append("  [ 거래 목록 ]")
+        for p in pairs:
+            mark = "✅" if p["win"] else "❌"
+            hold = f"{p['hold_min']:.0f}분" if p["hold_min"] else "?"
+            v    = "V" if p["is_v"] else "-"
+            lines.append(f"    {mark} {p['symbol']}  {p['pnl_pct']:+.1f}%  {p['pnl_amount']:+,.0f}원  {hold}  [{v}]  {p['exit_reason'][:25]}")
+
+        lines.append(sep)
         return "\n".join(lines)

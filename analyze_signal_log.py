@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""signal_log.csv 분석 스크립트
+
+실행:
+    python analyze_signal_log.py                          # 오늘 날짜
+    python analyze_signal_log.py 2026-05-27               # 특정 날짜
+    python analyze_signal_log.py 2026-05-27 2026-05-28   # 날짜 범위
+
+결과: 콘솔 출력 + reports/signal_analysis_YYYYMMDD.txt 저장
+"""
+
+from __future__ import annotations
+
+import csv
+import sys
+from collections import Counter, defaultdict
+from datetime import date, datetime
+from pathlib import Path
+
+
+# ── 설정 ────────────────────────────────────────────────────────
+SIGNAL_LOG = Path("logs/signal_log.csv")
+REPORTS_DIR = Path("reports")
+
+
+# ── 유틸 ────────────────────────────────────────────────────────
+def pct(n: int, total: int) -> str:
+    return f"{n/total*100:.1f}%" if total > 0 else "0.0%"
+
+def safe_float(v) -> float | None:
+    try:
+        f = float(v)
+        return f if f != 0.0 else None
+    except (ValueError, TypeError):
+        return None
+
+def safe_bool(v) -> bool | None:
+    if str(v).lower() == "true":  return True
+    if str(v).lower() == "false": return False
+    return None
+
+
+# ── 데이터 로드 ──────────────────────────────────────────────────
+def load(start: date, end: date) -> list[dict]:
+    if not SIGNAL_LOG.exists():
+        print(f"[ERROR] {SIGNAL_LOG} 파일이 없습니다.")
+        sys.exit(1)
+
+    rows = []
+    with SIGNAL_LOG.open(encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            try:
+                ts = datetime.fromisoformat(r["timestamp"]).date()
+            except (ValueError, KeyError):
+                continue
+            if start <= ts <= end:
+                rows.append(r)
+    return rows
+
+
+# ── 분석 ────────────────────────────────────────────────────────
+def analyze(rows: list[dict], start: date, end: date) -> str:
+    lines = []
+    W = 60
+
+    def sep(c="═"): lines.append(c * W)
+    def title(t): sep(); lines.append(f"  {t}"); sep()
+    def sub(t): lines.append(""); lines.append(f"── {t} ──")
+    def row(label, val, note=""): 
+        n = f"  ({note})" if note else ""
+        lines.append(f"  {label:<36} {val}{n}")
+
+    title(f"📊 signal_log 분석  {start} ~ {end}  (총 {len(rows):,}건)")
+
+    if not rows:
+        lines.append("  데이터가 없습니다.")
+        return "\n".join(lines)
+
+    total = len(rows)
+    buy_rows  = [r for r in rows if r.get("signal") == "BUY"]
+    hold_rows = [r for r in rows if r.get("signal") != "BUY"]
+
+    # ── 1. 시그널 분포 ──────────────────────────────────────────
+    sub("1. 시그널 분포")
+    row("전체 판단", f"{total:,}건")
+    row("BUY", f"{len(buy_rows):,}건  ({pct(len(buy_rows), total)})")
+    row("HOLD / SKIP", f"{len(hold_rows):,}건  ({pct(len(hold_rows), total)})")
+
+    # ── 2. 장세 분포 ──────────────────────────────────────────
+    sub("2. 장세 분포")
+    regime_cnt = Counter(r.get("regime","") for r in rows)
+    for regime, cnt in regime_cnt.most_common():
+        row(regime or "(없음)", f"{cnt:,}건  ({pct(cnt, total)})")
+
+    # ── 3. skip_reason 분포 ─────────────────────────────────
+    sub("3. skip_reason 분포  (BUY 제외)")
+    reason_cnt = Counter(r.get("skip_reason","") for r in hold_rows)
+    for reason, cnt in reason_cnt.most_common():
+        row(reason or "(없음)", f"{cnt:,}건  ({pct(cnt, len(hold_rows))})")
+
+    # ── 4. detected_patterns 분포 ───────────────────────────
+    sub("4. 감지 패턴 분포")
+    pat_cnt = Counter(r.get("detected_patterns","-") for r in rows)
+    for pat, cnt in pat_cnt.most_common():
+        buy_cnt = sum(1 for r in rows 
+                      if r.get("detected_patterns") == pat 
+                      and r.get("signal") == "BUY")
+        row(pat or "-", f"{cnt:,}건  →  BUY {buy_cnt}건  ({pct(buy_cnt,cnt)})")
+
+    # ── 5. V자 반등 분석 ───────────────────────────────────
+    sub("5. V자 반등 분석")
+    v_detected = [r for r in rows if safe_bool(r.get("is_v_rebound")) is True]
+    v_buy      = [r for r in v_detected if r.get("signal") == "BUY"]
+    row("V자 감지", f"{len(v_detected):,}건  ({pct(len(v_detected), total)})")
+    row("V자 → BUY", f"{len(v_buy):,}건  ({pct(len(v_buy), len(v_detected))})")
+
+    if v_detected:
+        drops   = [safe_float(r.get("v_drop_pct"))   for r in v_detected]
+        rises   = [safe_float(r.get("v_rise_pct"))   for r in v_detected]
+        ages    = [safe_float(r.get("v_low_age"))     for r in v_detected]
+        drops  = [x for x in drops  if x is not None]
+        rises  = [x for x in rises  if x is not None]
+        ages   = [x for x in ages   if x is not None]
+        if drops:  row("v_drop_pct  평균", f"{sum(drops)/len(drops):+.2f}%")
+        if rises:  row("v_rise_pct  평균", f"{sum(rises)/len(rises):+.2f}%")
+        if ages:   row("v_low_age   평균", f"{sum(ages)/len(ages):.1f}봉")
+
+        rspike = Counter(str(safe_bool(r.get("rebound_volume_spike"))) for r in v_detected)
+        bspike = Counter(str(safe_bool(r.get("v_bottom_spike")))      for r in v_detected)
+        row("rebound_volume_spike=True",  f"{rspike.get('True',0):,}건  ({pct(rspike.get('True',0), len(v_detected))})")
+        row("v_bottom_spike=True",        f"{bspike.get('True',0):,}건  ({pct(bspike.get('True',0), len(v_detected))})")
+
+    # v_low_age 분포 (전체 기준)
+    sub("  v_low_age 분포 (V자 감지 여부 무관)")
+    age_buckets: dict[str, int] = defaultdict(int)
+    for r in rows:
+        age = safe_float(r.get("v_low_age"))
+        if age is None: continue
+        if age <= 3:    age_buckets["1~3봉"] += 1
+        elif age <= 5:  age_buckets["4~5봉"] += 1
+        elif age <= 8:  age_buckets["6~8봉"] += 1
+        elif age <= 15: age_buckets["9~15봉"] += 1
+        else:           age_buckets["16봉↑"] += 1
+    for k in ["1~3봉","4~5봉","6~8봉","9~15봉","16봉↑"]:
+        cnt = age_buckets[k]
+        row(k, f"{cnt:,}건  ({pct(cnt, total)})")
+
+    # ── 6. upside_to_recent_high 분포 ──────────────────────
+    sub("6. 상승 여력 (upside_to_recent_high_pct) 분포")
+    up_buckets: dict[str, int] = defaultdict(int)
+    for r in rows:
+        up = safe_float(r.get("upside_to_recent_high_pct"))
+        if up is None: continue
+        if up < 1.0:   up_buckets["< 1%"] += 1
+        elif up < 2.0: up_buckets["1~2%"] += 1
+        elif up < 3.0: up_buckets["2~3%"] += 1
+        elif up < 5.0: up_buckets["3~5%"] += 1
+        else:          up_buckets["5%↑"] += 1
+    total_up = sum(up_buckets.values())
+    for k in ["< 1%","1~2%","2~3%","3~5%","5%↑"]:
+        cnt = up_buckets[k]
+        buy_cnt = sum(1 for r in rows
+                      if r.get("signal") == "BUY"
+                      and (lambda u: u is not None and (
+                          (k=="< 1%" and u < 1.0) or
+                          (k=="1~2%" and 1.0 <= u < 2.0) or
+                          (k=="2~3%" and 2.0 <= u < 3.0) or
+                          (k=="3~5%" and 3.0 <= u < 5.0) or
+                          (k=="5%↑"  and u >= 5.0)
+                      ))(safe_float(r.get("upside_to_recent_high_pct"))))
+        row(k, f"{cnt:,}건  →  BUY {buy_cnt}건")
+
+    # ── 7. VWAP 위치 분포 ──────────────────────────────────
+    sub("7. VWAP 대비 위치")
+    vwap_pos = [safe_float(r.get("current_vs_vwap_pct")) for r in rows]
+    vwap_pos = [x for x in vwap_pos if x is not None]
+    if vwap_pos:
+        above = sum(1 for x in vwap_pos if x > 0)
+        below = sum(1 for x in vwap_pos if x <= 0)
+        row("VWAP 위  (현재가 > VWAP)", f"{above:,}건  ({pct(above, len(vwap_pos))})")
+        row("VWAP 아래", f"{below:,}건  ({pct(below, len(vwap_pos))})")
+        row("평균 VWAP 거리", f"{sum(vwap_pos)/len(vwap_pos):+.2f}%")
+
+    # ── 8. 종목별 판단 횟수 Top 10 ──────────────────────────
+    sub("8. 종목별 판단 횟수 Top 10")
+    sym_cnt = Counter(r.get("symbol","") for r in rows)
+    for sym, cnt in sym_cnt.most_common(10):
+        buy_cnt = sum(1 for r in rows if r.get("symbol")==sym and r.get("signal")=="BUY")
+        row(sym, f"{cnt:,}건  →  BUY {buy_cnt}건")
+
+    sep()
+    return "\n".join(lines)
+
+
+# ── 메인 ────────────────────────────────────────────────────────
+def main():
+    args = sys.argv[1:]
+    today = date.today()
+
+    if len(args) == 0:
+        start = end = today
+    elif len(args) == 1:
+        start = end = date.fromisoformat(args[0])
+    else:
+        start = date.fromisoformat(args[0])
+        end   = date.fromisoformat(args[1])
+
+    rows   = load(start, end)
+    report = analyze(rows, start, end)
+
+    print(report)
+
+    REPORTS_DIR.mkdir(exist_ok=True)
+    fname = REPORTS_DIR / f"signal_analysis_{today.strftime('%Y%m%d')}.txt"
+    fname.write_text(report, encoding="utf-8")
+    print(f"\n  → 저장: {fname}")
+
+
+if __name__ == "__main__":
+    main()

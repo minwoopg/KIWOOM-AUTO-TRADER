@@ -94,6 +94,7 @@ class TradingService:
         self._reporter = DailyReporter(
             trade_log_file=settings.storage.trade_log_file,
             report_dir=str(Path(settings.storage.trade_log_file).parent),
+            signal_log_file=settings.storage.signal_log_file,
         )
         cfg = settings.market_regime
         self._minute_analyzer = MinuteAnalyzer(
