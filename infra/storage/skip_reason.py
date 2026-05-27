@@ -34,6 +34,11 @@ class SkipReason:
     CONSECUTIVE_LOSS_LIMIT  = "SKIP_CONSECUTIVE_LOSS"     # 연속 손절 한도 도달
     ORDER_FAILED            = "SKIP_ORDER_FAILED"         # 주문 실패 (브로커 거부)
 
+    # ── 보유 중 포지션 관리 ──────────────────────────────────────
+    HOLDING_TRAILING        = "HOLD_TRAILING"             # 트레일링 스탑 추적 중
+    HOLDING_POSITION        = "HOLD_POSITION"             # 보유 유지 (손절/익절 대기)
+    HOLDING_SELL            = "SELL"                      # 매도 신호
+
     # ── BUY 신호이지만 체결 안 된 경우 ──────────────────────────
     BUY_SIGNAL              = "BUY"                       # 매수 체결
 
@@ -77,6 +82,18 @@ def classify_skip_reason(signal_reason: str, signal_type_value: str) -> str:
     # 장세
     if "횡보장" in r or "하락장" in r or "UNKNOWN" in r:
         return SkipReason.MARKET_NOT_ALLOWED
+
+    # 보유 중 — 트레일링 추적
+    if "트레일링 추적 중" in r or "트레일링 스탑" in r:
+        return SkipReason.HOLDING_TRAILING
+
+    # 보유 중 — 보유 유지
+    if "보유 유지" in r or "손절" in r or "익절" in r or "추세 꺾임" in r:
+        return SkipReason.HOLDING_POSITION
+
+    # 눌림목 고가 이탈 (A조건)
+    if "고가에서 너무 밀림" in r:
+        return SkipReason.PULLBACK_OUT_OF_RANGE
 
     # fallback: 원본 앞 60자
     return r[:60]

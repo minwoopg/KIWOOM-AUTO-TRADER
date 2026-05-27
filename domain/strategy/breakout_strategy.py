@@ -122,27 +122,20 @@ class BreakoutStrategy(Strategy):
             cond_volume     = volume_surge
             cond_above_ma5  = above_ma5
 
-            # ── [3단계] 분봉 타이밍 점수 (4가지, V/PR은 elif로 중복 방지) ─
+            # ── [3단계] 분봉 타이밍 점수 (8점 체계) ──────────────
             cond_above_vwap = minute_analysis.price_above_vwap if minute_analysis else False
             cond_low_rising = minute_analysis.low_rising       if minute_analysis else False
-            # V자와 PR은 같은 현상의 다른 해석 → 중복 점수 방지 (elif)
             cond_v_or_pr    = (
-                minute_analysis.is_v_rebound
-                if minute_analysis else False
-            ) or (
-                minute_analysis.is_pulldown_recovery
-                if minute_analysis else False
+                (minute_analysis.is_v_rebound if minute_analysis else False)
+                or (minute_analysis.is_pulldown_recovery if minute_analysis else False)
             )
-            # v_bottom_spike는 저점 투매 확인용 보조 지표 → 로그에만 기록
-            # rebound_volume_spike는 반등봉 매수세 유입 확인 → 점수 반영
             cond_v_spike    = minute_analysis.rebound_volume_spike if minute_analysis else False
 
             score = sum([
                 cond_macd_cross, cond_macd_accel,
                 cond_volume, cond_above_ma5,
                 cond_above_vwap, cond_low_rising,
-                cond_v_or_pr,   # V자 또는 PR (중복 불가)
-                cond_v_spike,   # 저점 순간 거래량 spike
+                cond_v_or_pr, cond_v_spike,
             ])
 
             v_label = (

@@ -25,7 +25,6 @@ targets:
     - "006260"
     - "005930"
     - "080220"
-    - "000660"
     
 trading:
   poll_interval_seconds: 10
@@ -65,7 +64,7 @@ market_regime:
   # V자 반등 감지 파라미터
   v_bottom_lookback: 30
   v_low_min_age: 1
-  v_low_max_age: 5
+  v_low_max_age: 8
   v_drop_threshold_pct: -3.0
   v_rebound_threshold_pct: 2.0
   v_max_rebound_pct: 6.0

@@ -142,8 +142,26 @@ class TradingService:
         return self.settings.targets
 
     def update_targets(self, symbols: list[str]) -> None:
-        """조건검색 결과로 종목 목록을 동적으로 갱신합니다."""
-        self._dynamic_targets = symbols
+        """조건검색 결과로 종목 목록을 동적으로 갱신합니다.
+
+        보유 중인 종목은 조건검색 편출 여부와 무관하게 항상 포함합니다.
+        """
+        holding_symbols: list[str] = []
+        try:
+            balance = self._get_balance_with_cache()
+            holding_symbols = [p.symbol for p in balance.positions]
+        except Exception:
+            pass
+
+        merged = list(symbols)
+        for sym in holding_symbols:
+            if sym not in merged:
+                merged.append(sym)
+                self.app_logger.info(
+                    f"[TARGET] {sym} | 조건검색 편출됐으나 보유 중 → 모니터링 유지"
+                )
+
+        self._dynamic_targets = merged
 
     def get_excluded_symbols(self) -> set[str]:
         """자동 제외된 종목 목록을 반환합니다."""
@@ -595,19 +613,27 @@ class TradingService:
                 )
                 continue
 
-        # ── 일일 리포트 생성 (15:30 이후 하루 1회) ──────────
-        now = datetime.now()
-        if now.hour == 15 and now.minute >= 30 and not self._report_generated_today:
+        # ── 일일 리포트는 _run_end_of_day_tasks()에서 처리 ──
+        self._run_end_of_day_tasks(datetime.now())
+
+
+        self.state_store.save(self.state, self._highest_price)
+
+    def _run_end_of_day_tasks(self, now: datetime) -> None:
+        """장 마감 후 작업 (리포트/검증). run_once 밖에서도 호출 가능."""
+        if now.hour == 15 and now.minute >= 20 and not self._report_generated_today:
+            self.app_logger.info("━" * 45)
+            self.app_logger.info("  🔔 장 마감 (15:20) — 매매 종료")
+            self.app_logger.info("  보유 포지션은 다음날로 이월됩니다.")
+            self.app_logger.info("━" * 45)
             self._generate_daily_report()
             self._report_generated_today = True
             self.app_logger.info("[REPORT] 일일 리포트 생성 완료")
             self._validate_logs_today(now.date())
 
-
-        self.state_store.save(self.state, self._highest_price)
-
     def _validate_logs_today(self, target_date) -> None:
         """장 마감 후 로그 품질을 자동 검증하고 결과를 app.log에 기록합니다."""
+        # signal_log / trades.csv 검증
         try:
             from validate_logs import check_signal_log, check_trades_log
             e1, w1 = check_signal_log(target_date)
@@ -622,6 +648,27 @@ class TradingService:
                 )
         except Exception as exc:
             self.app_logger.warning(f"[VALIDATE] 로그 품질 검사 실패: {exc}")
+
+        # 1분봉 저장 품질 검증
+        try:
+            from validate_minute_bars import validate as validate_bars
+            report = validate_bars(target_date)
+            has_error = "❌" in report
+            has_warn  = "⚠️" in report
+            if not has_error and not has_warn:
+                self.app_logger.info("[VALIDATE] 1분봉 품질 검사 통과 ✅")
+            elif has_error:
+                self.app_logger.warning("[VALIDATE] 1분봉 품질 검사 — 오류 발견 (reports/ 확인)")
+            else:
+                self.app_logger.warning("[VALIDATE] 1분봉 품질 검사 — 경고 발견 (reports/ 확인)")
+            # 결과를 reports/에 저장
+            from pathlib import Path
+            Path("reports").mkdir(exist_ok=True)
+            Path(f"reports/minute_bar_quality_{target_date.strftime('%Y%m%d')}.txt").write_text(
+                report, encoding="utf-8"
+            )
+        except Exception as exc:
+            self.app_logger.warning(f"[VALIDATE] 1분봉 품질 검사 실패: {exc}")
 
     def _try_buy(
         self,

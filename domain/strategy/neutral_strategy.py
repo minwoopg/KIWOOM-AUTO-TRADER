@@ -96,15 +96,16 @@ class NeutralStrategy(Strategy):
             cond_above_ma5  = above_ma5
             cond_above_vwap = minute_analysis.price_above_vwap
             cond_low_rising = minute_analysis.low_rising
-            cond_v_or_pr    = minute_analysis.is_v_rebound or minute_analysis.is_pulldown_recovery
-            cond_v_spike    = minute_analysis.v_bottom_spike
+            cond_v_or_pr    = (
+                minute_analysis.is_v_rebound or minute_analysis.is_pulldown_recovery
+            )
+            cond_v_spike    = minute_analysis.rebound_volume_spike
 
             score = sum([
                 cond_macd_cross, cond_macd_accel,
                 cond_volume, cond_above_ma5,
                 cond_above_vwap, cond_low_rising,
-                cond_v_or_pr,
-                cond_v_spike,
+                cond_v_or_pr, cond_v_spike,
             ])
 
             v_label = (

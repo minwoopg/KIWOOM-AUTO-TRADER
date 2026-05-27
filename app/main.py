@@ -25,6 +25,7 @@ from domain.strategy.strategy_router import StrategyRouter
 from infra.broker.kiwoom_broker import KiwoomBroker
 from infra.broker.mock_broker import MockBroker
 from infra.storage.logger import TradeCsvLogger, SignalCsvLogger, build_app_logger
+from infra.storage.state_reconciler import StateReconciler
 from infra.storage.state_store import JsonStateStore
 from utils.time_utils import is_market_open, seconds_until_market_open
 
@@ -84,8 +85,19 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
 
     while True:
         try:
+            from datetime import datetime as _dt
+            now = _dt.now()
             if is_market_open() or settings.broker.use_mock:
                 await trading_service.run_once()
+            else:
+                # 장 외 시간 — 대기 메시지 (분 단위로 한 번)
+                if now.second < poll:
+                    app_logger.info(
+                        f"[WAIT] 장 외 시간 ({now.strftime('%H:%M')}) — "
+                        f"09:00 장 시작까지 대기 중"
+                    )
+                # 리포트는 장 외에서도 생성 (15:20 이후 하루 1회)
+                trading_service._run_end_of_day_tasks(now)
             await asyncio.sleep(poll)
 
         except (asyncio.CancelledError, KeyboardInterrupt):
@@ -121,6 +133,17 @@ async def async_main() -> None:
 
     broker = build_broker(settings)
     broker.authenticate()
+
+    # ── 시작 시 state.json과 실제 잔고 동기화 ──────────────
+    try:
+        balance_init = broker.get_account_balance()
+        reconciler   = StateReconciler(app_logger)
+        state, highest_price = state_store.load()
+        state, highest_price = reconciler.reconcile(state, highest_price, balance_init)
+        state_store.save(state, highest_price)
+        app_logger.info("[RECONCILE] state.json 동기화 완료")
+    except Exception as e:
+        app_logger.warning(f"[RECONCILE] 시작 시 state 동기화 실패: {e}")
 
     trading_service = build_trading_service(
         settings, broker, app_logger, trade_logger, signal_logger, state_store

@@ -11,7 +11,7 @@ from datetime import datetime, time, timedelta
 
 # 국장 기본 장중 시간(단순 버전)
 MARKET_OPEN = time(9, 0)
-MARKET_CLOSE = time(15, 30)
+MARKET_CLOSE = time(15, 20)  # 15:20 이후 단일가 — 신규 매수/매도 중단
 
 
 def now_local() -> datetime:
