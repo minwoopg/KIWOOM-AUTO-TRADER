@@ -28,6 +28,7 @@ from domain.strategy.strategy_router import StrategyRouter
 from infra.broker.base import Broker
 from infra.storage.daily_reporter import DailyReporter
 from infra.storage.logger import AppLogger, TradeCsvLogger, SignalCsvLogger
+from infra.storage.minute_bar_saver import MinuteBarSaver
 from infra.storage.skip_reason import classify_skip_reason, SkipReason
 from infra.storage.state_store import JsonStateStore
 from utils.time_utils import is_market_open
@@ -119,6 +120,13 @@ class TradingService:
         self._regime_summary: dict[str, str] = {}
         # 장 마감 리포트가 이미 생성됐는지 여부 (중복 방지)
         self._report_generated_today: bool = False
+
+        # 1분봉 저장기
+        self._minute_saver: MinuteBarSaver | None = (
+            MinuteBarSaver(settings.storage.minute_bars_dir)
+            if getattr(settings.storage, 'save_minute_bars', False)
+            else None
+        )
 
         # UNKNOWN 연속 횟수 카운터 (비정상 종목 자동 제외용)
         self._unknown_count: dict[str, int] = {}
@@ -309,6 +317,13 @@ class TradingService:
                 )
                 self.cached_minute_bars[symbol] = bars
                 self.cached_minute_bars_loaded_at[symbol] = now
+
+                # 1분봉 저장 (enabled 시)
+                if self._minute_saver is not None and bars:
+                    try:
+                        self._minute_saver.save(symbol, bars)
+                    except Exception as save_exc:
+                        self.app_logger.debug(f"[MIN] {symbol} | 분봉 저장 실패: {save_exc}")
             except Exception as exc:
                 self.app_logger.warning(f"[MIN] {symbol} | 분봉 조회 실패: {exc}")
                 bars = self.cached_minute_bars.get(symbol, [])
@@ -586,9 +601,27 @@ class TradingService:
             self._generate_daily_report()
             self._report_generated_today = True
             self.app_logger.info("[REPORT] 일일 리포트 생성 완료")
+            self._validate_logs_today(now.date())
 
 
         self.state_store.save(self.state, self._highest_price)
+
+    def _validate_logs_today(self, target_date) -> None:
+        """장 마감 후 로그 품질을 자동 검증하고 결과를 app.log에 기록합니다."""
+        try:
+            from validate_logs import check_signal_log, check_trades_log
+            e1, w1 = check_signal_log(target_date)
+            e2, w2 = check_trades_log(target_date)
+            total_errors   = e1 + e2
+            total_warnings = w1 + w2
+            if total_errors == 0 and total_warnings == 0:
+                self.app_logger.info("[VALIDATE] 로그 품질 검사 통과 ✅")
+            else:
+                self.app_logger.warning(
+                    f"[VALIDATE] 로그 품질 검사 — 오류 {total_errors}건 / 경고 {total_warnings}건"
+                )
+        except Exception as exc:
+            self.app_logger.warning(f"[VALIDATE] 로그 품질 검사 실패: {exc}")
 
     def _try_buy(
         self,

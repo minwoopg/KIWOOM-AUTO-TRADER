@@ -31,7 +31,7 @@ trading:
   poll_interval_seconds: 10
   balance_refresh_seconds: 180
   price_refresh_seconds: 60
-  order_cash_per_trade: 2500000
+  order_cash_per_trade: 500000
   max_positions: 5
   allow_multiple_entries_per_symbol_per_day: true
   force_exit_before_market_close_minutes: 12
@@ -83,7 +83,7 @@ market_regime:
 risk:
   max_daily_loss_amount: 100000  # 일일 손실 한도 (원)
   max_consecutive_losses: 3      # 연속 손절 허용 횟수 (0=비활성)
-  max_order_amount: 3000000
+  max_order_amount: 600000
   min_cash_buffer: 100000
 
 entry_watch:
@@ -106,3 +106,5 @@ storage:
   trade_log_file: logs/trades.csv
   signal_log_file: logs/signal_log.csv
   app_log_file: logs/app.log
+  save_minute_bars: true              # 1분봉 원본 저장 여부
+  minute_bars_dir: data/minute_bars   # 저장 경로

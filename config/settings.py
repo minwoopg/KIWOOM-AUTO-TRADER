@@ -130,6 +130,8 @@ class StorageConfig:
     trade_log_file: str
     signal_log_file: str
     app_log_file: str
+    save_minute_bars: bool
+    minute_bars_dir: str
 
 
 @dataclass(frozen=True)
