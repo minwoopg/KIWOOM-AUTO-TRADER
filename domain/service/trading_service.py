@@ -630,6 +630,23 @@ class TradingService:
             self._report_generated_today = True
             self.app_logger.info("[REPORT] 일일 리포트 생성 완료")
             self._validate_logs_today(now.date())
+            self._run_replay_today(now.date())
+
+    def _run_replay_today(self, target_date) -> None:
+        """장 마감 후 리플레이를 자동 실행합니다."""
+        try:
+            import subprocess, sys
+            result = subprocess.run(
+                [sys.executable, "replay_runner.py",
+                 target_date.strftime("%Y-%m-%d")],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode == 0:
+                self.app_logger.info("[REPLAY] 리플레이 완료 → reports/ 저장")
+            else:
+                self.app_logger.warning(f"[REPLAY] 리플레이 실패: {result.stderr[:200]}")
+        except Exception as exc:
+            self.app_logger.warning(f"[REPLAY] 리플레이 실행 오류: {exc}")
 
     def _validate_logs_today(self, target_date) -> None:
         """장 마감 후 로그 품질을 자동 검증하고 결과를 app.log에 기록합니다."""
