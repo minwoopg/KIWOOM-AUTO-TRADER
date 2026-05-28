@@ -183,9 +183,10 @@ async def async_main() -> None:
             on_symbols_changed=on_symbols_changed,
         )
 
+        seqs_str = ", ".join(str(s) for s in settings.websocket.condition_seqs)
         app_logger.info(
             f"[COND] 조건검색 모드 활성화 "
-            f"(조건식 번호: {settings.websocket.condition_seq})"
+            f"(조건식 번호: {seqs_str})"
         )
         app_logger.info("[COND] 종목은 조건검색으로 자동 설정됩니다")
 

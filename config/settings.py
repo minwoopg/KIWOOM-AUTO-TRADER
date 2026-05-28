@@ -100,7 +100,7 @@ class WebSocketConfig:
 
     enabled: bool
     url: str
-    condition_seq: int
+    condition_seqs: list  # 동시 구독할 조건식 번호 목록
     max_symbols: int
     app_key: str
     secret_key: str

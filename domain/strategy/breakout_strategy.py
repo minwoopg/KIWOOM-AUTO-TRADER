@@ -72,7 +72,8 @@ class BreakoutStrategy(Strategy):
 
                 # A/B/C/V/PR 조건 판단
                 pass_change   = minute_analysis.is_valid_change_rate   # A: 상승 돌파
-                pass_rebound  = minute_analysis.is_valid_rebound        # B: 저점 반등
+                # pass_rebound = minute_analysis.is_valid_rebound  # B: 저점 반등 — 단독 비활성화 (2일 연속 손실)
+                pass_rebound  = False  # B 단독 비활성 중
                 pass_pulldown = minute_analysis.is_valid_pulldown       # C: 눌림목
                 pass_v        = minute_analysis.is_v_rebound            # V: V자 반등
                 pass_pr       = minute_analysis.is_pulldown_recovery    # PR: 눌림목 재상승
