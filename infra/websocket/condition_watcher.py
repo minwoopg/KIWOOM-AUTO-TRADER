@@ -41,6 +41,9 @@ class ConditionWatcher:
         for seq in config.condition_seqs:
             self._symbols_by_seq[str(seq)] = set()
 
+        # 조건식 이름 저장 {seq: name}
+        self._condition_names: dict[str, str] = {}
+
         self._ws_client = KiwoomWebSocket(
             url=config.url,
             token=token,
@@ -109,6 +112,9 @@ class ConditionWatcher:
         for seq, name in conditions:
             marker = " ◀ 구독 중" if str(seq) in subscribed else ""
             logger.info(f"[COND]   [{seq}] {name}{marker}")
+            # 조건식 이름 저장
+            if str(seq) in subscribed:
+                self._condition_names[str(seq)] = name
 
     def _on_initial_result(self, msg: dict) -> None:
         if msg.get("return_code") != 0:
@@ -127,9 +133,10 @@ class ConditionWatcher:
         if seq in self._symbols_by_seq:
             self._symbols_by_seq[seq] = set(symbols)
 
-        logger.info(f"[COND] seq={seq} 초기 결과: {len(symbols)}개 종목")
+        cond_name = self._condition_names.get(seq, seq)
+        logger.info(f"[COND] [{cond_name}] 초기 결과: {len(symbols)}개 종목")
         for s in sorted(symbols):
-            logger.info(f"[COND]   편입: {s}")
+            logger.info(f"[COND]   [{cond_name}] 편입: {s}")
 
         self._notify()
 
@@ -151,11 +158,13 @@ class ConditionWatcher:
 
             target_set = self._symbols_by_seq.get(seq, set())
 
+            cond_name = self._condition_names.get(seq, seq)
+
             if action == "I":
                 if symbol not in target_set:
                     target_set.add(symbol)
                     self._symbols_by_seq[seq] = target_set
-                    logger.info(f"[COND] seq={seq} 편입: {symbol}")
+                    logger.info(f"[COND] [{cond_name}] 편입: {symbol}")
                     self._notify()
 
             elif action == "D":
@@ -167,9 +176,9 @@ class ConditionWatcher:
                         for k, s in self._symbols_by_seq.items() if k != seq
                     )
                     if still_in:
-                        logger.info(f"[COND] seq={seq} 편출: {symbol} (다른 조건식 유지)")
+                        logger.info(f"[COND] [{cond_name}] 편출: {symbol} (다른 조건식 유지)")
                     else:
-                        logger.info(f"[COND] seq={seq} 편출: {symbol} — targets에서 제거")
+                        logger.info(f"[COND] [{cond_name}] 편출: {symbol} — targets에서 제거")
                     self._notify()
 
     def _notify(self) -> None:
