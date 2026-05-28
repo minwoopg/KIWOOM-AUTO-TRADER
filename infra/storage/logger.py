@@ -50,6 +50,7 @@ TRADE_FIELDS = [
     "upside_to_recent_high_pct",  # 현재가→최근 고점 상승 여력 (%)
     "exit_reason",           # 매도 사유 (손절/트레일링/추세꺾임/강제청산 등)
     "hold_minutes",          # 보유 시간 (분)
+    "avg_buy_price",         # 잔고API 기준 평균매입단가 (손익 계산용)
 ]
 
 

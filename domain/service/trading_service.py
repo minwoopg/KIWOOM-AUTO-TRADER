@@ -605,6 +605,7 @@ class TradingService:
                     self._try_sell(
                         symbol, position.quantity, market_price.current_price,
                         exit_reason=signal.reason,
+                        avg_buy_price=position.average_price,
                     )
 
             except Exception as exc:
@@ -626,7 +627,41 @@ class TradingService:
             self._report_generated_today = True
             self.app_logger.info("[REPORT] 일일 리포트 생성 완료")
             self._validate_logs_today(now.date())
+            self._run_signal_analysis_today(now.date())
+            self._run_trade_analysis_today(now.date())
             self._run_replay_today(now.date())
+
+    def _run_signal_analysis_today(self, target_date) -> None:
+        """장 마감 후 시그널 분석을 자동 실행합니다."""
+        try:
+            import subprocess, sys
+            result = subprocess.run(
+                [sys.executable, "analyze_signal_log.py",
+                 target_date.strftime("%Y-%m-%d")],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0:
+                self.app_logger.info("[ANALYSIS] 시그널 분석 완료 → reports/ 저장")
+            else:
+                self.app_logger.warning(f"[ANALYSIS] 시그널 분석 실패: {result.stderr[:200]}")
+        except Exception as exc:
+            self.app_logger.warning(f"[ANALYSIS] 시그널 분석 오류: {exc}")
+
+    def _run_trade_analysis_today(self, target_date) -> None:
+        """장 마감 후 거래 분석을 자동 실행합니다."""
+        try:
+            import subprocess, sys
+            result = subprocess.run(
+                [sys.executable, "analyze_trades.py",
+                 target_date.strftime("%Y-%m-%d")],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0:
+                self.app_logger.info("[ANALYSIS] 거래 분석 완료 → reports/ 저장")
+            else:
+                self.app_logger.warning(f"[ANALYSIS] 거래 분석 실패: {result.stderr[:200]}")
+        except Exception as exc:
+            self.app_logger.warning(f"[ANALYSIS] 거래 분석 오류: {exc}")
 
     def _run_replay_today(self, target_date) -> None:
         """장 마감 후 리플레이를 자동 실행합니다."""
@@ -778,6 +813,7 @@ class TradingService:
         quantity: int,
         current_price: int = 0,
         exit_reason: str = "",
+        avg_buy_price: int = 0,
     ) -> None:
         """매도 주문을 생성하고 브로커로 전달합니다."""
         order = OrderRequest(symbol=symbol, side=OrderSide.SELL, quantity=quantity)
@@ -801,7 +837,11 @@ class TradingService:
             result.message,
             result.order_id,
             price=current_price,
-            context={"exit_reason": exit_reason, "hold_minutes": hold_minutes},
+            context={
+                "exit_reason": exit_reason,
+                "hold_minutes": hold_minutes,
+                "avg_buy_price": avg_buy_price,
+            },
         )
 
         if result.accepted:

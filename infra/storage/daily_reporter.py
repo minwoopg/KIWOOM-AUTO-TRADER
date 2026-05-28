@@ -105,14 +105,31 @@ class DailyReporter:
             else:
                 symbol_sells[t["symbol"]].append({"price": price, "qty": qty, "ts": t["timestamp"]})
 
-        # 손익 계산
+        # ── 전일 이월 포지션 분리 ─────────────────────────────────
+        # 오늘 매수 없이 매도만 있는 종목 = 전일 이월 포지션
+        carryover_sells = {
+            sym: sell_list
+            for sym, sell_list in symbol_sells.items()
+            if sym not in symbol_buys
+        }
+        today_sells = {
+            sym: sell_list
+            for sym, sell_list in symbol_sells.items()
+            if sym in symbol_buys
+        }
+
+        # 손익 계산 (당일 매수/매도 쌍만)
+        today_buys_flat  = [t for t in buys  if t["symbol"] in today_sells or t["symbol"] in symbol_buys]
         total_buy_amount  = sum(int(t.get("price", 0)) * int(t.get("quantity", 0)) for t in buys)
-        total_sell_amount = sum(int(t.get("price", 0)) * int(t.get("quantity", 0)) for t in sells)
+        total_sell_amount = sum(
+            int(t.get("price", 0)) * int(t.get("quantity", 0))
+            for t in sells if t["symbol"] in today_sells
+        )
         realized_pnl = total_sell_amount - total_buy_amount
 
-        # 승/패 계산 (매도한 종목 기준)
+        # 승/패 계산 (당일 매수/매도 쌍만)
         wins = losses = 0
-        for sym, sell_list in symbol_sells.items():
+        for sym, sell_list in today_sells.items():
             buy_list = symbol_buys.get(sym, [])
             if not buy_list:
                 continue
@@ -130,10 +147,12 @@ class DailyReporter:
         lines.append("")
         lines.append("[ 💰 손익 요약 ]")
         pnl_sign = "+" if realized_pnl >= 0 else ""
-        lines.append(f"  실현 손익   : {pnl_sign}{realized_pnl:>10,}원")
+        lines.append(f"  실현 손익   : {pnl_sign}{realized_pnl:>10,}원  (당일 매수/매도 기준)")
         lines.append(f"  매수 총액   : {total_buy_amount:>10,}원  ({len(buys)}건)")
-        lines.append(f"  매도 총액   : {total_sell_amount:>10,}원  ({len(sells)}건)")
+        lines.append(f"  매도 총액   : {total_sell_amount:>10,}원  ({len([t for t in sells if t['symbol'] in today_sells])}건)")
         lines.append(f"  승률        : {win_rate}")
+        if carryover_sells:
+            lines.append(f"  전일 이월 매도: {', '.join(sorted(carryover_sells.keys()))}  (손익 미집계)")
 
         # ── 종목별 상세 ────────────────────────────────────────────
         all_symbols = sorted(set(list(symbol_buys.keys()) + list(symbol_sells.keys())))
@@ -156,13 +175,23 @@ class DailyReporter:
                 if sell_list:
                     avg_sell = sum(s["price"]*s["qty"] for s in sell_list) / sum(s["qty"] for s in sell_list)
                     total_sell_qty = sum(s["qty"] for s in sell_list)
-                    pnl = (avg_sell - avg_buy) * total_sell_qty if avg_buy > 0 else 0
-                    pnl_pct = (avg_sell - avg_buy) / avg_buy * 100 if avg_buy > 0 else 0
-                    result_tag = "✅" if pnl >= 0 else "❌"
-                    sell_str = f"매도 {avg_sell:,.0f}원  {'+' if pnl>=0 else ''}{pnl:,.0f}원 ({pnl_pct:+.1f}%)  {result_tag}"
+                    # avg_buy_price(잔고API) 우선 사용
+                    api_buy_price = max(
+                        (int(s.get("avg_buy_price", 0) or 0) for s in sell_list),
+                        default=0
+                    )
+                    effective_buy = api_buy_price if api_buy_price > 0 else avg_buy
+                    if effective_buy > 0:
+                        pnl = (avg_sell - effective_buy) * total_sell_qty
+                        pnl_pct = (avg_sell - effective_buy) / effective_buy * 100
+                        result_tag = "✅" if pnl >= 0 else "❌"
+                        price_note = "(잔고기준)" if api_buy_price > 0 else ""
+                        sell_str = f"매도 {avg_sell:,.0f}원  {'+' if pnl>=0 else ''}{pnl:,.0f}원 ({pnl_pct:+.1f}%)  {result_tag} {price_note}"
+                    else:
+                        # 전일 이월 포지션
+                        sell_str = f"매도 {avg_sell:,.0f}원  [전일 이월 — 손익 미집계] 🔄"
                 else:
                     sell_str = "홀딩 중 🔄"
-                    pnl = 0
 
                 buy_str = f"매수 {avg_buy:,.0f}원 x{total_buy_qty}주" if buy_list else "매수없음"
                 lines.append(f"  {sym}  {buy_str}  →  {sell_str}")
@@ -318,12 +347,24 @@ class DailyReporter:
         for sym, sl in sym_sells.items():
             bl = list(sym_buys.get(sym, []))
             for sell in sl:
-                if not bl: break
-                buy = bl.pop(0)
-                bp  = int(buy.get("price",0) or 0)
                 sp  = int(sell.get("price",0) or 0)
                 qty = int(sell.get("quantity",0) or 0)
-                if bp <= 0 or sp <= 0: continue
+                if sp <= 0: continue
+
+                # 평균매입단가 우선순위:
+                # 1) 매도 기록의 avg_buy_price (잔고API 기준)
+                # 2) 당일 매수 기록의 price
+                avg_buy_price = int(sell.get("avg_buy_price", 0) or 0)
+                if avg_buy_price > 0:
+                    bp = avg_buy_price
+                    buy = bl.pop(0) if bl else None
+                elif bl:
+                    buy = bl.pop(0)
+                    bp  = int(buy.get("price",0) or 0)
+                else:
+                    continue
+
+                if bp <= 0: continue
                 pnl_pct = (sp - bp) / bp * 100
                 pairs.append({
                     "symbol":      sym,
@@ -332,8 +373,10 @@ class DailyReporter:
                     "win":         pnl_pct > 0,
                     "exit_reason": sell.get("exit_reason",""),
                     "hold_min":    self._safe_float(sell.get("hold_minutes")),
-                    "is_v":        self._safe_bool(buy.get("is_v_rebound")),
-                    "score":       buy.get("entry_score",""),
+                    "is_v":        self._safe_bool(buy.get("is_v_rebound") if buy else None),
+                    "score":       buy.get("entry_score","") if buy else "",
+                    "avg_buy_price": bp,
+                    "used_api_price": avg_buy_price > 0,
                 })
 
         if not pairs:
