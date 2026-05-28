@@ -613,10 +613,6 @@ class TradingService:
                 )
                 continue
 
-        # ── 일일 리포트는 _run_end_of_day_tasks()에서 처리 ──
-        self._run_end_of_day_tasks(datetime.now())
-
-
         self.state_store.save(self.state, self._highest_price)
 
     def _run_end_of_day_tasks(self, now: datetime) -> None:

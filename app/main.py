@@ -96,8 +96,9 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
                         f"[WAIT] 장 외 시간 ({now.strftime('%H:%M')}) — "
                         f"09:00 장 시작까지 대기 중"
                     )
-                # 리포트는 장 외에서도 생성 (15:20 이후 하루 1회)
-                trading_service._run_end_of_day_tasks(now)
+                # 리포트는 15:25 이후 생성 (마지막 체결 기록 완료 후)
+                if now.hour > 15 or (now.hour == 15 and now.minute >= 25):
+                    trading_service._run_end_of_day_tasks(now)
             await asyncio.sleep(poll)
 
         except (asyncio.CancelledError, KeyboardInterrupt):
