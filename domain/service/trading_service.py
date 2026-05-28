@@ -546,6 +546,19 @@ class TradingService:
                         self.app_logger.info(
                             f"[MIN ] {symbol} | {minute_analysis.score()}/5 | {minute_analysis.summary()}"
                         )
+                        # V자 실패 사유 로그 (감지 안 됐을 때, 분당 1회)
+                        if not minute_analysis.is_v_rebound:
+                            v_fails = getattr(self._minute_analyzer, '_last_v_fail_reasons', [])
+                            if v_fails:
+                                last_v_log = self.last_hold_log_at_by_symbol.get(
+                                    f"__vfail_{symbol}"
+                                )
+                                now_dt = datetime.now()
+                                if last_v_log is None or (now_dt - last_v_log).total_seconds() >= 60:
+                                    self.app_logger.info(
+                                        f"[V_FAIL] {symbol} | " + " / ".join(v_fails)
+                                    )
+                                    self.last_hold_log_at_by_symbol[f"__vfail_{symbol}"] = now_dt
     
                 strategy = self.strategy_router.select(regime)
                 position = next((p for p in balance.positions if p.symbol == symbol), None)

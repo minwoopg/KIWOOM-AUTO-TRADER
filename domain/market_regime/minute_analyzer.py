@@ -239,16 +239,27 @@ class MinuteAnalyzer:
         # ── VWAP 회복 + MA5 기울기 ──────────────────────────────
         vwap_ok = current_price > vwap
 
-        # ── 최종 판정 ───────────────────────────────────────────
-        is_v = (
-            drop_pct  <= self.v_drop_threshold_pct          # 낙폭 충분
-            and self.v_rebound_threshold_pct <= rise_pct    # 반등폭 최소
-            <= self.v_max_rebound_pct                       # 반등폭 최대 (추격매수 방지)
-            and vol_ratio >= self.v_volume_ratio            # 거래량 팽창
-            and vwap_ok                                     # VWAP 회복
-            and (ma5_rising or ma5_above_ma20)             # MA5 기울기 상승 또는 MA5>MA20
-            and bar_amount_ok                               # 현재봉 거래대금 충족
-        )
+        # ── 최종 판정 + 실패 사유 집계 ─────────────────────────
+        fail_reasons = []
+        if drop_pct > self.v_drop_threshold_pct:
+            fail_reasons.append(f"낙폭부족({drop_pct:+.1f}%,최소{self.v_drop_threshold_pct:+.1f}%)")
+        if rise_pct < self.v_rebound_threshold_pct:
+            fail_reasons.append(f"반등부족({rise_pct:+.1f}%,최소{self.v_rebound_threshold_pct:+.1f}%)")
+        elif rise_pct > self.v_max_rebound_pct:
+            fail_reasons.append(f"반등과다({rise_pct:+.1f}%,최대{self.v_max_rebound_pct:+.1f}%)")
+        if vol_ratio < self.v_volume_ratio:
+            fail_reasons.append(f"거래량부족(x{vol_ratio:.1f},최소x{self.v_volume_ratio:.1f})")
+        if not vwap_ok:
+            fail_reasons.append("VWAP미회복")
+        if not (ma5_rising or ma5_above_ma20):
+            fail_reasons.append("MA5조건미충족")
+        if not bar_amount_ok:
+            fail_reasons.append(f"거래대금부족({cur_bar_amount//100_000_000}억)")
+
+        is_v = len(fail_reasons) == 0
+
+        # 실패 사유를 v_fail_reasons에 저장 (외부에서 접근 가능)
+        self._last_v_fail_reasons = fail_reasons if not is_v else []
 
         return is_v, bottom_k, drop_pct, rise_pct, vol_ratio, bottom_spike, ma5_rising
 
