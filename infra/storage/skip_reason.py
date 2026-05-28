@@ -16,6 +16,21 @@ class SkipReason:
     NO_INDICATORS           = "SKIP_NO_INDICATORS"        # 일봉 지표 없음
     NO_VOLUME               = "SKIP_NO_VOLUME"            # 거래대금 부족
     NO_PATTERN              = "SKIP_NO_PATTERN"           # A/B/C/V/PR 모두 미충족
+    # A 조건 세분화
+    NO_PAT_A_RATE           = "NO_PAT_A_RATE"             # A: 등락률 범위 벗어남
+    # B 조건 세분화 (비활성화 중)
+    NO_PAT_B_REBOUND_SMALL  = "NO_PAT_B_REBOUND_SMALL"    # B: 반등폭 부족
+    NO_PAT_B_BELOW_VWAP     = "NO_PAT_B_BELOW_VWAP"       # B: VWAP 아래
+    # C 조건 세분화
+    NO_PAT_C_MA_FAIL        = "NO_PAT_C_MA_FAIL"          # C: MA5>MA20 미충족
+    NO_PAT_C_RATE_FAIL      = "NO_PAT_C_RATE_FAIL"        # C: 등락률 범위 벗어남
+    NO_PAT_C_VWAP_FAIL      = "NO_PAT_C_VWAP_FAIL"        # C: VWAP 아래
+    # PR 조건 세분화
+    NO_PAT_PR_MA_FAIL       = "NO_PAT_PR_MA_FAIL"         # PR: MA5>MA20 미충족
+    NO_PAT_PR_LOW_FAIL      = "NO_PAT_PR_LOW_FAIL"        # PR: 저점 우상향 미충족
+    NO_PAT_PR_VOL_FAIL      = "NO_PAT_PR_VOL_FAIL"        # PR: 거래량 팽창 미충족
+    # V 조건 세분화
+    NO_PAT_V_FAIL           = "NO_PAT_V_FAIL"             # V: 실패 (세부사유는 V_FAIL 로그)
     BELOW_VWAP              = "SKIP_BELOW_VWAP"           # VWAP 아래
     SCORE_TOO_LOW           = "SKIP_SCORE_TOO_LOW"        # 점수 부족
     TOO_MUCH_REBOUND        = "SKIP_TOO_MUCH_REBOUND"     # 반등폭 상한 초과 (추격매수)
@@ -63,7 +78,31 @@ def classify_skip_reason(signal_reason: str, signal_type_value: str) -> str:
     if "거래대금 부족" in r:
         return SkipReason.NO_VOLUME
 
-    # 패턴 미충족
+    # 패턴 미충족 — 세분화된 사유 먼저 확인
+    if "NO_PAT_BELOW_VWAP" in r:
+        return "NO_PAT_BELOW_VWAP"
+    if "NO_PAT_A_RATE" in r:
+        # 등락률 값 포함 (예: NO_PAT_A_RATE(+1.3%))
+        import re
+        m = re.search(r'NO_PAT_A_RATE\(([^)]+)\)', r)
+        return f"NO_PAT_A_RATE({m.group(1)})" if m else "NO_PAT_A_RATE"
+    if "NO_PAT_B_REBOUND_SMALL" in r:
+        import re
+        m = re.search(r'NO_PAT_B_REBOUND_SMALL\(([^)]+)\)', r)
+        return f"NO_PAT_B_REBOUND_SMALL({m.group(1)})" if m else "NO_PAT_B_REBOUND_SMALL"
+    if "NO_PAT_C_MA_FAIL" in r:
+        return "NO_PAT_C_MA_FAIL"
+    if "NO_PAT_C_PULLBACK" in r:
+        import re
+        m = re.search(r'NO_PAT_C_PULLBACK\(([^)]+)\)', r)
+        return f"NO_PAT_C_PULLBACK({m.group(1)})" if m else "NO_PAT_C_PULLBACK"
+    if "NO_PAT_PR_LOW_FAIL" in r:
+        return "NO_PAT_PR_LOW_FAIL"
+    if "NO_PAT_PR_VOL_WEAK" in r:
+        return "NO_PAT_PR_VOL_WEAK"
+    if "NO_PAT_V_FAIL" in r:
+        return "NO_PAT_V_FAIL"
+    # 기존 패턴 미충족 (세분화 전 호환)
     if "진입 조건 미충족" in r or "B/C 조건 미충족" in r or "B/C/V/PR" in r:
         return SkipReason.NO_PATTERN
 

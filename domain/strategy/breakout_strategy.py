@@ -79,15 +79,33 @@ class BreakoutStrategy(Strategy):
                 pass_pr       = minute_analysis.is_pulldown_recovery    # PR: 눌림목 재상승
 
                 if not any([pass_change, pass_rebound, pass_pulldown, pass_v, pass_pr]):
+                    ma = minute_analysis
+                    # ── 세분화 실패 사유 ──────────────────────
+                    if not ma.price_above_vwap:
+                        detail = "NO_PAT_BELOW_VWAP"
+                    elif not ma.is_valid_change_rate:
+                        detail = f"NO_PAT_A_RATE({ma.change_rate_pct:+.1f}%)"
+                    elif ma.rebound_pct < 2.0:
+                        detail = f"NO_PAT_B_REBOUND_SMALL({ma.rebound_pct:+.1f}%)"
+                    elif not ma.ma5_above_ma20:
+                        detail = "NO_PAT_C_MA_FAIL"
+                    elif not ma.is_valid_pullback:
+                        detail = f"NO_PAT_C_PULLBACK({ma.pullback_pct:+.1f}%)"
+                    elif not ma.pr_low_turning:
+                        detail = "NO_PAT_PR_LOW_FAIL"
+                    elif not ma.pr_volume_expanding:
+                        detail = "NO_PAT_PR_VOL_WEAK"
+                    else:
+                        detail = "NO_PAT_V_FAIL"
                     return Signal(
                         type=SignalType.HOLD,
                         reason=(
-                            f"진입 조건 미충족 — "
-                            f"A(등락 {minute_analysis.change_rate_pct:+.1f}%) / "
-                            f"B(반등 {minute_analysis.rebound_pct:+.1f}% VWAP {'위' if minute_analysis.price_above_vwap else '아래'}) / "
-                            f"C(눌림목 MA5>MA20:{'✓' if minute_analysis.ma5_above_ma20 else '✗'}) / "
-                            f"V(낙폭{minute_analysis.v_drop_pct:+.1f}% 반등{minute_analysis.v_rise_pct:+.1f}%) / "
-                            f"PR(저점전환:{'✓' if minute_analysis.pr_low_turning else '✗'})"
+                            f"{detail} — "
+                            f"A(등락 {ma.change_rate_pct:+.1f}%) / "
+                            f"B(반등 {ma.rebound_pct:+.1f}% VWAP {'위' if ma.price_above_vwap else '아래'}) / "
+                            f"C(MA5>MA20:{'✓' if ma.ma5_above_ma20 else '✗'}) / "
+                            f"V(낙폭{ma.v_drop_pct:+.1f}% 반등{ma.v_rise_pct:+.1f}%) / "
+                            f"PR(저점전환:{'✓' if ma.pr_low_turning else '✗'} 거래량:{'✓' if ma.pr_volume_expanding else '✗'})"
                         ),
                     )
 

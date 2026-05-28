@@ -98,6 +98,47 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
     for reason, cnt in reason_cnt.most_common():
         row(reason or "(없음)", f"{cnt:,}건  ({pct(cnt, len(hold_rows))})")
 
+    # ── 3-1. NO_PATTERN 세분화 ────────────────────────────
+    no_pat_rows = [
+        r for r in hold_rows
+        if r.get("skip_reason","").startswith("NO_PAT_")
+        or r.get("skip_reason","") == "SKIP_NO_PATTERN"
+    ]
+    if no_pat_rows:
+        sub("3-1. NO_PATTERN 세분화")
+        # skip_reason에서 NO_PAT_ 계열 값만 추출
+        def _coarse_reason(r):
+            sr = r.get("skip_reason","")
+            # 숫자 포함된 세부 사유는 prefix만 추출 (예: NO_PAT_A_RATE(+1.3%) → NO_PAT_A_RATE)
+            import re
+            m = re.match(r'(NO_PAT_[A-Z_]+)', sr)
+            return m.group(1) if m else sr
+        coarse_cnt = Counter(_coarse_reason(r) for r in no_pat_rows)
+        for reason, cnt in coarse_cnt.most_common():
+            row(f"  {reason}", f"{cnt:,}건  ({pct(cnt, len(no_pat_rows))})")
+        # 값 분포 (등락률, 반등폭, 눌림폭)
+        a_rate_vals = []
+        b_reb_vals  = []
+        c_pull_vals = []
+        import re
+        for r in no_pat_rows:
+            sr = r.get("skip_reason","")
+            m = re.search(r'NO_PAT_A_RATE\(([+-]?[\d.]+)%\)', sr)
+            if m: a_rate_vals.append(float(m.group(1)))
+            m = re.search(r'NO_PAT_B_REBOUND_SMALL\(([+-]?[\d.]+)%\)', sr)
+            if m: b_reb_vals.append(float(m.group(1)))
+            m = re.search(r'NO_PAT_C_PULLBACK\(([+-]?[\d.]+)%\)', sr)
+            if m: c_pull_vals.append(float(m.group(1)))
+        if a_rate_vals:
+            row("  A 등락률 평균", f"{sum(a_rate_vals)/len(a_rate_vals):+.2f}%",
+                f"(min {min(a_rate_vals):+.1f}% max {max(a_rate_vals):+.1f}%)")
+        if b_reb_vals:
+            row("  B 반등폭 평균", f"{sum(b_reb_vals)/len(b_reb_vals):+.2f}%",
+                f"(min {min(b_reb_vals):+.1f}% max {max(b_reb_vals):+.1f}%)")
+        if c_pull_vals:
+            row("  C 눌림폭 평균", f"{sum(c_pull_vals)/len(c_pull_vals):+.2f}%",
+                f"(min {min(c_pull_vals):+.1f}% max {max(c_pull_vals):+.1f}%)")
+
     # ── 4. detected_patterns 분포 ───────────────────────────
     sub("4. 감지 패턴 분포")
     pat_cnt = Counter(r.get("detected_patterns","-") for r in rows)
