@@ -78,6 +78,7 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
         )
         await asyncio.sleep(wait_sec)
         app_logger.info("장 시작 — 매매 루프 시작")
+        trading_service.reset_daily_loss_counts()
     else:
         app_logger.info("application started (장중 실행)")
 

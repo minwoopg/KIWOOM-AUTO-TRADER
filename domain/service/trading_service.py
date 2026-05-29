@@ -664,6 +664,13 @@ class TradingService:
 
         self.state_store.save(self.state, self._highest_price)
 
+    def reset_daily_loss_counts(self) -> None:
+        """당일 손실 횟수를 초기화합니다. 장 시작 전 호출합니다."""
+        self.state.symbol_loss_count_today.clear()
+        self.state.symbol_stoploss_at.clear()
+        self.state.symbol_trail_loss_at.clear()
+        self.app_logger.info("[RESET] 당일 종목별 손실 카운트 초기화 완료")
+
     def _run_end_of_day_tasks(self, now: datetime) -> None:
         """장 마감 후 작업 (리포트/검증). run_once 밖에서도 호출 가능."""
         if now.hour == 15 and now.minute >= 20 and not self._report_generated_today:
@@ -794,6 +801,44 @@ class TradingService:
                 )
                 return
 
+        # ── 종목별 재진입 제한 체크 ──────────────────────────────
+        now_dt = datetime.now()
+
+        # 1) 당일 손실 2회 이상 → 당일 매수 금지
+        loss_cnt = self.state.symbol_loss_count_today.get(symbol, 0)
+        if loss_cnt >= 2:
+            self.app_logger.info(
+                f"[BLOCK] {symbol} | 당일 손실 {loss_cnt}회 → 당일 매수 금지"
+            )
+            return
+
+        # 2) 손절 발생 → 30분 매수 금지
+        stoploss_str = self.state.symbol_stoploss_at.get(symbol)
+        if stoploss_str:
+            elapsed_sl = (now_dt - datetime.fromisoformat(stoploss_str)).total_seconds()
+            if elapsed_sl < 1800:  # 30분
+                remaining_sl = int(1800 - elapsed_sl)
+                self.app_logger.info(
+                    f"[BLOCK] {symbol} | 손절 후 매수 금지 "
+                    f"({remaining_sl}초 남음 / 총 1800초)"
+                )
+                return
+
+        # 3) 트레일링 손실 2회 이상 → 60분 매수 금지
+        trail_list = self.state.symbol_trail_loss_at.get(symbol, [])
+        recent_trail = [
+            t for t in trail_list
+            if (now_dt - datetime.fromisoformat(t)).total_seconds() < 3600
+        ]
+        if len(recent_trail) >= 2:
+            oldest = min(datetime.fromisoformat(t) for t in recent_trail)
+            remaining_tr = int(3600 - (now_dt - oldest).total_seconds())
+            self.app_logger.info(
+                f"[BLOCK] {symbol} | 트레일링 손실 {len(recent_trail)}회 → 60분 매수 금지 "
+                f"({remaining_tr}초 남음)"
+            )
+            return
+
         # ── 최대 보유 종목 수 체크 ────────────────────────────────
         try:
             live_balance = self.broker.get_account_balance()
@@ -901,8 +946,42 @@ class TradingService:
             self.cached_balance_loaded_at = None
 
             # 매도 시각 기록 → 재진입 쿨다운에 사용
-            self.state.last_sold_at_by_symbol[symbol] = datetime.now().isoformat()
+            now_iso = datetime.now().isoformat()
+            self.state.last_sold_at_by_symbol[symbol] = now_iso
             self.state.entry_time_by_symbol.pop(symbol, None)
+
+            # ── 재진입 제한 state 업데이트 ──────────────
+            avg_p = avg_buy_price if avg_buy_price > 0 else 0
+            sold_price = current_price
+            is_loss = avg_p > 0 and sold_price < avg_p
+            is_stoploss = "손절" in exit_reason
+            is_trail_loss = "트레일링" in exit_reason and is_loss
+
+            if is_loss:
+                cnt = self.state.symbol_loss_count_today.get(symbol, 0) + 1
+                self.state.symbol_loss_count_today[symbol] = cnt
+                self.app_logger.info(
+                    f"[LOSS_CNT] {symbol} | 당일 손실 {cnt}회"
+                )
+            if is_stoploss:
+                self.state.symbol_stoploss_at[symbol] = now_iso
+                self.app_logger.info(
+                    f"[STOPLOSS] {symbol} | 손절 기록 → 30분 매수 금지"
+                )
+            if is_trail_loss:
+                trail_list = self.state.symbol_trail_loss_at.get(symbol, [])
+                trail_list.append(now_iso)
+                # 최근 60분 이내 기록만 유지
+                now_dt = datetime.now()
+                trail_list = [
+                    t for t in trail_list
+                    if (now_dt - datetime.fromisoformat(t)).total_seconds() < 3600
+                ]
+                self.state.symbol_trail_loss_at[symbol] = trail_list
+                if len(trail_list) >= 2:
+                    self.app_logger.info(
+                        f"[TRAIL_LOSS] {symbol} | 트레일링 손실 {len(trail_list)}회 → 60분 매수 금지"
+                    )
 
             self.app_logger.info(
                 f"[ORDER] {symbol} | 매도 주문 접수 완료 | 수량 {quantity}주 | 주문번호 {result.order_id}"
