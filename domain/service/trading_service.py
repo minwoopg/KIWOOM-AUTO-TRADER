@@ -431,6 +431,41 @@ class TradingService:
             self.app_logger.info(
                 f"[SELL    ] {regime_tag} {symbol} | 현재가 {current_price:,}원 | {signal.reason}"
             )
+            # ── 매도 상세 로그 ──────────────────────────────────
+            reason = signal.reason
+            if position is not None:
+                avg_p = position.average_price
+                pnl   = (current_price - avg_p) / avg_p * 100
+                if "추세 꺾임" in reason:
+                    # 점수제 상세
+                    import re as _re
+                    score_m = _re.search(r'(\d)/5점', reason)
+                    score_v = score_m.group(1) if score_m else '?'
+                    conds = _re.search(r'— (.+?) \(', reason)
+                    conds_v = conds.group(1) if conds else reason
+                    ma = minute_analysis
+                    vwap_ok  = ma.price_above_vwap if ma else None
+                    ma5_ok   = market_price.indicator_price_above_ma5
+                    self.app_logger.info(
+                        f"[SELL_SCORE] {symbol} "
+                        f"profit={pnl:+.2f}% "
+                        f"score={score_v}/5 "
+                        f"조건=[{conds_v}] "
+                        f"VWAP={'위' if vwap_ok else '아래'} "
+                        f"MA5={'위' if ma5_ok else '아래'}"
+                    )
+                elif "트레일링" in reason:
+                    # 트레일링 상세
+                    import re as _re
+                    trail_m = _re.search(r'폭 -([\d.]+)%', reason)
+                    trail_v = trail_m.group(1) if trail_m else '?'
+                    self.app_logger.info(
+                        f"[TRAIL] {symbol} "
+                        f"profit={pnl:+.2f}% "
+                        f"high={highest_price:,}원 "
+                        f"trail_band={trail_v}% "
+                        f"stop={int(highest_price*(1-float(trail_v)/100)):,}원"
+                    )
             return
 
         # ── HOLD 처리 ─────────────────────────────────────────────

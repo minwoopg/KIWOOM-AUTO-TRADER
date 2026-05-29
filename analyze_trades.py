@@ -243,6 +243,54 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
             f"{p['pnl_amount']:+,.0f}원  {hold}  [{v}]  {p['exit_reason'][:30]}"
         )
 
+    # ── 10. 매도 점수제 / 트레일링 분석 ─────────────────────
+    sub("10. 추세꺾임 점수제 분석")
+    sell_score_pairs = [p for p in pairs if "추세 꺾임" in (p.get("exit_reason") or "")]
+    trail_pairs      = [p for p in pairs if "트레일링" in (p.get("exit_reason") or "")]
+
+    if sell_score_pairs:
+        row("추세꺾임 청산 건수", f"{len(sell_score_pairs)}건")
+        sc_win  = [p for p in sell_score_pairs if p["win"]]
+        sc_avg  = sum(p["pnl_pct"] for p in sell_score_pairs) / len(sell_score_pairs)
+        row("  승률", f"{len(sc_win)}/{len(sell_score_pairs)} ({len(sc_win)/len(sell_score_pairs)*100:.0f}%)")
+        row("  평균 수익률", f"{sc_avg:+.2f}%")
+        # 점수 분포
+        import re
+        for p in sell_score_pairs:
+            er = p.get("exit_reason", "")
+            m  = re.search(r'(\d)/5점', er)
+            score = m.group(1) if m else "?"
+            mark  = "✅" if p["win"] else "❌"
+            lines.append(
+                f"    {mark} {p['symbol']}  {p['pnl_pct']:+.1f}%  "
+                f"점수 {score}/5  {er[:40]}"
+            )
+    else:
+        row("추세꺾임 청산", "0건")
+
+    sub("10-1. 구간형 트레일링 분석")
+    if trail_pairs:
+        row("트레일링 청산 건수", f"{len(trail_pairs)}건")
+        t_win = [p for p in trail_pairs if p["win"]]
+        t_avg = sum(p["pnl_pct"] for p in trail_pairs) / len(trail_pairs)
+        row("  승률", f"{len(t_win)}/{len(trail_pairs)} ({len(t_win)/len(trail_pairs)*100:.0f}%)")
+        row("  평균 수익률", f"{t_avg:+.2f}%")
+        # 트레일링 폭별 분포
+        import re
+        band_groups = {}
+        for p in trail_pairs:
+            er = p.get("exit_reason", "")
+            m  = re.search(r'폭 -([\d.]+)%', er)
+            band = m.group(1) if m else "?"
+            band_groups.setdefault(band, []).append(p)
+        for band, grp in sorted(band_groups.items()):
+            w   = sum(1 for p in grp if p["win"])
+            avg = sum(p["pnl_pct"] for p in grp) / len(grp)
+            row(f"  -{band}% 트레일링",
+                f"{len(grp)}건  승률 {w/len(grp)*100:.0f}%  평균 {avg:+.2f}%")
+    else:
+        row("트레일링 청산", "0건")
+
     sep()
     return "\n".join(lines)
 
