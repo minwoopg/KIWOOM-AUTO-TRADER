@@ -808,7 +808,10 @@ class TradingService:
         loss_cnt = self.state.symbol_loss_count_today.get(symbol, 0)
         if loss_cnt >= 2:
             self.app_logger.info(
-                f"[BLOCK] {symbol} | 당일 손실 {loss_cnt}회 → 당일 매수 금지"
+                f"[SYMBOL_BLOCK_TODAY] {symbol} "
+                f"reason=DAILY_LOSS_{loss_cnt} "
+                f"loss_count_today={loss_cnt} "
+                f"block_buy=true"
             )
             return
 
@@ -819,8 +822,11 @@ class TradingService:
             if elapsed_sl < 1800:  # 30분
                 remaining_sl = int(1800 - elapsed_sl)
                 self.app_logger.info(
-                    f"[BLOCK] {symbol} | 손절 후 매수 금지 "
-                    f"({remaining_sl}초 남음 / 총 1800초)"
+                    f"[SYMBOL_COOLDOWN] {symbol} "
+                    f"reason=STOPLOSS "
+                    f"cooldown_until={(now_dt + __import__('datetime').timedelta(seconds=remaining_sl)).strftime('%H:%M')} "
+                    f"loss_count_today={loss_cnt} "
+                    f"block_buy=true"
                 )
                 return
 
@@ -834,8 +840,11 @@ class TradingService:
             oldest = min(datetime.fromisoformat(t) for t in recent_trail)
             remaining_tr = int(3600 - (now_dt - oldest).total_seconds())
             self.app_logger.info(
-                f"[BLOCK] {symbol} | 트레일링 손실 {len(recent_trail)}회 → 60분 매수 금지 "
-                f"({remaining_tr}초 남음)"
+                f"[SYMBOL_COOLDOWN] {symbol} "
+                f"reason=TRAILING_LOSS_{len(recent_trail)} "
+                f"cooldown_until={(now_dt + __import__('datetime').timedelta(seconds=remaining_tr)).strftime('%H:%M')} "
+                f"loss_count_today={loss_cnt} "
+                f"block_buy=true"
             )
             return
 
@@ -961,12 +970,17 @@ class TradingService:
                 cnt = self.state.symbol_loss_count_today.get(symbol, 0) + 1
                 self.state.symbol_loss_count_today[symbol] = cnt
                 self.app_logger.info(
-                    f"[LOSS_CNT] {symbol} | 당일 손실 {cnt}회"
+                    f"[LOSS_CNT] {symbol} | 당일 손실 {cnt}회 "
+                    f"| 수익률 {(sold_price - avg_p) / avg_p * 100 if avg_p else 0:+.2f}%"
                 )
             if is_stoploss:
                 self.state.symbol_stoploss_at[symbol] = now_iso
+                cooldown_until = (datetime.now() + __import__('datetime').timedelta(seconds=1800)).strftime('%H:%M')
                 self.app_logger.info(
-                    f"[STOPLOSS] {symbol} | 손절 기록 → 30분 매수 금지"
+                    f"[SYMBOL_COOLDOWN] {symbol} "
+                    f"reason=STOPLOSS "
+                    f"cooldown_until={cooldown_until} "
+                    f"loss_count={self.state.symbol_loss_count_today.get(symbol, 0)}"
                 )
             if is_trail_loss:
                 trail_list = self.state.symbol_trail_loss_at.get(symbol, [])
@@ -979,8 +993,12 @@ class TradingService:
                 ]
                 self.state.symbol_trail_loss_at[symbol] = trail_list
                 if len(trail_list) >= 2:
+                    cooldown_until = (datetime.now() + __import__('datetime').timedelta(seconds=3600)).strftime('%H:%M')
                     self.app_logger.info(
-                        f"[TRAIL_LOSS] {symbol} | 트레일링 손실 {len(trail_list)}회 → 60분 매수 금지"
+                        f"[SYMBOL_COOLDOWN] {symbol} "
+                        f"reason=TRAILING_LOSS_{len(trail_list)} "
+                        f"cooldown_until={cooldown_until} "
+                        f"loss_count={self.state.symbol_loss_count_today.get(symbol, 0)}"
                     )
 
             self.app_logger.info(
