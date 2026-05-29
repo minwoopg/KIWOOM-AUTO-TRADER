@@ -209,33 +209,64 @@ class BreakoutStrategy(Strategy):
                 reason=f"손절 — 평균단가 대비 {current_pnl_pct:+.1f}% ({stop_loss_price:,}원 하회)",
             )
 
-        # ② 트레일링 스탑
-        # 최소 수익률(trailing_start_pct) 이상 올랐을 때부터 작동
-        trailing_start_price = int(average_price * (1 + self.config.trailing_start_pct / 100))
+        # ② 구간형 트레일링 스탑
+        # 수익 구간에 따라 트레일링 폭을 다르게 적용합니다.
+        trailing_start_price = int(average_price * 1.005)  # +0.5% 이상 시 시작
         if highest_price >= trailing_start_price and highest_price > 0:
-            trailing_stop_price = int(highest_price * (1 - self.config.trailing_stop_pct / 100))
+            high_pnl_pct = (highest_price - average_price) / average_price * 100
+            if high_pnl_pct >= 3.0:
+                trail_pct = 2.0
+            elif high_pnl_pct >= 2.0:
+                trail_pct = 1.5
+            elif high_pnl_pct >= 1.0:
+                trail_pct = 1.2
+            else:  # +0.5~1.0%
+                trail_pct = 0.8
+            trailing_stop_price = int(highest_price * (1 - trail_pct / 100))
             from_high_pct = (current_price - highest_price) / highest_price * 100
             if current_price <= trailing_stop_price:
                 return Signal(
                     type=SignalType.SELL,
                     reason=(
                         f"트레일링 스탑 — 최고가 {highest_price:,}원 대비 {from_high_pct:.1f}% 하락 "
-                        f"(보유 수익 {current_pnl_pct:+.1f}%)"
+                        f"(트레일링 폭 -{trail_pct:.1f}% / 보유 수익 {current_pnl_pct:+.1f}%)"
                     ),
                 )
 
-        # ③ 추세 꺾임 감지 (RSI 과매수 + RSI 하락 전환 + MACD 히스토그램 축소)
-        if has_indicators and rsi is not None:
-            trend_reversal = (
-                rsi >= self.config.trend_reversal_rsi   # RSI 과매수 구간
-                and rsi_direction < 0                   # RSI 하락 전환
-                and macd_hist_dir < 0                   # MACD 모멘텀 약화
+        # ③ 추세 꺾임 — 점수제 (보유 수익 +0.5% 이상일 때만 활성화)
+        if has_indicators and rsi is not None and current_pnl_pct >= 0.5:
+            sell_score = 0
+            sell_reasons = []
+            # +1점: RSI 과매수
+            if rsi >= self.config.trend_reversal_rsi:
+                sell_score += 1
+                sell_reasons.append(f"RSI {rsi:.1f}")
+            # +1점: RSI 하락 전환
+            if rsi_direction < 0:
+                sell_score += 1
+                sell_reasons.append("RSI↓")
+            # +1점: MACD 히스토그램 축소
+            if macd_hist_dir < 0:
+                sell_score += 1
+                sell_reasons.append("MACD축소")
+            # +1점: VWAP 아래로 이탈
+            if minute_analysis is not None and not minute_analysis.price_above_vwap:
+                sell_score += 1
+                sell_reasons.append("VWAP이탈")
+            # +1점: MA5 아래로 이탈
+            if not above_ma5:
+                sell_score += 1
+                sell_reasons.append("MA5이탈")
+            price_fallen = (
+                (minute_analysis is not None and not minute_analysis.price_above_vwap)
+                or not above_ma5
             )
-            if trend_reversal:
+            if sell_score >= 3 and price_fallen:
                 return Signal(
                     type=SignalType.SELL,
                     reason=(
-                        f"추세 꺾임 감지 — RSI {rsi:.1f}↓ 과매수 + MACD 히스토그램 축소 "
+                        f"추세 꺾임 {sell_score}/5점 — "
+                        f"{'·'.join(sell_reasons)} "
                         f"(보유 수익 {current_pnl_pct:+.1f}%)"
                     ),
                 )
@@ -249,12 +280,17 @@ class BreakoutStrategy(Strategy):
 
         # 트레일링 스탑 진행 상황 표시
         if highest_price >= trailing_start_price and highest_price > 0:
-            trailing_stop_price = int(highest_price * (1 - self.config.trailing_stop_pct / 100))
+            high_pnl_pct2 = (highest_price - average_price) / average_price * 100
+            if high_pnl_pct2 >= 3.0:   trail_pct2 = 2.0
+            elif high_pnl_pct2 >= 2.0: trail_pct2 = 1.5
+            elif high_pnl_pct2 >= 1.0: trail_pct2 = 1.2
+            else:                       trail_pct2 = 0.8
+            trailing_stop_price = int(highest_price * (1 - trail_pct2 / 100))
             return Signal(
                 type=SignalType.HOLD,
                 reason=(
                     f"트레일링 추적 중 — 최고가 {highest_price:,}원 / "
-                    f"스탑 {trailing_stop_price:,}원 / 현재 {current_pnl_pct:+.1f}%"
+                    f"스탑 {trailing_stop_price:,}원 (폭 -{trail_pct2:.1f}%) / 현재 {current_pnl_pct:+.1f}%"
                 ),
             )
 

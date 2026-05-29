@@ -168,39 +168,70 @@ class NeutralStrategy(Strategy):
                 reason=f"[중립] 손절 — 평균단가 대비 {current_pnl_pct:+.1f}% ({stop_loss_price:,}원 하회)",
             )
 
-        # ② 트레일링 스탑
-        trailing_start = int(average_price * (1 + self.config.trailing_start_pct / 100))
-        if highest_price >= trailing_start and highest_price > 0:
-            trailing_stop = int(highest_price * (1 - self.config.trailing_stop_pct / 100))
-            from_high = (current_price - highest_price) / highest_price * 100
+        # ② 구간형 트레일링 스탑
+        trailing_start_price = int(average_price * 1.005)  # +0.5% 이상 시 시작
+        if highest_price >= trailing_start_price and highest_price > 0:
+            high_pnl_pct = (highest_price - average_price) / average_price * 100
+            if high_pnl_pct >= 3.0:
+                trail_pct = 2.0
+            elif high_pnl_pct >= 2.0:
+                trail_pct = 1.5
+            elif high_pnl_pct >= 1.0:
+                trail_pct = 1.2
+            else:
+                trail_pct = 0.8
+            trailing_stop = int(highest_price * (1 - trail_pct / 100))
+            from_high_pct = (current_price - highest_price) / highest_price * 100
             if current_price <= trailing_stop:
                 return Signal(
                     type=SignalType.SELL,
                     reason=(
-                        f"[중립] 트레일링 스탑 — 최고가 {highest_price:,}원 대비 {from_high:.1f}% "
-                        f"(보유 {current_pnl_pct:+.1f}%)"
+                        f"[중립] 트레일링 스탑 — 최고가 {highest_price:,}원 대비 {from_high_pct:.1f}% 하락 "
+                        f"(트레일링 폭 -{trail_pct:.1f}% / 보유 수익 {current_pnl_pct:+.1f}%)"
                     ),
                 )
             return Signal(
                 type=SignalType.HOLD,
                 reason=(
                     f"[중립] 트레일링 추적 중 — 최고가 {highest_price:,}원 / "
-                    f"스탑 {trailing_stop:,}원 / 현재 {current_pnl_pct:+.1f}%"
+                    f"스탑 {trailing_stop:,}원 (폭 -{trail_pct:.1f}%) / 현재 {current_pnl_pct:+.1f}%"
                 ),
             )
 
-        # ③ 추세 꺾임
-        if has_indicators and rsi is not None:
-            trend_reversal = (
-                rsi >= self.config.trend_reversal_rsi
-                and rsi_direction < 0
-                and macd_hist_dir < 0
+        # ③ 추세 꺾임 — 점수제 (보유 수익 +0.5% 이상일 때만 활성화)
+        if has_indicators and rsi is not None and current_pnl_pct >= 0.5:
+            sell_score = 0
+            sell_reasons = []
+            # +1점: RSI 과매수
+            if rsi >= self.config.trend_reversal_rsi:
+                sell_score += 1
+                sell_reasons.append(f"RSI {rsi:.1f}")
+            # +1점: RSI 하락 전환
+            if rsi_direction < 0:
+                sell_score += 1
+                sell_reasons.append("RSI↓")
+            # +1점: MACD 히스토그램 축소
+            if macd_hist_dir < 0:
+                sell_score += 1
+                sell_reasons.append("MACD축소")
+            # +1점: VWAP 아래로 이탈
+            if minute_analysis is not None and not minute_analysis.price_above_vwap:
+                sell_score += 1
+                sell_reasons.append("VWAP이탈")
+            # +1점: MA5 아래로 이탈
+            if not above_ma5:
+                sell_score += 1
+                sell_reasons.append("MA5이탈")
+            price_fallen = (
+                (minute_analysis is not None and not minute_analysis.price_above_vwap)
+                or not above_ma5
             )
-            if trend_reversal:
+            if sell_score >= 3 and price_fallen:
                 return Signal(
                     type=SignalType.SELL,
                     reason=(
-                        f"[중립] 추세 꺾임 — RSI {rsi:.1f}↓ + MACD 히스토그램 축소 "
+                        f"[중립] 추세 꺾임 {sell_score}/5점 — "
+                        f"{'·'.join(sell_reasons)} "
                         f"(보유 {current_pnl_pct:+.1f}%)"
                     ),
                 )
