@@ -19,7 +19,6 @@ broker:
 # 감시할 종목 목록 (조건검색 OFF 시 사용)
 targets:
   symbols:
-    - "247540"
     - "010170"
     - "006260"
     - "005930"
@@ -29,7 +28,7 @@ trading:
   poll_interval_seconds: 10
   balance_refresh_seconds: 180
   price_refresh_seconds: 60
-  order_cash_per_trade: 2000000
+  order_cash_per_trade: 6000000
   max_positions: 5
   allow_multiple_entries_per_symbol_per_day: true
   force_exit_before_market_close_minutes: 12
@@ -79,9 +78,9 @@ market_regime:
   rebound_min_pct: 2.0
 
 risk:
-  max_daily_loss_amount: 100000  # 일일 손실 한도 (원)
+  max_daily_loss_amount: 1000000  # 일일 손실 한도 (원)
   max_consecutive_losses: 3      # 연속 손절 허용 횟수 (0=비활성)
-  max_order_amount: 2000000
+  max_order_amount: 6000000
   min_cash_buffer: 100000
 
 entry_watch:
