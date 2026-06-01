@@ -459,12 +459,13 @@ class TradingService:
                     import re as _re
                     trail_m = _re.search(r'폭 -([\d.]+)%', reason)
                     trail_v = trail_m.group(1) if trail_m else '?'
+                    _high = self._highest_price.get(symbol, 0)
                     self.app_logger.info(
                         f"[TRAIL] {symbol} "
                         f"profit={pnl:+.2f}% "
-                        f"high={highest_price:,}원 "
+                        f"high={_high:,}원 "
                         f"trail_band={trail_v}% "
-                        f"stop={int(highest_price*(1-float(trail_v)/100)):,}원"
+                        f"stop={int(_high*(1-float(trail_v)/100)) if _high and trail_v != '?' else '?'}원"
                     )
             return
 
@@ -690,16 +691,17 @@ class TradingService:
         """장 마감 후 시그널 분석을 자동 실행합니다."""
         try:
             import subprocess, sys
+            date_str = target_date.strftime("%Y-%m-%d")
             result = subprocess.run(
-                [sys.executable, "analyze_signal_log.py",
-                 target_date.strftime("%Y-%m-%d")],
+                [sys.executable, "analyze_signal_log.py", date_str],
                 capture_output=True, text=True, timeout=60,
                 cwd=str(Path(__file__).resolve().parents[2]),
+                encoding="utf-8",
             )
             if result.returncode == 0:
                 self.app_logger.info("[ANALYSIS] 시그널 분석 완료 → reports/ 저장")
             else:
-                self.app_logger.warning(f"[ANALYSIS] 시그널 분석 실패: {result.stderr[:200]}")
+                self.app_logger.warning(f"[ANALYSIS] 시그널 분석 실패:\n{result.stderr}")
         except Exception as exc:
             self.app_logger.warning(f"[ANALYSIS] 시그널 분석 오류: {exc}")
 
@@ -707,16 +709,17 @@ class TradingService:
         """장 마감 후 거래 분석을 자동 실행합니다."""
         try:
             import subprocess, sys
+            date_str = target_date.strftime("%Y-%m-%d")
             result = subprocess.run(
-                [sys.executable, "analyze_trades.py",
-                 target_date.strftime("%Y-%m-%d")],
+                [sys.executable, "analyze_trades.py", date_str],
                 capture_output=True, text=True, timeout=60,
                 cwd=str(Path(__file__).resolve().parents[2]),
+                encoding="utf-8",
             )
             if result.returncode == 0:
                 self.app_logger.info("[ANALYSIS] 거래 분석 완료 → reports/ 저장")
             else:
-                self.app_logger.warning(f"[ANALYSIS] 거래 분석 실패: {result.stderr[:200]}")
+                self.app_logger.warning(f"[ANALYSIS] 거래 분석 실패:\n{result.stderr}")
         except Exception as exc:
             self.app_logger.warning(f"[ANALYSIS] 거래 분석 오류: {exc}")
 
@@ -724,16 +727,17 @@ class TradingService:
         """장 마감 후 리플레이를 자동 실행합니다."""
         try:
             import subprocess, sys
+            date_str = target_date.strftime("%Y-%m-%d")
             result = subprocess.run(
-                [sys.executable, "replay_runner.py",
-                 target_date.strftime("%Y-%m-%d")],
+                [sys.executable, "replay_runner.py", date_str],
                 capture_output=True, text=True, timeout=120,
                 cwd=str(Path(__file__).resolve().parents[2]),
+                encoding="utf-8",
             )
             if result.returncode == 0:
                 self.app_logger.info("[REPLAY] 리플레이 완료 → reports/ 저장")
             else:
-                self.app_logger.warning(f"[REPLAY] 리플레이 실패: {result.stderr[:200]}")
+                self.app_logger.warning(f"[REPLAY] 리플레이 실패:\n{result.stderr}")
         except Exception as exc:
             self.app_logger.warning(f"[REPLAY] 리플레이 실행 오류: {exc}")
 
@@ -786,6 +790,15 @@ class TradingService:
         minute_analysis=None,
     ) -> None:
         """매수 주문 가능 여부를 검사한 뒤 실제 주문을 시도합니다."""
+
+        # ── 시간대 제한 — 14:50 이후 신규매수 차단 ─────────────
+        _now = datetime.now()
+        if _now.hour > 14 or (_now.hour == 14 and _now.minute >= 50):
+            self.app_logger.info(
+                f"[BLOCK] {symbol} | 14:50 이후 신규매수 차단 "
+                f"({_now.strftime('%H:%M')})"
+            )
+            return
 
         # ── 재진입 쿨다운 체크 ────────────────────────────────────
         cooldown_sec = self.settings.trading.reentry_cooldown_seconds

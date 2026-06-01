@@ -1,0 +1,91 @@
+════════════════════════════════════════════════════════════
+  📊 signal_log 분석  2026-06-01 ~ 2026-06-01  (총 10,078건)
+════════════════════════════════════════════════════════════
+
+── 1. 시그널 분포 ──
+  전체 판단                                10,078건
+  BUY                                  240건  (2.4%)
+  HOLD / SKIP                          9,838건  (97.6%)
+
+── 2. 장세 분포 ──
+  BULLISH                              5,792건  (57.5%)
+  NEUTRAL                              2,430건  (24.1%)
+  SIDEWAYS                             1,816건  (18.0%)
+  BEARISH                              40건  (0.4%)
+
+── 3. skip_reason 분포  (BUY 제외) ──
+  HOLD_TRAILING                        2,765건  (28.1%)
+  SKIP_MARKET_NOT_ALLOWED              1,856건  (18.9%)
+  SKIP_SCORE_TOO_LOW                   1,434건  (14.6%)
+  SKIP_PULLBACK_OUT_OF_RANGE           1,430건  (14.5%)
+  NO_PAT_BELOW_VWAP                    1,427건  (14.5%)
+  HOLD_POSITION                        568건  (5.8%)
+  NO_PAT_C_MA_FAIL                     94건  (1.0%)
+  NO_PAT_B_REBOUND_SMALL(+1.0%)        61건  (0.6%)
+  NO_PAT_B_REBOUND_SMALL(+1.2%)        51건  (0.5%)
+  NO_PAT_B_REBOUND_SMALL(+1.5%)        27건  (0.3%)
+  SKIP_NO_VOLUME                       24건  (0.2%)
+  NO_PAT_B_REBOUND_SMALL(+1.7%)        20건  (0.2%)
+  SKIP_NO_INDICATORS                   19건  (0.2%)
+  NO_PAT_B_REBOUND_SMALL(+1.6%)        12건  (0.1%)
+  NO_PAT_B_REBOUND_SMALL(+2.0%)        9건  (0.1%)
+  NO_PAT_B_REBOUND_SMALL(+1.3%)        9건  (0.1%)
+  NO_PAT_B_REBOUND_SMALL(+0.9%)        7건  (0.1%)
+  NO_PAT_B_REBOUND_SMALL(+0.8%)        6건  (0.1%)
+  NO_PAT_B_REBOUND_SMALL(+0.7%)        5건  (0.1%)
+  NO_PAT_B_REBOUND_SMALL(+1.9%)        4건  (0.0%)
+  NO_PAT_B_REBOUND_SMALL(+1.8%)        4건  (0.0%)
+  NO_PAT_B_REBOUND_SMALL(+1.1%)        3건  (0.0%)
+  NO_PAT_B_REBOUND_SMALL(+1.4%)        3건  (0.0%)
+
+── 3-1. NO_PATTERN 세분화 ──
+    NO_PAT_BELOW_VWAP                  1,427건  (81.9%)
+    NO_PAT_B_REBOUND_SMALL             221건  (12.7%)
+    NO_PAT_C_MA_FAIL                   94건  (5.4%)
+    B 반등폭 평균                           +1.28%  ((min +0.7% max +2.0%))
+
+── 4. 감지 패턴 분포 ──
+  -                                    3,912건  →  BUY 0건  (0.0%)
+  A                                    3,688건  →  BUY 62건  (1.7%)
+  A/B                                  1,926건  →  BUY 41건  (2.1%)
+  C                                    207건  →  BUY 84건  (40.6%)
+  B/C                                  176건  →  BUY 37건  (21.0%)
+  B                                    122건  →  BUY 0건  (0.0%)
+  PR/A/B                               42건  →  BUY 15건  (35.7%)
+  PR                                   5건  →  BUY 1건  (20.0%)
+
+── 5. V자 반등 분석 ──
+  V자 감지                                0건  (0.0%)
+  V자 → BUY                             0건  (0.0%)
+
+──   v_low_age 분포 (V자 감지 여부 무관) ──
+  1~3봉                                 1,148건  (11.4%)
+  4~5봉                                 489건  (4.9%)
+  6~8봉                                 587건  (5.8%)
+  9~15봉                                1,348건  (13.4%)
+  16봉↑                                 4,650건  (46.1%)
+
+── 6. 상승 여력 (upside_to_recent_high_pct) 분포 ──
+  < 1%                                 4,662건  →  BUY 198건
+  1~2%                                 2,071건  →  BUY 15건
+  2~3%                                 451건  →  BUY 3건
+  3~5%                                 233건  →  BUY 1건
+  5%↑                                  297건  →  BUY 0건
+
+── 7. VWAP 대비 위치 ──
+  VWAP 위  (현재가 > VWAP)                 4,136건  (50.6%)
+  VWAP 아래                              4,032건  (49.4%)
+  평균 VWAP 거리                           +0.02%
+
+── 8. 종목별 판단 횟수 Top 10 ──
+  005930                               1,287건  →  BUY 0건
+  000660                               1,244건  →  BUY 5건
+  006260                               929건  →  BUY 0건
+  010170                               894건  →  BUY 0건
+  001440                               883건  →  BUY 9건
+  005380                               883건  →  BUY 10건
+  009150                               883건  →  BUY 121건
+  035720                               873건  →  BUY 9건
+  080220                               869건  →  BUY 35건
+  010120                               567건  →  BUY 49건
+════════════════════════════════════════════════════════════
