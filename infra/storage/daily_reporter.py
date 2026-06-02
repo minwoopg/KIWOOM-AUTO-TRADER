@@ -118,9 +118,14 @@ class DailyReporter:
             if sym in symbol_buys
         }
 
-        # 손익 계산 (당일 매수/매도 쌍만)
-        today_buys_flat  = [t for t in buys  if t["symbol"] in today_sells or t["symbol"] in symbol_buys]
-        total_buy_amount  = sum(int(t.get("price", 0)) * int(t.get("quantity", 0)) for t in buys)
+        # 손익 계산 — 당일 매수/매도 쌍이 완성된 종목만
+        # today_sells: 당일 매수+매도 모두 있는 종목
+        completed_buys = [t for t in buys if t["symbol"] in today_sells]
+        holding_buys   = [t for t in buys if t["symbol"] not in today_sells]
+        total_buy_amount  = sum(
+            int(t.get("price", 0)) * int(t.get("quantity", 0))
+            for t in completed_buys
+        )
         total_sell_amount = sum(
             int(t.get("price", 0)) * int(t.get("quantity", 0))
             for t in sells if t["symbol"] in today_sells
@@ -148,8 +153,12 @@ class DailyReporter:
         lines.append("[ 💰 손익 요약 ]")
         pnl_sign = "+" if realized_pnl >= 0 else ""
         lines.append(f"  실현 손익   : {pnl_sign}{realized_pnl:>10,}원  (당일 매수/매도 기준)")
-        lines.append(f"  매수 총액   : {total_buy_amount:>10,}원  ({len(buys)}건)")
+        lines.append(f"  매수 총액   : {total_buy_amount:>10,}원  ({len(completed_buys)}건)")
         lines.append(f"  매도 총액   : {total_sell_amount:>10,}원  ({len([t for t in sells if t['symbol'] in today_sells])}건)")
+        if holding_buys:
+            holding_syms = sorted(set(t['symbol'] for t in holding_buys))
+            holding_amt  = sum(int(t.get('price',0))*int(t.get('quantity',0)) for t in holding_buys)
+            lines.append(f"  홀딩 매수   : {holding_amt:>10,}원  ({', '.join(holding_syms)})  (미청산 — 손익 미집계)")
         lines.append(f"  승률        : {win_rate}")
         if carryover_sells:
             lines.append(f"  전일 이월 매도: {', '.join(sorted(carryover_sells.keys()))}  (손익 미집계)")
