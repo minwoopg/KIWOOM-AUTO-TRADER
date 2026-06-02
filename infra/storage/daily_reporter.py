@@ -118,19 +118,44 @@ class DailyReporter:
             if sym in symbol_buys
         }
 
-        # 손익 계산 — 당일 매수/매도 쌍이 완성된 종목만
-        # today_sells: 당일 매수+매도 모두 있는 종목
+        # ── 손익 계산 ─────────────────────────────────────────
+        # 실현 손익 = 수량 × (매도가 - 평균매입가) - 비용
+        # 비용: 왕복 수수료 0.25% + 세금 0.18% + 슬리피지 0.10% = 0.53%
+        COST_RATE = 0.0053
+
         completed_buys = [t for t in buys if t["symbol"] in today_sells]
         holding_buys   = [t for t in buys if t["symbol"] not in today_sells]
-        total_buy_amount  = sum(
-            int(t.get("price", 0)) * int(t.get("quantity", 0))
-            for t in completed_buys
-        )
-        total_sell_amount = sum(
-            int(t.get("price", 0)) * int(t.get("quantity", 0))
-            for t in sells if t["symbol"] in today_sells
-        )
-        realized_pnl = total_sell_amount - total_buy_amount
+
+        realized_pnl = 0
+        total_buy_amount  = 0
+        total_sell_amount = 0
+
+        for sym, sell_list in today_sells.items():
+            buy_list = symbol_buys.get(sym, [])
+            for sell in sells:
+                if sell["symbol"] != sym or sell["side"] != "SELL":
+                    continue
+                sell_price = int(sell.get("price", 0) or 0)
+                sell_qty   = int(sell.get("quantity", 0) or 0)
+                if sell_price <= 0 or sell_qty <= 0:
+                    continue
+
+                # 평균매입가: avg_buy_price(잔고API) 우선, 없으면 당일 매수가
+                avg_buy_p = int(sell.get("avg_buy_price", 0) or 0)
+                if avg_buy_p <= 0 and buy_list:
+                    total_buy_qty = sum(b["qty"] for b in buy_list)
+                    if total_buy_qty > 0:
+                        avg_buy_p = int(
+                            sum(b["price"] * b["qty"] for b in buy_list)
+                            / total_buy_qty
+                        )
+
+                if avg_buy_p > 0:
+                    gross = (sell_price - avg_buy_p) * sell_qty
+                    cost  = int(sell_price * sell_qty * COST_RATE)
+                    realized_pnl  += gross - cost
+                    total_buy_amount  += avg_buy_p * sell_qty
+                    total_sell_amount += sell_price * sell_qty
 
         # 승/패 계산 (당일 매수/매도 쌍만)
         wins = losses = 0
@@ -153,8 +178,9 @@ class DailyReporter:
         lines.append("[ 💰 손익 요약 ]")
         pnl_sign = "+" if realized_pnl >= 0 else ""
         lines.append(f"  실현 손익   : {pnl_sign}{realized_pnl:>10,}원  (당일 매수/매도 기준)")
-        lines.append(f"  매수 총액   : {total_buy_amount:>10,}원  ({len(completed_buys)}건)")
-        lines.append(f"  매도 총액   : {total_sell_amount:>10,}원  ({len([t for t in sells if t['symbol'] in today_sells])}건)")
+        completed_sell_cnt = len([t for t in sells if t['symbol'] in today_sells])
+        lines.append(f"  매수 총액   : {total_buy_amount:>10,}원  (평균매입가 기준)")
+        lines.append(f"  매도 총액   : {total_sell_amount:>10,}원  ({completed_sell_cnt}건)")
         if holding_buys:
             holding_syms = sorted(set(t['symbol'] for t in holding_buys))
             holding_amt  = sum(int(t.get('price',0))*int(t.get('quantity',0)) for t in holding_buys)
