@@ -165,7 +165,8 @@ async def async_main() -> None:
             filtered = [s for s in symbols if s not in excluded]
             combined = list(dict.fromkeys(manual_symbols + filtered))
             limited  = combined[:settings.websocket.max_symbols]
-            trading_service.update_targets(limited)
+            sym_to_cond = watcher.symbol_to_condition
+            trading_service.update_targets(limited, sym_to_cond)
             blocked = excluded & set(symbols)
             if blocked:
                 app_logger.info(f"[COND] 제외 종목 재편입 차단: {blocked}")

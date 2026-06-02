@@ -58,6 +58,16 @@ class ConditionWatcher:
             result |= symbols
         return result
 
+    @property
+    def symbol_to_condition(self) -> dict[str, str]:
+        """종목 → 조건식 이름 매핑 (복수 조건식 편입 시 마지막 기준)."""
+        mapping: dict[str, str] = {}
+        for seq, symbols in self._symbols_by_seq.items():
+            cond_name = self._condition_names.get(seq, f"seq{seq}")
+            for sym in symbols:
+                mapping[sym] = cond_name
+        return mapping
+
     async def start(self) -> None:
         await self._ws_client.start()
 

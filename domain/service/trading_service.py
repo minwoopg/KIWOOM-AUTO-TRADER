@@ -636,27 +636,37 @@ class TradingService:
                     # 거래대금 충분하면 카운트 초기화
                     self._low_volume_count[symbol] = 0
     
-                # ── 시그널 로그 기록 (BUY/HOLD 불문 전체) ──────────
+                # ── BUY 신호면 주문 시도 후 결과를 signal_log에 반영 ──
+                order_block_reason = ""
+                final_decision = signal.type.value
+                if signal.type == SignalType.BUY:
+                    block = self._try_buy(
+                        symbol, market_price.current_price, balance,
+                        signal=signal, regime=regime,
+                        minute_analysis=minute_analysis,
+                    )
+                    if block:
+                        order_block_reason = block
+                        final_decision = "BLOCKED"
+
+                # ── SELL 신호 처리 ───────────────────────────────
+                if signal.type == SignalType.SELL and position is not None:
+                    self._try_sell(
+                        symbol, position.quantity, market_price.current_price,
+                        exit_reason=signal.reason,
+                        avg_buy_price=position.average_price,
+                    )
+
+                # ── 시그널 로그 기록 (BUY/HOLD/SELL 불문 전체) ──
                 self._write_signal_log(
                     symbol=symbol,
                     price=market_price.current_price,
                     regime=regime,
                     signal=signal,
                     minute_analysis=minute_analysis,
+                    final_decision=final_decision,
+                    order_block_reason=order_block_reason,
                 )
-
-                if signal.type == SignalType.BUY:
-                    self._try_buy(
-                        symbol, market_price.current_price, balance,
-                        signal=signal, regime=regime,
-                        minute_analysis=minute_analysis,
-                    )
-                elif signal.type == SignalType.SELL and position is not None:
-                    self._try_sell(
-                        symbol, position.quantity, market_price.current_price,
-                        exit_reason=signal.reason,
-                        avg_buy_price=position.average_price,
-                    )
 
             except Exception as exc:
                 self.app_logger.exception(
@@ -789,8 +799,10 @@ class TradingService:
         signal=None,
         regime=None,
         minute_analysis=None,
-    ) -> None:
-        """매수 주문 가능 여부를 검사한 뒤 실제 주문을 시도합니다."""
+    ) -> str:
+        """매수 주문 가능 여부를 검사한 뒤 실제 주문을 시도합니다.
+        반환값: 차단 사유 문자열 (차단 없으면 빈 문자열)
+        """
 
         # ── 시간대 제한 — 14:50 이후 신규매수 차단 ─────────────
         _now = datetime.now()
@@ -799,7 +811,7 @@ class TradingService:
                 f"[BLOCK] {symbol} | 14:50 이후 신규매수 차단 "
                 f"({_now.strftime('%H:%M')})"
             )
-            return
+            return "AFTER_1450"
 
         # ── BUY 신호 종목별 쿨다운 (10분) ────────────────────────
         last_buy_sig = self._last_buy_signal_at.get(symbol)
@@ -824,7 +836,7 @@ class TradingService:
                     f"[COOL ] {symbol} | 매도 후 재진입 쿨다운 중 "
                     f"({remaining}초 남음 / 총 {cooldown_sec}초)"
                 )
-                return
+                return "REENTRY_COOLDOWN"
 
         # ── 종목별 재진입 제한 체크 ──────────────────────────────
         now_dt = datetime.now()
@@ -838,7 +850,7 @@ class TradingService:
                 f"loss_count_today={loss_cnt} "
                 f"block_buy=true"
             )
-            return
+            return "DAILY_LOSS_LIMIT"
 
         # 2) 손절 발생 → 30분 매수 금지
         stoploss_str = self.state.symbol_stoploss_at.get(symbol)
@@ -853,7 +865,7 @@ class TradingService:
                     f"loss_count_today={loss_cnt} "
                     f"block_buy=true"
                 )
-                return
+                return "STOPLOSS_COOLDOWN"
 
         # 3) 트레일링 손실 2회 이상 → 60분 매수 금지
         trail_list = self.state.symbol_trail_loss_at.get(symbol, [])
@@ -871,7 +883,7 @@ class TradingService:
                 f"loss_count_today={loss_cnt} "
                 f"block_buy=true"
             )
-            return
+            return "TRAIL_LOSS_COOLDOWN"
 
         # ── 최대 보유 종목 수 체크 ────────────────────────────────
         try:
@@ -884,7 +896,7 @@ class TradingService:
                 f"[BLOCK] {symbol} | 최대 보유 종목 수 초과 "
                 f"({held_count}/{self.settings.trading.max_positions})"
             )
-            return
+            return "STOPLOSS_COOLDOWN"
         quantity = max(1, self.settings.trading.order_cash_per_trade // current_price)
         order = OrderRequest(
             symbol=symbol,
@@ -893,13 +905,13 @@ class TradingService:
             price=current_price,
         )
 
-        can_order, reason = self.risk_manager.can_place_order(order, balance, self.state)
+        can_order, reason = self.risk_manager.can_place_order(order, live_balance, self.state)
 
         if not can_order:
             self.app_logger.warning(
                 f"[BLOCK] {symbol} | 매수 조건 충족했지만 주문 미실행 | 사유: {reason}"
             )
-            return
+            return "TRAIL_LOSS_COOLDOWN"
 
         result = self.broker.place_order(order)
 
@@ -972,6 +984,7 @@ class TradingService:
                 "exit_reason": exit_reason,
                 "hold_minutes": hold_minutes,
                 "avg_buy_price": avg_buy_price,
+                "condition_name": self._symbol_to_condition.get(symbol, ""),
             },
         )
 
@@ -995,10 +1008,19 @@ class TradingService:
             if is_loss:
                 cnt = self.state.symbol_loss_count_today.get(symbol, 0) + 1
                 self.state.symbol_loss_count_today[symbol] = cnt
+                self.state.consecutive_losses += 1
                 self.app_logger.info(
                     f"[LOSS_CNT] {symbol} | 당일 손실 {cnt}회 "
+                    f"| 연속손절 {self.state.consecutive_losses}회 "
                     f"| 수익률 {(sold_price - avg_p) / avg_p * 100 if avg_p else 0:+.2f}%"
                 )
+            else:
+                # 수익 매도 시 연속손절 초기화
+                if self.state.consecutive_losses > 0:
+                    self.app_logger.info(
+                        f"[CONSEC_RESET] {symbol} | 수익 매도 → 연속손절 초기화"
+                    )
+                self.state.consecutive_losses = 0
             if is_stoploss:
                 self.state.symbol_stoploss_at[symbol] = now_iso
                 cooldown_until = (datetime.now() + __import__('datetime').timedelta(seconds=1800)).strftime('%H:%M')
@@ -1115,6 +1137,8 @@ class TradingService:
         regime,
         signal,
         minute_analysis=None,
+        final_decision: str = "",
+        order_block_reason: str = "",
     ) -> None:
         """시그널 판단 결과를 signal_log.csv에 기록합니다.
 
@@ -1133,6 +1157,9 @@ class TradingService:
             "score":     score,
             "signal":    signal.type.value,
             "skip_reason": classify_skip_reason(signal.reason, signal.type.value),
+            "final_decision":    final_decision or signal.type.value,
+            "order_block_reason": order_block_reason,
+            "condition_name": self._symbol_to_condition.get(symbol, ""),
         }
         if minute_analysis is not None:
             ma = minute_analysis
@@ -1157,6 +1184,7 @@ class TradingService:
                 "v_bottom_spike":       ma.v_bottom_spike,
                 "upside_to_recent_high_pct": ma.upside_to_recent_high_pct,
                 "ma5_above_ma20":      ma.ma5_above_ma20,
+                "v_fail_reason":       ma.v_fail_reason if not ma.is_v_rebound else "",
             })
         else:
             row["detected_patterns"] = "-"

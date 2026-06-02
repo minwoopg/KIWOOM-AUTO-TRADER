@@ -35,7 +35,8 @@ class StrategyRouter:
         if regime == MarketRegime.NEUTRAL:
             return self._neutral
         if regime == MarketRegime.REBOUND:
-            return self._bottom
+            # BottomStrategy는 MarketPrice 필드 미완성 — 임시로 NeutralStrategy 사용
+            return self._neutral
         if regime == MarketRegime.BEARISH:
             return self._hold_bearish
         if regime == MarketRegime.UNKNOWN:

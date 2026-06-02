@@ -51,6 +51,7 @@ TRADE_FIELDS = [
     "exit_reason",           # 매도 사유 (손절/트레일링/추세꺾임/강제청산 등)
     "hold_minutes",          # 보유 시간 (분)
     "avg_buy_price",         # 잔고API 기준 평균매입단가 (손익 계산용)
+    "condition_name",         # 조건검색식 이름
 ]
 
 
@@ -85,7 +86,10 @@ SIGNAL_FIELDS = [
     "price",             # 현재가
     "regime",            # 장세
     "score",             # 점수
-    "signal",            # BUY / HOLD / SKIP
+    "signal",            # BUY / HOLD / SKIP (전략 판단)
+    "final_decision",    # 실제 결과: BUY / HOLD / BLOCKED
+    "order_block_reason",# 차단 사유: AFTER_1450 / REENTRY_COOLDOWN / RISK_LIMIT 등
+    "condition_name",    # 조건검색식 이름 (자동매매_돌파형A / 눌림목_PR / V자_BV)
     "skip_reason",       # HOLD/SKIP 사유 (전략 reason 그대로)
     "detected_patterns", # 감지된 패턴 목록 (V / PR / A / B / C)
     "is_v_rebound",
@@ -100,6 +104,7 @@ SIGNAL_FIELDS = [
     "v_bottom_spike",
     "upside_to_recent_high_pct",
     "ma5_above_ma20",
+    "v_fail_reason",      # V자 실패 사유 (V_FAIL_DROP_TOO_SMALL 등)
 ]
 
 

@@ -41,6 +41,7 @@ class MinuteAnalysis:
 
     # ── V자 반등 ────────────────────────────────────────────────
     is_v_rebound: bool          # V자 반등 완성 여부
+    v_fail_reason: str          # V자 실패 사유 (is_v_rebound=False일 때)
     v_bottom_k: int             # 저점이 현재 봉 기준 몇 봉 전 (0=미감지)
     v_drop_pct: float           # 고점→저점 낙폭 (%)
     v_rise_pct: float           # 저점→현재 반등폭 (%)
@@ -398,6 +399,7 @@ class MinuteAnalyzer:
             is_valid_pulldown=is_valid_pulldown,
             ma5_above_ma20=ma5_above_ma20,
             is_v_rebound=is_v,
+            v_fail_reason="" if is_v else (self._last_v_fail_reasons[0] if self._last_v_fail_reasons else "V_FAIL_UNKNOWN"),
             v_bottom_k=v_bottom_k,
             v_drop_pct=v_drop_pct,
             v_rise_pct=v_rise_pct,
