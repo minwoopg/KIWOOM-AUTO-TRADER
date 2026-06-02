@@ -84,6 +84,7 @@ class TradingService:
 
         # HOLD 로그 throttle
         self.last_hold_log_at_by_symbol: dict[str, datetime] = {}
+        self._last_buy_signal_at: dict[str, datetime] = {}  # 종목별 마지막 BUY신호 시각
 
         # 보유 종목별 최고가 추적 (트레일링 스탑용)
         self._highest_price: dict[str, int] = loaded_highest
@@ -800,6 +801,17 @@ class TradingService:
             )
             return
 
+        # ── BUY 신호 종목별 쿨다운 (10분) ────────────────────────
+        last_buy_sig = self._last_buy_signal_at.get(symbol)
+        if last_buy_sig:
+            elapsed_sig = (datetime.now() - last_buy_sig).total_seconds()
+            if elapsed_sig < 600:  # 10분
+                remaining_sig = int(600 - elapsed_sig)
+                self.app_logger.debug(
+                    f"[BUY_COOL] {symbol} | BUY 신호 쿨다운 중 ({remaining_sig}초 남음)"
+                )
+                return
+
         # ── 재진입 쿨다운 체크 ────────────────────────────────────
         cooldown_sec = self.settings.trading.reentry_cooldown_seconds
         last_sold_str = self.state.last_sold_at_by_symbol.get(symbol)
@@ -912,6 +924,7 @@ class TradingService:
             self.state.entry_time_by_symbol[symbol] = datetime.now().isoformat()
             self.state.bought_symbols_today.add(symbol)
             self.state.last_order_id_by_symbol[symbol] = result.order_id
+            self._last_buy_signal_at[symbol] = datetime.now()
 
             # 주문 성공 후 잔고 캐시 무효화
             self.cached_balance = None
