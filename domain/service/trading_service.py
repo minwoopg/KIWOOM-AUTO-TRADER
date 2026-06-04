@@ -143,11 +143,17 @@ class TradingService:
             return self._dynamic_targets
         return self.settings.targets
 
-    def update_targets(self, symbols: list[str]) -> None:
+    def update_targets(
+        self,
+        symbols: list[str],
+        sym_to_cond: dict[str, str] | None = None,
+    ) -> None:
         """조건검색 결과로 종목 목록을 동적으로 갱신합니다.
 
         보유 중인 종목은 조건검색 편출 여부와 무관하게 항상 포함합니다.
         """
+        if sym_to_cond:
+            self._symbol_to_condition.update(sym_to_cond)
         holding_symbols: list[str] = []
         try:
             balance = self._get_balance_with_cache()
