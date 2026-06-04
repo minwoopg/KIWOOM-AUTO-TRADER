@@ -141,6 +141,7 @@ class MinuteAnalyzer:
 
     # ── 내부 유틸 ────────────────────────────────────────────────
 
+        self._last_v_fail_reasons: list[str] = []  # V자 실패 사유 캐시
     def _ma5_rising(self, bars: list[MinuteBar], slope_bars: int) -> bool:
         """현재 MA5가 직전 MA5보다 높은지 확인합니다 (기울기 상승 전환).
 

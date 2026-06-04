@@ -85,6 +85,7 @@ class TradingService:
         # HOLD 로그 throttle
         self.last_hold_log_at_by_symbol: dict[str, datetime] = {}
         self._last_buy_signal_at: dict[str, datetime] = {}  # 종목별 마지막 BUY신호 시각
+        self._symbol_to_condition: dict[str, str] = {}       # 종목 → 조건검색식 이름
 
         # 보유 종목별 최고가 추적 (트레일링 스탑용)
         self._highest_price: dict[str, int] = loaded_highest
