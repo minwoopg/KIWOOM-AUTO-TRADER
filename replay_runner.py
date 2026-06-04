@@ -229,6 +229,7 @@ def format_report(symbol: str, results: list[dict], target_date: date) -> str:
         return "\n".join(lines)
 
     lines.append(f"  BUY 신호: {len(results)}건  │  비용 가정: 왕복 {ROUND_TRIP_COST_PCT}% + 슬리피지 {SLIPPAGE_PCT}%")
+    lines.append("  ※ 패턴 리플레이: 패턴 감지 봉 기준 수익률 (실제 전략 BUY와 다를 수 있음 — 점수제/쿨다운 미적용)")
     lines.append("")
 
     # ── 1. 수익률 (비용 전/후) ───────────────────────────────────
@@ -302,6 +303,7 @@ def format_report(symbol: str, results: list[dict], target_date: date) -> str:
     if v_res or pr_res:
         lines.append("")
         lines.append("  [ V자/PR vs 일반 비교 (5분 순수익) ]")
+        lines.append("    ※ V자 건수 = 패턴 감지 횟수 (signal_log V자와 다름 — 전략 미적용 기준)")
         for label, grp in [("V자", v_res), ("PR", pr_res), ("일반", gen_res)]:
             if not grp: continue
             w   = sum(1 for r in grp if r["net_5m"] > 0)
