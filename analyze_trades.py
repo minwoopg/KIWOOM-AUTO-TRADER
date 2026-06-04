@@ -296,6 +296,33 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
     else:
         row("트레일링 청산", "0건")
 
+    # ── 11. condition_name별 손익 ──────────────────────────────
+    cond_pairs = [p for p in pairs if p.get("condition_name","")]
+    if cond_pairs:
+        sub("11. 조건검색식별 손익")
+        cond_names = sorted(set(p["condition_name"] for p in cond_pairs))
+        for cname in cond_names:
+            grp  = [p for p in cond_pairs if p.get("condition_name") == cname]
+            wins = [p for p in grp if p["win"]]
+            avg  = sum(p["pnl_pct"] for p in grp) / len(grp) if grp else 0
+            pnl  = sum(p["pnl_amount"] for p in grp)
+            row(f"  {cname}",
+                f"{len(grp)}건  승률 {len(wins)}/{len(grp)} ({len(wins)/len(grp)*100:.0f}%)  "
+                f"평균 {avg:+.2f}%  손익 {pnl:+,.0f}원")
+            # 패턴별 세부
+            pat_cnt: dict = {}
+            for p in grp:
+                pat = p.get("entry_reason", "-")
+                pat_cnt.setdefault(pat, []).append(p)
+            for pat, pgrp in sorted(pat_cnt.items(),
+                                    key=lambda x: -len(x[1]))[:3]:
+                pw  = sum(1 for p in pgrp if p["win"])
+                pa  = sum(p["pnl_pct"] for p in pgrp) / len(pgrp)
+                lines.append(
+                    f"      {pat}: {len(pgrp)}건 "
+                    f"승률 {pw/len(pgrp)*100:.0f}% 평균 {pa:+.2f}%"
+                )
+
     sep()
     return "\n".join(lines)
 

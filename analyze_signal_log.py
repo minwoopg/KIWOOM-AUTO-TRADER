@@ -88,7 +88,8 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
     # ── 1. 시그널 분포 ──────────────────────────────────────────
     sub("1. 시그널 분포")
     row("전체 판단", f"{total:,}건")
-    row("BUY", f"{len(buy_rows):,}건  ({pct(len(buy_rows), total)})")
+    row("BUY",         f"{len(buy_rows):,}건  ({pct(len(buy_rows), total)})")
+    row("BLOCKED",     f"{len(blocked_rows):,}건  ({pct(len(blocked_rows), total)})")
     row("HOLD / SKIP", f"{len(hold_rows):,}건  ({pct(len(hold_rows), total)})")
 
     # ── 2. 장세 분포 ──────────────────────────────────────────
@@ -233,6 +234,25 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
     for sym, cnt in sym_cnt.most_common(10):
         buy_cnt = sum(1 for r in rows if r.get("symbol")==sym and r.get("signal")=="BUY")
         row(sym, f"{cnt:,}건  →  BUY {buy_cnt}건")
+
+    # ── 9. condition_name별 성과 ────────────────────────────
+    cond_rows = [r for r in rows if r.get("condition_name","")]
+    if cond_rows:
+        sub("9. 조건검색식별 성과")
+        cond_names = sorted(set(r["condition_name"] for r in cond_rows))
+        for cname in cond_names:
+            grp = [r for r in cond_rows if r.get("condition_name") == cname]
+            buy  = [r for r in grp if r.get("final_decision",r.get("signal","")) == "BUY"]
+            blk  = [r for r in grp if r.get("final_decision") == "BLOCKED"]
+            # 주요 skip_reason
+            skip = [r for r in grp if r.get("signal") not in ("BUY","")]
+            skip_top = Counter(r.get("skip_reason","") for r in skip).most_common(3)
+            buy_rate = f"{len(buy)/len(grp)*100:.1f}%" if grp else "-"
+            row(f"  {cname}",
+                f"판단 {len(grp):,}건  BUY {len(buy)}건({buy_rate})  BLOCKED {len(blk)}건")
+            for sr, sc in skip_top:
+                if sr:
+                    lines.append(f"      skip: {sr} {sc}건")
 
     sep()
     return "\n".join(lines)
