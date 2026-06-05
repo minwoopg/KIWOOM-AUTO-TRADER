@@ -56,7 +56,7 @@ class DailyReporter:
         if not self.trade_log_file.exists():
             return []
         trades = []
-        with self.trade_log_file.open(encoding="utf-8") as f:
+        with self.trade_log_file.open(encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
@@ -288,7 +288,7 @@ class DailyReporter:
         if not self.signal_log_file.exists():
             return []
         rows = []
-        with self.signal_log_file.open(encoding="utf-8") as f:
+        with self.signal_log_file.open(encoding="utf-8-sig") as f:
             for r in csv.DictReader(f):
                 try:
                     ts = datetime.fromisoformat(r["timestamp"]).date()
@@ -355,7 +355,7 @@ class DailyReporter:
             return ""
 
         rows = []
-        with self.trade_log_file.open(encoding="utf-8") as f:
+        with self.trade_log_file.open(encoding="utf-8-sig") as f:
             for r in csv.DictReader(f):
                 try:
                     ts = datetime.fromisoformat(r["timestamp"]).date()

@@ -42,7 +42,7 @@ def load_rows(path: Path, target: date) -> list[dict]:
     if not path.exists():
         return []
     rows = []
-    with path.open(encoding="utf-8") as f:
+    with path.open(encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             try:
                 ts = datetime.fromisoformat(r["timestamp"]).date()

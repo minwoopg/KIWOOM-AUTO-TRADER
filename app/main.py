@@ -134,11 +134,31 @@ async def async_main() -> None:
     state_store  = JsonStateStore(settings.storage.state_file)
 
     broker = build_broker(settings)
-    broker.authenticate()
+
+    # ── 시작 시 429 재시도 래퍼 ─────────────────────────────
+    async def _retry_on_429(fn, desc: str, max_retries: int = 10):
+        """429 에러 발생 시 최대 max_retries회 재시도합니다."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                return fn()
+            except Exception as e:
+                msg = str(e)
+                if "http=429" in msg or "허용된 요청 개수를 초과" in msg:
+                    wait = min(30 * attempt, 180)  # 30초 → 60초 → ... → 최대 180초
+                    app_logger.warning(
+                        f"[STARTUP] {desc} 429 에러 "
+                        f"({attempt}/{max_retries}회) — {wait}초 후 재시도"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+        raise RuntimeError(f"{desc} 최대 재시도 초과")
+
+    await _retry_on_429(broker.authenticate, "인증")
 
     # ── 시작 시 state.json과 실제 잔고 동기화 ──────────────
     try:
-        balance_init = broker.get_account_balance()
+        balance_init = await _retry_on_429(broker.get_account_balance, "잔고조회")
         reconciler   = StateReconciler(app_logger)
         state, highest_price = state_store.load()
         state, highest_price = reconciler.reconcile(state, highest_price, balance_init)

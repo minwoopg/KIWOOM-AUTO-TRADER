@@ -714,7 +714,7 @@ class TradingService:
                 [sys.executable, "analyze_signal_log.py", date_str],
                 capture_output=True, text=True, timeout=60,
                 cwd=str(Path(__file__).resolve().parents[2]),
-                encoding="utf-8",
+                encoding="utf-8", errors="replace",
             )
             if result.returncode == 0:
                 self.app_logger.info("[ANALYSIS] 시그널 분석 완료 → reports/ 저장")
@@ -732,7 +732,7 @@ class TradingService:
                 [sys.executable, "analyze_trades.py", date_str],
                 capture_output=True, text=True, timeout=60,
                 cwd=str(Path(__file__).resolve().parents[2]),
-                encoding="utf-8",
+                encoding="utf-8", errors="replace",
             )
             if result.returncode == 0:
                 self.app_logger.info("[ANALYSIS] 거래 분석 완료 → reports/ 저장")
@@ -750,7 +750,7 @@ class TradingService:
                 [sys.executable, "replay_runner.py", date_str],
                 capture_output=True, text=True, timeout=120,
                 cwd=str(Path(__file__).resolve().parents[2]),
-                encoding="utf-8",
+                encoding="utf-8", errors="replace",
             )
             if result.returncode == 0:
                 self.app_logger.info("[REPLAY] 리플레이 완료 → reports/ 저장")

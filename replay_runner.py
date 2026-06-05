@@ -54,7 +54,7 @@ def load_bars(symbol: str, target_date: date) -> list[MinuteBarRow]:
     if not path.exists():
         return []
     bars, acc = [], 0
-    with path.open(encoding="utf-8") as f:
+    with path.open(encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             try:
                 v = int(float(r.get("volume", 0) or 0))

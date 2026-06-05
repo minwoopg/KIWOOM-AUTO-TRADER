@@ -52,7 +52,7 @@ def load(start: date, end: date) -> list[dict]:
         sys.exit(1)
 
     rows = []
-    with SIGNAL_LOG.open(encoding="utf-8") as f:
+    with SIGNAL_LOG.open(encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             try:
                 ts = datetime.fromisoformat(r["timestamp"]).date()
