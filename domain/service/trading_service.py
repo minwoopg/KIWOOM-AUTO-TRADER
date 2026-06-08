@@ -880,7 +880,10 @@ class TradingService:
             t for t in trail_list
             if (now_dt - datetime.fromisoformat(t)).total_seconds() < 3600
         ]
-        if len(recent_trail) >= 2:
+        trail_loss_threshold = getattr(
+            self.settings.trading, 'trail_loss_cooldown_count', 2
+        )
+        if len(recent_trail) >= trail_loss_threshold:
             oldest = min(datetime.fromisoformat(t) for t in recent_trail)
             remaining_tr = int(3600 - (now_dt - oldest).total_seconds())
             self.app_logger.info(

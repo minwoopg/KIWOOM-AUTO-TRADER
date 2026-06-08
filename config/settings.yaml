@@ -33,6 +33,7 @@ trading:
   allow_multiple_entries_per_symbol_per_day: true
   force_exit_before_market_close_minutes: 12
   reentry_cooldown_seconds: 600
+  trail_loss_cooldown_count: 1   # 트레일링 손실 N회 → 60분 쿨다운 (기존 2회 → 1회)
 
 strategy:
   name: breakout
@@ -64,7 +65,7 @@ market_regime:
   v_low_min_age: 1
   v_low_max_age: 8
   v_drop_threshold_pct: -3.0
-  v_rebound_threshold_pct: 2.0
+  v_rebound_threshold_pct: 1.2
   v_max_rebound_pct: 6.0
   v_volume_ratio: 1.5
   v_min_bar_amount: 30000000

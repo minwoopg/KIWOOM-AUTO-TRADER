@@ -113,16 +113,28 @@ class ConditionWatcher:
             await asyncio.sleep(0.3)  # 연속 요청 간격
 
     def _on_condition_list(self, msg: dict) -> None:
-        conditions = msg.get("data", [])
+        conditions = msg.get("data") or []
         if not conditions:
             logger.warning("[COND] 등록된 조건검색식이 없습니다.")
             return
         logger.info(f"[COND] 사용 가능한 조건검색식 {len(conditions)}개:")
         subscribed = {str(s) for s in self.config.condition_seqs}
-        for seq, name in conditions:
+        for item in conditions:
+            # item이 [seq, name] 리스트 또는 (seq, name) 튜플 형태
+            try:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    seq, name = item[0], item[1]
+                elif isinstance(item, dict):
+                    seq = item.get("seq", item.get("no", ""))
+                    name = item.get("name", item.get("condition_name", ""))
+                else:
+                    logger.warning(f"[COND] 알 수 없는 조건식 형식: {item}")
+                    continue
+            except Exception as e:
+                logger.warning(f"[COND] 조건식 파싱 실패: {item} — {e}")
+                continue
             marker = " ◀ 구독 중" if str(seq) in subscribed else ""
             logger.info(f"[COND]   [{seq}] {name}{marker}")
-            # 조건식 이름 저장
             if str(seq) in subscribed:
                 self._condition_names[str(seq)] = name
 
@@ -133,7 +145,7 @@ class ConditionWatcher:
 
         # 어느 조건식 결과인지 확인
         seq = str(msg.get("seq", ""))
-        data = msg.get("data", [])
+        data = msg.get("data") or []
         symbols = [
             item["jmcode"].lstrip("A")
             for item in data
@@ -151,7 +163,7 @@ class ConditionWatcher:
         self._notify()
 
     def _on_realtime(self, msg: dict) -> None:
-        data_list = msg.get("data", [])
+        data_list = msg.get("data") or []
         seq = str(msg.get("seq", ""))
 
         for item in data_list:
