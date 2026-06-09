@@ -72,6 +72,17 @@ class BreakoutStrategy(Strategy):
 
                 # A/B/C/V/PR 조건 판단
                 pass_change   = minute_analysis.is_valid_change_rate   # A: 상승 돌파
+
+                # ── 패턴 D: 갭 급등 후 눌림목 ─────────────────
+                # 당일 +5% 이상 급등 후 VWAP 위에서 눌림 발생 시
+                # 기존 A/B/C/V/PR과 독립적으로 인정
+                cr   = minute_analysis.change_rate_pct
+                pb   = minute_analysis.pullback_pct if hasattr(minute_analysis, 'pullback_pct') else 0.0
+                pass_gap_pullback = (
+                    cr >= 5.0                          # 당일 +5% 이상 급등
+                    and minute_analysis.price_above_vwap  # VWAP 위 유지
+                    and -3.0 <= pb <= -0.1             # 고점 대비 -0.1~-3% 눌림
+                )
                 # pass_rebound = minute_analysis.is_valid_rebound  # B: 저점 반등 — 단독 비활성화 (2일 연속 손실)
                 pass_rebound  = False  # B 단독 비활성 중
                 pass_pulldown = minute_analysis.is_valid_pulldown       # C: 눌림목
@@ -149,6 +160,7 @@ class BreakoutStrategy(Strategy):
                 or (minute_analysis.is_pulldown_recovery if minute_analysis else False)
             )
             cond_v_spike    = minute_analysis.rebound_volume_spike if minute_analysis else False
+            cond_gap_pullback = pass_gap_pullback if minute_analysis else False
 
             score = sum([
                 cond_macd_cross, cond_macd_accel,
@@ -162,6 +174,7 @@ class BreakoutStrategy(Strategy):
                 'PR✓'  if (minute_analysis and minute_analysis.is_pulldown_recovery) else
                 'V/PR✗'
             )
+            gap_label = f"갭눌림D✓({minute_analysis.change_rate_pct:+.1f}%)" if cond_gap_pullback else "갭눌림D✗"
             tags = [
                 f"MACD {'골든✓' if cond_macd_cross else '데드✗'}",
                 f"모멘텀 {'가속✓' if cond_macd_accel else '둔화✗'}",
@@ -171,6 +184,7 @@ class BreakoutStrategy(Strategy):
                 f"저점 {'상승✓' if cond_low_rising else '하락✗'}",
                 v_label,
                 f"반등spike {'✓' if cond_v_spike else '✗'}",
+                gap_label,
             ]
             summary = " | ".join(tags)
 
@@ -188,6 +202,13 @@ class BreakoutStrategy(Strategy):
                 return Signal(
                     type=SignalType.BUY,
                     reason=f"보수적 진입 {score}/8 — {summary}",
+                )
+
+            # ── 갭 급등 눌림목 패턴 D — 점수 2점이어도 허용 ──
+            if cond_gap_pullback and score >= 2:
+                return Signal(
+                    type=SignalType.BUY,
+                    reason=f"[갭D] 갭 급등 눌림 {score}/8 — {summary}",
                 )
 
             return Signal(
