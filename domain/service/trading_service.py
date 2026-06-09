@@ -811,6 +811,14 @@ class TradingService:
         반환값: 차단 사유 문자열 (차단 없으면 빈 문자열)
         """
 
+        # ── excluded_symbols 차단 ───────────────────────────────
+        excluded = getattr(self.settings.trading, 'excluded_symbols', [])
+        if symbol in excluded:
+            self.app_logger.debug(
+                f"[EXCL] {symbol} | excluded_symbols 차단"
+            )
+            return "EXCLUDED_SYMBOL"
+
         # ── 시간대 제한 — 14:50 이후 신규매수 차단 ─────────────
         _now = datetime.now()
         if _now.hour > 14 or (_now.hour == 14 and _now.minute >= 50):

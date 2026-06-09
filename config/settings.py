@@ -41,6 +41,12 @@ class TradingConfig:
     allow_multiple_entries_per_symbol_per_day: bool
     force_exit_before_market_close_minutes: int
     reentry_cooldown_seconds: int
+    trail_loss_cooldown_count: int = 1  # 트레일링 손실 N회 → 60분 쿨다운
+    excluded_symbols: list = None       # 신규매수 영구 차단 종목
+
+    def __post_init__(self):
+        if self.excluded_symbols is None:
+            self.excluded_symbols = []
 
 
 @dataclass(frozen=True)

@@ -82,8 +82,14 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
         return "\n".join(lines)
 
     total = len(rows)
-    buy_rows  = [r for r in rows if r.get("signal") == "BUY"]
-    hold_rows = [r for r in rows if r.get("signal") != "BUY"]
+    # final_decision 기준: BUY=실제체결 / BLOCKED=차단 / 나머지=HOLD
+    buy_rows     = [r for r in rows if r.get("final_decision") == "BUY"
+                    or (r.get("signal") == "BUY"
+                        and r.get("final_decision","") == "")]
+    blocked_rows = [r for r in rows if r.get("final_decision") == "BLOCKED"]
+    hold_rows    = [r for r in rows
+                    if r.get("final_decision","") not in ("BUY","BLOCKED")
+                    and r.get("signal") != "BUY"]
 
     # ── 1. 시그널 분포 ──────────────────────────────────────────
     sub("1. 시그널 분포")
@@ -149,15 +155,15 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
     sub("4. 감지 패턴 분포")
     pat_cnt = Counter(r.get("detected_patterns","-") for r in rows)
     for pat, cnt in pat_cnt.most_common():
-        buy_cnt = sum(1 for r in rows 
-                      if r.get("detected_patterns") == pat 
-                      and r.get("signal") == "BUY")
+        buy_cnt = sum(1 for r in rows
+                      if r.get("detected_patterns") == pat
+                      and r.get("final_decision") == "BUY")
         row(pat or "-", f"{cnt:,}건  →  BUY {buy_cnt}건  ({pct(buy_cnt,cnt)})")
 
     # ── 5. V자 반등 분석 ───────────────────────────────────
     sub("5. V자 반등 분석")
     v_detected = [r for r in rows if safe_bool(r.get("is_v_rebound")) is True]
-    v_buy      = [r for r in v_detected if r.get("signal") == "BUY"]
+    v_buy      = [r for r in v_detected if r.get("final_decision") == "BUY"]
     row("V자 감지", f"{len(v_detected):,}건  ({pct(len(v_detected), total)})")
     row("V자 → BUY", f"{len(v_buy):,}건  ({pct(len(v_buy), len(v_detected))})")
 
@@ -207,7 +213,7 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
     for k in ["< 1%","1~2%","2~3%","3~5%","5%↑"]:
         cnt = up_buckets[k]
         buy_cnt = sum(1 for r in rows
-                      if r.get("signal") == "BUY"
+                      if r.get("final_decision") == "BUY"
                       and (lambda u: u is not None and (
                           (k=="< 1%" and u < 1.0) or
                           (k=="1~2%" and 1.0 <= u < 2.0) or

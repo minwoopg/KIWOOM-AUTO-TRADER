@@ -34,6 +34,10 @@ trading:
   force_exit_before_market_close_minutes: 12
   reentry_cooldown_seconds: 600
   trail_loss_cooldown_count: 1   # 트레일링 손실 N회 → 60분 쿨다운 (기존 2회 → 1회)
+  excluded_symbols:              # 신규매수 영구 차단 종목
+    - "080220"                   # 4일 연속 고위험
+    - "010170"                   # 2일 연속 고위험
+    - "001510"                   # 실제 손실 + 고위험
 
 strategy:
   name: breakout
