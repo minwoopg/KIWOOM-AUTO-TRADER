@@ -814,7 +814,7 @@ class TradingService:
         # ── excluded_symbols 차단 ───────────────────────────────
         excluded = getattr(self.settings.trading, 'excluded_symbols', [])
         if symbol in excluded:
-            self.app_logger.debug(
+            self.app_logger.info(
                 f"[EXCL] {symbol} | excluded_symbols 차단"
             )
             return "EXCLUDED_SYMBOL"
