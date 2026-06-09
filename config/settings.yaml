@@ -110,3 +110,9 @@ storage:
   app_log_file: logs/app.log
   save_minute_bars: true              # 1분봉 원본 저장 여부
   minute_bars_dir: data/minute_bars   # 저장 경로
+
+# ── 카카오톡 알림 ──────────────────────────────────────────
+kakao:
+  access_token:  "${KAKAO_ACCESS_TOKEN}"
+  refresh_token: "${KAKAO_REFRESH_TOKEN}"
+  rest_api_key:  "${KAKAO_REST_API_KEY}"

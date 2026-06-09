@@ -130,6 +130,13 @@ class EntryWatchConfig:
     fail_on_vwap_break: bool
 
 
+@dataclass
+class KakaoConfig:
+    access_token:  str = ""   # 카카오 액세스 토큰
+    refresh_token: str = ""   # 리프레시 토큰 (자동 갱신용)
+    rest_api_key:  str = ""   # REST API 키 (토큰 갱신용)
+
+
 @dataclass(frozen=True)
 class StorageConfig:
     state_file: str
@@ -153,6 +160,7 @@ class Settings:
     market_regime: MarketRegimeConfig
     storage: StorageConfig
     websocket: WebSocketConfig
+    kakao: KakaoConfig = None
 
 
 def _substitute_env(value: Any) -> Any:
@@ -171,6 +179,7 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     raw = _substitute_env(raw)
 
+    kakao_raw = raw.get("kakao", {})
     return Settings(
         app=AppConfig(**raw["app"]),
         broker=BrokerConfig(**raw["broker"]),
@@ -181,4 +190,5 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
         market_regime=MarketRegimeConfig(**raw["market_regime"]),
         storage=StorageConfig(**raw["storage"]),
         websocket=WebSocketConfig(**raw["websocket"]),
+        kakao=KakaoConfig(**kakao_raw) if kakao_raw else KakaoConfig(),
     )

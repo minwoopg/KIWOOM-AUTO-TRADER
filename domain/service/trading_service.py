@@ -30,6 +30,7 @@ from infra.storage.daily_reporter import DailyReporter
 from infra.storage.logger import AppLogger, TradeCsvLogger, SignalCsvLogger
 from infra.storage.minute_bar_saver import MinuteBarSaver
 from infra.storage.skip_reason import classify_skip_reason, SkipReason
+from infra.notify.kakao_notifier import KakaoNotifier, build_notifier
 from infra.storage.state_store import JsonStateStore
 from utils.time_utils import is_market_open
 
@@ -86,6 +87,7 @@ class TradingService:
         self.last_hold_log_at_by_symbol: dict[str, datetime] = {}
         self._last_buy_signal_at: dict[str, datetime] = {}  # 종목별 마지막 BUY신호 시각
         self._symbol_to_condition: dict[str, str] = {}       # 종목 → 조건검색식 이름
+        self._notifier: KakaoNotifier = build_notifier(settings)  # 카카오 알림
 
         # 보유 종목별 최고가 추적 (트레일링 스탑용)
         self._highest_price: dict[str, int] = loaded_highest
@@ -963,6 +965,12 @@ class TradingService:
             self.app_logger.info(
                 f"[ORDER] {symbol} | 매수 주문 접수 완료 | 수량 {quantity}주 | 주문번호 {result.order_id}"
             )
+            self._notifier.send(
+                f"🟢 [매수] {symbol}\n"
+                f"가격: {current_price:,}원 | 수량: {quantity}주\n"
+                f"금액: {current_price * quantity:,}원\n"
+                f"장세: {regime.value if regime else '-'} | 점수: {signal.reason[:30]}"
+            )
         else:
             self.app_logger.warning(
                 f"[FAIL ] {symbol} | 매수 주문 실패 | 사유: {result.message}"
@@ -1070,6 +1078,17 @@ class TradingService:
             self.app_logger.info(
                 f"[ORDER] {symbol} | 매도 주문 접수 완료 | 수량 {quantity}주 | 주문번호 {result.order_id}"
             )
+            # ── 카카오 알림 ──────────────────────────────
+            if avg_buy_price > 0:
+                pnl_pct = (current_price - avg_buy_price) / avg_buy_price * 100
+                pnl_amt = int((current_price - avg_buy_price) * quantity)
+                icon = "🔴" if pnl_amt < 0 else "🟡"
+                self._notifier.send(
+                    f"{icon} [매도] {symbol}\n"
+                    f"가격: {current_price:,}원 | 수량: {quantity}주\n"
+                    f"수익률: {pnl_pct:+.2f}% | 손익: {pnl_amt:+,}원\n"
+                    f"사유: {exit_reason[:40]}"
+                )
         else:
             self.app_logger.warning(
                 f"[FAIL ] {symbol} | 매도 주문 실패 | 사유: {result.message}"
