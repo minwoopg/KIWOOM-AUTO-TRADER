@@ -160,6 +160,24 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
                       and r.get("final_decision") == "BUY")
         row(pat or "-", f"{cnt:,}건  →  BUY {buy_cnt}건  ({pct(buy_cnt,cnt)})")
 
+    # ── 4-1. 갭D 패턴 분석 ──────────────────────────────────
+    gap_rows = [r for r in rows if "D" in r.get("detected_patterns", "").split("/")]
+    if gap_rows:
+        sub("4-1. 갭D (갭 급등 눌림목) 분석")
+        gap_buy     = [r for r in gap_rows if r.get("final_decision") == "BUY"]
+        gap_blocked = [r for r in gap_rows if r.get("final_decision") == "BLOCKED"]
+        gap_hold    = [r for r in gap_rows
+                       if r.get("final_decision") not in ("BUY", "BLOCKED")]
+        row("갭D 감지",    f"{len(gap_rows):,}건")
+        row("갭D BUY",     f"{len(gap_buy):,}건  ({pct(len(gap_buy), len(gap_rows))})")
+        row("갭D BLOCKED", f"{len(gap_blocked):,}건  ({pct(len(gap_blocked), len(gap_rows))})")
+        row("갭D HOLD",    f"{len(gap_hold):,}건  ({pct(len(gap_hold), len(gap_rows))})")
+        from collections import Counter as _GapCnt
+        for sym, cnt in _GapCnt(r.get('symbol') for r in gap_rows).most_common(5):
+            b = sum(1 for r in gap_rows
+                    if r.get('symbol') == sym and r.get('final_decision') == 'BUY')
+            lines.append(f"    {sym}: {cnt}건 → BUY {b}건")
+
     # ── 5. V자 반등 분석 ───────────────────────────────────
     sub("5. V자 반등 분석")
     v_detected = [r for r in rows if safe_bool(r.get("is_v_rebound")) is True]

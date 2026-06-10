@@ -59,12 +59,19 @@ class NeutralStrategy(Strategy):
                     reason=f"[중립] 거래대금 부족 — {minute_analysis.trading_value//100_000_000}억",
                 )
 
-            # B/C/V/PR 조건 허용 (A 상승 돌파 제외)
-            # pass_rebound = minute_analysis.is_valid_rebound  # B: 저점 반등 — 단독 비활성화 (2일 연속 손실)
-            pass_rebound  = False  # B 단독 비활성 중
+            # NEUTRAL 허용 패턴: PR/B, B/C, V, PR만 허용
+            # C 단독, B 단독, A/B 차단 — 반복 손실 방지
+            pass_rebound  = False  # B 단독 비활성
             pass_pulldown = minute_analysis.is_valid_pulldown       # C: 눌림목
             pass_v        = minute_analysis.is_v_rebound            # V: V자 반등
             pass_pr       = minute_analysis.is_pulldown_recovery    # PR: 눌림목 재상승
+
+            # PR 또는 V가 반드시 포함돼야 진입 허용
+            # (C 단독은 허용 안 함 — 오늘처럼 하락장에서 손실 방지)
+            has_pr_or_v = pass_v or pass_pr
+            has_b_or_c  = pass_rebound or pass_pulldown
+            # 허용: PR 단독, V 단독, PR/B, PR/C, B/C(C 포함 시 PR 필요)
+            neutral_pattern_ok = has_pr_or_v or (has_b_or_c and has_pr_or_v)
 
             if not any([pass_rebound, pass_pulldown, pass_v, pass_pr]):
                 ma = minute_analysis
@@ -143,8 +150,14 @@ class NeutralStrategy(Strategy):
             ]
             summary = " | ".join(tags)
 
-            # NEUTRAL은 4점 이상만 허용 (8점 체계)
-            if score >= 4:
+            # NEUTRAL: PR/V 포함 필수 + 5점 이상
+            if not has_pr_or_v:
+                return Signal(
+                    type=SignalType.HOLD,
+                    reason=f"[중립][{mode}] PR/V 없음 — C단독/B단독 진입 차단 {score}/8 — {summary}",
+                )
+
+            if score >= 5:
                 return Signal(
                     type=SignalType.BUY,
                     reason=f"[중립][{mode}] 진입 {score}/8 — {summary}",
@@ -152,7 +165,7 @@ class NeutralStrategy(Strategy):
 
             return Signal(
                 type=SignalType.HOLD,
-                reason=f"[중립][{mode}] 점수 부족 {score}/8 (최소 4점) — {summary}",
+                reason=f"[중립][{mode}] 점수 부족 {score}/8 (최소 5점) — {summary}",
             )
 
         # ── 보유 중 → 매도 판단 (BULLISH와 동일) ─────────────────

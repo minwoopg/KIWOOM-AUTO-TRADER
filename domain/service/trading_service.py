@@ -1214,6 +1214,8 @@ class TradingService:
             if ma.is_valid_change_rate:  patterns.append("A")
             if ma.is_valid_rebound:      patterns.append("B")
             if ma.is_valid_pulldown:     patterns.append("C")
+            # 갭D: breakout_strategy의 cond_gap_pullback 결과를 signal.reason으로 판단
+            if signal and "[갭D]" in signal.reason: patterns.append("D")
             row.update({
                 "detected_patterns":   "/".join(patterns) if patterns else "-",
                 "is_v_rebound":        ma.is_v_rebound,
