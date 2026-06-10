@@ -171,6 +171,18 @@ async def async_main() -> None:
         settings, broker, app_logger, trade_logger, signal_logger, state_store
     )
 
+    # ── 시작 알림 ────────────────────────────────────────────────
+    from infra.notify.kakao_notifier import build_notifier
+    from datetime import datetime as _dt_notify
+    _notifier = build_notifier(settings)
+    _now_str  = _dt_notify.now().strftime('%H:%M')
+    _mode     = '모의투자' if settings.broker.is_paper_trading else '실전투자'
+    _notifier.send(
+        f"🚀 자동매매 시작\n"
+        f"시각: {_now_str} | 모드: {_mode}\n"
+        f"감시 종목: 조건검색식 {settings.websocket.condition_seqs}"
+    )
+
     # ── WebSocket 조건검색 활성화 여부 ───────────────────────────
     if settings.websocket.enabled:
         from infra.websocket.condition_watcher import ConditionWatcher

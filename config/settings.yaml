@@ -112,6 +112,7 @@ storage:
   minute_bars_dir: data/minute_bars   # 저장 경로
 
 # ── 카카오톡 알림 ──────────────────────────────────────────
+# .env 파일에 아래 키를 입력하세요 (.gitignore로 보호됨)
 kakao:
   access_token:  "${KAKAO_ACCESS_TOKEN}"
   refresh_token: "${KAKAO_REFRESH_TOKEN}"
