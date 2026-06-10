@@ -1056,6 +1056,15 @@ class TradingService:
                     f"cooldown_until={cooldown_until} "
                     f"loss_count={self.state.symbol_loss_count_today.get(symbol, 0)}"
                 )
+                # ── NEUTRAL 손절 → 당일 재진입 완전 금지 ──────────
+                is_neutral_stoploss = "[중립]" in exit_reason
+                if is_neutral_stoploss:
+                    self.state.symbol_block_today.add(symbol)
+                    self.app_logger.info(
+                        f"[SYMBOL_BLOCK_TODAY] {symbol} "
+                        f"reason=NEUTRAL_STOPLOSS — "
+                        f"NEUTRAL 손절 발생 → 당일 재진입 금지"
+                    )
             if is_trail_loss:
                 trail_list = self.state.symbol_trail_loss_at.get(symbol, [])
                 trail_list.append(now_iso)
