@@ -201,8 +201,17 @@ async def async_main() -> None:
             trading_service.update_targets(limited, sym_to_cond)
             blocked = excluded & set(symbols)
             if blocked:
-                app_logger.info(f"[COND] 제외 종목 재편입 차단: {blocked}")
-            app_logger.info(f"[COND] 종목 목록 갱신: {limited}")
+                app_logger.info(f"[COND] 제외 종목 재편입 차단: {sorted(blocked)}")
+            # ── 조건검색식별 편입 현황 + final_targets 로그 ──
+            seq_info = " | ".join(
+                f"seq{seq}={len(syms)}종목"
+                for seq, syms in watcher._symbols_by_seq.items()
+            )
+            app_logger.info(
+                f"[COND_STATUS] {seq_info} | "
+                f"excluded={len(blocked)}차단 | "
+                f"final={len(limited)}종목: {limited}"
+            )
 
         # 조건검색은 실전 계좌 토큰으로 별도 발급
         app_logger.info("[COND] 실전 계좌 토큰 발급 중...")

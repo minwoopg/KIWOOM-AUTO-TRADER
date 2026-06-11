@@ -819,6 +819,18 @@ class TradingService:
             self.app_logger.info(
                 f"[EXCL] {symbol} | excluded_symbols 차단"
             )
+            # signal_log에도 SKIP_EXCLUDED_SYMBOL 기록
+            if signal is not None:
+                self._write_signal_log(
+                    symbol=symbol,
+                    price=current_price,
+                    regime=regime,
+                    score=0,
+                    signal=signal,
+                    minute_analysis=minute_analysis,
+                    final_decision="BLOCKED",
+                    order_block_reason="SKIP_EXCLUDED_SYMBOL",
+                )
             return "EXCLUDED_SYMBOL"
 
         # ── 시간대 제한 — 14:50 이후 신규매수 차단 ─────────────

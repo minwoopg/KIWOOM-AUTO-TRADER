@@ -31,6 +31,8 @@ class SkipReason:
     NO_PAT_PR_VOL_FAIL      = "NO_PAT_PR_VOL_FAIL"        # PR: 거래량 팽창 미충족
     # V 조건 세분화
     NO_PAT_V_FAIL           = "NO_PAT_V_FAIL"             # V: 실패 (세부사유는 V_FAIL 로그)
+    NEUTRAL_C_BLOCKED       = "NEUTRAL_C_BLOCKED"          # NEUTRAL: C/B단독 — PR/V 필수 미충족
+    SKIP_EXCLUDED_SYMBOL    = "SKIP_EXCLUDED_SYMBOL"       # excluded_symbols 차단
     BELOW_VWAP              = "SKIP_BELOW_VWAP"           # VWAP 아래
     SCORE_TOO_LOW           = "SKIP_SCORE_TOO_LOW"        # 점수 부족
     TOO_MUCH_REBOUND        = "SKIP_TOO_MUCH_REBOUND"     # 반등폭 상한 초과 (추격매수)

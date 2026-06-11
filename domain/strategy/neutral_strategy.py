@@ -154,7 +154,7 @@ class NeutralStrategy(Strategy):
             if not has_pr_or_v:
                 return Signal(
                     type=SignalType.HOLD,
-                    reason=f"[중립][{mode}] PR/V 없음 — C단독/B단독 진입 차단 {score}/8 — {summary}",
+                    reason="NEUTRAL_C_BLOCKED",
                 )
 
             if score >= 5:
