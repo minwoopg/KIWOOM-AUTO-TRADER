@@ -1,0 +1,95 @@
+# ── 스윙 전략 설정 ─────────────────────────────────────────────
+# python -m app.main_swing 으로 단독 실행
+
+app:
+  env: paper
+  log_level: INFO
+  is_paper_trading: true
+
+broker:
+  base_url: https://mockapi.kiwoom.com
+  app_key: ${KIWOOM_PAPER_APP_KEY}
+  secret_key: ${KIWOOM_PAPER_SECRET_KEY}
+  is_paper_trading: true
+
+# ── 감시 종목 (watchlist) ───────────────────────────────────────
+# 조건검색 편입 + watchlist 포함 시 점수 +1 가산
+swing_watchlist:
+  - "005930"   # 삼성전자
+  - "000660"   # SK하이닉스
+  - "035420"   # NAVER
+  - "035720"   # 카카오
+  - "000270"   # 기아
+  - "005380"   # 현대차
+
+# ── 진입 조건 ──────────────────────────────────────────────────
+swing_entry:
+  enabled: true
+  trade_enabled: false        # false=관찰모드 / true=실매수
+
+  start_time: "15:10"
+  end_time:   "15:20"
+
+  max_positions: 3            # 최대 보유 종목 수
+  order_cash_per_trade: 2000000  # 1회 주문금액 (200만원)
+
+  # 기술적 조건
+  ma10_distance_min_pct: -2.0   # MA10 대비 최소 거리 (%)
+  ma10_distance_max_pct:  1.0   # MA10 대비 최대 거리 (%)
+  require_ma20_rising: true     # MA20 상승 중 필수
+  block_if_below_ma20: true     # MA20 아래 차단
+
+  max_drawdown_from_52w_high_pct: -30.0  # 52주 고점 대비 최대 낙폭
+
+  day_rate_min_pct: -5.0        # 당일 등락률 최소
+  day_rate_max_pct:  3.0        # 당일 등락률 최대
+
+  min_trading_value: 100000000000   # 최소 거래대금 (1,000억)
+  min_volume_ratio_20d: 1.5         # 20일 평균 거래량 대비 최소 비율
+
+  block_if_close_near_low_pct: 15.0  # 당일 저가 부근 차단 (하위 15%)
+
+  min_score: 7                  # 최소 진입 점수 (8점 만점)
+
+# ── 매도 조건 ──────────────────────────────────────────────────
+swing_exit:
+  # 기본 손절 (수익 쿠션 없음)
+  no_cushion_stop_loss_pct: -5.0
+
+  # 수익 쿠션 (+5% 이상 찍은 이후)
+  cushion_trigger_profit_pct:     5.0
+  cushion_partial_drawdown_pct:  -5.0   # 고점 대비 -5% → 33% 보호매도
+  cushion_partial_sell_ratio:     0.33
+  cushion_full_drawdown_pct:     -8.0   # 고점 대비 -8% → 전량 청산
+
+  # 1차 부분익절
+  take_profit_1_pct:        15.0
+  take_profit_1_sell_ratio:  0.33
+
+  # 익절 후 잔여 물량 청산
+  after_take_profit_trailing_drawdown_pct: -7.0
+  exit_if_below_daily_ma5: true
+
+  # 기간 손절
+  time_stop_days: 3
+  time_stop_if_profit_below_pct: 0.0
+
+# ── 갭하락 대응 ────────────────────────────────────────────────
+swing_gap_down:
+  gap_down_watch_pct:       -3.0   # 감시 시작 기준
+  gap_down_immediate_pct:   -5.0   # 즉시 손절 기준
+  wait_minutes_after_open:   5     # 감시 후 대기 분
+
+# ── 로그/저장 ──────────────────────────────────────────────────
+swing_storage:
+  log_dir:    "logs"
+  report_dir: "reports"
+  app_log:    "logs/app_swing.log"
+  trades_csv: "logs/swing_trades.csv"
+  watch_csv:  "logs/swing_watch.csv"   # 관찰 모드 기록
+
+# ── 카카오 알림 ────────────────────────────────────────────────
+kakao:
+  access_token:  "${KAKAO_ACCESS_TOKEN}"
+  refresh_token: "${KAKAO_REFRESH_TOKEN}"
+  rest_api_key:  "${KAKAO_REST_API_KEY}"

@@ -455,7 +455,7 @@ class TradingService:
                     conds_v = conds.group(1) if conds else reason
                     ma = minute_analysis
                     vwap_ok  = ma.price_above_vwap if ma else None
-                    ma5_ok   = market_price.indicator_price_above_ma5
+                    ma5_ok   = ma.ma5_above_ma20 if ma else None
                     self.app_logger.info(
                         f"[SELL_SCORE] {symbol} "
                         f"profit={pnl:+.2f}% "
