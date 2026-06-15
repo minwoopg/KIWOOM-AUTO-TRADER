@@ -825,7 +825,6 @@ class TradingService:
                     symbol=symbol,
                     price=current_price,
                     regime=regime,
-                    score=0,
                     signal=signal,
                     minute_analysis=minute_analysis,
                     final_decision="BLOCKED",
