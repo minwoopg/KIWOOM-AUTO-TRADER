@@ -188,10 +188,32 @@ class BreakoutStrategy(Strategy):
             ]
             summary = " | ".join(tags)
 
+            # ── 추격매수 차단: 이미 +3% 이상 오른 상태에서 MACD 데드 ──
+            # 2026-06-15: 005930이 +5% 갭상승 후 MACD 데드 상태에서
+            # 3~4점으로 반복 진입 → 3연속 손절 발생.
+            # 동행지표(모멘텀/MA5/VWAP)만으로 채워지는 3~4점을 걸러내고
+            # 최소 5점(최적 타점)만 진입 허용.
+            chasing_overheated = (
+                minute_analysis is not None
+                and minute_analysis.change_rate_pct >= 3.0
+                and not cond_macd_cross  # MACD 데드
+            )
+            min_score = 5 if chasing_overheated else 3
+
             if score >= 5:
                 return Signal(
                     type=SignalType.BUY,
                     reason=f"최적 타점 {score}/8 — {summary}",
+                )
+            if chasing_overheated:
+                # 추격매수 구간: 5점 미만은 전부 HOLD (갭D 포함)
+                return Signal(
+                    type=SignalType.HOLD,
+                    reason=(
+                        f"추격매수 차단 {score}/8 — 당일 "
+                        f"{minute_analysis.change_rate_pct:+.1f}% + MACD데드 "
+                        f"→ 최소 {min_score}점 필요 — {summary}"
+                    ),
                 )
             if score == 4:
                 return Signal(

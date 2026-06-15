@@ -1046,10 +1046,18 @@ class TradingService:
             if is_loss:
                 cnt = self.state.symbol_loss_count_today.get(symbol, 0) + 1
                 self.state.symbol_loss_count_today[symbol] = cnt
-                self.state.consecutive_losses += 1
+                # ── 전역 연속손절 카운터는 '새로운 종목'의 손실만 반영 ──
+                # 2026-06-15: 한 종목 반복매매(같은 종목 2회 이상 손실)가
+                # 전역 max_consecutive_losses를 소진시켜 계좌 전체가
+                # 차단되는 문제 발생(005930 3연속 손절 → 전체 매수 중단).
+                # cnt==1(해당 종목 첫 손실)일 때만 전역 카운터 증가.
+                # 같은 종목 반복 손실은 symbol_loss_count_today(종목별
+                # DAILY_LOSS_LIMIT, 한도 2)로 별도 차단됨.
+                if cnt == 1:
+                    self.state.consecutive_losses += 1
                 self.app_logger.info(
                     f"[LOSS_CNT] {symbol} | 당일 손실 {cnt}회 "
-                    f"| 연속손절 {self.state.consecutive_losses}회 "
+                    f"| 연속손절(전역) {self.state.consecutive_losses}회 "
                     f"| 수익률 {(sold_price - avg_p) / avg_p * 100 if avg_p else 0:+.2f}%"
                 )
             else:

@@ -17,7 +17,7 @@ from domain.swing.swing_analyzer import SwingAnalyzer, SwingAnalysis
 from domain.swing.swing_strategy import (
     SwingStrategy, SwingPosition, SwingExitReason,
 )
-from infra.broker.base import BrokerBase
+from infra.broker.base import Broker as BrokerBase
 from infra.notify.kakao_notifier import KakaoNotifier
 
 

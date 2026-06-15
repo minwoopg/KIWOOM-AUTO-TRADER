@@ -73,15 +73,20 @@ async def main() -> None:
     logger.info("=" * 50)
 
     # ── 브로커 ──────────────────────────────────────────────────
-    from config.settings import BrokerConfig, AppConfig
+    from config.settings import BrokerConfig
     from infra.broker.kiwoom_broker import KiwoomBroker
 
     broker_cfg = raw["broker"]
     broker = KiwoomBroker(
-        base_url       = broker_cfg["base_url"],
-        app_key        = broker_cfg["app_key"],
-        secret_key     = broker_cfg["secret_key"],
-        is_paper_trading = broker_cfg.get("is_paper_trading", True),
+        config=BrokerConfig(
+            provider         = broker_cfg.get("provider", "kiwoom"),
+            use_mock         = broker_cfg.get("use_mock", True),
+            base_url         = broker_cfg["base_url"],
+            app_key          = broker_cfg["app_key"],
+            secret_key       = broker_cfg["secret_key"],
+            account_number   = broker_cfg.get("account_number", ""),
+            is_paper_trading = broker_cfg.get("is_paper_trading", True),
+        )
     )
     broker.authenticate()
     logger.info("[SWING] 브로커 인증 완료")

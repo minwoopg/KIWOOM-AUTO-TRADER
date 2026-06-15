@@ -7,9 +7,12 @@ app:
   is_paper_trading: true
 
 broker:
+  provider: kiwoom
+  use_mock: false
   base_url: https://mockapi.kiwoom.com
-  app_key: ${KIWOOM_PAPER_APP_KEY}
-  secret_key: ${KIWOOM_PAPER_SECRET_KEY}
+  app_key: ${KIWOOM_APP_KEY}
+  secret_key: ${KIWOOM_SECRET_KEY}
+  account_number: ${KIWOOM_ACCOUNT_NUMBER}
   is_paper_trading: true
 
 # ── 감시 종목 (watchlist) ───────────────────────────────────────
