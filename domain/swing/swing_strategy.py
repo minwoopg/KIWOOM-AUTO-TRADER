@@ -12,6 +12,7 @@ from enum import Enum
 
 class SwingExitReason(str, Enum):
     STOP_LOSS            = "손절 -5%"
+    PATTERN_STOP_LOSS    = "눌림목 추정 실패 — 저점 이탈"
     TIME_STOP            = "기간손절 3일 초과"
     CUSHION_PARTIAL      = "수익쿠션 부분보호매도"
     CUSHION_FULL         = "수익쿠션 전량청산"
@@ -38,6 +39,10 @@ class SwingPosition:
     cushion_hit:     bool  = False      # +5% 수익 쿠션 달성 여부
     partial_sold:    bool  = False      # 1차 부분익절 완료 여부
     cushion_partial_sold: bool = False  # 수익쿠션 부분보호매도 완료 여부
+
+    # 눌림목-반등 패턴으로 진입한 경우의 동적 손절가
+    # (저점 이탈 OR 매수가 대비 -5% 중 먼저 닿는 쪽으로 호출부에서 미리 계산)
+    pattern_stop_price: int = 0  # 0이면 패턴 진입 아님 (일반 점수제 진입)
 
     def __post_init__(self):
         if self.avg_price == 0:
@@ -154,7 +159,21 @@ class SwingStrategy:
                     ),
                 )
 
-        # ── 2순위: 기본 손절 (수익 쿠션 없음) ───────────────────
+        # ── 2순위: 눌림목 패턴 손절 (저점가 이탈) ────────────────
+        # pattern_stop_price가 설정된 포지션(눌림목-반등 패턴 진입)만 해당.
+        # 저점이라고 추정했던 가격이 깨지면 추정이 틀렸다고 보고 즉시 손절.
+        if pos.pattern_stop_price > 0 and current_price <= pos.pattern_stop_price:
+            return SwingExitSignal(
+                reason=SwingExitReason.PATTERN_STOP_LOSS,
+                sell_ratio=1.0,
+                message=(
+                    f"눌림목 저점 이탈 — "
+                    f"추정저점 {pos.pattern_stop_price:,}원 하회 "
+                    f"(현재 {profit_pct:+.1f}%)"
+                ),
+            )
+
+        # ── 3순위: 기본 손절 (수익 쿠션 없음, -5% 고정) ─────────
         if not pos.cushion_hit and profit_pct <= self.no_cushion_stop:
             return SwingExitSignal(
                 reason=SwingExitReason.STOP_LOSS,

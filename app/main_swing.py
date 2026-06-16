@@ -112,6 +112,13 @@ async def main() -> None:
         block_if_close_near_low_pct = cfg_entry["block_if_close_near_low_pct"],
         min_score                   = cfg_entry["min_score"],
         watchlist                   = watchlist,
+        enable_pullback_pattern        = cfg_entry.get("enable_pullback_pattern", True),
+        pullback_lookback_min          = cfg_entry.get("pullback_lookback_min", 5),
+        pullback_lookback_max          = cfg_entry.get("pullback_lookback_max", 20),
+        pullback_drawdown_min_pct      = cfg_entry.get("pullback_drawdown_min_pct", -20.0),
+        pullback_drawdown_max_pct      = cfg_entry.get("pullback_drawdown_max_pct", -10.0),
+        pullback_max_trough_age_days   = cfg_entry.get("pullback_max_trough_age_days", 1),
+        pullback_bonus_score           = cfg_entry.get("pullback_bonus_score", 2),
     )
 
     # ── SwingStrategy ────────────────────────────────────────────

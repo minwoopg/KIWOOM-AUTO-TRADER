@@ -190,11 +190,28 @@ class SwingService:
         result = self.broker.place_order(order)
 
         if result.accepted:
+            # 눌림목-반등 패턴으로 진입했으면 동적 손절가 계산
+            # (저점가 이탈 OR 매수가 대비 -5% 중 먼저 닿는 쪽 — 
+            #  저점가가 더 얕으면 저점이탈이, 더 깊으면 -5%가 먼저 걸림)
+            pattern_stop = 0
+            pr = analysis.pullback_result
+            if pr is not None and pr.detected:
+                pattern_stop = pr.stop_loss_price
+                self.logger.info(
+                    f"[SWING_PATTERN] {symbol} | "
+                    f"눌림목-반등 패턴 진입 | "
+                    f"고점 {pr.peak_price:,}원({pr.peak_days_ago}일전) → "
+                    f"저점 {pr.trough_price:,}원({pr.trough_days_ago}일전) "
+                    f"낙폭 {pr.drawdown_pct:+.1f}% | "
+                    f"동적손절가 {pattern_stop:,}원"
+                )
+
             pos = SwingPosition(
                 symbol=symbol,
                 entry_price=current_price,
                 quantity=quantity,
                 entry_date=date.today(),
+                pattern_stop_price=pattern_stop,
             )
             self._positions[symbol] = pos
 

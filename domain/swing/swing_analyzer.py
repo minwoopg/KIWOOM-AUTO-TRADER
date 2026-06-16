@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 from domain.models import PriceBar
+from domain.swing.pullback_rebound import (
+    detect_pullback_rebound,
+    PullbackReboundResult,
+)
 
 
 @dataclass
@@ -47,6 +51,9 @@ class SwingAnalysis:
     entry_ok: bool               # 최소 진입 조건 충족
     block_reason: str            # 차단 사유 (entry_ok=False 시)
 
+    # 눌림목-반등 패턴 (있으면 진입가의 동적 손절가 계산용)
+    pullback_result: Optional[PullbackReboundResult] = None
+
     def __str__(self) -> str:
         return (
             f"[스윙분석] {self.symbol} | "
@@ -77,6 +84,14 @@ class SwingAnalyzer:
         block_if_close_near_low_pct: float = 15.0,
         min_score: int = 7,
         watchlist: list[str] | None = None,
+        # 눌림목-반등 패턴 (2026-06-16 신규)
+        enable_pullback_pattern: bool = True,
+        pullback_lookback_min: int = 5,
+        pullback_lookback_max: int = 20,
+        pullback_drawdown_min_pct: float = -20.0,
+        pullback_drawdown_max_pct: float = -10.0,
+        pullback_max_trough_age_days: int = 1,
+        pullback_bonus_score: int = 2,
     ):
         self.ma10_dist_min          = ma10_dist_min
         self.ma10_dist_max          = ma10_dist_max
@@ -90,6 +105,13 @@ class SwingAnalyzer:
         self.block_near_low_pct     = block_if_close_near_low_pct
         self.min_score              = min_score
         self.watchlist              = set(watchlist or [])
+        self.enable_pullback        = enable_pullback_pattern
+        self.pullback_lookback_min  = pullback_lookback_min
+        self.pullback_lookback_max  = pullback_lookback_max
+        self.pullback_dd_min        = pullback_drawdown_min_pct
+        self.pullback_dd_max        = pullback_drawdown_max_pct
+        self.pullback_max_age       = pullback_max_trough_age_days
+        self.pullback_bonus         = pullback_bonus_score
 
     def analyze(
         self,
@@ -227,6 +249,30 @@ class SwingAnalyzer:
             score += 1
             score_tags.append("관심종목✓")
 
+        # ── 눌림목-반등 패턴 탐지 (+2점 보너스) ─────────────────
+        # 5~20일 구간에서 고점→저점(-10~-20%) 패턴을 찾고,
+        # 저점이 오늘 또는 어제(1일 이내)면 보너스 점수 + 동적 손절가 계산.
+        pullback_result = None
+        if self.enable_pullback:
+            pullback_result = detect_pullback_rebound(
+                bars=bars[:-1],  # 오늘 미완성봉 제외, 현재가는 별도 전달
+                current_price=current_price,
+                lookback_min=self.pullback_lookback_min,
+                lookback_max=self.pullback_lookback_max,
+                drawdown_min_pct=self.pullback_dd_min,
+                drawdown_max_pct=self.pullback_dd_max,
+                max_trough_age_days=self.pullback_max_age,
+            )
+            if pullback_result and pullback_result.detected:
+                score += self.pullback_bonus
+                score_tags.append(
+                    f"눌림반등✓(고점{pullback_result.peak_days_ago}일전→"
+                    f"저점{pullback_result.trough_days_ago}일전 "
+                    f"{pullback_result.drawdown_pct:+.1f}%)"
+                )
+            elif pullback_result:
+                score_tags.append(f"눌림반등✗({pullback_result.fail_reason})")
+
         score_detail = " | ".join(score_tags)
 
         return SwingAnalysis(
@@ -250,4 +296,5 @@ class SwingAnalyzer:
             block_reason         = block_reason if block_reason else (
                 f"점수 부족 {score}/{self.min_score}" if score < self.min_score else ""
             ),
+            pullback_result      = pullback_result,
         )
