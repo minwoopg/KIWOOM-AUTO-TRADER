@@ -30,8 +30,15 @@ swing_entry:
   enabled: true
   trade_enabled: false        # false=관찰모드 / true=실매수
 
-  start_time: "15:10"
+  start_time: "15:00"   # 2026-06-16: 15:10→15:00 — 조건검색 종목 늘어나서 여유시간 확보
   end_time:   "15:20"
+
+  # ── 스윙 전용 조건검색 결과 파일 (2026-06-16 신규) ─────────
+  # main.py(단타 프로세스)가 같은 WebSocket 연결로 스윙용 검색식도
+  # 같이 구독해서, 결과만 분리해 이 파일에 저장한다.
+  # 키움 HTS에서 검색식을 만들기 전까지는 파일이 없어도 안전
+  # (없으면 빈 리스트로 처리, watchlist만 사용).
+  swing_condition_file: data/swing_condition_symbols.json
 
   max_positions: 3            # 최대 보유 종목 수
   order_cash_per_trade: 2000000  # 1회 주문금액 (200만원)

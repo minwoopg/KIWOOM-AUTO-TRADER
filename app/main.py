@@ -28,6 +28,8 @@ from infra.storage.logger import TradeCsvLogger, SignalCsvLogger, build_app_logg
 from infra.storage.state_reconciler import StateReconciler
 from infra.storage.state_store import JsonStateStore
 from utils.time_utils import is_market_open, seconds_until_market_open
+import json
+from datetime import datetime
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -213,6 +215,28 @@ async def async_main() -> None:
                 f"final={len(limited)}종목: {limited}"
             )
 
+            # ── 스윙용 검색식 결과만 분리해서 파일로 저장 ───────
+            # main_swing.py(별도 프로세스)가 이 파일을 읽어 watchlist와 합침.
+            swing_seqs_set = {str(s) for s in settings.websocket.swing_condition_seqs}
+            if swing_seqs_set:
+                swing_symbols: set[str] = set()
+                for seq, syms in watcher._symbols_by_seq.items():
+                    if seq in swing_seqs_set:
+                        swing_symbols |= syms
+                out_path = Path(settings.websocket.swing_condition_output)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(
+                    json.dumps({
+                        "updated_at": datetime.now().isoformat(),
+                        "symbols": sorted(swing_symbols),
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                app_logger.info(
+                    f"[COND_SWING] 스윙용 검색식 결과 저장 "
+                    f"({len(swing_symbols)}종목) → {out_path}"
+                )
+
         # 조건검색은 실전 계좌 토큰으로 별도 발급
         app_logger.info("[COND] 실전 계좌 토큰 발급 중...")
         real_token = fetch_real_token(
@@ -221,8 +245,24 @@ async def async_main() -> None:
         )
         app_logger.info("[COND] 실전 계좌 토큰 발급 완료")
 
+        # ── 스윙용 조건검색 seq를 단타 구독 목록에 합침 ──────────
+        # (같은 WebSocket 연결로 동시 구독 — 별도 연결 불필요)
+        import dataclasses
+        swing_seqs = settings.websocket.swing_condition_seqs
+        combined_seqs = list(dict.fromkeys(
+            list(settings.websocket.condition_seqs) + list(swing_seqs)
+        ))
+        ws_config_combined = dataclasses.replace(
+            settings.websocket, condition_seqs=combined_seqs,
+        )
+        if swing_seqs:
+            app_logger.info(
+                f"[COND] 스윙용 검색식 seq={swing_seqs} 추가 구독 "
+                f"(결과는 {settings.websocket.swing_condition_output}에 저장)"
+            )
+
         watcher = ConditionWatcher(
-            config=settings.websocket,
+            config=ws_config_combined,
             token=real_token,
             on_symbols_changed=on_symbols_changed,
         )

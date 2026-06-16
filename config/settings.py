@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +110,8 @@ class WebSocketConfig:
     max_symbols: int
     app_key: str
     secret_key: str
+    swing_condition_seqs: list = field(default_factory=list)  # 스윙 전용 검색식 seq
+    swing_condition_output: str = "data/swing_condition_symbols.json"
 
 
 @dataclass(frozen=True)

@@ -6,6 +6,7 @@ python -m app.main_swing
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -26,6 +27,38 @@ def load_dotenv(path: str = ".env") -> None:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip())
+
+
+def load_swing_condition_symbols(path: str, logger) -> list[str]:
+    """
+    단타 프로세스(main.py)가 스윙용 검색식 결과를 저장해둔 파일을 읽는다.
+
+    파일이 없거나(검색식 미설정), 깨졌거나, 너무 오래됐으면
+    빈 리스트를 반환한다 (watchlist만 쓰는 기존 동작으로 안전하게 폴백).
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        updated_at = datetime.fromisoformat(data.get("updated_at", ""))
+        age_minutes = (datetime.now() - updated_at).total_seconds() / 60
+        # 너무 오래된 파일(예: 단타가 오늘 안 켜졌거나 멈췄음)이면 무시
+        if age_minutes > 60:
+            logger.warning(
+                f"[SWING] 조건검색 파일이 {age_minutes:.0f}분 전 데이터 "
+                f"— 단타 프로세스 상태 확인 필요, 무시하고 watchlist만 사용"
+            )
+            return []
+        symbols = data.get("symbols", [])
+        logger.info(
+            f"[SWING] 조건검색 종목 {len(symbols)}개 로드 "
+            f"({age_minutes:.0f}분 전 갱신)"
+        )
+        return symbols
+    except Exception as e:
+        logger.warning(f"[SWING] 조건검색 파일 읽기 실패: {e} — watchlist만 사용")
+        return []
 
 
 def load_swing_settings():
@@ -172,11 +205,12 @@ async def main() -> None:
     logger.info(f"[SWING] 모드: {mode}")
 
     # ── 메인 루프 ────────────────────────────────────────────────
-    # 감시 종목: watchlist를 기본으로 사용
-    # 추후 조건검색식 연동 가능
-    symbols = list(watchlist)
+    # 감시 종목: watchlist(고정) + 조건검색 결과(가변, 매 스캔마다 재로드)
+    condition_file = cfg_entry.get(
+        "swing_condition_file", "data/swing_condition_symbols.json"
+    )
 
-    logger.info(f"[SWING] 감시 종목: {symbols}")
+    logger.info(f"[SWING] 고정 감시 종목: {watchlist}")
 
     poll = 60  # 60초마다 체크
     while True:
@@ -188,9 +222,18 @@ async def main() -> None:
                 await asyncio.sleep(poll)
                 continue
 
-            # 15:10~15:20 진입 스캔
+            # 15:00~15:20 진입 스캔 (조건검색 결과는 스캔마다 재로드)
             now_str = now.strftime("%H:%M")
             if cfg_entry["start_time"] <= now_str <= cfg_entry["end_time"]:
+                condition_symbols = load_swing_condition_symbols(
+                    condition_file, logger
+                )
+                symbols = list(dict.fromkeys(watchlist + condition_symbols))
+                if condition_symbols:
+                    logger.info(
+                        f"[SWING] 최종 스캔 대상 {len(symbols)}종목 "
+                        f"(고정 {len(watchlist)} + 조건검색 {len(condition_symbols)})"
+                    )
                 service.run_entry_scan(symbols)
 
             # 보유 포지션 매도 체크 (장중 상시)
@@ -208,7 +251,10 @@ async def main() -> None:
 
 
 def run() -> None:
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("[SWING] 프로그램 종료")
 
 
 if __name__ == "__main__":
