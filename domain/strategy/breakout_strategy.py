@@ -263,8 +263,8 @@ class BreakoutStrategy(Strategy):
                 trail_pct = 1.5
             elif high_pnl_pct >= 1.0:
                 trail_pct = 1.2
-            else:  # +0.5~1.0%
-                trail_pct = 0.8
+            else:  # +0.5~1.0% — 2026-06-15: 0.8→1.0 상향 (손실 반복 방지)
+                trail_pct = 1.0
             trailing_stop_price = int(highest_price * (1 - trail_pct / 100))
             from_high_pct = (current_price - highest_price) / highest_price * 100
             if current_price <= trailing_stop_price:
@@ -327,7 +327,7 @@ class BreakoutStrategy(Strategy):
             if high_pnl_pct2 >= 3.0:   trail_pct2 = 2.0
             elif high_pnl_pct2 >= 2.0: trail_pct2 = 1.5
             elif high_pnl_pct2 >= 1.0: trail_pct2 = 1.2
-            else:                       trail_pct2 = 0.8
+            else:                       trail_pct2 = 1.0
             trailing_stop_price = int(highest_price * (1 - trail_pct2 / 100))
             return Signal(
                 type=SignalType.HOLD,

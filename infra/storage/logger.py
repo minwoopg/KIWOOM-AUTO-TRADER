@@ -105,6 +105,12 @@ SIGNAL_FIELDS = [
     "upside_to_recent_high_pct",
     "ma5_above_ma20",
     "v_fail_reason",      # V자 실패 사유 (V_FAIL_DROP_TOO_SMALL 등)
+    # ATR / 볼린저 지표 (로그 전용 — 매수 차단 없이 기록)
+    "atr_14",             # ATR(14) 절대값 (원화)
+    "atr_14_pct",         # ATR(14) / 현재가 × 100 (%)
+    "bb_percent_b",       # 볼린저 %B (0=하단, 1=상단)
+    "bb_bandwidth_pct",   # 볼린저 밴드폭 (%)
+    "bb_position",        # 볼린저 위치 (LOWER_ZONE / MID_UPPER 등)
 ]
 
 
