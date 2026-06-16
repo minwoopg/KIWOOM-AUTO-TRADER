@@ -43,6 +43,7 @@ class TradingConfig:
     reentry_cooldown_seconds: int
     trail_loss_cooldown_count: int = 1  # 트레일링 손실 N회 → 60분 쿨다운
     excluded_symbols: list = None       # 신규매수 영구 차단 종목
+    force_exit_cushion_pct: float = 0.3  # 이월방지 강제청산 — 이 수익률 이상이면 이월 허용
 
     def __post_init__(self):
         if self.excluded_symbols is None:
