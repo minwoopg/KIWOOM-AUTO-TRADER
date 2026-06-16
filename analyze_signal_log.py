@@ -256,8 +256,13 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
     sub("8. 종목별 판단 횟수 Top 10")
     sym_cnt = Counter(r.get("symbol","") for r in rows)
     for sym, cnt in sym_cnt.most_common(10):
-        buy_cnt = sum(1 for r in rows if r.get("symbol")==sym and r.get("signal")=="BUY")
-        row(sym, f"{cnt:,}건  →  BUY {buy_cnt}건")
+        buy_cnt = sum(1 for r in rows
+                      if r.get("symbol")==sym
+                      and r.get("final_decision")=="BUY")
+        blk_cnt = sum(1 for r in rows
+                      if r.get("symbol")==sym
+                      and r.get("final_decision")=="BLOCKED")
+        row(sym, f"{cnt:,}건  →  BUY {buy_cnt}건  BLOCKED {blk_cnt}건")
 
     # ── 9. condition_name별 성과 ────────────────────────────
     cond_rows = [r for r in rows if r.get("condition_name","")]
@@ -277,6 +282,47 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
             for sr, sc in skip_top:
                 if sr:
                     lines.append(f"      skip: {sr} {sc}건")
+
+    # ── 10. 트레일링 발동 조건 가상 분석 ────────────────────────
+    buy_rows_for_trail = [r for r in rows if r.get("final_decision") == "BUY"]
+    if buy_rows_for_trail:
+        sub("10. 트레일링 발동 조건 가상 분석")
+        # MFE(최대유리변동) 기준: upside_to_recent_high_pct 근사
+        mfe_vals = [
+            float(r["upside_to_recent_high_pct"])
+            for r in buy_rows_for_trail
+            if r.get("upside_to_recent_high_pct") not in (None, "", "None")
+        ]
+        if mfe_vals:
+            avg_mfe = sum(mfe_vals) / len(mfe_vals)
+            row("진입 당시 평균 상승여력", f"{avg_mfe:+.2f}%")
+
+        # 트레일링 구간별 가상 청산 시뮬
+        zones = [
+            ("0.5%~1.0%", 0.5, 1.0, -0.8),
+            ("1.0%~2.0%", 1.0, 2.0, -1.2),
+            ("2.0%~3.0%", 2.0, 3.0, -1.5),
+            ("3.0%↑",     3.0, 999, -2.0),
+        ]
+        row("구간", "해당 BUY건 / 트레일링폭 / 예상최대수익")
+        for label, lo, hi, trail in zones:
+            zone_rows = [
+                r for r in buy_rows_for_trail
+                if (u := r.get("upside_to_recent_high_pct")) not in (None,"","None")
+                and lo <= float(u) < hi
+            ]
+            if zone_rows:
+                avg_u = sum(float(r["upside_to_recent_high_pct"]) for r in zone_rows) / len(zone_rows)
+                lines.append(
+                    f"    {label:<12} {len(zone_rows):>4}건 | "
+                    f"트레일링 {trail}% | 예상최대 {avg_u:+.2f}% | "
+                    f"기대수익 {avg_u+trail:+.2f}%"
+                )
+
+        # 추격매수 차단 건수
+        chasing = [r for r in rows if "추격매수 차단" in r.get("skip_reason","")]
+        if chasing:
+            row("추격매수 차단", f"{len(chasing):,}건 (SKIP_TOO_MUCH_REBOUND)")
 
     sep()
     return "\n".join(lines)

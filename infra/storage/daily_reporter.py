@@ -312,10 +312,18 @@ class DailyReporter:
             return "\n".join(lines)
 
         total     = len(rows)
-        buy_rows  = [r for r in rows if r.get("signal") == "BUY"]
-        hold_rows = [r for r in rows if r.get("signal") != "BUY"]
+        # final_decision 기준으로만 집계 (signal==BUY 기준 제거)
+        buy_rows     = [r for r in rows if r.get("final_decision") == "BUY"]
+        blocked_rows = [r for r in rows if r.get("final_decision") == "BLOCKED"]
+        hold_rows    = [r for r in rows
+                        if r.get("final_decision","") not in ("BUY","BLOCKED")]
 
-        lines.append(f"  전체 판단: {total:,}건  │  BUY: {len(buy_rows)}건 ({self._pct(len(buy_rows),total)})  │  SKIP: {len(hold_rows)}건")
+        lines.append(
+            f"  전체 판단: {total:,}건  │  "
+            f"BUY: {len(buy_rows)}건 ({self._pct(len(buy_rows),total)})  │  "
+            f"BLOCKED: {len(blocked_rows)}건 ({self._pct(len(blocked_rows),total)})  │  "
+            f"SKIP: {len(hold_rows)}건"
+        )
 
         # skip_reason 분포
         lines.append("")
@@ -327,7 +335,9 @@ class DailyReporter:
         lines.append("")
         lines.append("  [ 감지 패턴 ]")
         for pat, cnt in Counter(r.get("detected_patterns","-") for r in rows).most_common():
-            bc = sum(1 for r in rows if r.get("detected_patterns")==pat and r.get("signal")=="BUY")
+            bc = sum(1 for r in rows
+                     if r.get("detected_patterns")==pat
+                     and r.get("final_decision")=="BUY")
             lines.append(f"    {(pat or '-'):<38} {cnt:>4}건  → BUY {bc}건")
 
         # V자 분석
@@ -335,7 +345,7 @@ class DailyReporter:
         lines.append("")
         lines.append(f"  [ V자 반등 ]  감지 {len(v_rows)}건 / 전체 {total}건 ({self._pct(len(v_rows),total)})")
         if v_rows:
-            v_buy = [r for r in v_rows if r.get("signal") == "BUY"]
+            v_buy = [r for r in v_rows if r.get("final_decision") == "BUY"]
             ages  = [self._safe_float(r.get("v_low_age")) for r in v_rows]
             ages  = [x for x in ages if x is not None]
             drops = [self._safe_float(r.get("v_drop_pct")) for r in v_rows]
