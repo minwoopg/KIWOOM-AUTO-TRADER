@@ -31,6 +31,7 @@ from infra.storage.logger import AppLogger, TradeCsvLogger, SignalCsvLogger
 from infra.storage.minute_bar_saver import MinuteBarSaver
 from infra.storage.skip_reason import classify_skip_reason, SkipReason
 from infra.notify.kakao_notifier import KakaoNotifier, build_notifier
+from domain.indicator.indicators import calc_atr, calc_bollinger, ATRResult, BollingerResult
 from infra.storage.state_store import JsonStateStore
 from utils.time_utils import is_market_open
 
@@ -88,6 +89,9 @@ class TradingService:
         self._last_buy_signal_at: dict[str, datetime] = {}  # 종목별 마지막 BUY신호 시각
         self._symbol_to_condition: dict[str, str] = {}       # 종목 → 조건검색식 이름
         self._notifier: KakaoNotifier = build_notifier(settings)  # 카카오 알림
+        # ATR/볼린저 계산용 일봉 캐시 (종목별 60개 유지)
+        self._daily_bars_cache: dict[str, dict] = {}  # {symbol: {h,l,c 리스트}}
+        self._last_indicators: dict[str, dict] = {}   # {symbol: {atr, bb}}
 
         # 보유 종목별 최고가 추적 (트레일링 스탑용)
         self._highest_price: dict[str, int] = loaded_highest
@@ -542,6 +546,11 @@ class TradingService:
         """자동매매 루프를 한 번 실행합니다."""
         balance = self._get_balance_with_cache()
 
+        # ── 이월 포지션 강제청산 체크 ──────────────────────────
+        # settings.yaml의 force_exit_before_market_close_minutes (기본 12분 전 = 14:48)
+        # 14:40~14:50 사이에 수익 쿠션 없는 보유 포지션을 청산해 이월 방지
+        await self._check_force_exit_overnight(balance)
+
         for i, symbol in enumerate(self.targets):
 
             if symbol in self._excluded_symbols:
@@ -666,6 +675,9 @@ class TradingService:
                         avg_buy_price=position.average_price,
                     )
 
+                # ── ATR / 볼린저 계산 (로그 전용, 일봉 캐시 사용) ──
+                self._update_indicators(symbol, market_price.current_price)
+
                 # ── 시그널 로그 기록 (BUY/HOLD/SELL 불문 전체) ──
                 self._write_signal_log(
                     symbol=symbol,
@@ -690,7 +702,109 @@ class TradingService:
         self.state.symbol_loss_count_today.clear()
         self.state.symbol_stoploss_at.clear()
         self.state.symbol_trail_loss_at.clear()
-        self.app_logger.info("[RESET] 당일 종목별 손실 카운트 초기화 완료")
+        self.state.symbol_entry_count_today.clear()
+        self.app_logger.info("[RESET] 당일 종목별 손실/진입 카운트 초기화 완료")
+
+    def _update_indicators(self, symbol: str, current_price: int) -> None:
+        """
+        ATR / 볼린저 지표를 계산해서 _last_indicators에 캐시합니다.
+        일봉 데이터는 하루 1회(처음 호출 시)만 로드합니다.
+        """
+        try:
+            # 일봉 캐시 로드 (없으면 API 호출)
+            if symbol not in self._daily_bars_cache:
+                bars = self.broker.get_daily_prices(symbol, days=65)
+                if bars and len(bars) >= 20:
+                    self._daily_bars_cache[symbol] = {
+                        'h': [b.high_price for b in bars],
+                        'l': [b.low_price  for b in bars],
+                        'c': [b.close_price for b in bars],
+                    }
+                else:
+                    self._daily_bars_cache[symbol] = {}
+
+            bars_dict = self._daily_bars_cache.get(symbol, {})
+            if not bars_dict:
+                return
+
+            h = bars_dict['h']
+            l = bars_dict['l']
+            c = bars_dict['c']
+
+            atr = calc_atr(h, l, c, period=14, current_price=current_price)
+            bb  = calc_bollinger(c, current_price=current_price, period=20)
+
+            self._last_indicators[symbol] = {'atr': atr, 'bb': bb}
+
+        except Exception as e:
+            self.app_logger.debug(f"[INDICATOR] {symbol} 계산 실패: {e}")
+
+    async def _check_force_exit_overnight(self, balance) -> None:
+        """
+        장 마감 전 이월 방지 강제청산.
+
+        14:40(force_exit_before_market_close_minutes=20) 기준:
+          - 수익 쿠션 없는 포지션(수익률 < +0.3%) → 즉시 청산
+          - 수익 쿠션 있는 포지션(수익률 >= +0.3%) → 이월 허용
+
+        이 로직은 매 폴링(10초)마다 호출되지만,
+        이미 청산 처리된 포지션은 balance 갱신 후 사라지므로 중복 청산 없음.
+        """
+        now = datetime.now()
+        force_exit_minutes = getattr(
+            self.settings.trading,
+            'force_exit_before_market_close_minutes',
+            12,
+        )
+        # 강제청산 시작 시각 계산 (15:30 - N분)
+        close_hour, close_min = 15, 30
+        force_min_total = close_hour * 60 + close_min - force_exit_minutes
+        force_h, force_m = divmod(force_min_total, 60)
+
+        now_min_total = now.hour * 60 + now.minute
+        is_force_exit_window = (
+            force_min_total <= now_min_total < close_hour * 60 + close_min
+        )
+        if not is_force_exit_window:
+            return
+
+        cushion_threshold = 0.3  # +0.3% 이상이면 이월 허용
+
+        for pos in balance.positions:
+            symbol = pos.symbol
+            avg = pos.average_price
+            if avg <= 0:
+                continue
+            try:
+                market_price = self._get_market_price_with_cache(symbol)
+                current = market_price.current_price
+            except Exception:
+                continue
+
+            pnl_pct = (current - avg) / avg * 100
+
+            if pnl_pct >= cushion_threshold:
+                self.app_logger.info(
+                    f"[OVERNIGHT] {symbol} | 수익 쿠션 {pnl_pct:+.2f}% "
+                    f"→ 이월 허용 (기준 +{cushion_threshold}%)"
+                )
+                continue
+
+            self.app_logger.warning(
+                f"[OVERNIGHT] {symbol} | 수익 쿠션 없음 {pnl_pct:+.2f}% "
+                f"→ 이월 방지 강제청산 ({now.strftime('%H:%M')})"
+            )
+            self._try_sell(
+                symbol=symbol,
+                quantity=pos.quantity,
+                current_price=current,
+                exit_reason=(
+                    f"이월 방지 강제청산 — "
+                    f"{force_h:02d}:{force_m:02d} 이후 수익 쿠션 없음 ({pnl_pct:+.2f}%)"
+                ),
+                avg_buy_price=avg,
+            )
+            await asyncio.sleep(0.5)
 
     def _run_end_of_day_tasks(self, now: datetime) -> None:
         """장 마감 후 작업 (리포트/검증). run_once 밖에서도 호출 가능."""
@@ -705,6 +819,7 @@ class TradingService:
             self._validate_logs_today(now.date())
             self._run_signal_analysis_today(now.date())
             self._run_trade_analysis_today(now.date())
+            self._run_indicator_analysis_today(now.date())
             self._run_replay_today(now.date())
 
     def _run_signal_analysis_today(self, target_date) -> None:
@@ -742,6 +857,24 @@ class TradingService:
                 self.app_logger.warning(f"[ANALYSIS] 거래 분석 실패:\n{result.stderr}")
         except Exception as exc:
             self.app_logger.warning(f"[ANALYSIS] 거래 분석 오류: {exc}")
+
+    def _run_indicator_analysis_today(self, target_date) -> None:
+        """장 마감 후 ATR/볼린저 지표 분석을 자동 실행합니다."""
+        try:
+            import subprocess, sys
+            date_str = target_date.strftime("%Y-%m-%d")
+            result = subprocess.run(
+                [sys.executable, "analyze_indicators.py", date_str],
+                capture_output=True, text=True, timeout=60,
+                cwd=str(Path(__file__).resolve().parents[2]),
+                encoding="utf-8", errors="replace",
+            )
+            if result.returncode == 0:
+                self.app_logger.info("[ANALYSIS] 지표(ATR/볼린저) 분석 완료 → reports/ 저장")
+            else:
+                self.app_logger.warning(f"[ANALYSIS] 지표 분석 실패:\n{result.stderr}")
+        except Exception as exc:
+            self.app_logger.warning(f"[ANALYSIS] 지표 분석 오류: {exc}")
 
     def _run_replay_today(self, target_date) -> None:
         """장 마감 후 리플레이를 자동 실행합니다."""
@@ -831,6 +964,21 @@ class TradingService:
                     order_block_reason="SKIP_EXCLUDED_SYMBOL",
                 )
             return "EXCLUDED_SYMBOL"
+
+        # ── 동일 종목 1일 1회 진입 제한 ──────────────────────────
+        allow_multi = getattr(
+            self.settings.trading,
+            'allow_multiple_entries_per_symbol_per_day',
+            True,
+        )
+        if not allow_multi:
+            entry_cnt = self.state.symbol_entry_count_today.get(symbol, 0)
+            if entry_cnt >= 1:
+                self.app_logger.info(
+                    f"[ENTRY_LIMIT] {symbol} | 당일 {entry_cnt}회 진입 완료 "
+                    f"— 1일 1회 제한으로 신규매수 차단"
+                )
+                return "DAILY_ENTRY_LIMIT"
 
         # ── 시간대 제한 — 14:50 이후 신규매수 차단 ─────────────
         _now = datetime.now()
@@ -968,6 +1116,10 @@ class TradingService:
             self.state.bought_symbols_today.add(symbol)
             self.state.last_order_id_by_symbol[symbol] = result.order_id
             self._last_buy_signal_at[symbol] = datetime.now()
+            # 1일 1회 진입 제한용 카운터
+            self.state.symbol_entry_count_today[symbol] = (
+                self.state.symbol_entry_count_today.get(symbol, 0) + 1
+            )
 
             # 주문 성공 후 잔고 캐시 무효화
             self.cached_balance = None
@@ -1204,6 +1356,8 @@ class TradingService:
         minute_analysis=None,
         final_decision: str = "",
         order_block_reason: str = "",
+        atr_result=None,
+        bb_result=None,
     ) -> None:
         """시그널 판단 결과를 signal_log.csv에 기록합니다.
 
@@ -1255,4 +1409,14 @@ class TradingService:
             })
         else:
             row["detected_patterns"] = "-"
+        # ATR / 볼린저 (로그 전용)
+        atr = atr_result or self._last_indicators.get(symbol, {}).get('atr')
+        bb  = bb_result  or self._last_indicators.get(symbol, {}).get('bb')
+        row.update({
+            "atr_14":          round(atr.atr, 2) if atr else "",
+            "atr_14_pct":      round(atr.atr_pct, 3) if atr else "",
+            "bb_percent_b":    round(bb.percent_b, 4) if bb else "",
+            "bb_bandwidth_pct": round(bb.bandwidth_pct, 2) if bb else "",
+            "bb_position":     bb.position if bb else "",
+        })
         self.signal_logger.append(row)
