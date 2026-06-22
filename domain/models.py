@@ -183,7 +183,11 @@ class RuntimeState:
     peak_price_by_symbol: dict[str, int] = field(default_factory=dict)
     # 당일 종목별 손실 횟수 (재진입 제한용)
     symbol_loss_count_today: dict[str, int] = field(default_factory=dict)
+    # 당일 종목별 매수 진입 횟수 (1일 1회 제한용)
+    symbol_entry_count_today: dict[str, int] = field(default_factory=dict)
     # 종목별 손절 발생 시각 (ISO 문자열, 30분 금지용)
     symbol_stoploss_at: dict[str, str] = field(default_factory=dict)
     # 종목별 트레일링 손실 발생 시각 목록 (60분 금지용)
     symbol_trail_loss_at: dict[str, list] = field(default_factory=dict)
+    # NEUTRAL 손절 발생 종목 — 당일 재진입 완전 금지
+    symbol_block_today: set[str] = field(default_factory=set)

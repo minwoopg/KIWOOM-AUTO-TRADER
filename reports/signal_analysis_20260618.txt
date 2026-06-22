@@ -1,0 +1,90 @@
+════════════════════════════════════════════════════════════
+  📊 signal_log 분석  2026-06-18 ~ 2026-06-18  (총 2,111건)
+════════════════════════════════════════════════════════════
+
+── 1. 시그널 분포 ──
+  전체 판단                                2,111건
+  BUY                                  1건  (0.0%)
+  BLOCKED                              402건  (19.0%)
+  HOLD / SKIP                          1,708건  (80.9%)
+
+── 2. 장세 분포 ──
+  NEUTRAL                              1,396건  (66.1%)
+  BULLISH                              687건  (32.5%)
+  BEARISH                              28건  (1.3%)
+
+── 3. skip_reason 분포  (BUY 제외) ──
+  NO_PAT_BELOW_VWAP                    473건  (27.7%)
+  SKIP_TOO_MUCH_REBOUND                182건  (10.7%)
+  NO_PAT_B_REBOUND_SMALL(+0.9%)        180건  (10.5%)
+  NO_PAT_B_REBOUND_SMALL(+0.7%)        155건  (9.1%)
+  NO_PAT_B_REBOUND_SMALL(+0.6%)        90건  (5.3%)
+  NO_PAT_B_REBOUND_SMALL(+1.0%)        84건  (4.9%)
+  SKIP_SCORE_TOO_LOW                   75건  (4.4%)
+  NO_PAT_B_REBOUND_SMALL(+1.5%)        60건  (3.5%)
+  NO_PAT_B_REBOUND_SMALL(+0.8%)        60건  (3.5%)
+  NO_PAT_B_REBOUND_SMALL(+1.3%)        58건  (3.4%)
+  HOLD_POSITION                        45건  (2.6%)
+  NO_PAT_B_REBOUND_SMALL(+1.6%)        42건  (2.5%)
+  NO_PAT_B_REBOUND_SMALL(+1.7%)        38건  (2.2%)
+  SKIP_MARKET_NOT_ALLOWED              28건  (1.6%)
+  NO_PAT_B_REBOUND_SMALL(+1.2%)        24건  (1.4%)
+  NO_PAT_B_REBOUND_SMALL(+1.4%)        24건  (1.4%)
+  NO_PAT_C_PULLBACK(-0.1%)             18건  (1.1%)
+  NO_PAT_B_REBOUND_SMALL(+1.8%)        18건  (1.1%)
+  NO_PAT_B_REBOUND_SMALL(+1.1%)        15건  (0.9%)
+  NO_PAT_B_REBOUND_SMALL(+0.5%)        12건  (0.7%)
+  SKIP_NO_VOLUME                       9건  (0.5%)
+  NO_PAT_C_PULLBACK(+0.0%)             6건  (0.4%)
+  NO_PAT_B_REBOUND_SMALL(+0.4%)        6건  (0.4%)
+  SKIP_NO_INDICATORS                   3건  (0.2%)
+  NO_PAT_A_RATE(+1.9%)                 3건  (0.2%)
+
+── 3-1. NO_PATTERN 세분화 ──
+    NO_PAT_B_REBOUND_SMALL             866건  (63.4%)
+    NO_PAT_BELOW_VWAP                  473건  (34.6%)
+    NO_PAT_C_PULLBACK                  24건  (1.8%)
+    NO_PAT_A_RATE                      3건  (0.2%)
+    A 등락률 평균                           +1.90%  ((min +1.9% max +1.9%))
+    B 반등폭 평균                           +1.01%  ((min +0.4% max +1.8%))
+    C 눌림폭 평균                           -0.07%  ((min -0.1% max +0.0%))
+
+── 4. 감지 패턴 분포 ──
+  -                                    1,371건  →  BUY 0건  (0.0%)
+  A                                    606건  →  BUY 0건  (0.0%)
+  A/B                                  80건  →  BUY 1건  (1.2%)
+  B                                    54건  →  BUY 0건  (0.0%)
+
+── 5. V자 반등 분석 ──
+  V자 감지                                0건  (0.0%)
+  V자 → BUY                             0건  (0.0%)
+
+──   v_low_age 분포 (V자 감지 여부 무관) ──
+  1~3봉                                 84건  (4.0%)
+  4~5봉                                 63건  (3.0%)
+  6~8봉                                 95건  (4.5%)
+  9~15봉                                240건  (11.4%)
+  16봉↑                                 1,601건  (75.8%)
+
+── 6. 상승 여력 (upside_to_recent_high_pct) 분포 ──
+  < 1%                                 1,322건  →  BUY 0건
+  1~2%                                 449건  →  BUY 0건
+  2~3%                                 24건  →  BUY 0건
+  3~5%                                 0건  →  BUY 0건
+  5%↑                                  0건  →  BUY 0건
+
+── 7. VWAP 대비 위치 ──
+  VWAP 위  (현재가 > VWAP)                 1,470건  (71.0%)
+  VWAP 아래                              601건  (29.0%)
+  평균 VWAP 거리                           +0.21%
+
+── 8. 종목별 판단 횟수 Top 10 ──
+  005930                               2,064건  →  BUY 1건  BLOCKED 402건
+  010170                               31건  →  BUY 0건  BLOCKED 0건
+  006260                               8건  →  BUY 0건  BLOCKED 0건
+  080220                               8건  →  BUY 0건  BLOCKED 0건
+
+── 10. 트레일링 발동 조건 가상 분석 ──
+  진입 당시 평균 상승여력                        +0.00%
+  구간                                   해당 BUY건 / 트레일링폭 / 예상최대수익
+════════════════════════════════════════════════════════════

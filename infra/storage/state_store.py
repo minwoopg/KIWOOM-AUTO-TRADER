@@ -31,8 +31,10 @@ class JsonStateStore:
                 k: int(v) for k, v in raw.get("peak_price_by_symbol", {}).items()
             },
             symbol_loss_count_today     = raw.get("symbol_loss_count_today", {}),
+            symbol_entry_count_today    = raw.get("symbol_entry_count_today", {}),
             symbol_stoploss_at          = raw.get("symbol_stoploss_at", {}),
             symbol_trail_loss_at        = raw.get("symbol_trail_loss_at", {}),
+            symbol_block_today          = set(raw.get("symbol_block_today", [])),
         )
         highest_price = {k: int(v) for k, v in raw.get("highest_price", {}).items()}
         return state, highest_price
@@ -47,8 +49,10 @@ class JsonStateStore:
             "consecutive_losses":       state.consecutive_losses,
             "peak_price_by_symbol":     state.peak_price_by_symbol,
             "symbol_loss_count_today":  state.symbol_loss_count_today,
+            "symbol_entry_count_today": state.symbol_entry_count_today,
             "symbol_stoploss_at":       state.symbol_stoploss_at,
             "symbol_trail_loss_at":     state.symbol_trail_loss_at,
+            "symbol_block_today":       sorted(state.symbol_block_today),
             "highest_price":            highest_price or {},
         }
         self.path.write_text(

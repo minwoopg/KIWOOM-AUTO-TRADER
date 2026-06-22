@@ -71,9 +71,9 @@ market_regime:
   v_low_min_age: 1
   v_low_max_age: 8
   v_drop_threshold_pct: -2.5   # 2026-06-16: -3.0 → -2.5 완화 (V자 0건 지속, 낙폭부족 75.4%가 주원인)
-  v_rebound_threshold_pct: 1.2
+  v_rebound_threshold_pct: 0.5   # 2026-06-19: 1.2 → 0.5 완화 (V자 0건 지속, 반등부족 2위 사유)
   v_max_rebound_pct: 6.0
-  v_volume_ratio: 1.5
+  v_volume_ratio: 1.2   # 2026-06-19: 1.5 → 1.2 완화 (거래량부족 3위 사유)
   v_min_bar_amount: 30000000
   v_bottom_spike_ratio: 1.5
   v_ma5_slope_bars: 3

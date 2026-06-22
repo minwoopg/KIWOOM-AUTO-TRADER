@@ -90,7 +90,7 @@ class TradingService:
         self._symbol_to_condition: dict[str, str] = {}       # 종목 → 조건검색식 이름
         self._notifier: KakaoNotifier = build_notifier(settings)  # 카카오 알림
         # ATR/볼린저 계산용 일봉 캐시 (종목별 60개 유지)
-        self._daily_bars_cache: dict[str, dict] = {}  # {symbol: {h,l,c 리스트}}
+        self._daily_bars_cache: dict[str, dict] = {}  # (미사용 — _update_indicators가 cached_daily_bars 재사용)
         self._last_indicators: dict[str, dict] = {}   # {symbol: {atr, bb}}
 
         # 보유 종목별 최고가 추적 (트레일링 스탑용)
@@ -190,9 +190,11 @@ class TradingService:
             self.cached_balance = balance
             self.cached_balance_loaded_at = now
 
+            held = [f"{p.symbol}({p.quantity}주)" for p in balance.positions]
             self.app_logger.info(
-                "account balance loaded from api",
-                extra={"cash": balance.cash, "positions": len(balance.positions)},
+                f"account balance loaded from api | "
+                f"cash={balance.cash:,} | positions={len(balance.positions)} | "
+                f"held={held}"
             )
             return balance
 
@@ -203,9 +205,11 @@ class TradingService:
             self.cached_balance = balance
             self.cached_balance_loaded_at = now
 
+            held = [f"{p.symbol}({p.quantity}주)" for p in balance.positions]
             self.app_logger.info(
-                "account balance loaded from api",
-                extra={"cash": balance.cash, "positions": len(balance.positions)},
+                f"account balance loaded from api | "
+                f"cash={balance.cash:,} | positions={len(balance.positions)} | "
+                f"held={held}"
             )
             return balance
 
@@ -617,7 +621,22 @@ class TradingService:
     
                 strategy = self.strategy_router.select(regime)
                 position = next((p for p in balance.positions if p.symbol == symbol), None)
-    
+
+                if position is None and balance.positions:
+                    # symbol이 정확히 일치하는 포지션이 없을 때,
+                    # 비슷한(문자열 차이만 있는) 포지션이 있는지 확인해서
+                    # 공백/접두사 등 매칭 실패 원인을 즉시 드러냄
+                    close_matches = [
+                        p.symbol for p in balance.positions
+                        if symbol in p.symbol or p.symbol in symbol
+                    ]
+                    if close_matches:
+                        self.app_logger.warning(
+                            f"[POS_MISMATCH] {symbol} | "
+                            f"정확히 일치하는 포지션 없음, 유사 symbol 발견: {close_matches} "
+                            f"(repr: {[repr(s) for s in close_matches]})"
+                        )
+
                 # 보유 중인 경우 최고가 갱신 (트레일링 스탑 + entry watch 공용)
                 if position is not None:
                     current = market_price.current_price
@@ -703,33 +722,30 @@ class TradingService:
         self.state.symbol_stoploss_at.clear()
         self.state.symbol_trail_loss_at.clear()
         self.state.symbol_entry_count_today.clear()
+        self.state.symbol_block_today.clear()
         self.app_logger.info("[RESET] 당일 종목별 손실/진입 카운트 초기화 완료")
 
     def _update_indicators(self, symbol: str, current_price: int) -> None:
         """
         ATR / 볼린저 지표를 계산해서 _last_indicators에 캐시합니다.
-        일봉 데이터는 하루 1회(처음 호출 시)만 로드합니다.
+
+        regime 판정에서 이미 받아온 cached_daily_bars를 재사용합니다
+        (별도 API 호출 없음 — 중복 호출로 인한 429 방지).
         """
         try:
-            # 일봉 캐시 로드 (없으면 API 호출)
-            if symbol not in self._daily_bars_cache:
-                bars = self.broker.get_daily_prices(symbol, days=65)
-                if bars and len(bars) >= 20:
-                    self._daily_bars_cache[symbol] = {
-                        'h': [b.high_price for b in bars],
-                        'l': [b.low_price  for b in bars],
-                        'c': [b.close_price for b in bars],
-                    }
-                else:
-                    self._daily_bars_cache[symbol] = {}
-
-            bars_dict = self._daily_bars_cache.get(symbol, {})
-            if not bars_dict:
+            # regime 판정용으로 이미 로드된 일봉 캐시를 그대로 재사용
+            bars = self.cached_daily_bars.get(symbol)
+            if not bars or len(bars) < 20:
+                self.app_logger.warning(
+                    f"[INDICATOR] {symbol} 일봉 데이터 부족 "
+                    f"({len(bars) if bars else 0}개, 최소 20개 필요) — "
+                    f"ATR/볼린저 계산 불가 (regime 캐시 대기 중)"
+                )
                 return
 
-            h = bars_dict['h']
-            l = bars_dict['l']
-            c = bars_dict['c']
+            h = [b.high_price for b in bars]
+            l = [b.low_price  for b in bars]
+            c = [b.close_price for b in bars]
 
             atr = calc_atr(h, l, c, period=14, current_price=current_price)
             bb  = calc_bollinger(c, current_price=current_price, period=20)
@@ -737,7 +753,9 @@ class TradingService:
             self._last_indicators[symbol] = {'atr': atr, 'bb': bb}
 
         except Exception as e:
-            self.app_logger.debug(f"[INDICATOR] {symbol} 계산 실패: {e}")
+            self.app_logger.warning(
+                f"[INDICATOR] {symbol} 계산 실패: {type(e).__name__}: {e}"
+            )
 
     async def _check_force_exit_overnight(self, balance) -> None:
         """
@@ -1016,6 +1034,15 @@ class TradingService:
 
         # ── 종목별 재진입 제한 체크 ──────────────────────────────
         now_dt = datetime.now()
+
+        # 0) NEUTRAL 손절 발생 → 당일 매수 완전 금지
+        if symbol in self.state.symbol_block_today:
+            self.app_logger.info(
+                f"[SYMBOL_BLOCK_TODAY] {symbol} "
+                f"reason=NEUTRAL_STOPLOSS_BLOCK "
+                f"block_buy=true"
+            )
+            return "NEUTRAL_STOPLOSS_BLOCK"
 
         # 1) 당일 손실 2회 이상 → 당일 매수 금지
         loss_cnt = self.state.symbol_loss_count_today.get(symbol, 0)
