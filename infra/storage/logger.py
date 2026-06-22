@@ -128,6 +128,45 @@ class SignalCsvLogger:
             with self.file_path.open("w", newline="", encoding="utf-8") as fp:
                 writer = csv.DictWriter(fp, fieldnames=SIGNAL_FIELDS)
                 writer.writeheader()
+        else:
+            self._migrate_header_if_needed()
+
+    def _migrate_header_if_needed(self) -> None:
+        """
+        기존 CSV의 헤더에 새 필드(atr_14 등)가 없으면 헤더를 갱신합니다.
+
+        extrasaction='ignore' 때문에, 헤더에 없는 컬럼은 조용히 버려집니다.
+        따라서 SIGNAL_FIELDS에 컬럼을 추가해도 기존 파일은 그대로면
+        새 데이터가 영영 안 들어갑니다. 이 함수가 그 격차를 메웁니다.
+
+        주의: 기존 파일이 utf-8-sig(BOM 포함)로 쓰였을 수 있으므로
+        반드시 utf-8-sig로 읽어야 첫 컬럼(timestamp)의 키가 BOM 때문에
+        깨지지 않는다. (utf-8로 읽으면 '\ufefftimestamp'가 되어 값이 유실됨)
+        """
+        try:
+            with self.file_path.open("r", newline="", encoding="utf-8-sig") as fp:
+                reader = csv.reader(fp)
+                existing_header = next(reader, [])
+        except (StopIteration, OSError):
+            return
+
+        # 헤더가 이미 최신이면 아무것도 안 함
+        missing = [f for f in SIGNAL_FIELDS if f not in existing_header]
+        if not missing:
+            return
+
+        # 기존 데이터를 모두 읽어서 DictReader로 파싱 (utf-8-sig로 BOM 제거)
+        with self.file_path.open("r", newline="", encoding="utf-8-sig") as fp:
+            old_rows = list(csv.DictReader(fp))
+
+        # 새 헤더 + 기존 행(없는 컬럼은 빈 값)으로 전체 재작성
+        with self.file_path.open("w", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=SIGNAL_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            for old_row in old_rows:
+                for field in SIGNAL_FIELDS:
+                    old_row.setdefault(field, "")
+                writer.writerow(old_row)
 
     def append(self, row: dict[str, Any]) -> None:
         """시그널 로그 한 줄을 추가합니다."""
