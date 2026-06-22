@@ -254,17 +254,20 @@ class BreakoutStrategy(Strategy):
 
         # ② 구간형 트레일링 스탑
         # 수익 구간에 따라 트레일링 폭을 다르게 적용합니다.
-        trailing_start_price = int(average_price * 1.005)  # +0.5% 이상 시 시작
+        # 2026-06-22 개편: 손익비 개선 — 시작점을 +1.2%로 늦추고 전 구간 폭 확대.
+        #   (기존엔 +0.5%부터 -1.0%로 추적해서 본전 근처 조기청산이 빈번,
+        #    이길 때 평균 +0.23% vs 질 때 -1.14%로 손익비가 1:4.9로 거꾸로였음)
+        trailing_start_price = int(average_price * 1.012)  # +1.2% 이상 시 시작
         if highest_price >= trailing_start_price and highest_price > 0:
             high_pnl_pct = (highest_price - average_price) / average_price * 100
-            if high_pnl_pct >= 3.0:
-                trail_pct = 2.0
+            if high_pnl_pct >= 5.0:
+                trail_pct = 2.8
+            elif high_pnl_pct >= 3.5:
+                trail_pct = 2.2
             elif high_pnl_pct >= 2.0:
+                trail_pct = 1.8
+            else:  # +1.2~2.0%
                 trail_pct = 1.5
-            elif high_pnl_pct >= 1.0:
-                trail_pct = 1.2
-            else:  # +0.5~1.0% — 2026-06-15: 0.8→1.0 상향 (손실 반복 방지)
-                trail_pct = 1.0
             trailing_stop_price = int(highest_price * (1 - trail_pct / 100))
             from_high_pct = (current_price - highest_price) / highest_price * 100
             if current_price <= trailing_stop_price:
@@ -321,13 +324,13 @@ class BreakoutStrategy(Strategy):
                 reason=f"안전망 익절 — 평균단가 대비 +{self.config.take_profit_pct:.0f}% 도달",
             )
 
-        # 트레일링 스탑 진행 상황 표시
+        # 트레일링 스탑 진행 상황 표시 (② 실제 청산 로직과 동일한 구간 유지)
         if highest_price >= trailing_start_price and highest_price > 0:
             high_pnl_pct2 = (highest_price - average_price) / average_price * 100
-            if high_pnl_pct2 >= 3.0:   trail_pct2 = 2.0
-            elif high_pnl_pct2 >= 2.0: trail_pct2 = 1.5
-            elif high_pnl_pct2 >= 1.0: trail_pct2 = 1.2
-            else:                       trail_pct2 = 1.0
+            if high_pnl_pct2 >= 5.0:   trail_pct2 = 2.8
+            elif high_pnl_pct2 >= 3.5: trail_pct2 = 2.2
+            elif high_pnl_pct2 >= 2.0: trail_pct2 = 1.8
+            else:                       trail_pct2 = 1.5
             trailing_stop_price = int(highest_price * (1 - trail_pct2 / 100))
             return Signal(
                 type=SignalType.HOLD,

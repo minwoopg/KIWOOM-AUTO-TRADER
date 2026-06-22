@@ -48,7 +48,7 @@ strategy:
   stop_loss_pct: 1.5             # 손절 기준
   reference_price_type: previous_close
   trailing_stop_pct: 2.0         # 최고가 대비 -2% 하락 시 매도
-  trailing_start_pct: 1.0        # 최소 +1% 이상 올랐을 때부터 트레일링 시작
+  trailing_start_pct: 1.2        # 2026-06-22: 1.0→1.2 (본전권 조기청산 방지, 손익비 개선)
   trend_reversal_rsi: 70.0       # 추세 꺾임 감지 RSI 기준
 
 market_regime:
