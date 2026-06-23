@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Callable
 
 from config.settings import WebSocketConfig
@@ -170,12 +171,14 @@ class ConditionWatcher:
             values   = item.get("values", {})
             raw_code = values.get("9001", "")
             action   = values.get("843", "")
+            # 키움 9001은 'A005930' 또는 'A 없이 005930'으로 올 수 있음.
+            # 기존엔 'A로 시작 안 하면 ETF'로 간주해 제외했으나, 실제로는
+            # 정상 개별주(092790 넥스틸, 198440 강동씨앤엘 등)도 A 없이 와서
+            # 오인 제외되는 버그가 있었음. → A 접두사를 떼고 6자리 숫자인지로 판정.
             symbol   = raw_code.lstrip("A")
 
-            if not raw_code.startswith("A"):
-                logger.info(f"[COND] 제외: {raw_code} — ETF/인버스 등")
-                continue
-            if not symbol:
+            if not re.fullmatch(r"\d{6}", symbol):
+                logger.info(f"[COND] 제외: {raw_code} — 종목코드 형식 아님(6자리 숫자 아님)")
                 continue
 
             target_set = self._symbols_by_seq.get(seq, set())
