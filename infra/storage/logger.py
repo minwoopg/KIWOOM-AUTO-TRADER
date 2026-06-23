@@ -11,17 +11,39 @@ AppLogger = logging.Logger
 
 
 def build_app_logger(log_file: str, level: str = "INFO") -> AppLogger:
-    """파일 기반 앱 로거를 생성합니다."""
+    """파일 기반 앱 로거를 생성합니다.
+
+    프로젝트 전체 로그(app_logger + infra.* / domain.* 모듈 로거)를
+    하나의 app.log로 모으기 위해, 파일 핸들러를 루트 로거에 붙입니다.
+    그동안 condition_watcher / kiwoom_ws 의 [COND]/[WS] 로그가
+    app.log에 안 찍히던 원인을 해결합니다.
+    """
 
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    # 루트 로거에 파일 핸들러를 붙여 모든 하위 로거의 로그를 한곳에 모음
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level.upper())
+    target_path = str(Path(log_file).resolve())
+    already_has_file = any(
+        isinstance(h, logging.FileHandler)
+        and getattr(h, "baseFilename", "") == target_path
+        for h in root_logger.handlers
+    )
+    if not already_has_file:
+        root_file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        root_file_handler.setFormatter(formatter)
+        root_logger.addHandler(root_file_handler)
+        # 외부 라이브러리의 과도한 로그는 억제
+        logging.getLogger("websockets").setLevel(logging.WARNING)
+        logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+    # app_logger는 별도 핸들러 없이 루트 핸들러로 전파(propagate)시켜 중복 방지
     logger = logging.getLogger("kiwoom_auto_trader")
     logger.setLevel(level.upper())
-
-    if not logger.handlers:
-        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+    logger.handlers.clear()      # 기존에 직접 붙인 핸들러 제거 (중복 방지)
+    logger.propagate = True
 
     return logger
 

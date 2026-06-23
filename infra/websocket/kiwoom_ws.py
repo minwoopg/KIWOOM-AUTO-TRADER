@@ -48,6 +48,7 @@ class KiwoomWebSocket:
         연결이 끊기면 자동으로 재연결합니다.
         """
         self._running = True
+        logger.info("[WS] start() 진입 — 재연결 루프 시작")
         while self._running:
             try:
                 await self._connect_and_run()

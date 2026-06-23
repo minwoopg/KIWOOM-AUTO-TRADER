@@ -194,14 +194,25 @@ async def async_main() -> None:
         manual_symbols = settings.targets
 
         def on_symbols_changed(symbols: list[str]) -> None:
+            # ── 단타 seq에 속한 종목만 추림 (스윙 seq 종목은 단타 targets에서 제외) ──
+            # 어제 스윙 seq를 같은 WebSocket으로 합쳐 구독하면서, 콜백의 symbols에
+            # 스윙용 종목까지 섞여 들어와 단타 targets를 오염시키는 문제가 있었음.
+            day_seqs_set = {str(s) for s in settings.websocket.condition_seqs}
+            day_symbols: list[str] = []
+            for seq, syms in watcher._symbols_by_seq.items():
+                if seq in day_seqs_set:
+                    for s in syms:
+                        if s not in day_symbols:
+                            day_symbols.append(s)
+
             # 자동 제외된 종목은 재편입 차단
             excluded = trading_service.get_excluded_symbols()
-            filtered = [s for s in symbols if s not in excluded]
+            filtered = [s for s in day_symbols if s not in excluded]
             combined = list(dict.fromkeys(manual_symbols + filtered))
             limited  = combined[:settings.websocket.max_symbols]
             sym_to_cond = watcher.symbol_to_condition
             trading_service.update_targets(limited, sym_to_cond)
-            blocked = excluded & set(symbols)
+            blocked = excluded & set(day_symbols)
             if blocked:
                 app_logger.info(f"[COND] 제외 종목 재편입 차단: {sorted(blocked)}")
             # ── 조건검색식별 편입 현황 + final_targets 로그 ──
@@ -274,9 +285,18 @@ async def async_main() -> None:
         )
         app_logger.info("[COND] 종목은 조건검색으로 자동 설정됩니다")
 
+        async def watcher_start_guarded() -> None:
+            # watcher가 조용히 죽는 문제 진단용 — 예외를 반드시 로그로 노출
+            try:
+                app_logger.info("[COND] watcher.start() 진입 — WebSocket 연결 시작")
+                await watcher.start()
+                app_logger.warning("[COND] watcher.start()가 정상 종료됨 (예상치 못함)")
+            except Exception as exc:
+                app_logger.exception(f"[COND] watcher.start() 예외로 중단: {exc}")
+
         await asyncio.gather(
             trading_loop(trading_service, settings, app_logger),
-            watcher.start(),
+            watcher_start_guarded(),
         )
 
     else:
