@@ -165,20 +165,29 @@ class ConditionWatcher:
 
     def _on_realtime(self, msg: dict) -> None:
         data_list = msg.get("data") or []
-        seq = str(msg.get("seq", ""))
+        # ── 종목별로 처리 (seq는 data[i].item 필드에 있음) ──────────
+        # 2026-06-24 REAL 메시지 구조 확인:
+        #   msg_keys = ['data', 'trnm']  (최상위에 seq 없음)
+        #   data[0]_keys = ['values', 'type', 'name', 'item']
+        #   → seq는 각 item의 'item' 필드에 담겨 있음
 
         for item in data_list:
             values   = item.get("values", {})
             raw_code = values.get("9001", "")
             action   = values.get("843", "")
-            # 키움 9001은 'A005930' 또는 'A 없이 005930'으로 올 수 있음.
-            # 기존엔 'A로 시작 안 하면 ETF'로 간주해 제외했으나, 실제로는
-            # 정상 개별주(092790 넥스틸, 198440 강동씨앤엘 등)도 A 없이 와서
-            # 오인 제외되는 버그가 있었음. → A 접두사를 떼고 6자리 숫자인지로 판정.
-            symbol   = raw_code.lstrip("A")
 
+            # seq를 data 항목의 'item' 필드에서 추출
+            seq = str(item.get("item", "") or msg.get("seq", "") or "")
+            if seq not in self._symbols_by_seq:
+                if self._symbols_by_seq:
+                    seq = next(iter(self._symbols_by_seq))  # 임시: 첫 번째 단타 seq로 귀속
+                else:
+                    continue
+
+            # A 접두사를 떼고 6자리 숫자인지로 판정 (A 유무 혼용 대응)
+            symbol = raw_code.lstrip("A")
             if not re.fullmatch(r"\d{6}", symbol):
-                logger.info(f"[COND] 제외: {raw_code} — 종목코드 형식 아님(6자리 숫자 아님)")
+                logger.debug(f"[COND] 제외: {raw_code} — 종목코드 형식 아님")
                 continue
 
             target_set = self._symbols_by_seq.get(seq, set())
