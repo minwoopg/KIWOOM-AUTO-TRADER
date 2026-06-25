@@ -179,6 +179,16 @@ class ConditionWatcher:
             # seq를 data 항목의 'item' 필드에서 추출
             seq = str(item.get("item", "") or msg.get("seq", "") or "")
             if seq not in self._symbols_by_seq:
+                # 실제 item 필드 값을 한 번만 찍어서 seq 구조 확인
+                if not getattr(self, "_logged_item_structure", False):
+                    logger.info(
+                        f"[COND] REAL item 구조 확인 | "
+                        f"item.keys={list(item.keys())} | "
+                        f"item[item]='{item.get('item')}' | "
+                        f"item[name]='{item.get('name')}' | "
+                        f"known_seqs={list(self._symbols_by_seq.keys())}"
+                    )
+                    self._logged_item_structure = True
                 if self._symbols_by_seq:
                     seq = next(iter(self._symbols_by_seq))  # 임시: 첫 번째 단타 seq로 귀속
                 else:
