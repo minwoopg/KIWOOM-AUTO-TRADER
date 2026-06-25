@@ -565,6 +565,9 @@ class TradingService:
 
             try:
                 position_check = next((p for p in balance.positions if p.symbol == symbol), None)
+                # 하루 매도 완료 종목은 직전 잔고 API 지연 시 잘못 보일 수 있으니 None 처리
+                if position_check is not None and symbol in getattr(self, '_sold_today', set()):
+                    position_check = None
                 if position_check is not None:
                     try:
                         market_price = self.broker.get_market_price(symbol)
@@ -723,6 +726,8 @@ class TradingService:
         self.state.symbol_trail_loss_at.clear()
         self.state.symbol_entry_count_today.clear()
         self.state.symbol_block_today.clear()
+        if hasattr(self, '_sold_today'):
+            self._sold_today.clear()  # 당일 매도 완료 종목 초기화
         self.app_logger.info("[RESET] 당일 종목별 손실/진입 카운트 초기화 완료")
 
     def _update_indicators(self, symbol: str, current_price: int) -> None:
@@ -1208,6 +1213,12 @@ class TradingService:
             # 주문 성공 후 잔고 캐시 무효화
             self.cached_balance = None
             self.cached_balance_loaded_at = None
+
+            # 매도 완료 종목 기록 — 모의투자 API가 즉시 수량을 반영 안 할 류에
+            # 다음 포링 사이클에서 같은 종목을 또 매도 시도하는 것을 방지
+            if not hasattr(self, '_sold_today'):
+                self._sold_today: set[str] = set()
+            self._sold_today.add(symbol)
 
             # 매도 시각 기록 → 재진입 쿨다운에 사용
             now_iso = datetime.now().isoformat()
