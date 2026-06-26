@@ -147,11 +147,12 @@ class ConditionWatcher:
         # 어느 조건식 결과인지 확인
         seq = str(msg.get("seq", ""))
         data = msg.get("data") or []
-        symbols = [
-            item["jmcode"].lstrip("A")
-            for item in data
-            if "jmcode" in item and item["jmcode"].startswith("A")
-        ]
+        symbols = []
+        for d in data:
+            jmcode = d.get("jmcode", "")
+            code = jmcode.lstrip("A")
+            if re.fullmatch(r"\d{6}", code):
+                symbols.append(code)
 
         if seq in self._symbols_by_seq:
             self._symbols_by_seq[seq] = set(symbols)
@@ -176,23 +177,14 @@ class ConditionWatcher:
             raw_code = values.get("9001", "")
             action   = values.get("843", "")
 
-            # seq를 data 항목의 'item' 필드에서 추출
-            seq = str(item.get("item", "") or msg.get("seq", "") or "")
-            if seq not in self._symbols_by_seq:
-                # 실제 item 필드 값을 한 번만 찍어서 seq 구조 확인
-                if not getattr(self, "_logged_item_structure", False):
-                    logger.info(
-                        f"[COND] REAL item 구조 확인 | "
-                        f"item.keys={list(item.keys())} | "
-                        f"item[item]='{item.get('item')}' | "
-                        f"item[name]='{item.get('name')}' | "
-                        f"known_seqs={list(self._symbols_by_seq.keys())}"
-                    )
-                    self._logged_item_structure = True
-                if self._symbols_by_seq:
-                    seq = next(iter(self._symbols_by_seq))  # 임시: 첫 번째 단타 seq로 귀속
-                else:
-                    continue
+            # ── seq 귀속 ─────────────────────────────────────────
+            # 키움 REAL 메시지에는 어느 조건식에서 편입됐는지 정보가 없음.
+            # (item['item']은 종목코드, item['name']은 '조건검색'으로 고정 — 2026-06-26 확인)
+            # 따라서 편입된 종목을 모든 단타 seq에 동시 귀속시킴.
+            # → 조건검색식별 통계는 의미없어지나, 종목 편입/편출 자체는 정상 동작.
+            seq = next(iter(self._symbols_by_seq)) if self._symbols_by_seq else None
+            if seq is None:
+                continue
 
             # A 접두사를 떼고 6자리 숫자인지로 판정 (A 유무 혼용 대응)
             symbol = raw_code.lstrip("A")
