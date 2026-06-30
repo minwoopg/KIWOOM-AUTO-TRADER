@@ -109,6 +109,7 @@ def pair_trades(rows: list[dict]) -> list[dict]:
                 "v_rise_pct":    safe_float(buy.get("v_rise_pct")),
                 "upside":        safe_float(buy.get("upside_to_recent_high_pct")),
                 "rebound_spike": safe_bool(buy.get("rebound_volume_spike")),
+                "change_rate":   safe_float(buy.get("change_rate_pct")),
                 "exit_reason":   sell.get("exit_reason",""),
                 "hold_minutes":  safe_float(sell.get("hold_minutes")),
                 "buy_time":      buy.get("timestamp",""),
@@ -225,6 +226,31 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
         w   = sum(1 for p in grp if p["win"])
         avg = sum(p["pnl_pct"] for p in grp) / len(grp)
         row(label, f"{len(grp)}건  승률 {pct(w,len(grp))}  평균 {avg:+.2f}%")
+
+    # ── 7-1. 당일 등락률 구간별 손익 (급등 종목 진입 추적) ────
+    cr_pairs = [p for p in pairs if p.get("change_rate") is not None]
+    if cr_pairs:
+        sub("7-1. 당일 등락률 구간별 손익")
+        cr_buckets = [
+            ("< +3%",     lambda c: c < 3.0),
+            ("+3~+5%",    lambda c: 3.0 <= c < 5.0),
+            ("+5~+10%",   lambda c: 5.0 <= c < 10.0),
+            ("+10~+15%",  lambda c: 10.0 <= c < 15.0),
+            ("+15%+ (고변동)", lambda c: c >= 15.0),
+        ]
+        for label, fn in cr_buckets:
+            grp = [p for p in cr_pairs if fn(p["change_rate"])]
+            if not grp: continue
+            w   = sum(1 for p in grp if p["win"])
+            avg = sum(p["pnl_pct"] for p in grp) / len(grp)
+            row(label, f"{len(grp)}건  승률 {pct(w,len(grp))}  평균 {avg:+.2f}%")
+        loss_pairs = sorted([p for p in cr_pairs if not p["win"]],
+                            key=lambda p: -(p["change_rate"] or 0))
+        if loss_pairs:
+            lines.append("")
+            lines.append("  [ 손실 거래의 당일 등락률 (높은 순) ]")
+            for p in loss_pairs[:8]:
+                row(f"  {p['symbol']}", f"당일 {p['change_rate']:+.1f}%  →  {p['pnl_pct']:+.2f}%")
 
     # ── 8. 종목별 손익 ─────────────────────────────────────
     sub("8. 종목별 손익")

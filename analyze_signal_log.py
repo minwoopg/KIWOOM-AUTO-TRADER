@@ -98,6 +98,25 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
     row("BLOCKED",     f"{len(blocked_rows):,}건  ({pct(len(blocked_rows), total)})")
     row("HOLD / SKIP", f"{len(hold_rows):,}건  ({pct(len(hold_rows), total)})")
 
+    # ── 1-1. BLOCKED 사유 분포 (order_block_reason) ───────────
+    if blocked_rows:
+        sub("1-1. BLOCKED 사유 분포")
+        block_cnt = Counter(r.get("order_block_reason","") or "(미기록)" for r in blocked_rows)
+        for reason, cnt in block_cnt.most_common():
+            row(reason, f"{cnt:,}건  ({pct(cnt, len(blocked_rows))})")
+
+        block_by_sym = Counter(r.get("symbol","") for r in blocked_rows)
+        if block_by_sym:
+            lines.append("")
+            lines.append("  [ 종목별 BLOCKED Top 5 ]")
+            for sym, cnt in block_by_sym.most_common(5):
+                sym_reasons = Counter(
+                    r.get("order_block_reason","") or "(미기록)"
+                    for r in blocked_rows if r.get("symbol") == sym
+                )
+                top_reason = sym_reasons.most_common(1)[0][0] if sym_reasons else ""
+                row(f"  {sym}", f"{cnt:,}건  (주사유: {top_reason})")
+
     # ── 2. 장세 분포 ──────────────────────────────────────────
     sub("2. 장세 분포")
     regime_cnt = Counter(r.get("regime","") for r in rows)
@@ -200,6 +219,39 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
         bspike = Counter(str(safe_bool(r.get("v_bottom_spike")))      for r in v_detected)
         row("rebound_volume_spike=True",  f"{rspike.get('True',0):,}건  ({pct(rspike.get('True',0), len(v_detected))})")
         row("v_bottom_spike=True",        f"{bspike.get('True',0):,}건  ({pct(bspike.get('True',0), len(v_detected))})")
+
+        # ── 반등봉 거래량 비율 분포 (spike 기준=2.0배, 왜 0인지 진단) ──
+        ratios = [safe_float(r.get("rebound_volume_ratio")) for r in v_detected]
+        ratios = [x for x in ratios if x is not None]
+        if ratios:
+            lines.append("")
+            lines.append("  [ 반등봉 거래량 비율 (현재봉/당일평균, spike 기준 2.0배) ]")
+            row("  평균 비율", f"x{sum(ratios)/len(ratios):.2f}")
+            row("  최소 / 최대", f"x{min(ratios):.2f} / x{max(ratios):.2f}")
+            rb: dict[str,int] = defaultdict(int)
+            for x in ratios:
+                if x < 1.0:    rb["<1.0배"] += 1
+                elif x < 1.5:  rb["1.0~1.5배"] += 1
+                elif x < 2.0:  rb["1.5~2.0배 (기준 직전)"] += 1
+                else:          rb["2.0배+ (spike)"] += 1
+            for k in ["<1.0배","1.0~1.5배","1.5~2.0배 (기준 직전)","2.0배+ (spike)"]:
+                if rb[k]:
+                    row(f"  {k}", f"{rb[k]:,}건  ({pct(rb[k], len(ratios))})")
+
+    # ── 5-1. V자 실패 사유 분포 (v_fail_reason) ──────────────
+    v_fail_rows = [r for r in rows if (r.get("v_fail_reason","") or "").strip()]
+    if v_fail_rows:
+        sub("5-1. V자 실패 사유 분포")
+        fail_kw: dict[str,int] = defaultdict(int)
+        for r in v_fail_rows:
+            reason = r.get("v_fail_reason","")
+            for kw in ["낙폭부족","반등부족","거래량부족","VWAP미회복","MA5조건미충족","저점나이"]:
+                if kw in reason:
+                    fail_kw[kw] += 1
+        total_vfail = len(v_fail_rows)
+        row("V자 실패 판단 건수", f"{total_vfail:,}건")
+        for kw, cnt in sorted(fail_kw.items(), key=lambda x: -x[1]):
+            row(f"  {kw}", f"{cnt:,}건  ({pct(cnt, total_vfail)})")
 
     # v_low_age 분포 (전체 기준)
     sub("  v_low_age 분포 (V자 감지 여부 무관)")

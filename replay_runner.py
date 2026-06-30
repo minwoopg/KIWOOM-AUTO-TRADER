@@ -327,7 +327,7 @@ def format_report(symbol: str, results: list[dict], target_date: date) -> str:
     return "\n".join(lines)
 
 
-def build_summary(all_results: dict[str, list[dict]]) -> str:
+def build_summary(all_results: dict[str, list[dict]], actual_buys: set = None) -> str:
     """전 종목 요약 리포트를 생성합니다."""
     lines = ["═" * 60, "  📋 전 종목 요약", "═" * 60, ""]
 
@@ -357,8 +357,56 @@ def build_summary(all_results: dict[str, list[dict]]) -> str:
         for sym in risk_symbols:
             lines.append(f"      → {sym}")
 
+    # ── 놓친 기회 (missed opportunity) ────────────────────────
+    # replay 5분 순수익이 좋은데(평균 +0.5%↑) 실제로 매수 안 한 종목
+    if actual_buys is not None:
+        MIN_NET_5M = 0.5
+        MIN_SIGNALS = 3
+        missed = []
+        for symbol, results in all_results.items():
+            if symbol in actual_buys:
+                continue
+            net_5m = [r["net_5m"] for r in results if r["net_5m"] is not None]
+            if len(net_5m) < MIN_SIGNALS:
+                continue
+            avg = sum(net_5m) / len(net_5m)
+            if avg >= MIN_NET_5M:
+                win = sum(1 for v in net_5m if v > 0)
+                missed.append((symbol, len(net_5m), avg, win))
+        if missed:
+            missed.sort(key=lambda x: -x[2])
+            lines.append("")
+            lines.append("  💡 놓친 기회 (replay 양호 + 실제 미매수):")
+            lines.append(f"      (기준: 5분순수익 평균 +{MIN_NET_5M}%+, 신호 {MIN_SIGNALS}건+)")
+            for sym, cnt, avg, win in missed[:10]:
+                lines.append(
+                    f"      → {sym}  신호 {cnt}건  5분순수익 {avg:+.2f}%  승률 {win}/{cnt}"
+                )
+        else:
+            lines.append("")
+            lines.append("  💡 놓친 기회: 없음 (replay 양호한 미매수 종목 없음)")
+
     lines.append("─" * 60)
     return "\n".join(lines)
+
+
+def load_actual_buys(target_date: date) -> set:
+    """trades.csv에서 해당 날짜에 실제 매수한 종목 집합을 반환합니다."""
+    trades_path = Path("logs/trades.csv")
+    if not trades_path.exists():
+        return set()
+    buys = set()
+    try:
+        with trades_path.open(encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                ts = r.get("timestamp", "")
+                if ts[:10] != target_date.isoformat():
+                    continue
+                if r.get("side") == "BUY" and r.get("accepted") == "True":
+                    buys.add(r.get("symbol", ""))
+    except Exception:
+        pass
+    return buys
 
 
 def main():
@@ -396,7 +444,8 @@ def main():
 
     # 전 종목 요약
     if not filter_sym and len(all_results) > 1:
-        summary = build_summary(all_results)
+        actual_buys = load_actual_buys(target_date)
+        summary = build_summary(all_results, actual_buys)
         print(summary)
         all_reports.append(summary)
 

@@ -1373,6 +1373,7 @@ class TradingService:
             ctx["bar_amount"]             = ma.trading_value
             ctx["rebound_volume_spike"]   = ma.rebound_volume_spike
             ctx["rebound_volume_ratio"]   = ma.rebound_volume_ratio
+            ctx["change_rate_pct"]        = round(ma.change_rate_pct, 2)
             ctx["v_bottom_spike"]         = ma.v_bottom_spike
             ctx["upside_to_recent_high_pct"] = ma.upside_to_recent_high_pct
         return ctx
@@ -1459,6 +1460,7 @@ class TradingService:
                 "bar_amount":          ma.trading_value,
                 "rebound_volume_spike": ma.rebound_volume_spike,
                 "rebound_volume_ratio": ma.rebound_volume_ratio,
+                "change_rate_pct": round(ma.change_rate_pct, 2),
                 "v_bottom_spike":       ma.v_bottom_spike,
                 "upside_to_recent_high_pct": ma.upside_to_recent_high_pct,
                 "ma5_above_ma20":      ma.ma5_above_ma20,
