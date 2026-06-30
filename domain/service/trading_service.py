@@ -1148,6 +1148,23 @@ class TradingService:
             self.state.bought_symbols_today.add(symbol)
             self.state.last_order_id_by_symbol[symbol] = result.order_id
             self._last_buy_signal_at[symbol] = datetime.now()
+
+            # ── 볼린저 상단 돌파 매수 경고 (2026-06-30 추가) ──────────
+            # 볼린저 %B > 1.0(상단 돌파)에서의 매수는 추격매수 위험이 높음.
+            # 차단하지 않고 경고만 남겨 추적(어떤 결과로 이어지는지 데이터 수집).
+            _ind = self._last_indicators.get(symbol, {})
+            _bb  = _ind.get("bb")
+            if _bb is not None and getattr(_bb, "percent_b", None) is not None:
+                if _bb.percent_b > 1.0:
+                    self.app_logger.warning(
+                        f"[BB_WARN] {symbol} | 볼린저 상단 돌파 매수 "
+                        f"(%B={_bb.percent_b:.2f}) — 추격매수 위험 구간"
+                    )
+                elif _bb.percent_b >= 0.8:
+                    self.app_logger.info(
+                        f"[BB_WARN] {symbol} | 볼린저 상단 근처 매수 "
+                        f"(%B={_bb.percent_b:.2f})"
+                    )
             # 1일 1회 진입 제한용 카운터
             self.state.symbol_entry_count_today[symbol] = (
                 self.state.symbol_entry_count_today.get(symbol, 0) + 1
@@ -1355,6 +1372,7 @@ class TradingService:
             ctx["volume_ratio"]           = round(ma.v_volume_ratio, 2)
             ctx["bar_amount"]             = ma.trading_value
             ctx["rebound_volume_spike"]   = ma.rebound_volume_spike
+            ctx["rebound_volume_ratio"]   = ma.rebound_volume_ratio
             ctx["v_bottom_spike"]         = ma.v_bottom_spike
             ctx["upside_to_recent_high_pct"] = ma.upside_to_recent_high_pct
         return ctx
@@ -1440,6 +1458,7 @@ class TradingService:
                 "volume_ratio":        round(ma.v_volume_ratio, 2),
                 "bar_amount":          ma.trading_value,
                 "rebound_volume_spike": ma.rebound_volume_spike,
+                "rebound_volume_ratio": ma.rebound_volume_ratio,
                 "v_bottom_spike":       ma.v_bottom_spike,
                 "upside_to_recent_high_pct": ma.upside_to_recent_high_pct,
                 "ma5_above_ma20":      ma.ma5_above_ma20,

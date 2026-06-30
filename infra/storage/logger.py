@@ -123,6 +123,7 @@ SIGNAL_FIELDS = [
     "volume_ratio",
     "bar_amount",
     "rebound_volume_spike",
+    "rebound_volume_ratio",
     "v_bottom_spike",
     "upside_to_recent_high_pct",
     "ma5_above_ma20",

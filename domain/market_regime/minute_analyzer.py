@@ -49,6 +49,7 @@ class MinuteAnalysis:
     v_bottom_spike: bool        # 저점봉 순간 거래량 급등 여부 (투매 확인용 보조)
     v_ma5_rising: bool          # MA5 기울기 상승 여부
     rebound_volume_spike: bool  # 현재 반등봉 거래량 급등 여부 (매수세 유입 핵심 지표)
+    rebound_volume_ratio: float # 현재봉 거래량 / 당일 평균 거래량 (spike 판정 입력값, 진단용)
     upside_to_recent_high_pct: float  # 현재가→최근 고점까지 상승 여력 (%)
 
     # ── 눌림목 재상승 ────────────────────────────────────────────
@@ -365,8 +366,9 @@ class MinuteAnalyzer:
         # ── 반등봉 거래량 spike (현재봉 거래량 vs 당일 평균) ────
         # 저점봉 spike(투매 확인)와 달리 반등봉 spike는 매수세 유입을 확인하는 핵심 지표
         avg_daily_vol = sum(b.volume for b in bars) / len(bars) if bars else 1
+        rebound_volume_ratio = (bars[-1].volume / avg_daily_vol) if avg_daily_vol > 0 else 0.0
         rebound_volume_spike = (
-            bars[-1].volume > avg_daily_vol * 2.0  # 당일 평균의 2배 이상
+            rebound_volume_ratio > 2.0  # 당일 평균의 2배 이상
         )
 
         # ── 최근 고점까지 상승 여력 ─────────────────────────────
@@ -408,6 +410,7 @@ class MinuteAnalyzer:
             v_bottom_spike=v_bottom_spike,
             v_ma5_rising=ma5_rising,
             rebound_volume_spike=rebound_volume_spike,
+            rebound_volume_ratio=round(rebound_volume_ratio, 2),
             upside_to_recent_high_pct=round(upside_to_recent_high_pct, 2),
             is_pulldown_recovery=is_pr,
             pr_low_turning=pr_low_turning,
