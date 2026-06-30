@@ -88,6 +88,8 @@ class MarketRegimeConfig:
     change_rate_min: float
     change_rate_max: float
     rebound_min_pct: float
+    gap_pullback_min_pct: float
+    gap_pullback_max_pct: float
     # V자 반등 감지 파라미터
     v_bottom_lookback: int
     v_low_min_age: int

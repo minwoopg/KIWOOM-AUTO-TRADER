@@ -78,10 +78,15 @@ class BreakoutStrategy(Strategy):
                 # 기존 A/B/C/V/PR과 독립적으로 인정
                 cr   = minute_analysis.change_rate_pct
                 pb   = minute_analysis.pullback_pct if hasattr(minute_analysis, 'pullback_pct') else 0.0
+                # 패턴 D 상하한 (2026-06-30: 상한 추가)
+                # +5~10% 갭상승 후 눌림목만 인정. +10% 초과는 고점추격으로 간주해 D 비활성.
+                # 근거: 6/29 475150(+17.8%)·141080(+13.7%)이 D로 진입 후 즉시 손절.
+                GAP_PULLBACK_MIN = 5.0
+                GAP_PULLBACK_MAX = 10.0
                 pass_gap_pullback = (
-                    cr >= 5.0                          # 당일 +5% 이상 급등
-                    and minute_analysis.price_above_vwap  # VWAP 위 유지
-                    and -3.0 <= pb <= -0.1             # 고점 대비 -0.1~-3% 눌림
+                    GAP_PULLBACK_MIN <= cr <= GAP_PULLBACK_MAX  # 당일 +5~10% 급등
+                    and minute_analysis.price_above_vwap         # VWAP 위 유지
+                    and -3.0 <= pb <= -0.1                       # 고점 대비 -0.1~-3% 눌림
                 )
                 # pass_rebound = minute_analysis.is_valid_rebound  # B: 저점 반등 — 단독 비활성화 (2일 연속 손실)
                 pass_rebound  = False  # B 단독 비활성 중

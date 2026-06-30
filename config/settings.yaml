@@ -83,6 +83,8 @@ market_regime:
   change_rate_min: 2.0
   change_rate_max: 18.0
   rebound_min_pct: 2.0
+  gap_pullback_min_pct: 5.0   # 패턴 D(갭급등 눌림목) 하한: 당일 +5% 이상
+  gap_pullback_max_pct: 10.0  # 2026-06-30: 패턴 D 상한 추가. +10% 초과 갭등은 고점추격으로 간주, D 비활성 (475150/141080 손절 방지)
 
 risk:
   max_daily_loss_amount: 1000000  # 일일 손실 한도 (원)
