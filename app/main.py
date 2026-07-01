@@ -12,6 +12,7 @@ from __future__ import annotations
 """
 
 import asyncio
+import logging
 import os
 import shutil
 import time
@@ -131,6 +132,10 @@ async def async_main() -> None:
     settings = load_settings()
 
     app_logger   = build_app_logger(settings.storage.app_log_file, settings.app.log_level)
+    print("=" * 50)
+    print("  키움 자동매매 시스템 (단타) 시작")
+    print(f"  app.log: {settings.storage.app_log_file}")
+    print("=" * 50)
     trade_logger  = TradeCsvLogger(settings.storage.trade_log_file)
     signal_logger = SignalCsvLogger(settings.storage.signal_log_file)
     state_store  = JsonStateStore(settings.storage.state_file)
@@ -309,7 +314,13 @@ def main() -> None:
     try:
         asyncio.run(async_main())
     except KeyboardInterrupt:
-        pass
+        print("\n[종료] Ctrl+C 감지 — 정상 종료 처리 중...")
+    finally:
+        # 파일 핸들러를 명시적으로 flush/close.
+        # (Ctrl+C 시 close() 없이 종료되면 다음 실행 때 app.log에
+        #  로그가 안 찍히는 것처럼 보이는 문제의 원인이었음)
+        logging.shutdown()
+        print("[종료] 로그 정리 완료. 프로그램을 종료합니다.")
 
 
 if __name__ == "__main__":

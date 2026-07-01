@@ -19,10 +19,9 @@ broker:
 # 감시할 종목 목록 (조건검색 OFF 시 사용)
 targets:
   symbols:
-    - "010170"
     - "006260"
     - "005930"
-    - "080220"
+    - "000660"
     
 trading:
   poll_interval_seconds: 10

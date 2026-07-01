@@ -400,3 +400,5 @@ class SwingService:
                 "block_reason": a.block_reason,
                 "score_detail": a.score_detail,
             })
+
+

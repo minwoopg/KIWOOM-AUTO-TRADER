@@ -7,6 +7,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 AppLogger = logging.Logger
 
 
@@ -35,6 +37,9 @@ def build_app_logger(log_file: str, level: str = "INFO") -> AppLogger:
         root_file_handler = logging.FileHandler(log_file, encoding="utf-8")
         root_file_handler.setFormatter(formatter)
         root_logger.addHandler(root_file_handler)
+        # 콘솔에는 로그를 흘리지 않음 — 전량 출력은 터미널을 뒤덮어 오히려
+        # 실행 확인을 방해함. 실행 확인은 main.py의 시작 배너(print)로 대신함.
+
         # 외부 라이브러리의 과도한 로그는 억제
         logging.getLogger("websockets").setLevel(logging.WARNING)
         logging.getLogger("asyncio").setLevel(logging.WARNING)
@@ -152,6 +157,7 @@ class SignalCsvLogger:
             with self.file_path.open("w", newline="", encoding="utf-8") as fp:
                 writer = csv.DictWriter(fp, fieldnames=SIGNAL_FIELDS)
                 writer.writeheader()
+            logger.info(f"[SIGNAL_LOG] 신규 생성: {self.file_path} ({len(SIGNAL_FIELDS)}개 컬럼)")
         else:
             self._migrate_header_if_needed()
 
@@ -171,13 +177,19 @@ class SignalCsvLogger:
             with self.file_path.open("r", newline="", encoding="utf-8-sig") as fp:
                 reader = csv.reader(fp)
                 existing_header = next(reader, [])
-        except (StopIteration, OSError):
+        except (StopIteration, OSError) as exc:
+            logger.warning(f"[SIGNAL_LOG] 헤더 확인 실패 — 마이그레이션 건너뜀: {exc}")
             return
 
         # 헤더가 이미 최신이면 아무것도 안 함
         missing = [f for f in SIGNAL_FIELDS if f not in existing_header]
         if not missing:
+            logger.info(f"[SIGNAL_LOG] 헤더 최신 상태 확인 ({len(existing_header)}개 컬럼) — 마이그레이션 불필요")
             return
+
+        logger.info(
+            f"[SIGNAL_LOG] 헤더 마이그레이션 시작 — 누락 컬럼 {len(missing)}개: {missing}"
+        )
 
         # 기존 데이터를 모두 읽어서 DictReader로 파싱 (utf-8-sig로 BOM 제거)
         with self.file_path.open("r", newline="", encoding="utf-8-sig") as fp:
@@ -191,6 +203,11 @@ class SignalCsvLogger:
                 for field in SIGNAL_FIELDS:
                     old_row.setdefault(field, "")
                 writer.writerow(old_row)
+
+        logger.info(
+            f"[SIGNAL_LOG] 헤더 마이그레이션 완료 — {len(old_rows):,}행 재작성, "
+            f"컬럼 {len(existing_header)}개 → {len(SIGNAL_FIELDS)}개"
+        )
 
     def append(self, row: dict[str, Any]) -> None:
         """시그널 로그 한 줄을 추가합니다."""
