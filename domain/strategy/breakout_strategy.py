@@ -42,6 +42,7 @@ class BreakoutStrategy(Strategy):
         position: Position | None,
         minute_analysis=None,
         highest_price: int = 0,
+        bb_percent_b: float | None = None,
     ) -> Signal:
 
         current_price = market_price.current_price
@@ -203,7 +204,12 @@ class BreakoutStrategy(Strategy):
                 and minute_analysis.change_rate_pct >= 3.0
                 and not cond_macd_cross  # MACD 데드
             )
-            min_score = 5 if chasing_overheated else 3
+            # ── 볼린저 상단 돌파 추격매수 완화 조치 (2026-07-02) ──────
+            # %B>=1.0(상단 돌파)에서 4점(강한 진입)만으로 매수하던 걸 막고
+            # 5점 이상(최적 타점)만 허용. 완전 차단은 아님 — 표본 부족(11건,
+            # 그중 >1.0은 1건뿐)이라 강한 신호(5점+)까지 막을 근거는 없음.
+            bb_overheated = bb_percent_b is not None and bb_percent_b >= 1.0
+            min_score = 5 if (chasing_overheated or bb_overheated) else 3
 
             if score >= 5:
                 return Signal(
@@ -217,6 +223,15 @@ class BreakoutStrategy(Strategy):
                     reason=(
                         f"추격매수 차단 {score}/8 — 당일 "
                         f"{minute_analysis.change_rate_pct:+.1f}% + MACD데드 "
+                        f"→ 최소 {min_score}점 필요 — {summary}"
+                    ),
+                )
+            if bb_overheated:
+                # 볼린저 상단 돌파 구간: 5점 미만은 HOLD (4점 강한진입도 차단)
+                return Signal(
+                    type=SignalType.HOLD,
+                    reason=(
+                        f"볼린저 상단돌파 차단 {score}/8 — %B={bb_percent_b:.2f} "
                         f"→ 최소 {min_score}점 필요 — {summary}"
                     ),
                 )

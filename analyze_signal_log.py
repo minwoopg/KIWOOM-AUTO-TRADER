@@ -253,6 +253,36 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
         for kw, cnt in sorted(fail_kw.items(), key=lambda x: -x[1]):
             row(f"  {kw}", f"{cnt:,}건  ({pct(cnt, total_vfail)})")
 
+        # ── 5-2. v_drop_pct 실제 분포 (기준 -2.5% 대비 얼마나 근접했는지) ──
+        # v_fail_reason 문자열 "낙폭부족(-1.8%,최소-2.5%)"에서 실제 낙폭값 파싱.
+        # 기준선 바로 위(-2.0~-2.5%) 구간에 몰려있으면 기준이 병목이라는 뜻.
+        import re as _re
+        drop_vals = []
+        for r in v_fail_rows:
+            reason = r.get("v_fail_reason","")
+            m = _re.search(r"낙폭부족\(([+\-][\d.]+)%,최소([+\-][\d.]+)%\)", reason)
+            if m:
+                drop_vals.append(float(m.group(1)))
+        # V자 감지 성공한 것도 포함 (이미 기준 통과)
+        drop_vals += [d for d in drops if d is not None] if 'drops' in dir() else []
+
+        if drop_vals:
+            sub("5-2. v_drop_pct 실제 분포 (기준 -2.5% 대비)")
+            db: dict[str,int] = defaultdict(int)
+            for d in drop_vals:
+                if d > -1.0:      db["> -1.0% (얕음)"] += 1
+                elif d > -1.5:    db["-1.0~-1.5%"] += 1
+                elif d > -2.0:    db["-1.5~-2.0%"] += 1
+                elif d > -2.5:    db["-2.0~-2.5% (기준 직전, 병목 의심)"] += 1
+                else:             db["-2.5%↓ (기준 통과)"] += 1
+            total_d = len(drop_vals)
+            row("낙폭 데이터 보유", f"{total_d:,}건")
+            order = ["> -1.0% (얕음)","-1.0~-1.5%","-1.5~-2.0%",
+                     "-2.0~-2.5% (기준 직전, 병목 의심)","-2.5%↓ (기준 통과)"]
+            for k in order:
+                if db[k]:
+                    row(f"  {k}", f"{db[k]:,}건  ({pct(db[k], total_d)})")
+
     # v_low_age 분포 (전체 기준)
     sub("  v_low_age 분포 (V자 감지 여부 무관)")
     age_buckets: dict[str, int] = defaultdict(int)

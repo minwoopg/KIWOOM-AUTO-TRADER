@@ -652,7 +652,13 @@ class TradingService:
                     self._highest_price.pop(symbol, None)
     
                 highest_price = self._highest_price.get(symbol, 0)
-                signal = strategy.generate_signal(market_price, position, minute_analysis, highest_price)
+                # 볼린저 %B — 상단 돌파 시 진입 문턱 상향에 사용 (2026-07-02)
+                _bb_cached = self._last_indicators.get(symbol, {}).get('bb')
+                _bb_pb = getattr(_bb_cached, 'percent_b', None) if _bb_cached is not None else None
+                signal = strategy.generate_signal(
+                    market_price, position, minute_analysis, highest_price,
+                    bb_percent_b=_bb_pb,
+                )
     
                 self._log_signal_decision(
                     symbol, signal, market_price.current_price,
