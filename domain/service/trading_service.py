@@ -857,6 +857,7 @@ class TradingService:
             self._run_trade_analysis_today(now.date())
             self._run_indicator_analysis_today(now.date())
             self._run_replay_today(now.date())
+            self._run_bb_block_impact_today(now.date())
 
     def _run_signal_analysis_today(self, target_date) -> None:
         """장 마감 후 시그널 분석을 자동 실행합니다."""
@@ -911,6 +912,24 @@ class TradingService:
                 self.app_logger.warning(f"[ANALYSIS] 지표 분석 실패:\n{result.stderr}")
         except Exception as exc:
             self.app_logger.warning(f"[ANALYSIS] 지표 분석 오류: {exc}")
+
+    def _run_bb_block_impact_today(self, target_date) -> None:
+        """장 마감 후 볼린저 상단돌파 차단 가상 성과 분석을 자동 실행합니다."""
+        try:
+            import subprocess, sys
+            date_str = target_date.strftime("%Y-%m-%d")
+            result = subprocess.run(
+                [sys.executable, "analyze_bb_block_impact.py", date_str],
+                capture_output=True, text=True, timeout=60,
+                cwd=str(Path(__file__).resolve().parents[2]),
+                encoding="utf-8", errors="replace",
+            )
+            if result.returncode == 0:
+                self.app_logger.info("[ANALYSIS] 볼린저 차단 영향 분석 완료 → reports/ 저장")
+            else:
+                self.app_logger.warning(f"[ANALYSIS] 볼린저 차단 영향 분석 실패:\n{result.stderr}")
+        except Exception as exc:
+            self.app_logger.warning(f"[ANALYSIS] 볼린저 차단 영향 분석 오류: {exc}")
 
     def _run_replay_today(self, target_date) -> None:
         """장 마감 후 리플레이를 자동 실행합니다."""
