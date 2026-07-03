@@ -21,6 +21,7 @@ class Strategy(ABC):
         position: Position | None,
         minute_analysis=None,
         highest_price: int = 0,
+        **kwargs,
     ) -> Signal:
         """현재 시세와 보유 포지션을 보고 BUY/SELL/HOLD를 결정합니다.
 

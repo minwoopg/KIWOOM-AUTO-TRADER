@@ -624,8 +624,15 @@ class TradingService:
     
                 strategy = self.strategy_router.select(regime)
                 position = next((p for p in balance.positions if p.symbol == symbol), None)
+                # 당일 매도 완료 종목은 잔고 API 지연으로 잘못 보일 수 있으니 None 처리
+                # (2026-07-03: position_check에만 적용돼 있던 걸 실제 판단용 position에도 적용
+                #  — 064290이 14:48 매도 성공 후 5번 추가 매도 시도한 원인)
+                _forced_none_by_sold_today = False
+                if position is not None and symbol in getattr(self, '_sold_today', set()):
+                    position = None
+                    _forced_none_by_sold_today = True
 
-                if position is None and balance.positions:
+                if position is None and balance.positions and not _forced_none_by_sold_today:
                     # symbol이 정확히 일치하는 포지션이 없을 때,
                     # 비슷한(문자열 차이만 있는) 포지션이 있는지 확인해서
                     # 공백/접두사 등 매칭 실패 원인을 즉시 드러냄

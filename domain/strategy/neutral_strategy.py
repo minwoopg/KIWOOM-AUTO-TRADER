@@ -32,6 +32,7 @@ class NeutralStrategy(Strategy):
         position: Position | None,
         minute_analysis=None,
         highest_price: int = 0,
+        **kwargs,  # bb_percent_b 등 다른 전략용 추가 인자를 안전하게 무시
     ) -> Signal:
 
         current_price = market_price.current_price

@@ -26,7 +26,7 @@ class HoldStrategy(Strategy):
         self.config = config
         self.regime_label = regime_label
 
-    def generate_signal(self, market_price: MarketPrice, position: Position | None, minute_analysis=None, highest_price: int = 0) -> Signal:
+    def generate_signal(self, market_price: MarketPrice, position: Position | None, minute_analysis=None, highest_price: int = 0, **kwargs) -> Signal:
         """보유 중이면 익절/손절 판단, 미보유면 무조건 HOLD."""
 
         current_price = market_price.current_price
