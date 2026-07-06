@@ -741,6 +741,7 @@ class TradingService:
         self.state.symbol_block_today.clear()
         if hasattr(self, '_sold_today'):
             self._sold_today.clear()  # 당일 매도 완료 종목 초기화
+        self._excluded_symbols.clear()  # 당일 제외 종목(매매제한 등) 초기화 — 익일 재시도 허용
         self.app_logger.info("[RESET] 당일 종목별 손실/진입 카운트 초기화 완료")
 
     def _update_indicators(self, symbol: str, current_price: int) -> None:
@@ -1219,6 +1220,24 @@ class TradingService:
             self.app_logger.warning(
                 f"[FAIL ] {symbol} | 매수 주문 실패 | 사유: {result.message}"
             )
+            # ── 영구적 실패 사유는 당일 재시도 차단 (2026-07-06) ──────
+            # RC4007(매매제한 종목) 등은 재시도해도 항상 실패함.
+            # 252670이 09:00~15:11까지 계속 재시도되며 실패 163건을 만든 원인.
+            # 일시적 사유(수량부족, 네트워크 등)는 재시도 여지를 남기기 위해
+            # 제외하고, 명백히 영구적인 사유만 골라서 차단한다.
+            _permanent_fail_keywords = [
+                "매매제한", "RC4007",       # 매매제한 종목
+                "거래정지", "관리종목",       # 거래정지/관리종목
+                "상장폐지",                  # 상장폐지
+            ]
+            _msg = result.message or ""
+            if any(kw in _msg for kw in _permanent_fail_keywords):
+                if symbol not in self._excluded_symbols:
+                    self._excluded_symbols.add(symbol)
+                    self.app_logger.warning(
+                        f"[EXCL] {symbol} | 영구적 매수 실패 사유로 당일 재시도 차단 "
+                        f"— {_msg}"
+                    )
 
     def _try_sell(
         self,

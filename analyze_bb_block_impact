@@ -96,15 +96,19 @@ def simulate_event(event: dict) -> dict | None:
         return None
 
     # entry_ts와 가장 가까운(같거나 직후) 분봉 인덱스 찾기
+    # cntr_tm은 'YYYYMMDDHHMMSS' 14자리 형식 (replay_runner의 get_time_bucket과 동일 슬라이싱)
     entry_idx = None
     for i, b in enumerate(bars):
+        tm = b.cntr_tm.strip()
         try:
-            bar_time = datetime.strptime(b.cntr_tm, "%H%M%S").time()
-        except ValueError:
-            try:
-                bar_time = datetime.strptime(b.cntr_tm, "%H:%M:%S").time()
-            except ValueError:
+            if len(tm) >= 14:
+                bar_time = datetime.strptime(tm[8:14], "%H%M%S").time()
+            elif len(tm) == 6:
+                bar_time = datetime.strptime(tm, "%H%M%S").time()
+            else:
                 continue
+        except ValueError:
+            continue
         if bar_time >= entry_ts.time():
             entry_idx = i
             break
