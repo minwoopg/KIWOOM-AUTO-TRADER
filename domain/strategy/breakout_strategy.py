@@ -211,6 +211,15 @@ class BreakoutStrategy(Strategy):
             bb_overheated = bb_percent_b is not None and bb_percent_b >= 1.0
             min_score = 5 if (chasing_overheated or bb_overheated) else 3
 
+            # ── 종목별 진입 문턱 상향 (2026-07-06) ────────────────────
+            # 특정 종목이 구조적으로 저품질 진입을 반복 생산할 때 사용.
+            # 000660: replay 67건 A/B패턴 5분순수익 -0.61%, 실거래 손절
+            _symbol_overrides = getattr(self.config, "symbol_min_score_override", None) or {}
+            _symbol_min = _symbol_overrides.get(market_price.symbol)
+            symbol_overheated = _symbol_min is not None and score < _symbol_min
+            if _symbol_min is not None:
+                min_score = max(min_score, _symbol_min)
+
             if score >= 5:
                 return Signal(
                     type=SignalType.BUY,
@@ -233,6 +242,15 @@ class BreakoutStrategy(Strategy):
                     reason=(
                         f"볼린저 상단돌파 차단 {score}/8 — %B={bb_percent_b:.2f} "
                         f"→ 최소 {min_score}점 필요 — {summary}"
+                    ),
+                )
+            if symbol_overheated:
+                # 종목별 문턱: 해당 종목은 min_score 미만이면 전부 HOLD
+                return Signal(
+                    type=SignalType.HOLD,
+                    reason=(
+                        f"종목별 진입제한 {score}/8 — {market_price.symbol} "
+                        f"→ 최소 {_symbol_min}점 필요 — {summary}"
                     ),
                 )
             if score == 4:

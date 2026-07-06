@@ -62,6 +62,7 @@ class StrategyConfig:
     trailing_stop_pct: float      # 최고가 대비 하락 기준
     trailing_start_pct: float     # 트레일링 시작 최소 수익률
     trend_reversal_rsi: float     # 추세 꺾임 감지 RSI 기준
+    symbol_min_score_override: dict = None  # {종목코드: 최소진입점수} 개별 종목 진입문턱 상향
 
 
 @dataclass(frozen=True)

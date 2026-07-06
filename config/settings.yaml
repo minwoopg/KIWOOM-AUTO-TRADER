@@ -19,9 +19,10 @@ broker:
 # 감시할 종목 목록 (조건검색 OFF 시 사용)
 targets:
   symbols:
+    - "010170"
     - "006260"
     - "005930"
-    - "000660"
+    - "080220"
     
 trading:
   poll_interval_seconds: 10
@@ -39,6 +40,8 @@ trading:
     - "010170"                   # 2일 연속 고위험
     - "001510"                   # 실제 손실 + 고위험
     - "001740"                   # 2일 연속 실제 손실(6/9,6/15) + 리플레이 고위험
+    - "114800"                   # KODEX 인버스 ETF (2026-07-06: 개별주 전략과 성격 불일치, replay 310건 5분순수익 -0.34%)
+    - "252670"                   # KODEX 200선물인버스2X (2026-07-06: 레버리지 인버스 ETF, replay 238건 5분순수익 -0.33%)
 
 strategy:
   name: breakout
@@ -49,6 +52,8 @@ strategy:
   trailing_stop_pct: 2.0         # 최고가 대비 -2% 하락 시 매도
   trailing_start_pct: 1.2        # 2026-06-22: 1.0→1.2 (본전권 조기청산 방지, 손익비 개선)
   trend_reversal_rsi: 70.0       # 추세 꺾임 감지 RSI 기준
+  symbol_min_score_override:     # 종목별 진입 문턱 상향 (5점=최적타점만 허용)
+    "000660": 5                  # 2026-07-06: A/B패턴 구조적 부진 (replay 67건 5분순수익 -0.61%, 실거래 손절)
 
 market_regime:
   short_ma_days: 5
