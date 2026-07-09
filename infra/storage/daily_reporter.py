@@ -428,16 +428,11 @@ class DailyReporter:
                 qty = int(sell.get("quantity",0) or 0)
                 if sp <= 0: continue
 
-                # 평균매입단가 우선순위:
-                # 1) 매도 기록의 avg_buy_price (잔고API 기준)
-                # 2) 당일 매수 기록의 price
-                avg_buy_price = int(sell.get("avg_buy_price", 0) or 0)
-                if avg_buy_price > 0:
-                    bp = avg_buy_price
-                    buy = bl.pop(0) if bl else None
-                elif bl:
+                # 평균매입단가: 당일 실제 체결가 기준 (상단 [손익 요약],
+                # analyze_trades.py의 pair_trades()와 동일 기준 — 2026-07-09)
+                if bl:
                     buy = bl.pop(0)
-                    bp  = int(buy.get("price",0) or 0)
+                    bp  = int(buy.get("price", 0) or 0)
                 else:
                     continue
 
@@ -453,7 +448,6 @@ class DailyReporter:
                     "is_v":        self._safe_bool(buy.get("is_v_rebound") if buy else None),
                     "score":       buy.get("entry_score","") if buy else "",
                     "avg_buy_price": bp,
-                    "used_api_price": avg_buy_price > 0,
                 })
 
         if not pairs:
