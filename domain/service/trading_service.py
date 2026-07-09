@@ -1008,17 +1008,10 @@ class TradingService:
             self.app_logger.info(
                 f"[EXCL] {symbol} | excluded_symbols 차단"
             )
-            # signal_log에도 SKIP_EXCLUDED_SYMBOL 기록
-            if signal is not None:
-                self._write_signal_log(
-                    symbol=symbol,
-                    price=current_price,
-                    regime=regime,
-                    signal=signal,
-                    minute_analysis=minute_analysis,
-                    final_decision="BLOCKED",
-                    order_block_reason="SKIP_EXCLUDED_SYMBOL",
-                )
+            # signal_log 기록은 호출부(_try_buy 호출 지점)에서
+            # order_block_reason="EXCLUDED_SYMBOL"로 한 번만 남긴다.
+            # (2026-07-09: 여기서 한 번 더 기록하던 걸 제거 — 동일 이벤트가
+            #  SKIP_EXCLUDED_SYMBOL / EXCLUDED_SYMBOL 두 줄로 중복 집계되던 버그)
             return "EXCLUDED_SYMBOL"
 
         # ── 동일 종목 1일 1회 진입 제한 ──────────────────────────

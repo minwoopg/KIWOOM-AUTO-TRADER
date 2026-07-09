@@ -63,6 +63,10 @@ class StrategyConfig:
     trailing_start_pct: float     # 트레일링 시작 최소 수익률
     trend_reversal_rsi: float     # 추세 꺾임 감지 RSI 기준
     symbol_min_score_override: dict = None  # {종목코드: 최소진입점수} 개별 종목 진입문턱 상향
+    disable_score3_buy: bool = False               # 3점("보수적 진입") 매수 비활성화
+    low_upside_guard_enabled: bool = False          # 상승여력 부족 시 5점 미만 차단
+    min_upside_to_recent_high_pct: float = 1.0      # 이 값 미만이면 low_upside_guard 발동
+    low_upside_guard_apply_to_pattern_d: bool = False  # 패턴D(갭눌림)에도 상승여력 게이트 적용
 
 
 @dataclass(frozen=True)

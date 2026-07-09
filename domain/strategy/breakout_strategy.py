@@ -209,7 +209,32 @@ class BreakoutStrategy(Strategy):
             # 5점 이상(최적 타점)만 허용. 완전 차단은 아님 — 표본 부족(11건,
             # 그중 >1.0은 1건뿐)이라 강한 신호(5점+)까지 막을 근거는 없음.
             bb_overheated = bb_percent_b is not None and bb_percent_b >= 1.0
-            min_score = 5 if (chasing_overheated or bb_overheated) else 3
+
+            # ── 상승여력 부족 게이트 (2026-07-09) ──────────────────────
+            # trades.csv 전체 이력: 상승여력<1% 95건 승률36%/평균-0.24%,
+            # 1~2% 구간 20건 승률60%/평균+0.03% — <1% 구간이 확연히 열세.
+            # 볼린저/추격매수와 동일한 방식으로: 5점 미만이면 HOLD, 5점 이상은 통과.
+            _low_upside_guard = getattr(self.config, "low_upside_guard_enabled", False)
+            _upside_pct = (
+                getattr(minute_analysis, "upside_to_recent_high_pct", None)
+                if minute_analysis is not None else None
+            )
+            _min_upside_pct = getattr(self.config, "min_upside_to_recent_high_pct", 1.0)
+            low_upside_blocked = (
+                _low_upside_guard
+                and _upside_pct is not None
+                and _upside_pct < _min_upside_pct
+            )
+            # 패턴D(갭눌림목)는 원래 고점 근처에서 나오는 패턴이라 상승여력이
+            # 구조적으로 낮게 잡히기 쉽다. apply_to_pattern_d=False면 패턴D는
+            # 이 게이트에서 예외로 둔다 (아래 patternD 분기가 정상 도달하도록).
+            _upside_guard_exempts_pattern_d = (
+                cond_gap_pullback
+                and not getattr(self.config, "low_upside_guard_apply_to_pattern_d", False)
+            )
+            low_upside_gate_active = low_upside_blocked and not _upside_guard_exempts_pattern_d
+
+            min_score = 5 if (chasing_overheated or bb_overheated or low_upside_gate_active) else 3
 
             # ── 종목별 진입 문턱 상향 (2026-07-06) ────────────────────
             # 특정 종목이 구조적으로 저품질 진입을 반복 생산할 때 사용.
@@ -244,6 +269,15 @@ class BreakoutStrategy(Strategy):
                         f"→ 최소 {min_score}점 필요 — {summary}"
                     ),
                 )
+            if low_upside_gate_active:
+                # 상승여력 부족 구간: 5점 미만은 HOLD (4점 강한진입도 차단)
+                return Signal(
+                    type=SignalType.HOLD,
+                    reason=(
+                        f"상승여력부족 차단 {score}/8 — 상승여력={_upside_pct:.2f}% "
+                        f"→ 최소 {min_score}점 필요 — {summary}"
+                    ),
+                )
             if symbol_overheated:
                 # 종목별 문턱: 해당 종목은 min_score 미만이면 전부 HOLD
                 return Signal(
@@ -258,13 +292,15 @@ class BreakoutStrategy(Strategy):
                     type=SignalType.BUY,
                     reason=f"강한 진입 {score}/8 — {summary}",
                 )
-            if score == 3:
+            if score == 3 and not getattr(self.config, "disable_score3_buy", False):
                 return Signal(
                     type=SignalType.BUY,
                     reason=f"보수적 진입 {score}/8 — {summary}",
                 )
 
             # ── 갭 급등 눌림목 패턴 D — 점수 2점이어도 허용 ──
+            # (상승여력 게이트는 위 low_upside_gate_active에서 이미
+            #  low_upside_guard_apply_to_pattern_d 설정을 반영해 처리됨)
             if cond_gap_pullback and score >= 2:
                 return Signal(
                     type=SignalType.BUY,

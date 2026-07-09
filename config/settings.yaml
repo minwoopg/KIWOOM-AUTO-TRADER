@@ -30,7 +30,12 @@ trading:
   price_refresh_seconds: 60
   order_cash_per_trade: 6000000
   max_positions: 5
-  allow_multiple_entries_per_symbol_per_day: false  # 동일 종목 1일 1회 진입 제한 (2026-06-15)
+  allow_multiple_entries_per_symbol_per_day: true  # 2026-07-09: 1일1회(결과무관) 차단 대신
+                                                     # 아래 DAILY_LOSS_LIMIT(종목별 손실 2회)로 전환.
+                                                     # 근거: 7/9 058730 20분 순수익 +0.59%(제외후보 아님)인데도
+                                                     # 1일1회 제한으로 재진입 38건 전부 차단됨.
+                                                     # 028300/477850처럼 시스템이 WATCHLIST_EXCLUDE_CANDIDATE로
+                                                     # 판정한 종목은 여전히 손실 2회에서 차단되므로 보호는 유지.
   force_exit_before_market_close_minutes: 20  # 15:10부터 수익쿠션 없는 포지션 강제청산
   force_exit_cushion_pct: 0.3                 # +0.3% 이상이면 이월 허용
   reentry_cooldown_seconds: 600
@@ -52,8 +57,16 @@ strategy:
   trailing_stop_pct: 2.0         # 최고가 대비 -2% 하락 시 매도
   trailing_start_pct: 1.2        # 2026-06-22: 1.0→1.2 (본전권 조기청산 방지, 손익비 개선)
   trend_reversal_rsi: 70.0       # 추세 꺾임 감지 RSI 기준
-  symbol_min_score_override:     # 종목별 진입 문턱 상향 (5점=최적타점만 허용)
-    "000660": 5                  # 2026-07-06: A/B패턴 구조적 부진 (replay 67건 5분순수익 -0.61%, 실거래 손절)
+  # symbol_min_score_override:     # 종목별 진입 문턱 상향 (5점=최적타점만 허용)
+  #   "000660": 5                  # 2026-07-06: A/B패턴 구조적 부진 (replay 67건 5분순수익 -0.61%, 실거래 손절)
+  # ── 진입 품질 게이트 (2026-07-09) ──────────────────────────────
+  # 근거: trades.csv 전체 이력
+  #   3점 진입      45건  승률50% 평균-0.21% (4점+58건 평균+0.25%, 5점 40건 평균+0.28%보다 열세)
+  #   상승여력<1%   95건  승률36% 평균-0.24% (1~2%구간 20건 승률60% 평균+0.03%보다 열세)
+  disable_score3_buy: true
+  low_upside_guard_enabled: true
+  min_upside_to_recent_high_pct: 1.0
+  low_upside_guard_apply_to_pattern_d: true
 
 market_regime:
   short_ma_days: 5

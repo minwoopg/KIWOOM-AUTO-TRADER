@@ -120,6 +120,10 @@ def classify_skip_reason(signal_reason: str, signal_type_value: str) -> str:
     if "추격" in r or "상승 초과" in r:
         return SkipReason.TOO_MUCH_REBOUND
 
+    # 상승여력 부족 (2026-07-09)
+    if "상승여력부족 차단" in r:
+        return "SKIP_LOW_UPSIDE_REQUIRE5"
+
     # 장세
     if "횡보장" in r or "하락장" in r or "UNKNOWN" in r:
         return SkipReason.MARKET_NOT_ALLOWED
