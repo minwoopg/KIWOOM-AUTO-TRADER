@@ -119,43 +119,45 @@ class DailyReporter:
         }
 
         # ── 손익 계산 ─────────────────────────────────────────
-        # 실현 손익 = 수량 × (매도가 - 평균매입가) - 비용
-        # 비용: 왕복 수수료 0.25% + 세금 0.18% + 슬리피지 0.10% = 0.53%
+        # 기준: 당일 실제 체결가 (매수 평균 체결가 vs 매도 평균 체결가)
+        # → 종목별 상세 / trade_analysis.py 와 동일한 기준으로 통일 (2026-07-09)
+        # 비용(왕복 수수료 0.25% + 세금 0.18% + 슬리피지 0.10% = 0.53%)은
+        # 실현 손익에 섞지 않고 별도 줄로 분리 표기한다.
         COST_RATE = 0.0053
 
         completed_buys = [t for t in buys if t["symbol"] in today_sells]
         holding_buys   = [t for t in buys if t["symbol"] not in today_sells]
 
-        realized_pnl = 0
+        realized_pnl   = 0   # 당일 체결가 기준 gross 손익 (비용 미차감)
+        estimated_cost = 0   # 추정 비용 (별도 표기용)
         total_buy_amount  = 0
         total_sell_amount = 0
 
         for sym, sell_list in today_sells.items():
             buy_list = symbol_buys.get(sym, [])
-            for sell in sells:
-                if sell["symbol"] != sym or sell["side"] != "SELL":
-                    continue
+            if not buy_list:
+                continue
+            total_buy_qty = sum(b["qty"] for b in buy_list)
+            if total_buy_qty <= 0:
+                continue
+            avg_buy_p = sum(b["price"] * b["qty"] for b in buy_list) / total_buy_qty
+
+            for sell in sell_list:
                 sell_price = int(sell.get("price", 0) or 0)
-                sell_qty   = int(sell.get("quantity", 0) or 0)
+                sell_qty   = int(sell.get("qty", 0) or 0)
                 if sell_price <= 0 or sell_qty <= 0:
                     continue
 
-                # 평균매입가: avg_buy_price(잔고API) 우선, 없으면 당일 매수가
-                avg_buy_p = int(sell.get("avg_buy_price", 0) or 0)
-                if avg_buy_p <= 0 and buy_list:
-                    total_buy_qty = sum(b["qty"] for b in buy_list)
-                    if total_buy_qty > 0:
-                        avg_buy_p = int(
-                            sum(b["price"] * b["qty"] for b in buy_list)
-                            / total_buy_qty
-                        )
+                gross = (sell_price - avg_buy_p) * sell_qty
+                cost  = int(sell_price * sell_qty * COST_RATE)
+                realized_pnl   += gross
+                estimated_cost += cost
+                total_buy_amount  += avg_buy_p * sell_qty
+                total_sell_amount += sell_price * sell_qty
 
-                if avg_buy_p > 0:
-                    gross = (sell_price - avg_buy_p) * sell_qty
-                    cost  = int(sell_price * sell_qty * COST_RATE)
-                    realized_pnl  += gross - cost
-                    total_buy_amount  += avg_buy_p * sell_qty
-                    total_sell_amount += sell_price * sell_qty
+        realized_pnl      = int(round(realized_pnl))
+        total_buy_amount  = int(round(total_buy_amount))
+        net_realized_pnl  = realized_pnl - estimated_cost
 
         # 승/패 계산 (당일 매수/매도 쌍만)
         wins = losses = 0
@@ -194,25 +196,32 @@ class DailyReporter:
                 sign  = "+" if net >= 0 else ""
                 carryover_details.append(f"    {sym}  {rate:+.1f}%  {sign}{net:,}원")
 
-        total_pnl = realized_pnl + carryover_pnl
+        # 합계는 "순손익"끼리 더한다 (당일 신규 순손익 + 이월 청산 순손익).
+        # carryover_pnl은 위에서 이미 비용을 차감한 net 값.
+        total_pnl = net_realized_pnl + carryover_pnl
 
         # ── 손익 요약 ──────────────────────────────────────────────
+        # 기준: 당일 실제 체결가 (종목별 상세 / trade_analysis.py와 동일 기준)
         lines.append("")
         lines.append("[ 💰 손익 요약 ]")
         pnl_sign = "+" if realized_pnl >= 0 else ""
-        lines.append(f"  실현 손익 (당일 신규)   : {pnl_sign}{realized_pnl:>11,}원")
+        lines.append(f"  실현 손익 (당일 신규, 체결가 기준) : {pnl_sign}{realized_pnl:>11,}원")
         completed_sell_cnt = len([t for t in sells if t['symbol'] in today_sells])
-        lines.append(f"    매수 총액 : {total_buy_amount:>11,}원  (평균매입가 기준)")
+        lines.append(f"    매수 총액 : {total_buy_amount:>11,}원  (당일 체결가 기준)")
         lines.append(f"    매도 총액 : {total_sell_amount:>11,}원  ({completed_sell_cnt}건)")
         lines.append(f"    승률      : {win_rate}")
+        cost_sign = "-" if estimated_cost > 0 else ""
+        lines.append(f"  추정 비용 (수수료+세금+슬리피지 {COST_RATE*100:.2f}%) : {cost_sign}{estimated_cost:>11,}원")
+        net_sign = "+" if net_realized_pnl >= 0 else ""
+        lines.append(f"  당일 신규 순손익        : {net_sign}{net_realized_pnl:>11,}원")
         if carryover_sells:
             co_sign = "+" if carryover_pnl >= 0 else ""
-            lines.append(f"  이월 청산 손익          : {co_sign}{carryover_pnl:>11,}원")
+            lines.append(f"  이월 청산 손익 (순액)   : {co_sign}{carryover_pnl:>11,}원")
             for d in carryover_details:
                 lines.append(d)
         total_sign = "+" if total_pnl >= 0 else ""
         lines.append("  " + "─" * 38)
-        lines.append(f"  합계 실현 손익          : {total_sign}{total_pnl:>11,}원")
+        lines.append(f"  합계 실현 손익 (순액)   : {total_sign}{total_pnl:>11,}원")
         if holding_buys:
             holding_syms = sorted(set(t['symbol'] for t in holding_buys))
             holding_amt  = sum(int(t.get('price',0))*int(t.get('quantity',0)) for t in holding_buys)
@@ -239,20 +248,14 @@ class DailyReporter:
                 if sell_list:
                     avg_sell = sum(s["price"]*s["qty"] for s in sell_list) / sum(s["qty"] for s in sell_list)
                     total_sell_qty = sum(s["qty"] for s in sell_list)
-                    # avg_buy_price(잔고API) 우선 사용
-                    api_buy_price = max(
-                        (int(s.get("avg_buy_price", 0) or 0) for s in sell_list),
-                        default=0
-                    )
-                    effective_buy = api_buy_price if api_buy_price > 0 else avg_buy
-                    if effective_buy > 0:
-                        pnl = (avg_sell - effective_buy) * total_sell_qty
-                        pnl_pct = (avg_sell - effective_buy) / effective_buy * 100
+                    # 당일 체결가 기준 (상단 [손익 요약]과 동일 기준, 비용 미차감 — 원본가 비교용)
+                    if avg_buy > 0:
+                        pnl = (avg_sell - avg_buy) * total_sell_qty
+                        pnl_pct = (avg_sell - avg_buy) / avg_buy * 100
                         result_tag = "✅" if pnl >= 0 else "❌"
-                        price_note = "(잔고기준)" if api_buy_price > 0 else ""
-                        sell_str = f"매도 {avg_sell:,.0f}원  {'+' if pnl>=0 else ''}{pnl:,.0f}원 ({pnl_pct:+.1f}%)  {result_tag} {price_note}"
+                        sell_str = f"매도 {avg_sell:,.0f}원  {'+' if pnl>=0 else ''}{pnl:,.0f}원 ({pnl_pct:+.1f}%)  {result_tag}"
                     else:
-                        # 전일 이월 포지션
+                        # 전일 이월 포지션 (당일 매수 기록 없음 → 상단 [이월 청산 손익]에서 별도 집계)
                         sell_str = f"매도 {avg_sell:,.0f}원  [전일 이월 — 손익 미집계] 🔄"
                 else:
                     sell_str = "홀딩 중 🔄"
