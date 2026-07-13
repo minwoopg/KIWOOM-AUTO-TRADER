@@ -101,7 +101,11 @@ class DailyReporter:
             price = int(t.get("price", 0))
             qty   = int(t.get("quantity", 0))
             if t["side"] == "BUY":
-                symbol_buys[t["symbol"]].append({"price": price, "qty": qty, "ts": t["timestamp"]})
+                symbol_buys[t["symbol"]].append({
+                    "price": price, "qty": qty, "ts": t["timestamp"],
+                    "regime": t.get("market_regime", ""),
+                    "entry_score": t.get("entry_score", ""),
+                })
             else:
                 symbol_sells[t["symbol"]].append({"price": price, "qty": qty, "ts": t["timestamp"]})
 
@@ -261,6 +265,12 @@ class DailyReporter:
                     sell_str = "홀딩 중 🔄"
 
                 buy_str = f"매수 {avg_buy:,.0f}원 x{total_buy_qty}주" if buy_list else "매수없음"
+                if buy_list:
+                    entry_regime = buy_list[0].get("regime", "")
+                    entry_score  = buy_list[0].get("entry_score", "")
+                    tag_bits = [b for b in (entry_regime, f"{entry_score}점" if entry_score else "") if b]
+                    if tag_bits:
+                        buy_str += f" [매수시점 {'/'.join(tag_bits)}]"
                 lines.append(f"  {sym}  {buy_str}  →  {sell_str}")
 
         # ── 매매 통계 ──────────────────────────────────────────────
@@ -287,7 +297,7 @@ class DailyReporter:
         # ── 장세 판단 요약 ─────────────────────────────────────────
         if regime_summary:
             lines.append("")
-            lines.append("[ 🌐 장세 판단 ]")
+            lines.append("[ 🌐 장세 판단 (리포트 생성 시점 기준 — 매수 시점과 다를 수 있음) ]")
             for sym in all_symbols:
                 if sym in regime_summary:
                     lines.append(f"  {sym}  {regime_summary[sym]}")
