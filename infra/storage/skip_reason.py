@@ -37,6 +37,7 @@ class SkipReason:
     SCORE_TOO_LOW           = "SKIP_SCORE_TOO_LOW"        # 점수 부족
     TOO_MUCH_REBOUND        = "SKIP_TOO_MUCH_REBOUND"     # 반등폭 상한 초과 (추격매수)
     PULLBACK_OUT_OF_RANGE   = "SKIP_PULLBACK_OUT_OF_RANGE" # 눌림목 범위 이탈
+    NO_CONFIRMATION_SCORE5  = "SKIP_NO_CONFIRMATION_SCORE5" # 5점이나 확인지표(거래량/V/PR/spike) 없음
 
     # ── 장세 조건 미충족 ─────────────────────────────────────────
     MARKET_NOT_ALLOWED      = "SKIP_MARKET_NOT_ALLOWED"   # 장세가 매수를 허용하지 않음
@@ -123,6 +124,10 @@ def classify_skip_reason(signal_reason: str, signal_type_value: str) -> str:
     # 상승여력 부족 (2026-07-09)
     if "상승여력부족 차단" in r:
         return "SKIP_LOW_UPSIDE_REQUIRE5"
+
+    # 확인지표 부족 (2026-07-14)
+    if "확인지표부족 차단" in r:
+        return "SKIP_NO_CONFIRMATION_SCORE5"
 
     # 장세
     if "횡보장" in r or "하락장" in r or "UNKNOWN" in r:

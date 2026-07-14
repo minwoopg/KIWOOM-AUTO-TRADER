@@ -67,6 +67,9 @@ strategy:
   low_upside_guard_enabled: true
   min_upside_to_recent_high_pct: 1.0
   low_upside_guard_apply_to_pattern_d: true
+  require_confirmation_for_score5: true   # 2026-07-14: 5점도 거래량급증/V자/PR/반등spike
+                                            # 중 최소 1개 요구 (동행지표만으로 채워진 5점의
+                                            # 성과가 확인지표 포함 5점보다 뚜렷이 열세임을 확인)
 
 market_regime:
   short_ma_days: 5

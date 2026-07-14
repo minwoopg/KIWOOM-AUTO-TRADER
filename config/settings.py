@@ -67,6 +67,7 @@ class StrategyConfig:
     low_upside_guard_enabled: bool = False          # 상승여력 부족 시 5점 미만 차단
     min_upside_to_recent_high_pct: float = 1.0      # 이 값 미만이면 low_upside_guard 발동
     low_upside_guard_apply_to_pattern_d: bool = False  # 패턴D(갭눌림)에도 상승여력 게이트 적용
+    require_confirmation_for_score5: bool = False   # 5점 진입도 거래량급증/V자/PR/반등spike 중 최소 1개 요구
 
 
 @dataclass(frozen=True)

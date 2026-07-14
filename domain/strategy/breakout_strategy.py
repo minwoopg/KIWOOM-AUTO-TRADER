@@ -246,9 +246,30 @@ class BreakoutStrategy(Strategy):
                 min_score = max(min_score, _symbol_min)
 
             if score >= 5:
+                # ── 5점 확인지표 요건 (2026-07-14) ──────────────────────
+                # 근거: trades.csv 전체 이력(5점 57건) 재검증 결과, 8개 채점
+                # 조건 중 "동행지표"(MACD골든/모멘텀가속/MA5위/VWAP위/저점상승)
+                # 5개만으로 채워진 5점과, 확인지표(거래량급증/V자/PR/반등spike)
+                # 가 하나라도 포함된 5점의 성과가 뚜렷이 갈림:
+                #   확인지표 있음  22건  평균-0.86%  중앙값-0.54%  승률27.3%
+                #   확인지표 없음  35건  평균-1.91%  중앙값-0.92%  승률22.9%
+                # (중앙값·평균 방향 일치, 특정 종목 쏠림 없음 — outlier 아님)
+                has_confirmation = cond_volume or cond_v_or_pr or cond_v_spike
+                require_confirmation = getattr(
+                    self.config, "require_confirmation_for_score5", False
+                )
+                if not require_confirmation or has_confirmation:
+                    return Signal(
+                        type=SignalType.BUY,
+                        reason=f"최적 타점 {score}/8 — {summary}",
+                    )
+                # 확인지표 없는 5점은 통과시키지 않고 사유를 남긴 채 HOLD로 흘려보냄
                 return Signal(
-                    type=SignalType.BUY,
-                    reason=f"최적 타점 {score}/8 — {summary}",
+                    type=SignalType.HOLD,
+                    reason=(
+                        f"확인지표부족 차단 {score}/8 — 거래량급증/V자/PR/반등spike "
+                        f"전부 미충족 — {summary}"
+                    ),
                 )
             if chasing_overheated:
                 # 추격매수 구간: 5점 미만은 전부 HOLD (갭D 포함)
