@@ -88,6 +88,13 @@ class TradingService:
         self.last_hold_log_at_by_symbol: dict[str, datetime] = {}
         self._last_buy_signal_at: dict[str, datetime] = {}  # 종목별 마지막 BUY신호 시각
         self._symbol_to_condition: dict[str, str] = {}       # 종목 → 조건검색식 이름
+
+        # [REGIME]/[MIN] 로그 중복 억제 (2026-07-14: app.log 200MB 급증 원인 —
+        # 매 폴링(10초)마다 값이 살짝만 바뀌어도 무조건 재로깅되던 것을,
+        # 실제로 라벨/점수가 바뀌었을 때 + 최소 간격으로만 남기도록 축소)
+        self._last_regime_logged: dict[str, tuple[str, datetime]] = {}
+        self._last_min_logged: dict[str, tuple[int, datetime]] = {}
+        self._regime_log_heartbeat_sec = 300  # REGIME: 라벨 불변 시 5분마다 하트비트
         self._notifier: KakaoNotifier = build_notifier(settings)  # 카카오 알림
         # ATR/볼린저 계산용 일봉 캐시 (종목별 60개 유지)
         self._daily_bars_cache: dict[str, dict] = {}  # (미사용 — _update_indicators가 cached_daily_bars 재사용)
@@ -275,6 +282,22 @@ class TradingService:
         )
         return cached_price
 
+    def _log_regime_if_changed(self, symbol: str, label: str, reason: str) -> None:
+        """[REGIME] 로그를 라벨 변경 시 + 5분 하트비트로만 남깁니다.
+
+        기존엔 이 지점 3곳(일봉분류/급등강제/급락강제)이 매 폴링(10초)마다
+        무조건 info 로그를 남겨서 app.log가 200MB까지 불어난 주 원인이었음.
+        급등락 % 같은 세부값은 바뀌어도, 실제로 봐야 할 건 "장세 라벨이
+        바뀌었는가"이므로 라벨 기준으로만 dedup.
+        """
+        now = datetime.now()
+        last = self._last_regime_logged.get(symbol)
+        changed = last is None or last[0] != label
+        heartbeat_due = last is not None and (now - last[1]).total_seconds() >= self._regime_log_heartbeat_sec
+        if changed or heartbeat_due:
+            self.app_logger.info(f"[REGIME] {symbol} | {label} | {reason}")
+            self._last_regime_logged[symbol] = (label, now)
+
     def _get_regime_with_cache(self, symbol: str, current_price: int = 0, prev_close: int = 0) -> tuple[MarketRegime, str]:
         """일봉 히스토리를 가져와 장세를 분류합니다. 결과는 캐시합니다.
 
@@ -301,9 +324,7 @@ class TradingService:
                 regime, reason = self.regime_classifier.classify(bars)
                 self.cached_regime[symbol] = regime
 
-                self.app_logger.info(
-                    f"[REGIME] {symbol} | {regime.value} | {reason}"
-                )
+                self._log_regime_if_changed(symbol, regime.value, reason)
                 self._regime_summary[symbol] = f"{regime.value} ({reason})"
 
             except Exception as exc:
@@ -319,12 +340,12 @@ class TradingService:
             change_rate = (current_price - prev_close) / prev_close * 100
             if change_rate >= 2.0:
                 reason = f"당일 급등 {change_rate:+.1f}% — BULLISH 강제 적용"
-                self.app_logger.info(f"[REGIME] {symbol} | BULLISH | {reason}")
+                self._log_regime_if_changed(symbol, "BULLISH", reason)
                 self._regime_summary[symbol] = f"BULLISH ({reason})"
                 return MarketRegime.BULLISH, reason
             elif change_rate <= -2.0:
                 reason = f"당일 급락 {change_rate:+.1f}% — NEUTRAL 강제 적용"
-                self.app_logger.info(f"[REGIME] {symbol} | NEUTRAL | {reason}")
+                self._log_regime_if_changed(symbol, "NEUTRAL", reason)
                 self._regime_summary[symbol] = f"NEUTRAL ({reason})"
                 return MarketRegime.NEUTRAL, reason
 
@@ -605,9 +626,19 @@ class TradingService:
                         symbol, market_price.previous_close
                     )
                     if minute_analysis:
-                        self.app_logger.info(
-                            f"[MIN ] {symbol} | {minute_analysis.score()}/5 | {minute_analysis.summary()}"
-                        )
+                        score = minute_analysis.score()
+                        last = self._last_min_logged.get(symbol)
+                        now = datetime.now()
+                        score_changed = last is None or last[0] != score
+                        min_interval_passed = last is None or (now - last[1]).total_seconds() >= 30
+                        # 2026-07-14: 기존엔 스로틀이 전혀 없어서 매 폴링(10초)마다
+                        # 무조건 로깅 — app.log 최대 기여 태그(227k/997k줄)였음.
+                        # 점수 변화 시 + 최소 30초 간격(다른 로그들과 동일 cadence)으로 축소.
+                        if score_changed or min_interval_passed:
+                            self.app_logger.info(
+                                f"[MIN ] {symbol} | {score}/5 | {minute_analysis.summary()}"
+                            )
+                            self._last_min_logged[symbol] = (score, now)
                         # V자 실패 사유 로그 (감지 안 됐을 때, 분당 1회)
                         if not minute_analysis.is_v_rebound:
                             v_fails = getattr(self._minute_analyzer, '_last_v_fail_reasons', [])

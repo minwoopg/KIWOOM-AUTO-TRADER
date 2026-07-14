@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import csv
 import logging
+import logging.handlers
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 AppLogger = logging.Logger
+
+# 단일 파일 최대 20MB, 최근 10개(최대 200MB)까지만 보관 후 압축 없이 순환.
+# 기존엔 FileHandler 하나로 무한정 append만 해서 200MB까지 불어난 상태였음.
+APP_LOG_MAX_BYTES = 20 * 1024 * 1024
+APP_LOG_BACKUP_COUNT = 10
 
 
 def build_app_logger(log_file: str, level: str = "INFO") -> AppLogger:
@@ -29,12 +35,17 @@ def build_app_logger(log_file: str, level: str = "INFO") -> AppLogger:
     root_logger.setLevel(level.upper())
     target_path = str(Path(log_file).resolve())
     already_has_file = any(
-        isinstance(h, logging.FileHandler)
+        isinstance(h, (logging.FileHandler, logging.handlers.RotatingFileHandler))
         and getattr(h, "baseFilename", "") == target_path
         for h in root_logger.handlers
     )
     if not already_has_file:
-        root_file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        root_file_handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=APP_LOG_MAX_BYTES,
+            backupCount=APP_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
         root_file_handler.setFormatter(formatter)
         root_logger.addHandler(root_file_handler)
         # 콘솔에는 로그를 흘리지 않음 — 전량 출력은 터미널을 뒤덮어 오히려
