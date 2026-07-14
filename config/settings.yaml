@@ -95,7 +95,7 @@ market_regime:
   v_bottom_spike_ratio: 1.5
   v_ma5_slope_bars: 3
   min_trading_value: 50000000000  # 500억 이상
-  pullback_min_pct: -7.0
+  pullback_min_pct: -17.5  # 2026-07-14: -7.0 → -17.5 완화 (34거래일 리플레이 시뮬레이션 근거)
   pullback_max_pct: -0.3   # 완화: 고가 대비 -0.3% 이내까지 허용
   change_rate_min: 2.0
   change_rate_max: 18.0
