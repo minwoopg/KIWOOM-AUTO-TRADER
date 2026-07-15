@@ -843,6 +843,14 @@ class TradingService:
             avg = pos.average_price
             if avg <= 0:
                 continue
+            # 2026-07-15: 기존 정규 매도 경로(595/667라인)는 _sold_today로
+            # "매도 접수 직후 balance 미반영으로 인한 중복 매도 시도"를
+            # 막고 있었는데, 이 강제청산 경로만 그 체크가 빠져 있었음.
+            # 7/15 사례: 475150 664주 강제청산 접수 후, 모의투자 체결 반영
+            # 지연으로 다음 폴링에도 포지션이 그대로 보여 11회 연속
+            # "매도가능수량 부족" 재시도/실패가 발생. 동일 메커니즘 재사용.
+            if symbol in getattr(self, '_sold_today', set()):
+                continue
             try:
                 market_price = self._get_market_price_with_cache(symbol)
                 current = market_price.current_price
