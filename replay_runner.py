@@ -344,8 +344,13 @@ def build_summary(all_results: dict[str, list[dict]], actual_buys: set = None) -
         mae  = sum(maes) / len(maes)
         high_risk, _ = is_high_risk(results)
         flag = "  ⚠️ 고위험" if high_risk else ""
+        # 2026-07-16: 기존엔 신호 건수를 len(results)(net_5m=None인 장마감
+        # 근처 봉까지 포함)로 표시하면서, 정작 옆의 평균은 net_5m만으로
+        # 계산해서 분자·분모가 안 맞았음(004310 사례: 여기 13건 vs
+        # "놓친 기회" 섹션 8건 — 같은 종목이 다른 숫자로 두 번 나와
+        # 리포트 신뢰도 문제 유발). "놓친 기회"와 동일하게 len(net_5m)로 통일.
         lines.append(
-            f"  {symbol}  신호 {len(results):>3}건  "
+            f"  {symbol}  신호 {len(net_5m):>3}건  "
             f"5분순수익 {avg:+.2f}%  MAE {mae:+.2f}%{flag}"
         )
         if high_risk:
