@@ -18,6 +18,52 @@ from pathlib import Path
 DAYS_KO = ["월", "화", "수", "목", "금", "토", "일"]
 
 
+def _fifo_match(buy_list: list[dict], sell_list: list[dict]) -> list[dict]:
+    """매수 로트를 시간순 FIFO로 소진하며 매도 건별 가중평균 매수가를 계산합니다.
+
+    2026-07-16 수정: 기존엔 종목당 "전체 매수 평균가"를 매도 수량에
+    그대로 곱해서 썼음 — 아직 안 팔린 물량의 매수가까지 평균에 섞이는
+    문제가 있었음(재진입 허용 이후 부분체결이 흔해지며 실제로 발생).
+    analyze_trades.py의 pair_trades()와 동일한 방식으로 통일 — 매도
+    수량만큼만 매수 큐에서 정확히 소진해 가중평균을 계산한다.
+
+    Returns: [{"buy_price": 가중평균매수가, "sell_price", "qty", "buy": 첫매수row, "sell": 매도row}, ...]
+    """
+    buy_queue = [[int(b.get("qty", 0) or 0), int(b.get("price", 0) or 0), b] for b in buy_list]
+    matched = []
+    for sell in sell_list:
+        sell_price = int(sell.get("price", 0) or 0)
+        sell_qty   = int(sell.get("qty", 0) or 0)
+        if sell_price <= 0 or sell_qty <= 0:
+            continue
+        remaining, consumed_cost, consumed_qty, first_buy = sell_qty, 0, 0, None
+        while remaining > 0 and buy_queue:
+            lot = buy_queue[0]
+            lot_qty, lot_price, lot_row = lot
+            if lot_price <= 0 or lot_qty <= 0:
+                buy_queue.pop(0)
+                continue
+            if first_buy is None:
+                first_buy = lot_row
+            take = min(remaining, lot_qty)
+            consumed_cost += take * lot_price
+            consumed_qty  += take
+            lot[0] -= take
+            remaining -= take
+            if lot[0] <= 0:
+                buy_queue.pop(0)
+        if consumed_qty <= 0 or first_buy is None:
+            continue
+        matched.append({
+            "buy_price": consumed_cost / consumed_qty,
+            "sell_price": sell_price,
+            "qty": consumed_qty,
+            "buy": first_buy,
+            "sell": sell,
+        })
+    return matched
+
+
 class DailyReporter:
     """당일 trades.csv를 분석해 일일 리포트를 생성합니다."""
 
@@ -140,45 +186,31 @@ class DailyReporter:
         estimated_cost = 0   # 추정 비용 (별도 표기용)
         total_buy_amount  = 0
         total_sell_amount = 0
+        wins = losses = 0
 
+        symbol_matches: dict[str, list[dict]] = {}
         for sym, sell_list in today_sells.items():
             buy_list = symbol_buys.get(sym, [])
             if not buy_list:
                 continue
-            total_buy_qty = sum(b["qty"] for b in buy_list)
-            if total_buy_qty <= 0:
-                continue
-            avg_buy_p = sum(b["price"] * b["qty"] for b in buy_list) / total_buy_qty
+            matches = _fifo_match(buy_list, sell_list)
+            symbol_matches[sym] = matches
 
-            for sell in sell_list:
-                sell_price = int(sell.get("price", 0) or 0)
-                sell_qty   = int(sell.get("qty", 0) or 0)
-                if sell_price <= 0 or sell_qty <= 0:
-                    continue
-
-                gross = (sell_price - avg_buy_p) * sell_qty
-                cost  = int(sell_price * sell_qty * COST_RATE)
+            for m in matches:
+                gross = (m["sell_price"] - m["buy_price"]) * m["qty"]
+                cost  = int(m["sell_price"] * m["qty"] * COST_RATE)
                 realized_pnl   += gross
                 estimated_cost += cost
-                total_buy_amount  += avg_buy_p * sell_qty
-                total_sell_amount += sell_price * sell_qty
+                total_buy_amount  += m["buy_price"] * m["qty"]
+                total_sell_amount += m["sell_price"] * m["qty"]
+                if m["sell_price"] >= m["buy_price"]:
+                    wins += 1
+                else:
+                    losses += 1
 
         realized_pnl      = int(round(realized_pnl))
         total_buy_amount  = int(round(total_buy_amount))
         net_realized_pnl  = realized_pnl - estimated_cost
-
-        # 승/패 계산 (당일 매수/매도 쌍만)
-        wins = losses = 0
-        for sym, sell_list in today_sells.items():
-            buy_list = symbol_buys.get(sym, [])
-            if not buy_list:
-                continue
-            avg_buy  = sum(b["price"] * b["qty"] for b in buy_list) / sum(b["qty"] for b in buy_list)
-            avg_sell = sum(s["price"] * s["qty"] for s in sell_list) / sum(s["qty"] for s in sell_list)
-            if avg_sell >= avg_buy:
-                wins += 1
-            else:
-                losses += 1
 
         total_match = wins + losses
         win_rate = f"{wins}승 {losses}패 ({wins/total_match*100:.0f}%)" if total_match > 0 else "해당없음"
@@ -253,18 +285,28 @@ class DailyReporter:
                     avg_buy = 0
                     total_buy_qty = 0
 
-                if sell_list:
+                matches = symbol_matches.get(sym, [])
+                if matches:
+                    # 2026-07-16: FIFO 매칭 결과 사용 — 매도된 수량만큼만 정확히
+                    # 반영. 기존엔 avg_buy(매수 전체 평균)를 매도 전체수량에
+                    # 곱해서, 라벨의 "x{total_buy_qty}주"와 실제 손익 계산에
+                    # 쓰인 수량이 달라 오해를 유발했음(7/16: 096770 사례).
+                    matched_qty = sum(m["qty"] for m in matches)
+                    gross = sum((m["sell_price"] - m["buy_price"]) * m["qty"] for m in matches)
+                    avg_sell = sum(m["sell_price"] * m["qty"] for m in matches) / matched_qty
+                    matched_avg_buy = sum(m["buy_price"] * m["qty"] for m in matches) / matched_qty
+                    pnl = gross
+                    pnl_pct = gross / (matched_avg_buy * matched_qty) * 100
+                    result_tag = "✅" if pnl >= 0 else "❌"
+                    sell_qty_note = f" x{matched_qty}주" if matched_qty != total_buy_qty else ""
+                    sell_str = (
+                        f"매도 {avg_sell:,.0f}원{sell_qty_note}  "
+                        f"{'+' if pnl>=0 else ''}{pnl:,.0f}원 ({pnl_pct:+.1f}%)  {result_tag}"
+                    )
+                elif sell_list:
                     avg_sell = sum(s["price"]*s["qty"] for s in sell_list) / sum(s["qty"] for s in sell_list)
-                    total_sell_qty = sum(s["qty"] for s in sell_list)
-                    # 당일 체결가 기준 (상단 [손익 요약]과 동일 기준, 비용 미차감 — 원본가 비교용)
-                    if avg_buy > 0:
-                        pnl = (avg_sell - avg_buy) * total_sell_qty
-                        pnl_pct = (avg_sell - avg_buy) / avg_buy * 100
-                        result_tag = "✅" if pnl >= 0 else "❌"
-                        sell_str = f"매도 {avg_sell:,.0f}원  {'+' if pnl>=0 else ''}{pnl:,.0f}원 ({pnl_pct:+.1f}%)  {result_tag}"
-                    else:
-                        # 전일 이월 포지션 (당일 매수 기록 없음 → 상단 [이월 청산 손익]에서 별도 집계)
-                        sell_str = f"매도 {avg_sell:,.0f}원  [전일 이월 — 손익 미집계] 🔄"
+                    # 전일 이월 포지션 (당일 매수 기록 없음 → 상단 [이월 청산 손익]에서 별도 집계)
+                    sell_str = f"매도 {avg_sell:,.0f}원  [전일 이월 — 손익 미집계] 🔄"
                 else:
                     sell_str = "홀딩 중 🔄"
 

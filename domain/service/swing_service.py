@@ -1,404 +1,417 @@
-"""
-스윙 전략 서비스.
+#!/usr/bin/env python3
+"""trades.csv 분석 스크립트
 
-15:10~15:20 사이 일봉 MA10 근처 눌림 종목을 매수하고
-익일~수일 내 매도 조건 충족 시 청산합니다.
+실행:
+    python analyze_trades.py                          # 오늘 날짜
+    python analyze_trades.py 2026-05-27               # 특정 날짜
+    python analyze_trades.py 2026-05-27 2026-05-28   # 날짜 범위
+
+결과: 콘솔 출력 + reports/trade_analysis_YYYYMMDD.txt 저장
 """
+
 from __future__ import annotations
 
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+
+
 import csv
-import logging
+import sys
+from collections import Counter, defaultdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
-
-from domain.models import PriceBar
-from domain.swing.swing_analyzer import SwingAnalyzer, SwingAnalysis
-from domain.swing.swing_strategy import (
-    SwingStrategy, SwingPosition, SwingExitReason,
-)
-from infra.broker.base import Broker as BrokerBase
-from infra.notify.kakao_notifier import KakaoNotifier
 
 
-class SwingService:
-    """스윙 전략 서비스."""
+# ── 설정 ────────────────────────────────────────────────────────
+TRADES_LOG  = Path("logs/trades.csv")
+REPORTS_DIR = Path("reports")
 
-    def __init__(
-        self,
-        broker: BrokerBase,
-        analyzer: SwingAnalyzer,
-        strategy: SwingStrategy,
-        notifier: KakaoNotifier,
-        settings,
-        app_logger: logging.Logger,
-    ):
-        self.broker    = broker
-        self.analyzer  = analyzer
-        self.strategy  = strategy
-        self.notifier  = notifier
-        self.settings  = settings
-        self.logger    = app_logger
 
-        self._positions: dict[str, SwingPosition] = {}
-        self._watch_log: list[dict] = []
+# ── 유틸 ────────────────────────────────────────────────────────
+def pct(n: int, total: int) -> str:
+    return f"{n/total*100:.1f}%" if total > 0 else "0.0%"
 
-        # 설정 단축
-        cfg_entry = settings.swing_entry
-        cfg_store = settings.swing_storage
-        self._trade_enabled     = cfg_entry.trade_enabled
-        self._max_positions     = cfg_entry.max_positions
-        self._order_cash        = cfg_entry.order_cash_per_trade
-        self._start_time        = cfg_entry.start_time   # "15:10"
-        self._end_time          = cfg_entry.end_time     # "15:20"
-        self._trades_csv        = Path(cfg_store.trades_csv)
-        self._watch_csv         = Path(cfg_store.watch_csv)
+def safe_float(v) -> float | None:
+    try:
+        f = float(v)
+        return f if f != 0.0 else None
+    except (ValueError, TypeError):
+        return None
 
-        self._trades_csv.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_csv_headers()
+def safe_bool(v) -> bool | None:
+    if str(v).lower() == "true":  return True
+    if str(v).lower() == "false": return False
+    return None
 
-    # ── 메인 루프 ─────────────────────────────────────────────
 
-    def run_entry_scan(self, symbols: list[str]) -> None:
-        """
-        15:10~15:20 사이 진입 스캔.
-        각 종목의 일봉 데이터를 받아 진입 조건 평가.
-        """
-        now      = datetime.now()
-        now_str  = now.strftime("%H:%M")
-        mode_tag = "실매수" if self._trade_enabled else "관찰모드"
+# ── 데이터 로드 ──────────────────────────────────────────────────
+def load(start: date, end: date) -> list[dict]:
+    if not TRADES_LOG.exists():
+        print(f"[ERROR] {TRADES_LOG} 파일이 없습니다.")
+        sys.exit(1)
 
-        if not (self._start_time <= now_str <= self._end_time):
-            return
+    rows = []
+    with TRADES_LOG.open(encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            try:
+                ts = datetime.fromisoformat(r["timestamp"]).date()
+            except (ValueError, KeyError):
+                continue
+            if start <= ts <= end:
+                rows.append(r)
+    return rows
 
-        self.logger.info(
-            f"[SWING] 진입 스캔 시작 ({mode_tag}) | "
-            f"후보 {len(symbols)}종목"
+
+# ── 매매 쌍 매칭 (매수-매도 페어링) ──────────────────────────────
+def pair_trades(rows: list[dict]) -> list[dict]:
+    """BUY-SELL 쌍을 매칭해 손익을 계산합니다.
+
+    2026-07-16 수정: 기존엔 매도 1건마다 매수 레코드를 통째로 하나씩
+    pop(0)해서 그 레코드의 가격을 그대로 썼음 — 매수/매도 수량이 안
+    맞아도(예: 매수 48주+49주 vs 매도 49주) 수량 가중 없이 첫 매수
+    레코드 가격만 사용해 왜곡 발생. 재진입 허용(7/9) 이후 한 종목에
+    여러 번 나눠 사는 게 흔해지면서 이 왜곡이 실제로 나타남
+    (7/16: 096770 daily_report +7,678원/+0.1% vs trade_analysis
+    +39,200원/+0.66% — 같은 매매를 서로 다른 숫자로 보고).
+    지금은 매도 수량만큼 매수 큐에서 수량 단위로 정확히 소진하며
+    가중평균 매수가를 계산하는 방식으로 교체.
+    """
+    accepted = [r for r in rows if str(r.get("accepted","")).lower() == "true"]
+    buys:  dict[str, list[dict]] = defaultdict(list)
+    sells: dict[str, list[dict]] = defaultdict(list)
+
+    for r in accepted:
+        sym = r.get("symbol","")
+        if r.get("side") == "BUY":
+            buys[sym].append(r)
+        elif r.get("side") == "SELL":
+            sells[sym].append(r)
+
+    pairs = []
+    for sym, sell_list in sells.items():
+        # [남은수량, 매수가, 원본row] 큐 — 파일에 쓰인 순서 그대로 FIFO
+        buy_queue = [[int(b.get("quantity", 0) or 0), int(b.get("price", 0) or 0), b] for b in buys.get(sym, [])]
+
+        for sell in sell_list:
+            sell_price = int(sell.get("price", 0) or 0)
+            sell_qty   = int(sell.get("quantity", 0) or 0)
+            if sell_price <= 0 or sell_qty <= 0:
+                continue
+
+            remaining = sell_qty
+            consumed_cost = 0
+            consumed_qty  = 0
+            first_buy = None
+            while remaining > 0 and buy_queue:
+                lot = buy_queue[0]
+                lot_qty, lot_price, lot_row = lot
+                if lot_price <= 0 or lot_qty <= 0:
+                    buy_queue.pop(0)
+                    continue
+                if first_buy is None:
+                    first_buy = lot_row
+                take = min(remaining, lot_qty)
+                consumed_cost += take * lot_price
+                consumed_qty  += take
+                lot[0] -= take
+                remaining -= take
+                if lot[0] <= 0:
+                    buy_queue.pop(0)
+
+            if consumed_qty <= 0 or first_buy is None:
+                continue
+
+            buy_price = consumed_cost / consumed_qty
+            qty = consumed_qty  # 매수 물량이 부족했던 경우 실제 매칭된 수량만 반영
+            buy = first_buy
+            pnl_pct = (sell_price - buy_price) / buy_price * 100
+            pnl_amt = (sell_price - buy_price) * qty
+            pairs.append({
+                "symbol":        sym,
+                "buy_price":     buy_price,
+                "sell_price":    sell_price,
+                "quantity":      qty,
+                "pnl_pct":       pnl_pct,
+                "pnl_amount":    pnl_amt,
+                "win":           pnl_pct > 0,
+                "entry_strategy": buy.get("entry_strategy",""),
+                "market_regime": buy.get("market_regime",""),
+                "entry_score":   buy.get("entry_score",""),
+                "entry_reason":  buy.get("entry_reason",""),
+                "is_v_rebound":  safe_bool(buy.get("is_v_rebound")),
+                "is_pr":         safe_bool(buy.get("is_pulldown_recovery")),
+                "v_drop_pct":    safe_float(buy.get("v_drop_pct")),
+                "v_rise_pct":    safe_float(buy.get("v_rise_pct")),
+                "upside":        safe_float(buy.get("upside_to_recent_high_pct")),
+                "rebound_spike": safe_bool(buy.get("rebound_volume_spike")),
+                "change_rate":   safe_float(buy.get("change_rate_pct")),
+                "exit_reason":   sell.get("exit_reason",""),
+                "hold_minutes":  safe_float(sell.get("hold_minutes")),
+                "buy_time":      buy.get("timestamp",""),
+                "sell_time":     sell.get("timestamp",""),
+            })
+    return pairs
+
+
+# ── 분석 ────────────────────────────────────────────────────────
+def analyze(rows: list[dict], start: date, end: date) -> str:
+    lines = []
+    W = 60
+
+    def sep(c="═"): lines.append(c * W)
+    def title(t): sep(); lines.append(f"  {t}"); sep()
+    def sub(t): lines.append(""); lines.append(f"── {t} ──")
+    def row(label, val, note=""):
+        n = f"  ({note})" if note else ""
+        lines.append(f"  {label:<36} {val}{n}")
+
+    buy_rows  = [r for r in rows if r.get("side") == "BUY"
+                 and str(r.get("accepted","")).lower() == "true"]
+    sell_rows = [r for r in rows if r.get("side") == "SELL"
+                 and str(r.get("accepted","")).lower() == "true"]
+    pairs = pair_trades(rows)
+
+    title(f"📈 trades.csv 분석  {start} ~ {end}")
+    row("총 체결 건수", f"{len(rows):,}건")
+    row("매수 체결", f"{len(buy_rows):,}건")
+    row("매도 체결", f"{len(sell_rows):,}건")
+    row("매매 쌍 (손익 계산 가능)", f"{len(pairs):,}건")
+
+    if not pairs:
+        lines.append("  매매 쌍이 없습니다.")
+        return "\n".join(lines)
+
+    # ── 1. 전체 손익 요약 ──────────────────────────────────
+    sub("1. 전체 손익 요약")
+    wins   = [p for p in pairs if p["win"]]
+    losses = [p for p in pairs if not p["win"]]
+    total_pnl = sum(p["pnl_amount"] for p in pairs)
+    avg_pnl   = sum(p["pnl_pct"] for p in pairs) / len(pairs)
+    row("승률", f"{len(wins)}/{len(pairs)}  ({pct(len(wins), len(pairs))})")
+    row("누적 손익", f"{total_pnl:+,.0f}원")
+    row("평균 수익률", f"{avg_pnl:+.2f}%")
+    if wins:
+        row("평균 수익 (승)", f"{sum(p['pnl_pct'] for p in wins)/len(wins):+.2f}%")
+    if losses:
+        row("평균 손실 (패)", f"{sum(p['pnl_pct'] for p in losses)/len(losses):+.2f}%")
+    holds = [p["hold_minutes"] for p in pairs if p["hold_minutes"] is not None]
+    if holds:
+        row("평균 보유 시간", f"{sum(holds)/len(holds):.1f}분")
+
+    # ── 2. exit_reason별 손익 ──────────────────────────────
+    sub("2. exit_reason별 손익")
+    er_groups: dict[str, list] = defaultdict(list)
+    for p in pairs:
+        er_groups[p["exit_reason"] or "(없음)"].append(p)
+    for er, grp in sorted(er_groups.items(), key=lambda x: -len(x[1])):
+        w = sum(1 for p in grp if p["win"])
+        avg = sum(p["pnl_pct"] for p in grp) / len(grp)
+        row(er[:36], f"{len(grp)}건  승률 {pct(w,len(grp))}  평균 {avg:+.2f}%")
+
+    # ── 3. 전략별 손익 ─────────────────────────────────────
+    sub("3. 전략별 손익")
+    st_groups: dict[str, list] = defaultdict(list)
+    for p in pairs:
+        st_groups[p["entry_strategy"] or "(없음)"].append(p)
+    for st, grp in sorted(st_groups.items(), key=lambda x: -len(x[1])):
+        w   = sum(1 for p in grp if p["win"])
+        avg = sum(p["pnl_pct"] for p in grp) / len(grp)
+        row(st, f"{len(grp)}건  승률 {pct(w,len(grp))}  평균 {avg:+.2f}%")
+
+    # ── 4. 점수별 손익 ─────────────────────────────────────
+    sub("4. entry_score별 손익")
+    score_groups: dict[str, list] = defaultdict(list)
+    for p in pairs:
+        score_groups[p["entry_score"] or "?"].append(p)
+    for sc, grp in sorted(score_groups.items()):
+        w   = sum(1 for p in grp if p["win"])
+        avg = sum(p["pnl_pct"] for p in grp) / len(grp)
+        row(f"{sc}점", f"{len(grp)}건  승률 {pct(w,len(grp))}  평균 {avg:+.2f}%")
+
+    # ── 5. V자 진입 vs 일반 진입 ───────────────────────────
+    sub("5. V자 진입 vs 일반 진입 비교")
+    v_pairs    = [p for p in pairs if p["is_v_rebound"] is True]
+    non_v      = [p for p in pairs if p["is_v_rebound"] is not True]
+    pr_pairs   = [p for p in pairs if p["is_pr"] is True]
+    for label, grp in [("V자 진입", v_pairs), ("PR 진입", pr_pairs), ("일반 진입", non_v)]:
+        if not grp: continue
+        w   = sum(1 for p in grp if p["win"])
+        avg = sum(p["pnl_pct"] for p in grp) / len(grp)
+        row(label, f"{len(grp)}건  승률 {pct(w,len(grp))}  평균 {avg:+.2f}%")
+
+    # ── 6. rebound_volume_spike별 손익 ──────────────────────
+    sub("6. rebound_volume_spike별 손익")
+    for spike_val, label in [(True,"True (반등봉 급등)"),(False,"False (일반)")]:
+        grp = [p for p in pairs if p["rebound_spike"] == spike_val]
+        if not grp: continue
+        w   = sum(1 for p in grp if p["win"])
+        avg = sum(p["pnl_pct"] for p in grp) / len(grp)
+        row(label, f"{len(grp)}건  승률 {pct(w,len(grp))}  평균 {avg:+.2f}%")
+
+    # ── 7. upside_to_recent_high 구간별 손익 ────────────────
+    sub("7. 상승 여력 구간별 손익")
+    buckets = [("< 1%", lambda u: u<1.0),
+               ("1~2%", lambda u: 1.0<=u<2.0),
+               ("2~3%", lambda u: 2.0<=u<3.0),
+               ("3~5%", lambda u: 3.0<=u<5.0),
+               ("5%↑",  lambda u: u>=5.0)]
+    for label, fn in buckets:
+        grp = [p for p in pairs if p["upside"] is not None and fn(p["upside"])]
+        if not grp: continue
+        w   = sum(1 for p in grp if p["win"])
+        avg = sum(p["pnl_pct"] for p in grp) / len(grp)
+        row(label, f"{len(grp)}건  승률 {pct(w,len(grp))}  평균 {avg:+.2f}%")
+
+    # ── 7-1. 당일 등락률 구간별 손익 (급등 종목 진입 추적) ────
+    cr_pairs = [p for p in pairs if p.get("change_rate") is not None]
+    if cr_pairs:
+        sub("7-1. 당일 등락률 구간별 손익")
+        cr_buckets = [
+            ("< +3%",     lambda c: c < 3.0),
+            ("+3~+5%",    lambda c: 3.0 <= c < 5.0),
+            ("+5~+10%",   lambda c: 5.0 <= c < 10.0),
+            ("+10~+15%",  lambda c: 10.0 <= c < 15.0),
+            ("+15%+ (고변동)", lambda c: c >= 15.0),
+        ]
+        for label, fn in cr_buckets:
+            grp = [p for p in cr_pairs if fn(p["change_rate"])]
+            if not grp: continue
+            w   = sum(1 for p in grp if p["win"])
+            avg = sum(p["pnl_pct"] for p in grp) / len(grp)
+            row(label, f"{len(grp)}건  승률 {pct(w,len(grp))}  평균 {avg:+.2f}%")
+        loss_pairs = sorted([p for p in cr_pairs if not p["win"]],
+                            key=lambda p: -(p["change_rate"] or 0))
+        if loss_pairs:
+            lines.append("")
+            lines.append("  [ 손실 거래의 당일 등락률 (높은 순) ]")
+            for p in loss_pairs[:8]:
+                row(f"  {p['symbol']}", f"당일 {p['change_rate']:+.1f}%  →  {p['pnl_pct']:+.2f}%")
+
+    # ── 8. 종목별 손익 ─────────────────────────────────────
+    sub("8. 종목별 손익")
+    sym_groups: dict[str, list] = defaultdict(list)
+    for p in pairs:
+        sym_groups[p["symbol"]].append(p)
+    for sym, grp in sorted(sym_groups.items(), key=lambda x: -sum(p["pnl_amount"] for p in x[1])):
+        w     = sum(1 for p in grp if p["win"])
+        total = sum(p["pnl_amount"] for p in grp)
+        avg   = sum(p["pnl_pct"] for p in grp) / len(grp)
+        row(sym, f"{len(grp)}건  승률 {pct(w,len(grp))}  손익 {total:+,.0f}원  평균 {avg:+.2f}%")
+
+    # ── 9. 거래 상세 목록 ──────────────────────────────────
+    sub("9. 거래 상세 목록")
+    for p in sorted(pairs, key=lambda x: x["buy_time"]):
+        mark = "✅" if p["win"] else "❌"
+        hold = f"{p['hold_minutes']:.0f}분" if p["hold_minutes"] else "?"
+        v    = "V" if p["is_v_rebound"] else ("PR" if p["is_pr"] else "-")
+        lines.append(
+            f"  {mark} {p['symbol']}  {p['pnl_pct']:+.1f}%  "
+            f"{p['pnl_amount']:+,.0f}원  {hold}  [{v}]  {p['exit_reason'][:30]}"
         )
 
-        candidates: list[SwingAnalysis] = []
+    # ── 10. 매도 점수제 / 트레일링 분석 ─────────────────────
+    sub("10. 추세꺾임 점수제 분석")
+    sell_score_pairs = [p for p in pairs if "추세 꺾임" in (p.get("exit_reason") or "")]
+    trail_pairs      = [p for p in pairs if "트레일링" in (p.get("exit_reason") or "")]
 
-        for symbol in symbols:
-            try:
-                analysis = self._analyze_symbol(symbol)
-                if analysis is None:
-                    continue
+    if sell_score_pairs:
+        row("추세꺾임 청산 건수", f"{len(sell_score_pairs)}건")
+        sc_win  = [p for p in sell_score_pairs if p["win"]]
+        sc_avg  = sum(p["pnl_pct"] for p in sell_score_pairs) / len(sell_score_pairs)
+        row("  승률", f"{len(sc_win)}/{len(sell_score_pairs)} ({len(sc_win)/len(sell_score_pairs)*100:.0f}%)")
+        row("  평균 수익률", f"{sc_avg:+.2f}%")
+        # 점수 분포
+        import re
+        for p in sell_score_pairs:
+            er = p.get("exit_reason", "")
+            m  = re.search(r'(\d)/5점', er)
+            score = m.group(1) if m else "?"
+            mark  = "✅" if p["win"] else "❌"
+            lines.append(
+                f"    {mark} {p['symbol']}  {p['pnl_pct']:+.1f}%  "
+                f"점수 {score}/5  {er[:40]}"
+            )
+    else:
+        row("추세꺾임 청산", "0건")
 
-                self.logger.info(f"[SWING_WATCH] {analysis}")
+    sub("10-1. 구간형 트레일링 분석")
+    if trail_pairs:
+        row("트레일링 청산 건수", f"{len(trail_pairs)}건")
+        t_win = [p for p in trail_pairs if p["win"]]
+        t_avg = sum(p["pnl_pct"] for p in trail_pairs) / len(trail_pairs)
+        row("  승률", f"{len(t_win)}/{len(trail_pairs)} ({len(t_win)/len(trail_pairs)*100:.0f}%)")
+        row("  평균 수익률", f"{t_avg:+.2f}%")
+        # 트레일링 폭별 분포
+        import re
+        band_groups = {}
+        for p in trail_pairs:
+            er = p.get("exit_reason", "")
+            m  = re.search(r'폭 -([\d.]+)%', er)
+            band = m.group(1) if m else "?"
+            band_groups.setdefault(band, []).append(p)
+        for band, grp in sorted(band_groups.items()):
+            w   = sum(1 for p in grp if p["win"])
+            avg = sum(p["pnl_pct"] for p in grp) / len(grp)
+            row(f"  -{band}% 트레일링",
+                f"{len(grp)}건  승률 {w/len(grp)*100:.0f}%  평균 {avg:+.2f}%")
+    else:
+        row("트레일링 청산", "0건")
 
-                # 관찰 로그 저장
-                self._write_watch_log(analysis)
-
-                if analysis.entry_ok:
-                    candidates.append(analysis)
-                else:
-                    self.logger.info(
-                        f"[SWING_SKIP] {symbol} | {analysis.block_reason}"
-                    )
-
-            except Exception as e:
-                self.logger.warning(f"[SWING] {symbol} 분석 실패: {e}")
-
-        # 점수 높은 순 정렬
-        candidates.sort(key=lambda a: a.score, reverse=True)
-
-        # 최대 포지션 수 제한
-        slots = self._max_positions - len(self._positions)
-        for analysis in candidates[:slots]:
-            self._try_entry(analysis)
-
-    def run_exit_check(self, today: date) -> None:
-        """
-        보유 포지션 매도 조건 체크.
-        장 중 주기적으로 호출.
-        """
-        for symbol, pos in list(self._positions.items()):
-            try:
-                market_price = self.broker.get_market_price(symbol)
-                if market_price is None:
-                    continue
-
-                current_price = market_price.current_price
-
-                # 일봉 데이터로 MA5 계산
-                daily_bars = self.broker.get_daily_prices(symbol, days=10)
-                ma5 = self._calc_ma(daily_bars, 5)
-
-                signal = self.strategy.check_exit(
-                    pos=pos,
-                    current_price=current_price,
-                    today=today,
-                    ma5=ma5,
+    # ── 11. condition_name별 손익 ──────────────────────────────
+    cond_pairs = [p for p in pairs if p.get("condition_name","")]
+    if cond_pairs:
+        sub("11. 조건검색식별 손익")
+        cond_names = sorted(set(p["condition_name"] for p in cond_pairs))
+        for cname in cond_names:
+            grp  = [p for p in cond_pairs if p.get("condition_name") == cname]
+            wins = [p for p in grp if p["win"]]
+            avg  = sum(p["pnl_pct"] for p in grp) / len(grp) if grp else 0
+            pnl  = sum(p["pnl_amount"] for p in grp)
+            row(f"  {cname}",
+                f"{len(grp)}건  승률 {len(wins)}/{len(grp)} ({len(wins)/len(grp)*100:.0f}%)  "
+                f"평균 {avg:+.2f}%  손익 {pnl:+,.0f}원")
+            # 패턴별 세부
+            pat_cnt: dict = {}
+            for p in grp:
+                pat = p.get("entry_reason", "-")
+                pat_cnt.setdefault(pat, []).append(p)
+            for pat, pgrp in sorted(pat_cnt.items(),
+                                    key=lambda x: -len(x[1]))[:3]:
+                pw  = sum(1 for p in pgrp if p["win"])
+                pa  = sum(p["pnl_pct"] for p in pgrp) / len(pgrp)
+                lines.append(
+                    f"      {pat}: {len(pgrp)}건 "
+                    f"승률 {pw/len(pgrp)*100:.0f}% 평균 {pa:+.2f}%"
                 )
 
-                if signal is None:
-                    profit_pct = (
-                        (current_price - pos.avg_price) / pos.avg_price * 100
-                    )
-                    self.logger.debug(
-                        f"[SWING_HOLD] {symbol} | "
-                        f"수익률 {profit_pct:+.1f}% | "
-                        f"고점 {pos.peak_price:,}원 | "
-                        f"쿠션 {'O' if pos.cushion_hit else 'X'}"
-                    )
-                    continue
-
-                # 감시 신호 (매도 없음)
-                if signal.sell_ratio == 0:
-                    self.logger.warning(
-                        f"[SWING_WATCH] {symbol} | {signal.message}"
-                    )
-                    self.notifier.send(
-                        f"⚠️ [스윙 감시] {symbol}\n{signal.message}"
-                    )
-                    continue
-
-                self._try_exit(pos, current_price, signal)
-
-            except Exception as e:
-                self.logger.warning(f"[SWING] {symbol} 매도 체크 실패: {e}")
-
-    # ── 진입/청산 ─────────────────────────────────────────────
-
-    def _try_entry(self, analysis: SwingAnalysis) -> None:
-        symbol        = analysis.symbol
-        current_price = analysis.current_price
-        quantity      = max(1, self._order_cash // current_price)
-
-        self.logger.info(
-            f"[SWING_{'BUY' if self._trade_enabled else 'WATCH'}] "
-            f"{symbol} | 점수 {analysis.score}/8 | "
-            f"수량 {quantity}주 | {analysis.score_detail}"
-        )
-
-        if not self._trade_enabled:
-            # 관찰 모드 — 주문 없이 기록만
-            self.logger.info(
-                f"[SWING_WATCH_ENTRY] {symbol} | "
-                f"가격 {current_price:,}원 | 수량 {quantity}주 (관찰)"
-            )
-            return
-
-        # 실매수
-        from domain.models import OrderRequest, OrderSide
-        order = OrderRequest(
-            symbol=symbol,
-            side=OrderSide.BUY,
-            quantity=quantity,
-            price=current_price,
-        )
-        result = self.broker.place_order(order)
-
-        if result.accepted:
-            # 눌림목-반등 패턴으로 진입했으면 동적 손절가 계산
-            # (저점가 이탈 OR 매수가 대비 -5% 중 먼저 닿는 쪽 — 
-            #  저점가가 더 얕으면 저점이탈이, 더 깊으면 -5%가 먼저 걸림)
-            pattern_stop = 0
-            pr = analysis.pullback_result
-            if pr is not None and pr.detected:
-                pattern_stop = pr.stop_loss_price
-                self.logger.info(
-                    f"[SWING_PATTERN] {symbol} | "
-                    f"눌림목-반등 패턴 진입 | "
-                    f"고점 {pr.peak_price:,}원({pr.peak_days_ago}일전) → "
-                    f"저점 {pr.trough_price:,}원({pr.trough_days_ago}일전) "
-                    f"낙폭 {pr.drawdown_pct:+.1f}% | "
-                    f"동적손절가 {pattern_stop:,}원"
-                )
-
-            pos = SwingPosition(
-                symbol=symbol,
-                entry_price=current_price,
-                quantity=quantity,
-                entry_date=date.today(),
-                pattern_stop_price=pattern_stop,
-            )
-            self._positions[symbol] = pos
-
-            self.logger.info(
-                f"[SWING_BUY] {symbol} | "
-                f"{current_price:,}원 x {quantity}주 | "
-                f"점수 {analysis.score}/8"
-            )
-            self.notifier.send(
-                f"📈 [스윙 매수] {symbol}\n"
-                f"가격: {current_price:,}원 | 수량: {quantity}주\n"
-                f"점수: {analysis.score}/8 | {analysis.score_detail}"
-            )
-            self._write_trade_log(
-                symbol, "BUY", quantity, current_price,
-                reason=f"스윙진입 점수{analysis.score}"
-            )
-        else:
-            self.logger.warning(
-                f"[SWING_FAIL] {symbol} | 매수 실패: {result.message}"
-            )
-
-    def _try_exit(
-        self,
-        pos: SwingPosition,
-        current_price: int,
-        signal,
-    ) -> None:
-        symbol   = pos.symbol
-        sell_qty = max(1, int(pos.quantity * signal.sell_ratio))
-
-        profit_pct = (current_price - pos.avg_price) / pos.avg_price * 100
-        profit_amt = (current_price - pos.avg_price) * sell_qty
-
-        self.logger.info(
-            f"[SWING_SELL] {symbol} | "
-            f"{current_price:,}원 x {sell_qty}주 | "
-            f"수익률 {profit_pct:+.1f}% | {signal.message}"
-        )
-
-        if not self._trade_enabled:
-            self.logger.info(f"[SWING_WATCH_EXIT] {symbol} | (관찰)")
-            return
-
-        from domain.models import OrderRequest, OrderSide
-        order = OrderRequest(
-            symbol=symbol,
-            side=OrderSide.SELL,
-            quantity=sell_qty,
-            price=current_price,
-        )
-        result = self.broker.place_order(order)
-
-        if result.accepted:
-            icon = "✅" if profit_amt >= 0 else "❌"
-            self.notifier.send(
-                f"{icon} [스윙 매도] {symbol}\n"
-                f"가격: {current_price:,}원 | 수량: {sell_qty}주\n"
-                f"수익률: {profit_pct:+.2f}% | 손익: {profit_amt:+,}원\n"
-                f"사유: {signal.message}"
-            )
-            self._write_trade_log(
-                symbol, "SELL", sell_qty, current_price,
-                reason=signal.message,
-                profit_pct=profit_pct,
-                profit_amt=profit_amt,
-            )
-
-            # 전량 청산 시 포지션 제거
-            if signal.sell_ratio >= 1.0:
-                self._positions.pop(symbol, None)
-            else:
-                pos.quantity -= sell_qty
-                # 부분매도 후 평균단가 유지
-        else:
-            self.logger.warning(
-                f"[SWING_SELL_FAIL] {symbol} | 실패: {result.message}"
-            )
-
-    # ── 분석 ──────────────────────────────────────────────────
-
-    def _analyze_symbol(
-        self, symbol: str
-    ) -> Optional[SwingAnalysis]:
-        """종목 일봉 데이터 수집 및 스윙 분석."""
-        import time
-
-        daily_bars = self.broker.get_daily_prices(symbol, days=260)
-        time.sleep(0.3)  # API 과호출 방지
-
-        if not daily_bars or len(daily_bars) < 22:
-            self.logger.debug(f"[SWING] {symbol} 일봉 부족")
-            return None
-
-        market_price = self.broker.get_market_price(symbol)
-        if market_price is None:
-            return None
-
-        current_price = market_price.current_price
-
-        # 당일 거래대금 = 당일 봉 종가 × 거래량으로 근사
-        # (일봉 API에 거래대금 필드가 없으므로)
-        today_bar     = daily_bars[-1] if daily_bars else None
-        trading_value = (
-            today_bar.close_price * today_bar.volume
-            if today_bar else 0
-        )
-
-        return self.analyzer.analyze(
-            symbol=symbol,
-            bars=daily_bars,
-            current_price=current_price,
-            trading_value=trading_value,
-        )
-
-    @staticmethod
-    def _calc_ma(bars: list[PriceBar], period: int) -> float:
-        """이동평균 계산."""
-        closes = [b.close_price for b in bars]
-        prev   = closes[:-1]  # 당일 미완성봉 제외
-        if len(prev) < period:
-            return 0.0
-        return sum(prev[-period:]) / period
-
-    # ── CSV 로그 ──────────────────────────────────────────────
-
-    def _ensure_csv_headers(self) -> None:
-        if not self._trades_csv.exists():
-            with self._trades_csv.open("w", newline="", encoding="utf-8") as f:
-                csv.DictWriter(f, fieldnames=[
-                    "timestamp", "symbol", "side", "quantity", "price",
-                    "reason", "profit_pct", "profit_amt",
-                ]).writeheader()
-        if not self._watch_csv.exists():
-            with self._watch_csv.open("w", newline="", encoding="utf-8") as f:
-                csv.DictWriter(f, fieldnames=[
-                    "timestamp", "symbol", "price", "score",
-                    "ma10_dist", "ma20_rising", "vol_ratio",
-                    "drawdown_52w", "day_rate", "entry_ok", "block_reason",
-                    "score_detail",
-                ]).writeheader()
-
-    def _write_trade_log(
-        self,
-        symbol: str,
-        side: str,
-        quantity: int,
-        price: int,
-        reason: str,
-        profit_pct: float = 0.0,
-        profit_amt: int = 0,
-    ) -> None:
-        with self._trades_csv.open("a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=[
-                "timestamp", "symbol", "side", "quantity", "price",
-                "reason", "profit_pct", "profit_amt",
-            ]).writerow({
-                "timestamp":  datetime.now().isoformat(),
-                "symbol":     symbol,
-                "side":       side,
-                "quantity":   quantity,
-                "price":      price,
-                "reason":     reason,
-                "profit_pct": round(profit_pct, 4),
-                "profit_amt": profit_amt,
-            })
-
-    def _write_watch_log(self, a: SwingAnalysis) -> None:
-        with self._watch_csv.open("a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=[
-                "timestamp", "symbol", "price", "score",
-                "ma10_dist", "ma20_rising", "vol_ratio",
-                "drawdown_52w", "day_rate", "entry_ok", "block_reason",
-                "score_detail",
-            ]).writerow({
-                "timestamp":    datetime.now().isoformat(),
-                "symbol":       a.symbol,
-                "price":        a.current_price,
-                "score":        a.score,
-                "ma10_dist":    round(a.ma10_distance_pct, 2),
-                "ma20_rising":  a.ma20_rising,
-                "vol_ratio":    round(a.volume_ratio_20d, 2),
-                "drawdown_52w": round(a.drawdown_from_52w_pct, 2),
-                "day_rate":     round(a.day_rate_pct, 2),
-                "entry_ok":     a.entry_ok,
-                "block_reason": a.block_reason,
-                "score_detail": a.score_detail,
-            })
+    sep()
+    return "\n".join(lines)
 
 
+# ── 메인 ────────────────────────────────────────────────────────
+def main():
+    args  = sys.argv[1:]
+    today = date.today()
+
+    if len(args) == 0:
+        start = end = today
+    elif len(args) == 1:
+        start = end = date.fromisoformat(args[0])
+    else:
+        start = date.fromisoformat(args[0])
+        end   = date.fromisoformat(args[1])
+
+    rows   = load(start, end)
+    report = analyze(rows, start, end)
+
+    print(report)
+
+    REPORTS_DIR.mkdir(exist_ok=True)
+    fname = REPORTS_DIR / f"trade_analysis_{today.strftime('%Y%m%d')}.txt"
+    fname.write_text(report, encoding="utf-8")
+    print(f"\n  → 저장: {fname}")
+
+
+if __name__ == "__main__":
+    main()
