@@ -127,7 +127,11 @@ class DailyReporter:
         # → 종목별 상세 / trade_analysis.py 와 동일한 기준으로 통일 (2026-07-09)
         # 비용(왕복 수수료 0.25% + 세금 0.18% + 슬리피지 0.10% = 0.53%)은
         # 실현 손익에 섞지 않고 별도 줄로 분리 표기한다.
-        COST_RATE = 0.0053
+        # 2026-07-15: 실제 계좌 스크린샷(7/15)과 대조한 결과 0.53% 가정이
+        # 실제보다 크게 낮았음 — 실제 수수료+세금 427,911원 / 매도총액
+        # 47,438,100원 = 0.902%. 스크린샷 1건 기반 보정이라 잠정치이며,
+        # 데이터가 더 쌓이면 재보정 필요.
+        COST_RATE = 0.009
 
         completed_buys = [t for t in buys if t["symbol"] in today_sells]
         holding_buys   = [t for t in buys if t["symbol"] not in today_sells]
