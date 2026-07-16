@@ -44,6 +44,10 @@ class TradingConfig:
     trail_loss_cooldown_count: int = 1  # 트레일링 손실 N회 → 60분 쿨다운
     excluded_symbols: list = None       # 신규매수 영구 차단 종목
     force_exit_cushion_pct: float = 0.3  # 이월방지 강제청산 — 이 수익률 이상이면 이월 허용
+    max_entries_per_symbol_per_day: int = 3  # 2026-07-16: allow_multiple_entries=True일 때도
+                                               # 종목당 진입 횟수 상한 (무제한 재진입으로 인한
+                                               # 단일종목 과집중 방지 — 7/15 475150 사례:
+                                               # 7회 재진입, 41,766,000원 투입)
 
     def __post_init__(self):
         if self.excluded_symbols is None:

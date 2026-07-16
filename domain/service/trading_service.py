@@ -1053,7 +1053,7 @@ class TradingService:
             #  SKIP_EXCLUDED_SYMBOL / EXCLUDED_SYMBOL 두 줄로 중복 집계되던 버그)
             return "EXCLUDED_SYMBOL"
 
-        # ── 동일 종목 1일 1회 진입 제한 ──────────────────────────
+        # ── 동일 종목 1일 1회 진입 제한 (allow_multi=False일 때만) ────
         allow_multi = getattr(
             self.settings.trading,
             'allow_multiple_entries_per_symbol_per_day',
@@ -1067,6 +1067,25 @@ class TradingService:
                     f"— 1일 1회 제한으로 신규매수 차단"
                 )
                 return "DAILY_ENTRY_LIMIT"
+
+        # ── 종목당 일일 최대 진입 횟수 상한 (2026-07-16) ────────────
+        # allow_multi=True(현재값)라도 재진입 자체는 무제한이 아니어야 함.
+        # 7/15 475150 사례: 손실 없이 계속 상승하는 종목에 재진입이
+        # 반복되어(7회) 41,766,000원(order_cash_per_trade x7)이 하루 만에
+        # 한 종목에 쏠림 — 손실 2회 게이트는 "손실이 나야" 작동하므로
+        # 계속 수익 중인 추격매수는 못 막았음. 상한을 걸어 과집중 방지.
+        max_entries = getattr(
+            self.settings.trading,
+            'max_entries_per_symbol_per_day',
+            3,
+        )
+        entry_cnt = self.state.symbol_entry_count_today.get(symbol, 0)
+        if entry_cnt >= max_entries:
+            self.app_logger.info(
+                f"[ENTRY_LIMIT] {symbol} | 당일 {entry_cnt}회 진입 완료 "
+                f"— 일일 최대 {max_entries}회 상한으로 신규매수 차단"
+            )
+            return "MAX_ENTRIES_PER_DAY"
 
         # ── 시간대 제한 — 14:50 이후 신규매수 차단 ─────────────
         _now = datetime.now()
