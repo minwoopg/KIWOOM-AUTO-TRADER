@@ -130,6 +130,13 @@ class TradingService:
             v_min_bar_amount=cfg.v_min_bar_amount,
             v_bottom_spike_ratio=cfg.v_bottom_spike_ratio,
             v_ma5_slope_bars=cfg.v_ma5_slope_bars,
+            slow_v_bottom_lookback=cfg.slow_v_bottom_lookback,
+            slow_v_low_min_age=cfg.slow_v_low_min_age,
+            slow_v_low_max_age=cfg.slow_v_low_max_age,
+            slow_v_drop_threshold_pct=cfg.slow_v_drop_threshold_pct,
+            slow_v_rebound_threshold_pct=cfg.slow_v_rebound_threshold_pct,
+            slow_v_max_rebound_pct=cfg.slow_v_max_rebound_pct,
+            slow_v_volume_ratio=cfg.slow_v_volume_ratio,
         )
         # 장세 판단 요약 (리포트용)
         self._regime_summary: dict[str, str] = {}

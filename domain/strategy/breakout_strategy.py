@@ -94,8 +94,13 @@ class BreakoutStrategy(Strategy):
                 pass_pulldown = minute_analysis.is_valid_pulldown       # C: 눌림목
                 pass_v        = minute_analysis.is_v_rebound            # V: V자 반등
                 pass_pr       = minute_analysis.is_pulldown_recovery    # PR: 눌림목 재상승
+                # 느린 V자 (2026-07-16): 34일 백테스트 결과 전 구간 마이너스
+                # (5분 승률25%/-0.64%)라 실거래 반영은 slow_v_enabled로 게이트.
+                # 감지 자체(is_slow_v_rebound 필드)는 계속 동작 — 로그/분석용.
+                slow_v_enabled = getattr(self.config, "slow_v_enabled", False)
+                pass_slow_v   = minute_analysis.is_slow_v_rebound if slow_v_enabled else False
 
-                if not any([pass_change, pass_rebound, pass_pulldown, pass_v, pass_pr]):
+                if not any([pass_change, pass_rebound, pass_pulldown, pass_v, pass_pr, pass_slow_v]):
                     ma = minute_analysis
                     # ── 세분화 실패 사유 ──────────────────────
                     if not ma.price_above_vwap:
@@ -164,6 +169,7 @@ class BreakoutStrategy(Strategy):
             cond_v_or_pr    = (
                 (minute_analysis.is_v_rebound if minute_analysis else False)
                 or (minute_analysis.is_pulldown_recovery if minute_analysis else False)
+                or (minute_analysis.is_slow_v_rebound if (minute_analysis and slow_v_enabled) else False)
             )
             cond_v_spike    = minute_analysis.rebound_volume_spike if minute_analysis else False
             cond_gap_pullback = pass_gap_pullback if minute_analysis else False
@@ -178,6 +184,7 @@ class BreakoutStrategy(Strategy):
             v_label = (
                 'V자✓' if (minute_analysis and minute_analysis.is_v_rebound) else
                 'PR✓'  if (minute_analysis and minute_analysis.is_pulldown_recovery) else
+                '느린V자✓' if (minute_analysis and minute_analysis.is_slow_v_rebound) else
                 'V/PR✗'
             )
             gap_label = f"갭눌림D✓({minute_analysis.change_rate_pct:+.1f}%)" if cond_gap_pullback else "갭눌림D✗"

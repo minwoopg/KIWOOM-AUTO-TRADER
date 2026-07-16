@@ -72,6 +72,9 @@ class StrategyConfig:
     min_upside_to_recent_high_pct: float = 1.0      # 이 값 미만이면 low_upside_guard 발동
     low_upside_guard_apply_to_pattern_d: bool = False  # 패턴D(갭눌림)에도 상승여력 게이트 적용
     require_confirmation_for_score5: bool = False   # 5점 진입도 거래량급증/V자/PR/반등spike 중 최소 1개 요구
+    slow_v_enabled: bool = False   # 2026-07-16: 느린 V자 탐지는 구현했으나 34일 백테스트
+                                     # 결과 전 구간 마이너스(5분 승률25%/-0.64%)라 실거래
+                                     # 반영은 비활성. 감지 자체(로그/분석용)는 계속 동작.
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,14 @@ class MarketRegimeConfig:
     v_min_bar_amount: int
     v_bottom_spike_ratio: float
     v_ma5_slope_bars: int
+    # 느린 V자(Slow V) 반등 감지 파라미터 (2026-07-16)
+    slow_v_bottom_lookback: int = 150
+    slow_v_low_min_age: int = 9
+    slow_v_low_max_age: int = 120
+    slow_v_drop_threshold_pct: float = -2.5
+    slow_v_rebound_threshold_pct: float = 0.5
+    slow_v_max_rebound_pct: float = 15.0
+    slow_v_volume_ratio: float = 1.0
 
 
 @dataclass(frozen=True)

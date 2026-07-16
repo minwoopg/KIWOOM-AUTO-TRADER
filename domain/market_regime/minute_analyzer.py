@@ -57,6 +57,15 @@ class MinuteAnalysis:
     pr_low_turning: bool        # 저점 우상향 전환 여부
     pr_volume_expanding: bool   # 거래량 수축→팽창 전환 여부
 
+    # ── 느린 V자 반등 (Slow V, 2026-07-16) ────────────────────────
+    # 기존 V자(v_low_max_age=8봉≈8분)는 몇 시간짜리 완만한 반전을
+    # 구조적으로 못 잡음(7/14 SK하이닉스 -8.9%→+4.8%, 2시간+ 소요,
+    # v_low_age 16봉↑이 전체의 44~56%). 훨씬 넓은 탐색창으로 별도 감지.
+    is_slow_v_rebound: bool = False
+    slow_v_drop_pct: float = 0.0
+    slow_v_rise_pct: float = 0.0
+    slow_v_bottom_k: int = 0
+
     def score(self) -> int:
         """진입 타이밍 점수를 계산합니다 (0~5점)."""
         return sum([
@@ -82,6 +91,11 @@ class MinuteAnalysis:
             f"(저점전환:{'✓' if self.pr_low_turning else '✗'}"
             f" 거래량팽창:{'✓' if self.pr_volume_expanding else '✗'})"
         )
+        slow_v_tag = (
+            f"느린V자 {'✓' if self.is_slow_v_rebound else '✗'}"
+            f"(낙폭{self.slow_v_drop_pct:+.1f}% 반등{self.slow_v_rise_pct:+.1f}%"
+            f" {self.slow_v_bottom_k}봉전)"
+        )
         tags = [
             f"VWAP {'위✓' if self.price_above_vwap else '아래✗'}({self.vwap:,.0f})",
             f"저점 {'상승✓' if self.low_rising else '하락✗'}",
@@ -91,6 +105,7 @@ class MinuteAnalysis:
             f"눌림목C {'유효✓' if self.is_valid_pulldown else '무효✗'}(MA5>MA20:{'✓' if self.ma5_above_ma20 else '✗'})",
             v_tag,
             pr_tag,
+            slow_v_tag,
             f"거래대금 {'충분✓' if self.is_valid_trading_value else '부족✗'}({self.trading_value//100_000_000}억)",
         ]
         return " | ".join(tags)
@@ -119,6 +134,19 @@ class MinuteAnalyzer:
         v_min_bar_amount: int = 30_000_000,
         v_bottom_spike_ratio: float = 1.5,
         v_ma5_slope_bars: int = 3,
+        # 느린 V자(Slow V) 파라미터 — 기존 V자(v_low_max_age까지)와
+        # 겹치지 않도록 slow_v_low_min_age를 기존 v_low_max_age 바로
+        # 다음부터 시작하는 것을 권장 (기본값도 그렇게 맞춰둠).
+        # 낙폭/반등 기준은 현재 튜닝된 fast-V 값(v_drop=-2.5,
+        # v_rebound=0.5)과 동일하게 시작하되, 반등상한/거래량비율은
+        # 시간이 오래 걸리는 반전 특성상 더 느슨하게 설정.
+        slow_v_bottom_lookback: int = 150,
+        slow_v_low_min_age: int = 9,
+        slow_v_low_max_age: int = 120,
+        slow_v_drop_threshold_pct: float = -2.5,
+        slow_v_rebound_threshold_pct: float = 0.5,
+        slow_v_max_rebound_pct: float = 15.0,
+        slow_v_volume_ratio: float = 1.0,
     ) -> None:
         self.min_trading_value       = min_trading_value
         self.pullback_min_pct        = pullback_min_pct
@@ -139,6 +167,13 @@ class MinuteAnalyzer:
         self.v_min_bar_amount        = v_min_bar_amount
         self.v_bottom_spike_ratio    = v_bottom_spike_ratio
         self.v_ma5_slope_bars        = v_ma5_slope_bars
+        self.slow_v_bottom_lookback       = slow_v_bottom_lookback
+        self.slow_v_low_min_age           = slow_v_low_min_age
+        self.slow_v_low_max_age           = slow_v_low_max_age
+        self.slow_v_drop_threshold_pct    = slow_v_drop_threshold_pct
+        self.slow_v_rebound_threshold_pct = slow_v_rebound_threshold_pct
+        self.slow_v_max_rebound_pct       = slow_v_max_rebound_pct
+        self.slow_v_volume_ratio          = slow_v_volume_ratio
 
     # ── 내부 유틸 ────────────────────────────────────────────────
 
@@ -161,6 +196,14 @@ class MinuteAnalyzer:
     def _detect_v_rebound(
         self, bars: list[MinuteBar], current_price: int, vwap: float,
         ma5_above_ma20: bool, ma5_rising: bool,
+        *,
+        lookback: int | None = None,
+        low_min_age: int | None = None,
+        low_max_age: int | None = None,
+        drop_threshold_pct: float | None = None,
+        rebound_threshold_pct: float | None = None,
+        max_rebound_pct: float | None = None,
+        volume_ratio_threshold: float | None = None,
     ) -> tuple[bool, int, float, float, float, bool, bool]:
         """V자 반등 패턴을 감지합니다.
 
@@ -176,9 +219,22 @@ class MinuteAnalyzer:
             - 현재봉 거래대금 최소 기준
             - 저점봉 순간 거래량 spike 감지
             - VWAP 회복 + MA5 기울기 상승 필수
+
+        2026-07-16: 키워드 전용 파라미터로 lookback/age/threshold를
+        오버라이드할 수 있게 확장 — 느린 V자(Slow V) 감지에서 동일 로직을
+        재사용하기 위함(생략 시 기존 self.v_* 값 그대로 사용, 기존 호출
+        방식과 100% 하위호환).
         """
+        lookback               = self.v_bottom_lookback       if lookback               is None else lookback
+        low_min_age            = self.v_low_min_age           if low_min_age            is None else low_min_age
+        low_max_age            = self.v_low_max_age           if low_max_age            is None else low_max_age
+        drop_threshold_pct     = self.v_drop_threshold_pct    if drop_threshold_pct     is None else drop_threshold_pct
+        rebound_threshold_pct  = self.v_rebound_threshold_pct if rebound_threshold_pct  is None else rebound_threshold_pct
+        max_rebound_pct        = self.v_max_rebound_pct       if max_rebound_pct        is None else max_rebound_pct
+        volume_ratio_threshold = self.v_volume_ratio          if volume_ratio_threshold is None else volume_ratio_threshold
+
         n = len(bars)
-        lookback = min(self.v_bottom_lookback, n - 2)
+        lookback = min(lookback, n - 2)
         if lookback < 3:
             return False, 0, 0.0, 0.0, 0.0, False, ma5_rising
 
@@ -192,7 +248,7 @@ class MinuteAnalyzer:
         bottom_k = len(search_bars) - low_idx
 
         # 저점 나이 제한 (너무 오래된 저점, 너무 직전 저점 제외)
-        if not (self.v_low_min_age <= bottom_k <= self.v_low_max_age):
+        if not (low_min_age <= bottom_k <= low_max_age):
             return False, bottom_k, 0.0, 0.0, 0.0, False, ma5_rising
 
         # ── 순서 검증: high_idx < low_idx ──────────────────────
@@ -244,14 +300,14 @@ class MinuteAnalyzer:
 
         # ── 최종 판정 + 실패 사유 집계 ─────────────────────────
         fail_reasons = []
-        if drop_pct > self.v_drop_threshold_pct:
-            fail_reasons.append(f"낙폭부족({drop_pct:+.1f}%,최소{self.v_drop_threshold_pct:+.1f}%)")
-        if rise_pct < self.v_rebound_threshold_pct:
-            fail_reasons.append(f"반등부족({rise_pct:+.1f}%,최소{self.v_rebound_threshold_pct:+.1f}%)")
-        elif rise_pct > self.v_max_rebound_pct:
-            fail_reasons.append(f"반등과다({rise_pct:+.1f}%,최대{self.v_max_rebound_pct:+.1f}%)")
-        if vol_ratio < self.v_volume_ratio:
-            fail_reasons.append(f"거래량부족(x{vol_ratio:.1f},최소x{self.v_volume_ratio:.1f})")
+        if drop_pct > drop_threshold_pct:
+            fail_reasons.append(f"낙폭부족({drop_pct:+.1f}%,최소{drop_threshold_pct:+.1f}%)")
+        if rise_pct < rebound_threshold_pct:
+            fail_reasons.append(f"반등부족({rise_pct:+.1f}%,최소{rebound_threshold_pct:+.1f}%)")
+        elif rise_pct > max_rebound_pct:
+            fail_reasons.append(f"반등과다({rise_pct:+.1f}%,최대{max_rebound_pct:+.1f}%)")
+        if vol_ratio < volume_ratio_threshold:
+            fail_reasons.append(f"거래량부족(x{vol_ratio:.1f},최소x{volume_ratio_threshold:.1f})")
         if not vwap_ok:
             fail_reasons.append("VWAP미회복")
         if not (ma5_rising or ma5_above_ma20):
@@ -362,6 +418,29 @@ class MinuteAnalyzer:
         is_v, v_bottom_k, v_drop_pct, v_rise_pct, v_vol_ratio, v_bottom_spike, _ = (
             self._detect_v_rebound(bars, current_price, vwap, ma5_above_ma20, ma5_rising)
         )
+        # fast-V 실패사유를 즉시 로컬로 캡처 (아래 slow-V 호출이
+        # self._last_v_fail_reasons를 덮어쓰기 전에 보존해야 함)
+        v_fail_reason = "" if is_v else (self._last_v_fail_reasons[0] if self._last_v_fail_reasons else "V_FAIL_UNKNOWN")
+
+        # ── 느린 V자(Slow V) 반등 감지 (2026-07-16) ─────────────
+        # fast-V(v_low_max_age봉 이내)가 못 잡는, 수 시간 걸리는 완만한
+        # 반전을 훨씬 넓은 탐색창으로 별도 감지. fast-V가 이미 잡았으면
+        # 중복 계산할 필요 없음.
+        if is_v:
+            is_slow_v, slow_v_bottom_k, slow_v_drop_pct, slow_v_rise_pct = False, 0, 0.0, 0.0
+        else:
+            is_slow_v, slow_v_bottom_k, slow_v_drop_pct, slow_v_rise_pct, _, _, _ = (
+                self._detect_v_rebound(
+                    bars, current_price, vwap, ma5_above_ma20, ma5_rising,
+                    lookback=self.slow_v_bottom_lookback,
+                    low_min_age=self.slow_v_low_min_age,
+                    low_max_age=self.slow_v_low_max_age,
+                    drop_threshold_pct=self.slow_v_drop_threshold_pct,
+                    rebound_threshold_pct=self.slow_v_rebound_threshold_pct,
+                    max_rebound_pct=self.slow_v_max_rebound_pct,
+                    volume_ratio_threshold=self.slow_v_volume_ratio,
+                )
+            )
 
         # ── 반등봉 거래량 spike (현재봉 거래량 vs 당일 평균) ────
         # 저점봉 spike(투매 확인)와 달리 반등봉 spike는 매수세 유입을 확인하는 핵심 지표
@@ -402,7 +481,7 @@ class MinuteAnalyzer:
             is_valid_pulldown=is_valid_pulldown,
             ma5_above_ma20=ma5_above_ma20,
             is_v_rebound=is_v,
-            v_fail_reason="" if is_v else (self._last_v_fail_reasons[0] if self._last_v_fail_reasons else "V_FAIL_UNKNOWN"),
+            v_fail_reason=v_fail_reason,
             v_bottom_k=v_bottom_k,
             v_drop_pct=v_drop_pct,
             v_rise_pct=v_rise_pct,
@@ -415,4 +494,8 @@ class MinuteAnalyzer:
             is_pulldown_recovery=is_pr,
             pr_low_turning=pr_low_turning,
             pr_volume_expanding=pr_volume_expanding,
+            is_slow_v_rebound=is_slow_v,
+            slow_v_drop_pct=slow_v_drop_pct,
+            slow_v_rise_pct=slow_v_rise_pct,
+            slow_v_bottom_k=slow_v_bottom_k,
         )

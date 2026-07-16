@@ -78,6 +78,12 @@ strategy:
   require_confirmation_for_score5: true   # 2026-07-14: 5점도 거래량급증/V자/PR/반등spike
                                             # 중 최소 1개 요구 (동행지표만으로 채워진 5점의
                                             # 성과가 확인지표 포함 5점보다 뚜렷이 열세임을 확인)
+  slow_v_enabled: false   # 2026-07-16: 느린 V자 탐지는 구현됐으나 34일 백테스트
+                            # (rising-edge 369건) 결과 전 구간 마이너스
+                            # (5분 승률25.1%/-0.64%, 10분 -0.27%, 20분 -0.37%,
+                            # 낙폭/반등폭/저점나이 어느 구간으로 잘라도 마이너스)
+                            # 라 실거래 반영은 비활성. 감지 필드는 계속 채워지므로
+                            # signal_log로 데이터 축적 후 재튜닝 가능.
 
 market_regime:
   short_ma_days: 5
@@ -105,6 +111,18 @@ market_regime:
   v_min_bar_amount: 30000000
   v_bottom_spike_ratio: 1.5
   v_ma5_slope_bars: 3
+  # 느린 V자(Slow V) 반등 감지 (2026-07-16) — 기존 V자는 저점이
+  # v_low_max_age(8분) 이내여야 해서 몇 시간짜리 완만한 반전을 구조적으로
+  # 못 잡음(7/14 SK하이닉스 -8.9%→+4.8%, 2시간+ 소요). 별도 탐색창으로 감지.
+  slow_v_bottom_lookback: 150      # low_max_age(120)보다 여유(버퍼 30분)있게 설정 —
+                                     # 버퍼 없으면 저점이 탐색창 맨 앞에 걸릴 때 "저점 이전
+                                     # 고점" 탐색 자체가 실패함 (테스트 중 실제로 발견)
+  slow_v_low_min_age: 9           # 기존 V자(최대 8봉)와 안 겹치게 9봉부터 시작
+  slow_v_low_max_age: 120
+  slow_v_drop_threshold_pct: -2.5   # fast-V와 동일 기준으로 시작
+  slow_v_rebound_threshold_pct: 0.5
+  slow_v_max_rebound_pct: 15.0      # 시간이 오래 걸린 반등이라 상한을 넉넉히
+  slow_v_volume_ratio: 1.0          # 넓은 구간 평균이라 기준 완화
   min_trading_value: 50000000000  # 500억 이상
   pullback_min_pct: -17.5  # 2026-07-14: -7.0 → -17.5 완화 (34거래일 리플레이 시뮬레이션 근거)
                             # simulate_pullback_removal.py 결과: C조건 하한 개방 시 신규 180건
