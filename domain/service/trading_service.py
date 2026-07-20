@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from config.settings import Settings
@@ -95,6 +95,15 @@ class TradingService:
         self._last_regime_logged: dict[str, tuple[str, datetime]] = {}
         self._last_min_logged: dict[str, tuple[int, datetime]] = {}
         self._regime_log_heartbeat_sec = 300  # REGIME: 라벨 불변 시 5분마다 하트비트
+
+        # 2026-07-20: 일별 상태(symbol_entry_count_today 등) 리셋이
+        # main.py의 "장 시작 전 대기" 분기에서만 호출되고 있었음 — 프로세스가
+        # 이미 실행 중이면(주말 내내 켜져있던 경우 등) 리셋이 전혀 안 됨.
+        # 7/20(월) 실제 사례: 금요일 475150 진입 3회로 카운터가 이미 3에
+        # 도달해 있었는데 주말 지나고도 리셋이 안 돼서, 월요일 매수 0건인데
+        # MAX_ENTRIES_PER_DAY가 203회 차단되는 버그 발생. 프로세스 재시작
+        # 타이밍에 의존하지 않도록, 폴링마다 날짜변경을 직접 체크하도록 변경.
+        self._last_reset_date = None
         self._notifier: KakaoNotifier = build_notifier(settings)  # 카카오 알림
         # ATR/볼린저 계산용 일봉 캐시 (종목별 60개 유지)
         self._daily_bars_cache: dict[str, dict] = {}  # (미사용 — _update_indicators가 cached_daily_bars 재사용)
@@ -576,6 +585,18 @@ class TradingService:
 
     async def run_once(self) -> None:
         """자동매매 루프를 한 번 실행합니다."""
+        # 2026-07-20: 프로세스 재시작 타이밍에 의존하지 않는 날짜변경 감지.
+        # main.py의 조건부 reset_daily_loss_counts() 호출과 별개로, 여기서
+        # 매 폴링마다 직접 오늘 날짜를 확인해 확실하게 리셋되도록 보강.
+        today = date.today()
+        if self._last_reset_date != today:
+            if self._last_reset_date is not None:
+                self.app_logger.info(
+                    f"[RESET] 날짜변경 감지 {self._last_reset_date} → {today} — 일별 상태 초기화"
+                )
+            self.reset_daily_loss_counts()
+            self._last_reset_date = today
+
         balance = self._get_balance_with_cache()
 
         # ── 이월 포지션 강제청산 체크 ──────────────────────────
@@ -771,12 +792,17 @@ class TradingService:
         self.state_store.save(self.state, self._highest_price)
 
     def reset_daily_loss_counts(self) -> None:
-        """당일 손실 횟수를 초기화합니다. 장 시작 전 호출합니다."""
+        """당일 손실 횟수를 초기화합니다. 매일 최초 1회(날짜변경 감지 시) 호출됩니다."""
         self.state.symbol_loss_count_today.clear()
         self.state.symbol_stoploss_at.clear()
         self.state.symbol_trail_loss_at.clear()
         self.state.symbol_entry_count_today.clear()
         self.state.symbol_block_today.clear()
+        # 2026-07-20: StateReconciler.reconcile()이 프로세스 시작 시 1회만
+        # 호출되어 bought_symbols_today/consecutive_losses도 동일한 유형의
+        # "주말 넘어가면 초기화 누락" 버그에 노출되어 있었음 — 여기로 통합.
+        self.state.bought_symbols_today.clear()
+        self.state.consecutive_losses = 0
         if hasattr(self, '_sold_today'):
             self._sold_today.clear()  # 당일 매도 완료 종목 초기화
         self._excluded_symbols.clear()  # 당일 제외 종목(매매제한 등) 초기화 — 익일 재시도 허용

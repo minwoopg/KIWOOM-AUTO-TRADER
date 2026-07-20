@@ -81,7 +81,10 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
         )
         await asyncio.sleep(wait_sec)
         app_logger.info("장 시작 — 매매 루프 시작")
-        trading_service.reset_daily_loss_counts()
+        # 2026-07-20: reset_daily_loss_counts() 명시 호출 제거 — run_once()가
+        # 매 폴링마다 날짜변경을 직접 감지해서 확실하게 호출하도록 바뀌어
+        # 여기서 조건부로 호출하던 건 중복(그리고 프로세스가 이미 떠있던
+        # 경우엔 이 분기 자체를 안 타서 리셋이 누락되던 버그의 원인이었음)
     else:
         app_logger.info("application started (장중 실행)")
 
