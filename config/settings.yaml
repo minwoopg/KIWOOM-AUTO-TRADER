@@ -146,7 +146,10 @@ risk:
   min_cash_buffer: 100000
 
 entry_watch:
-  enabled: false                 # true로 변경 시 entry watch 청산 활성화
+  enabled: true                  # 2026-07-20: 구현 완료 후 활성화 (근거: trades.csv 171건
+                                   # 검증 결과 5분내 +0.5% 미달 128건 최종평균-0.41%/승률29.7%,
+                                   # 달성 40건 최종평균+0.40%/승률60.0% — 초반 5분 흐름과
+                                   # 최종결과 상관관계 뚜렷)
   watch_minutes: 5               # 매수 후 관찰 시간 (분)
   min_profit_pct: 0.5            # 관찰 기간 중 최소 달성 수익률 (%)
   fail_cut_pct: -1.0             # 이 손실 이하면 즉시 청산 (%)

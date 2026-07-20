@@ -721,10 +721,18 @@ class TradingService:
                 # 볼린저 %B — 상단 돌파 시 진입 문턱 상향에 사용 (2026-07-02)
                 _bb_cached = self._last_indicators.get(symbol, {}).get('bb')
                 _bb_pb = getattr(_bb_cached, 'percent_b', None) if _bb_cached is not None else None
-                signal = strategy.generate_signal(
-                    market_price, position, minute_analysis, highest_price,
-                    bb_percent_b=_bb_pb,
+
+                # ── entry_watch: 정규 전략보다 먼저 체크 ──────────────
+                # 매수 후 watch_minutes(+1분 버퍼) 이내에서만 작동. SELL을
+                # 내면 정규 전략(손절/트레일링) 호출 자체를 건너뜀.
+                signal = self._check_entry_watch(
+                    symbol, position, market_price.current_price, minute_analysis,
                 )
+                if signal is None:
+                    signal = strategy.generate_signal(
+                        market_price, position, minute_analysis, highest_price,
+                        bb_percent_b=_bb_pb,
+                    )
     
                 self._log_signal_decision(
                     symbol, signal, market_price.current_price,
@@ -914,6 +922,83 @@ class TradingService:
                 avg_buy_price=avg,
             )
             await asyncio.sleep(0.5)
+
+    def _check_entry_watch(
+        self,
+        symbol: str,
+        position,
+        current_price: int,
+        minute_analysis,
+    ) -> "Signal | None":
+        """
+        매수 직후 watch_minutes 동안 실패한 진입(V자 등)을 빠르게 정리합니다.
+
+        정규 전략(손절/트레일링)보다 먼저 체크하며, 다음 중 하나라도
+        해당하면 즉시 SELL 신호를 반환합니다:
+          1) 관찰 기간 중 fail_cut_pct 이하로 급락
+          2) fail_on_vwap_break=True이고 VWAP 이탈
+          3) watch_minutes(+1분 버퍼) 경과 시점에도 min_profit_pct 미달
+
+        watch_minutes(+버퍼)를 초과하면 더 이상 관여하지 않고 None을
+        반환해 정규 전략에 판단을 위임합니다. position이 없거나
+        entry_watch가 비활성화된 경우도 None을 반환합니다.
+        """
+        ew = getattr(self.settings, "entry_watch", None)
+        if ew is None or not ew.enabled:
+            return None
+        if position is None:
+            return None
+
+        entry_time_str = self.state.entry_time_by_symbol.get(symbol, "")
+        if not entry_time_str:
+            return None
+        try:
+            entry_dt = datetime.fromisoformat(entry_time_str)
+        except ValueError:
+            return None
+
+        elapsed_min = (datetime.now() - entry_dt).total_seconds() / 60
+        # 관찰 윈도우(+1분 버퍼) 초과 시 정규 전략에 위임
+        if elapsed_min > ew.watch_minutes + 1:
+            return None
+
+        avg = position.average_price
+        if avg <= 0:
+            return None
+        pnl_pct = (current_price - avg) / avg * 100
+
+        # 1) 급락 즉시 청산
+        if pnl_pct <= ew.fail_cut_pct:
+            return Signal(
+                type=SignalType.SELL,
+                reason=(
+                    f"entry_watch 급락청산 — 매수 후 {elapsed_min:.1f}분, "
+                    f"수익률 {pnl_pct:+.2f}% (기준 {ew.fail_cut_pct:+.1f}% 이하)"
+                ),
+            )
+
+        # 2) VWAP 이탈 청산
+        if ew.fail_on_vwap_break and minute_analysis is not None:
+            if not minute_analysis.price_above_vwap:
+                return Signal(
+                    type=SignalType.SELL,
+                    reason=(
+                        f"entry_watch VWAP이탈청산 — 매수 후 {elapsed_min:.1f}분, "
+                        f"수익률 {pnl_pct:+.2f}%, VWAP {minute_analysis.vwap:,.0f}원 아래"
+                    ),
+                )
+
+        # 3) watch_minutes 경과 시점에 최소수익 미달 청산
+        if elapsed_min >= ew.watch_minutes and pnl_pct < ew.min_profit_pct:
+            return Signal(
+                type=SignalType.SELL,
+                reason=(
+                    f"entry_watch 최소수익미달청산 — 매수 후 {elapsed_min:.1f}분, "
+                    f"수익률 {pnl_pct:+.2f}% (기준 {ew.min_profit_pct:+.1f}% 미달)"
+                ),
+            )
+
+        return None
 
     def _run_end_of_day_tasks(self, now: datetime) -> None:
         """장 마감 후 작업 (리포트/검증). run_once 밖에서도 호출 가능."""

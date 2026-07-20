@@ -186,6 +186,7 @@ class Settings:
     market_regime: MarketRegimeConfig
     storage: StorageConfig
     websocket: WebSocketConfig
+    entry_watch: EntryWatchConfig = None
     kakao: KakaoConfig = None
 
 
@@ -206,6 +207,7 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
     raw = _substitute_env(raw)
 
     kakao_raw = raw.get("kakao", {})
+    entry_watch_raw = raw.get("entry_watch", {})
     return Settings(
         app=AppConfig(**raw["app"]),
         broker=BrokerConfig(**raw["broker"]),
@@ -216,5 +218,6 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
         market_regime=MarketRegimeConfig(**raw["market_regime"]),
         storage=StorageConfig(**raw["storage"]),
         websocket=WebSocketConfig(**raw["websocket"]),
+        entry_watch=EntryWatchConfig(**entry_watch_raw) if entry_watch_raw else None,
         kakao=KakaoConfig(**kakao_raw) if kakao_raw else KakaoConfig(),
     )
