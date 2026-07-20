@@ -50,8 +50,13 @@ class TradingConfig:
                                                # 7회 재진입, 41,766,000원 투입)
 
     def __post_init__(self):
+        # frozen=True dataclass라 self.x = ... 직접 대입은 FrozenInstanceError.
+        # object.__setattr__로 우회 (2026-07-20: excluded_symbols=None으로
+        # 생성될 때 FrozenInstanceError가 나던 잠재 버그를 테스트 중 발견 —
+        # 지금까지 settings.yaml이 항상 excluded_symbols: 리스트를 명시해서
+        # None 케이스가 실제로 발생한 적이 없었을 뿐이었음)
         if self.excluded_symbols is None:
-            self.excluded_symbols = []
+            object.__setattr__(self, "excluded_symbols", [])
 
 
 @dataclass(frozen=True)

@@ -666,6 +666,70 @@ trading:
 보다 작아서, "+0.5% 미달 청산"이 본전권 거래를 비용 확정 손실로
 만들 가능성이 있음 — 실거래 누적 후 손익 breakdown으로 재검증 필요.
 
+### 7.11 보유 포지션 손절 체결 지연 — targets 순회 순서 문제 (2026-07-20)
+
+**증상**: 정상 손절 41건 중 30건(73%)이 기준(-1.5%)보다 나쁘게 체결.
+평균 1.44%p, 최악 7.53%p 괴리(005930, 기준 -3.7%인데 실제 -9.0%
+체결). GPT 검토 과정에서 지적받아 재검증한 결과 추정치보다 심각했음.
+
+**원인**: `run_once()`가 `targets`(조건검색 편입 순서 등, 매매와 무관한
+순서)를 그대로 `for symbol in self.targets`로 순회하며, 종목마다
+`await asyncio.sleep(1.0)`을 낀 채 순차 처리. 손절 판단은
+`strategy.generate_signal()` 내부, 즉 장세판단(`_get_regime_with_cache`)
+과 분봉 2차 필터(`_get_minute_analysis`) 등 무거운 신규 후보 분석을
+전부 거친 뒤에야 나옴. 보유 종목이 `targets` 리스트 뒷쪽에 있으면,
+앞선 미보유 종목들의 처리 시간(1초 sleep × 개수)을 전부 기다린 뒤에야
+손절 신호를 받는 구조였음. 보유·미보유 종목이 완전히 동일한 무거운
+경로를 거치는 것도 원인 중 하나.
+
+**검토한 대안과 기각 사유**: 보유 포지션 감시를 완전히 별도의
+async 루프(1초 주기)로 분리하는 안도 검토했으나 기각. `state`,
+`balance` 캐시, `_sold_today`, `_highest_price` 등 공유 mutable
+상태를 두 개의 asyncio 태스크가 동시에 건드리면 경쟁 조건(race
+condition) 위험이 큼 — 예: 신규후보 루프가 매수 처리 중인데 감시
+루프가 동시에 같은 종목을 매도 처리하는 경우. 리스크 대비 효과가
+불확실해 채택하지 않음.
+
+**수정**: `run_once()` 내부에서 순서만 재정렬. `targets`를 보유
+종목/미보유 종목 두 그룹으로 나누고, 보유 종목을 먼저 처리하도록
+`sorted()`(안정 정렬 — 같은 그룹 내 원래 순서는 그대로 보존)로
+재배치. 기존 종목별 처리 로직(장세판단/분봉분석/신호판단/주문/로깅)은
+전혀 바꾸지 않고 `_process_symbol()` 메서드로 그대로 추출해서
+재사용 — 회귀 위험을 최소화하기 위해 로직 자체는 한 글자도 안 바꿈.
+
+```python
+held_symbols = {p.symbol for p in balance.positions}
+ordered_targets = sorted(
+    enumerate(self.targets),
+    key=lambda pair: 0 if pair[1] in held_symbols else 1,
+)
+```
+
+**효과 (시뮬레이션)**: targets 10개 중 보유종목 1개가 맨 뒤(9번째)에
+있는 경우, 처리 시작까지의 대기시간이 8초 → 0초. 보유종목이
+`max_positions`(5개) 전체를 차지하며 분산된 경우, 평균 대기시간
+5.0초 → 2.0초(60% 단축).
+
+**검증**:
+- `test_position_priority_order.py` — 정렬 로직 자체 단위테스트 9건
+  (보유종목 우선순위, 같은 그룹 내 순서 보존, 빈 리스트, 전원
+  보유/전원 미보유 등 경계 케이스) 전부 통과
+- `test_run_once_integration.py` — `MockBroker`로 `TradingService`를
+  실제 조립해 `run_once()`를 1회 실행, `_process_symbol` 실제 호출
+  순서를 추적. targets 3번째였던 보유종목이 실제로 첫 번째로
+  처리됨을 확인, 종목 누락/중복 없음, 나머지 종목 순서 원본 유지
+  확인, 손절 매도가 trades.csv에 정상 기록되는 것까지 확인
+
+**부가 발견 및 수정**: 테스트 작성 중 `TradingConfig.excluded_symbols`
+필드가 `None`으로 생성되면 `__post_init__`에서 `frozen=True`
+dataclass에 직접 대입(`self.excluded_symbols = []`)을 시도해
+`FrozenInstanceError`가 나는 잠재 버그를 발견. 지금까지
+`settings.yaml`이 항상 `excluded_symbols:` 리스트를 명시해서
+`None` 케이스가 실제로 발생한 적이 없었을 뿐. `object.__setattr__`
+사용하도록 즉시 수정하고, 명시적 전달/생략 두 케이스 모두 정상
+동작하는 것과 `load_settings()`로 실제 yaml을 로드하는 정상
+경로가 깨지지 않은 것을 확인.
+
 ---
 
 ## 8. 로깅 인프라 개선 (2026-07-14)

@@ -604,200 +604,226 @@ class TradingService:
         # 14:40~14:50 사이에 수익 쿠션 없는 보유 포지션을 청산해 이월 방지
         await self._check_force_exit_overnight(balance)
 
-        for i, symbol in enumerate(self.targets):
+        # ── 보유 종목 우선 처리 (2026-07-20) ──────────────────────
+        # 기존엔 targets를 그냥 순서대로(조건검색 편입 순 등) 순회해서,
+        # 보유 종목이 리스트 뒷쪽에 있으면 앞선 미보유 종목들의 무거운
+        # 분석(장세판단/분봉2차필터)과 종목당 1초 sleep을 전부 거친 뒤에야
+        # 손절/트레일링 판단을 받았음. 정상 손절 41건 중 30건(73%)이
+        # 기준(-1.5%)보다 나쁘게 체결, 최악 -9.0%(7.5%p 괴리) 사례 확인.
+        #
+        # targets 자체를 두 그룹으로 나눠 보유 종목을 먼저 처리하는 것으로
+        # 완화. 처리 로직(_process_symbol)은 완전히 동일하게 재사용 —
+        # 순서만 바꿔서 보유 종목이 앞선 미보유 종목들의 sleep 누적을
+        # 기다리지 않게 함. (완전 별도 async 루프로 분리하지 않은 이유:
+        # state/balance 캐시를 두 태스크가 동시에 건드리면 경쟁 조건 위험)
+        held_symbols = {p.symbol for p in balance.positions}
+        ordered_targets = sorted(
+            enumerate(self.targets),
+            key=lambda pair: 0 if pair[1] in held_symbols else 1,
+        )
+
+        for order_idx, (_orig_i, symbol) in enumerate(ordered_targets):
 
             if symbol in self._excluded_symbols:
                 continue
 
-            if i > 0:
+            if order_idx > 0:
                 await asyncio.sleep(1.0)
 
-            try:
-                position_check = next((p for p in balance.positions if p.symbol == symbol), None)
-                # 하루 매도 완료 종목은 직전 잔고 API 지연 시 잘못 보일 수 있으니 None 처리
-                if position_check is not None and symbol in getattr(self, '_sold_today', set()):
-                    position_check = None
-                if position_check is not None:
-                    try:
-                        market_price = self.broker.get_market_price(symbol)
-                        self.cached_market_prices[symbol] = market_price
-                        self.cached_market_price_loaded_at[symbol] = datetime.now()
-                    except Exception:
-                        market_price = self._get_market_price_with_cache(symbol)
-                else:
-                    market_price = self._get_market_price_with_cache(symbol)
-    
-                market_price = self._attach_indicators(market_price, symbol)
-    
-                # 장세 판단 — 현재가/전일 종가 전달해서 당일 급등/급락 감지
-                regime, _ = self._get_regime_with_cache(
-                    symbol,
-                    current_price=market_price.current_price,
-                    prev_close=market_price.previous_close,
-                )
-    
-                if regime == MarketRegime.UNKNOWN:
-                    self._unknown_count[symbol] = self._unknown_count.get(symbol, 0) + 1
-                    if self._unknown_count[symbol] >= 3:
-                        self._excluded_symbols.add(symbol)
-                        self.app_logger.warning(
-                            f"[EXCL] {symbol} | UNKNOWN 3회 연속 — 감시 대상에서 제외합니다"
-                        )
-                        continue
-                else:
-                    self._unknown_count[symbol] = 0
-    
-                # BULLISH일 때만 분봉 2차 필터 적용
-                minute_analysis = None
-                if regime in (MarketRegime.BULLISH, MarketRegime.NEUTRAL, MarketRegime.REBOUND):
-                    minute_analysis = self._get_minute_analysis(
-                        symbol, market_price.previous_close
-                    )
-                    if minute_analysis:
-                        score = minute_analysis.score()
-                        last = self._last_min_logged.get(symbol)
-                        now = datetime.now()
-                        score_changed = last is None or last[0] != score
-                        min_interval_passed = last is None or (now - last[1]).total_seconds() >= 30
-                        # 2026-07-14: 기존엔 스로틀이 전혀 없어서 매 폴링(10초)마다
-                        # 무조건 로깅 — app.log 최대 기여 태그(227k/997k줄)였음.
-                        # 점수 변화 시 + 최소 30초 간격(다른 로그들과 동일 cadence)으로 축소.
-                        if score_changed or min_interval_passed:
-                            self.app_logger.info(
-                                f"[MIN ] {symbol} | {score}/5 | {minute_analysis.summary()}"
-                            )
-                            self._last_min_logged[symbol] = (score, now)
-                        # V자 실패 사유 로그 (감지 안 됐을 때, 분당 1회)
-                        if not minute_analysis.is_v_rebound:
-                            v_fails = getattr(self._minute_analyzer, '_last_v_fail_reasons', [])
-                            if v_fails:
-                                last_v_log = self.last_hold_log_at_by_symbol.get(
-                                    f"__vfail_{symbol}"
-                                )
-                                now_dt = datetime.now()
-                                if last_v_log is None or (now_dt - last_v_log).total_seconds() >= 60:
-                                    self.app_logger.info(
-                                        f"[V_FAIL] {symbol} | " + " / ".join(v_fails)
-                                    )
-                                    self.last_hold_log_at_by_symbol[f"__vfail_{symbol}"] = now_dt
-    
-                strategy = self.strategy_router.select(regime)
-                position = next((p for p in balance.positions if p.symbol == symbol), None)
-                # 당일 매도 완료 종목은 잔고 API 지연으로 잘못 보일 수 있으니 None 처리
-                # (2026-07-03: position_check에만 적용돼 있던 걸 실제 판단용 position에도 적용
-                #  — 064290이 14:48 매도 성공 후 5번 추가 매도 시도한 원인)
-                _forced_none_by_sold_today = False
-                if position is not None and symbol in getattr(self, '_sold_today', set()):
-                    position = None
-                    _forced_none_by_sold_today = True
-
-                if position is None and balance.positions and not _forced_none_by_sold_today:
-                    # symbol이 정확히 일치하는 포지션이 없을 때,
-                    # 비슷한(문자열 차이만 있는) 포지션이 있는지 확인해서
-                    # 공백/접두사 등 매칭 실패 원인을 즉시 드러냄
-                    close_matches = [
-                        p.symbol for p in balance.positions
-                        if symbol in p.symbol or p.symbol in symbol
-                    ]
-                    if close_matches:
-                        self.app_logger.warning(
-                            f"[POS_MISMATCH] {symbol} | "
-                            f"정확히 일치하는 포지션 없음, 유사 symbol 발견: {close_matches} "
-                            f"(repr: {[repr(s) for s in close_matches]})"
-                        )
-
-                # 보유 중인 경우 최고가 갱신 (트레일링 스탑 + entry watch 공용)
-                if position is not None:
-                    current = market_price.current_price
-                    if current > self._highest_price.get(symbol, 0):
-                        self._highest_price[symbol] = current
-                    # entry watch용 peak_price 갱신
-                    if current > self.state.peak_price_by_symbol.get(symbol, 0):
-                        self.state.peak_price_by_symbol[symbol] = current
-                else:
-                    self._highest_price.pop(symbol, None)
-    
-                highest_price = self._highest_price.get(symbol, 0)
-                # 볼린저 %B — 상단 돌파 시 진입 문턱 상향에 사용 (2026-07-02)
-                _bb_cached = self._last_indicators.get(symbol, {}).get('bb')
-                _bb_pb = getattr(_bb_cached, 'percent_b', None) if _bb_cached is not None else None
-
-                # ── entry_watch: 정규 전략보다 먼저 체크 ──────────────
-                # 매수 후 watch_minutes(+1분 버퍼) 이내에서만 작동. SELL을
-                # 내면 정규 전략(손절/트레일링) 호출 자체를 건너뜀.
-                signal = self._check_entry_watch(
-                    symbol, position, market_price.current_price, minute_analysis,
-                )
-                if signal is None:
-                    signal = strategy.generate_signal(
-                        market_price, position, minute_analysis, highest_price,
-                        bb_percent_b=_bb_pb,
-                    )
-    
-                self._log_signal_decision(
-                    symbol, signal, market_price.current_price,
-                    regime, position, minute_analysis
-                )
-    
-                # 거래대금 부족 3회 연속이면 자동 제외
-                if (
-                    signal.type == SignalType.HOLD
-                    and minute_analysis is not None
-                    and not minute_analysis.is_valid_trading_value
-                ):
-                    self._low_volume_count[symbol] = self._low_volume_count.get(symbol, 0) + 1
-                    if self._low_volume_count[symbol] >= 3:
-                        self._excluded_symbols.add(symbol)
-                        self.app_logger.warning(
-                            f"[EXCL] {symbol} | 거래대금 부족 3회 연속 "
-                            f"({minute_analysis.trading_value//100_000_000}억) — 감시 대상에서 제외합니다"
-                        )
-                else:
-                    # 거래대금 충분하면 카운트 초기화
-                    self._low_volume_count[symbol] = 0
-    
-                # ── BUY 신호면 주문 시도 후 결과를 signal_log에 반영 ──
-                order_block_reason = ""
-                final_decision = signal.type.value
-                if signal.type == SignalType.BUY:
-                    block = self._try_buy(
-                        symbol, market_price.current_price, balance,
-                        signal=signal, regime=regime,
-                        minute_analysis=minute_analysis,
-                    )
-                    if block:
-                        order_block_reason = block
-                        final_decision = "BLOCKED"
-
-                # ── SELL 신호 처리 ───────────────────────────────
-                if signal.type == SignalType.SELL and position is not None:
-                    self._try_sell(
-                        symbol, position.quantity, market_price.current_price,
-                        exit_reason=signal.reason,
-                        avg_buy_price=position.average_price,
-                    )
-
-                # ── ATR / 볼린저 계산 (로그 전용, 일봉 캐시 사용) ──
-                self._update_indicators(symbol, market_price.current_price)
-
-                # ── 시그널 로그 기록 (BUY/HOLD/SELL 불문 전체) ──
-                self._write_signal_log(
-                    symbol=symbol,
-                    price=market_price.current_price,
-                    regime=regime,
-                    signal=signal,
-                    minute_analysis=minute_analysis,
-                    final_decision=final_decision,
-                    order_block_reason=order_block_reason,
-                )
-
-            except Exception as exc:
-                self.app_logger.exception(
-                    f"[ERROR] {symbol} | 종목 처리 중 예외 발생, 다음 종목으로 계속합니다: {exc}"
-                )
-                continue
+            await self._process_symbol(symbol, balance)
 
         self.state_store.save(self.state, self._highest_price)
+
+    async def _process_symbol(self, symbol: str, balance) -> None:
+        """종목 하나에 대해 시세 조회 → 장세/분봉분석 → 신호판단 → 주문을 수행합니다.
+
+        run_once()의 순회 루프에서 종목마다 호출됩니다. 보유 종목 우선
+        처리를 위해 2026-07-20에 run_once() 본문에서 분리했습니다.
+        """
+        try:
+            position_check = next((p for p in balance.positions if p.symbol == symbol), None)
+            # 하루 매도 완료 종목은 직전 잔고 API 지연 시 잘못 보일 수 있으니 None 처리
+            if position_check is not None and symbol in getattr(self, '_sold_today', set()):
+                position_check = None
+            if position_check is not None:
+                try:
+                    market_price = self.broker.get_market_price(symbol)
+                    self.cached_market_prices[symbol] = market_price
+                    self.cached_market_price_loaded_at[symbol] = datetime.now()
+                except Exception:
+                    market_price = self._get_market_price_with_cache(symbol)
+            else:
+                market_price = self._get_market_price_with_cache(symbol)
+
+            market_price = self._attach_indicators(market_price, symbol)
+
+            # 장세 판단 — 현재가/전일 종가 전달해서 당일 급등/급락 감지
+            regime, _ = self._get_regime_with_cache(
+                symbol,
+                current_price=market_price.current_price,
+                prev_close=market_price.previous_close,
+            )
+
+            if regime == MarketRegime.UNKNOWN:
+                self._unknown_count[symbol] = self._unknown_count.get(symbol, 0) + 1
+                if self._unknown_count[symbol] >= 3:
+                    self._excluded_symbols.add(symbol)
+                    self.app_logger.warning(
+                        f"[EXCL] {symbol} | UNKNOWN 3회 연속 — 감시 대상에서 제외합니다"
+                    )
+                    return
+            else:
+                self._unknown_count[symbol] = 0
+
+            # BULLISH일 때만 분봉 2차 필터 적용
+            minute_analysis = None
+            if regime in (MarketRegime.BULLISH, MarketRegime.NEUTRAL, MarketRegime.REBOUND):
+                minute_analysis = self._get_minute_analysis(
+                    symbol, market_price.previous_close
+                )
+                if minute_analysis:
+                    score = minute_analysis.score()
+                    last = self._last_min_logged.get(symbol)
+                    now = datetime.now()
+                    score_changed = last is None or last[0] != score
+                    min_interval_passed = last is None or (now - last[1]).total_seconds() >= 30
+                    # 2026-07-14: 기존엔 스로틀이 전혀 없어서 매 폴링(10초)마다
+                    # 무조건 로깅 — app.log 최대 기여 태그(227k/997k줄)였음.
+                    # 점수 변화 시 + 최소 30초 간격(다른 로그들과 동일 cadence)으로 축소.
+                    if score_changed or min_interval_passed:
+                        self.app_logger.info(
+                            f"[MIN ] {symbol} | {score}/5 | {minute_analysis.summary()}"
+                        )
+                        self._last_min_logged[symbol] = (score, now)
+                    # V자 실패 사유 로그 (감지 안 됐을 때, 분당 1회)
+                    if not minute_analysis.is_v_rebound:
+                        v_fails = getattr(self._minute_analyzer, '_last_v_fail_reasons', [])
+                        if v_fails:
+                            last_v_log = self.last_hold_log_at_by_symbol.get(
+                                f"__vfail_{symbol}"
+                            )
+                            now_dt = datetime.now()
+                            if last_v_log is None or (now_dt - last_v_log).total_seconds() >= 60:
+                                self.app_logger.info(
+                                    f"[V_FAIL] {symbol} | " + " / ".join(v_fails)
+                                )
+                                self.last_hold_log_at_by_symbol[f"__vfail_{symbol}"] = now_dt
+
+            strategy = self.strategy_router.select(regime)
+            position = next((p for p in balance.positions if p.symbol == symbol), None)
+            # 당일 매도 완료 종목은 잔고 API 지연으로 잘못 보일 수 있으니 None 처리
+            # (2026-07-03: position_check에만 적용돼 있던 걸 실제 판단용 position에도 적용
+            #  — 064290이 14:48 매도 성공 후 5번 추가 매도 시도한 원인)
+            _forced_none_by_sold_today = False
+            if position is not None and symbol in getattr(self, '_sold_today', set()):
+                position = None
+                _forced_none_by_sold_today = True
+
+            if position is None and balance.positions and not _forced_none_by_sold_today:
+                # symbol이 정확히 일치하는 포지션이 없을 때,
+                # 비슷한(문자열 차이만 있는) 포지션이 있는지 확인해서
+                # 공백/접두사 등 매칭 실패 원인을 즉시 드러냄
+                close_matches = [
+                    p.symbol for p in balance.positions
+                    if symbol in p.symbol or p.symbol in symbol
+                ]
+                if close_matches:
+                    self.app_logger.warning(
+                        f"[POS_MISMATCH] {symbol} | "
+                        f"정확히 일치하는 포지션 없음, 유사 symbol 발견: {close_matches} "
+                        f"(repr: {[repr(s) for s in close_matches]})"
+                    )
+
+            # 보유 중인 경우 최고가 갱신 (트레일링 스탑 + entry watch 공용)
+            if position is not None:
+                current = market_price.current_price
+                if current > self._highest_price.get(symbol, 0):
+                    self._highest_price[symbol] = current
+                # entry watch용 peak_price 갱신
+                if current > self.state.peak_price_by_symbol.get(symbol, 0):
+                    self.state.peak_price_by_symbol[symbol] = current
+            else:
+                self._highest_price.pop(symbol, None)
+
+            highest_price = self._highest_price.get(symbol, 0)
+            # 볼린저 %B — 상단 돌파 시 진입 문턱 상향에 사용 (2026-07-02)
+            _bb_cached = self._last_indicators.get(symbol, {}).get('bb')
+            _bb_pb = getattr(_bb_cached, 'percent_b', None) if _bb_cached is not None else None
+
+            # ── entry_watch: 정규 전략보다 먼저 체크 ──────────────
+            # 매수 후 watch_minutes(+1분 버퍼) 이내에서만 작동. SELL을
+            # 내면 정규 전략(손절/트레일링) 호출 자체를 건너뜀.
+            signal = self._check_entry_watch(
+                symbol, position, market_price.current_price, minute_analysis,
+            )
+            if signal is None:
+                signal = strategy.generate_signal(
+                    market_price, position, minute_analysis, highest_price,
+                    bb_percent_b=_bb_pb,
+                )
+
+            self._log_signal_decision(
+                symbol, signal, market_price.current_price,
+                regime, position, minute_analysis
+            )
+
+            # 거래대금 부족 3회 연속이면 자동 제외
+            if (
+                signal.type == SignalType.HOLD
+                and minute_analysis is not None
+                and not minute_analysis.is_valid_trading_value
+            ):
+                self._low_volume_count[symbol] = self._low_volume_count.get(symbol, 0) + 1
+                if self._low_volume_count[symbol] >= 3:
+                    self._excluded_symbols.add(symbol)
+                    self.app_logger.warning(
+                        f"[EXCL] {symbol} | 거래대금 부족 3회 연속 "
+                        f"({minute_analysis.trading_value//100_000_000}억) — 감시 대상에서 제외합니다"
+                    )
+            else:
+                # 거래대금 충분하면 카운트 초기화
+                self._low_volume_count[symbol] = 0
+
+            # ── BUY 신호면 주문 시도 후 결과를 signal_log에 반영 ──
+            order_block_reason = ""
+            final_decision = signal.type.value
+            if signal.type == SignalType.BUY:
+                block = self._try_buy(
+                    symbol, market_price.current_price, balance,
+                    signal=signal, regime=regime,
+                    minute_analysis=minute_analysis,
+                )
+                if block:
+                    order_block_reason = block
+                    final_decision = "BLOCKED"
+
+            # ── SELL 신호 처리 ───────────────────────────────
+            if signal.type == SignalType.SELL and position is not None:
+                self._try_sell(
+                    symbol, position.quantity, market_price.current_price,
+                    exit_reason=signal.reason,
+                    avg_buy_price=position.average_price,
+                )
+
+            # ── ATR / 볼린저 계산 (로그 전용, 일봉 캐시 사용) ──
+            self._update_indicators(symbol, market_price.current_price)
+
+            # ── 시그널 로그 기록 (BUY/HOLD/SELL 불문 전체) ──
+            self._write_signal_log(
+                symbol=symbol,
+                price=market_price.current_price,
+                regime=regime,
+                signal=signal,
+                minute_analysis=minute_analysis,
+                final_decision=final_decision,
+                order_block_reason=order_block_reason,
+            )
+
+        except Exception as exc:
+            self.app_logger.exception(
+                f"[ERROR] {symbol} | 종목 처리 중 예외 발생, 다음 종목으로 계속합니다: {exc}"
+            )
+            return
 
     def reset_daily_loss_counts(self) -> None:
         """당일 손실 횟수를 초기화합니다. 매일 최초 1회(날짜변경 감지 시) 호출됩니다."""
