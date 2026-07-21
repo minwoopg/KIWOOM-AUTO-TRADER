@@ -270,3 +270,47 @@ class EntryWatchShadowLogger:
             for field in SHADOW_FIELDS:
                 row.setdefault(field, "")
             writer.writerow(row)
+
+
+# ── position_lifecycle.csv ───────────────────────────────────────────────────
+# 포지션 5단계 상태머신(shadow, 2026-07-22)의 모든 상태 전이를 기록.
+# 정상 전이(FLAT->BUY_PENDING->OPEN->...)와 이상 전이(부분체결/거부/
+# 미반영/불변조건위반)를 전부 남겨서, shadow 검증 기간 동안 상태머신이
+# 실제로 어떻게 동작하는지 사후 분석할 수 있게 한다.
+# (기존엔 POSITION_STATE_MISMATCH 위반 시에만 app.log에 CRITICAL로
+#  한 줄 남았고, 정상 전이는 메모리에만 있다가 다음 전이에 덮어써져
+#  전혀 추적할 수 없었음)
+
+LIFECYCLE_FIELDS = [
+    "timestamp",           # 전이 발생 시각
+    "symbol",
+    "event",                # BUY_REQUESTED / BUY_RESULT / SELL_REQUESTED /
+                             # SELL_RESULT / SYNC / INVARIANT_VIOLATION
+    "from_lifecycle",       # 전이 전 상태
+    "to_lifecycle",         # 전이 후 상태
+    "broker_quantity",      # 이 이벤트 시점의 브로커 잔고 수량(조회한 경우)
+    "pending_quantity",     # 진행 중이던 주문의 요청 수량
+    "known_quantity",       # 상태머신이 마지막으로 확인한 수량
+    "detail",                # PARTIAL_FILL / SELL_REJECTED / BUY_REJECTED 등
+                             # last_error 값 또는 불변조건 위반 메시지
+]
+
+
+class PositionLifecycleLogger:
+    """포지션 상태머신의 모든 전이를 CSV로 남기는 로거입니다."""
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.file_path.exists():
+            with self.file_path.open("w", newline="", encoding="utf-8") as fp:
+                writer = csv.DictWriter(fp, fieldnames=LIFECYCLE_FIELDS)
+                writer.writeheader()
+
+    def append(self, row: dict[str, Any]) -> None:
+        """상태 전이 로그 한 줄을 추가합니다."""
+        with self.file_path.open("a", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=LIFECYCLE_FIELDS, extrasaction="ignore")
+            for field in LIFECYCLE_FIELDS:
+                row.setdefault(field, "")
+            writer.writerow(row)

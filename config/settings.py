@@ -199,6 +199,8 @@ class StorageConfig:
     minute_bars_dir: str
     # entry_watch 반사실적(counterfactual) 비교 로그 (2026-07-22)
     entry_watch_shadow_log_file: str = "logs/entry_watch_shadow.csv"
+    # 포지션 상태머신(shadow) 전이 로그 (2026-07-22)
+    position_lifecycle_log_file: str = "logs/position_lifecycle.csv"
 
 
 @dataclass(frozen=True)

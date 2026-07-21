@@ -981,6 +981,131 @@ sleep 자체를 스킵하는 것까지 확인.
 스펙 문서로 확인된 게 아니라 절충으로 정한 값. 실거래 반영 후 API
 오류(과다호출 등)가 발생하는지 지켜볼 것.
 
+### 7.17 포지션 5단계 상태머신 도입 (shadow 모드) (2026-07-22)
+
+**배경**: 7.12절(재매수 오판)과 7.14절(수량기반 판정 전환)로 그
+시점까지 발견된 사고는 막았지만, GPT 검토에서 "`_sold_today` 이분법
+(set 기반)을 완전히 벗어나려면 명시적인 상태 머신이 필요하다"는
+지적을 받음 — 부분체결/매도거부/체결반영지연 같은 시나리오를
+근본적으로 다루려면 종목별로 "지금 정확히 어떤 상태인지"를 몇 개의
+명시적 단계로 추적해야 함.
+
+**설계 결정 (사용자 확정)**:
+- 완전한 5단계 lifecycle + 불변조건 자동검사까지 구현(중간 단계인
+  단순 3단계 enum이 아니라 GPT가 제안한 전체 버전 채택)
+- 불변조건 위반(잔고>0인데 로컬상태 FLAT) 감지 시: 다음 정상
+  폴링에서 불일치가 해소되면 자동으로 신규매수 재개, 단 CRITICAL
+  로그는 계속 남겨 발생 빈도를 추적 가능하게
+- 적용 범위: 바로 실제 판정을 교체하지 않고, 먼저 shadow로
+  기존 로직(`_sold_today_qty_snapshot`, 7.14절)과 병행 운영해
+  실거래로 검증한 뒤 교체
+
+**구현**: `domain/position/lifecycle.py` 신규 모듈.
+
+```python
+class PositionLifecycle(str, Enum):
+    FLAT = "FLAT"
+    BUY_PENDING = "BUY_PENDING"
+    OPEN = "OPEN"
+    SELL_PENDING = "SELL_PENDING"
+    ERROR = "ERROR"
+```
+
+이 시스템의 `place_order()`가 동기 호출이라는 점이 설계에 중요함
+— 원래 의미의 "주문 대기"는 없고, PENDING은 "주문은 접수됐는데
+브로커 잔고 API에 아직 반영 안 된 짧은 구간"만 의미. 매수는
+`on_buy_requested` → `on_buy_result`가 `_try_buy()` 안에서 바로
+이어서 호출됨(거부 시 이전 상태로 즉시 복귀). 매도는
+`on_sell_requested`만 `_try_sell()`에서 호출하고, `on_sell_result`
+(전량체결/부분체결/미반영/거부 네 갈래 판정)는 **다음 폴링**에서
+`_sync_position_state_machine_shadow()`가 브로커 잔고를 다시
+조회해 호출 — 실제 비동기적 체결 확인 흐름과 동일하게 맞춤.
+
+상태는 영속화하지 않음(휘발성, 다른 캐시와 동일 패턴) — 재시작 시
+`state.json`의 옛 PENDING 상태를 신뢰하는 게 오히려 위험하므로,
+매 프로세스 시작 시 브로커 실제 잔고 기준으로 재초기화.
+
+`run_once()`의 `balance` 조회 직후, 모든 실행 흐름(신규후보
+분석/보유종목 처리/강제청산 등) 이전에
+`_sync_position_state_machine_shadow()`를 호출 — PENDING이 아닌
+종목은 잔고로 재동기화, SELL_PENDING인 종목은 `on_sell_result`로
+전이 시도, 그리고 `check_invariant()`로 불변조건(잔고>0인데
+로컬상태=FLAT)을 검사해 위반 시 `CRITICAL` 로그만 남김(PENDING
+상태는 검사 제외 — 그 동안의 일시 불일치는 정상).
+
+**shadow 모드 보장**: 이 기능은 기존 판정 로직
+(`_sold_today`/`_sold_today_qty_snapshot`)을 전혀 건드리지 않음 —
+`_process_symbol()`의 실제 position 판정, `_try_buy`/`_try_sell`의
+게이트 로직 모두 변경 없음. 상태머신은 관찰과 검증 목적으로만
+병행 계산됨.
+
+**검증**: `test_position_lifecycle_shadow.py` — 22건 전부 통과.
+1부(상태머신 자체, 10건): 초기상태/매수정상흐름/매수거부/매도정상
+흐름(전량체결)/매도미반영(7.4절 원조 문제와 동일 시나리오)/매도
+부분체결(GPT가 지적한 시나리오)/매도거부/불변조건 위반감지/PENDING
+중 불변조건 예외/정상 상태 불변조건 통과. 2부(TradingService 배선,
+3건): 상태머신 존재 및 초기화 여부, `_try_sell` 호출 시
+`SELL_PENDING` 통지, **shadow 동기화 실행 전후 기존 판정 결과가
+동일함**(shadow가 실제 판정에 영향 없다는 가장 중요한 안전성
+확인)까지 확인. `run_once()`를 2회 연속 호출하는 통합 확인으로
+초기화→실동기화 흐름과 실제 손절 발생 시 `OPEN→FLAT` 전이까지
+자연스럽게 동작함을 확인. 기존 회귀 테스트 전부(8개 파일, 70건)
+재통과 확인 — 총 9개 파일 92건.
+
+**다음 단계**: 실거래로 며칠 운영하며 `POSITION_STATE_MISMATCH`
+CRITICAL 로그가 실제로 발생하는지, 발생한다면 얼마나 자주/어떤
+상황에서인지 관찰. 문제없이 안정적으로 동작하면 실제 판정 로직
+(`_process_symbol()`의 position 체크, `_try_buy`/`_try_sell`의
+`_sold_today` 계열 게이트)을 이 상태머신 기반으로 교체.
+
+### 7.18 포지션 상태전이 CSV 로깅 보강 (2026-07-22)
+
+**배경**: 7.17절 구현 직후 "상태머신이 자동으로 로그에 기록되고
+있는지" 질문을 받고 확인한 결과, 실제로는 `app_logger.critical()`
+한 줄(`check_invariant()`가 위반을 감지했을 때만)만 `app.log`에
+남고 있었음. 정상 상태 전이(FLAT→BUY_PENDING→OPEN→SELL_PENDING→
+FLAT)나 이상 케이스(부분체결/거부/API미반영)는 메모리에만 있다가
+다음 전이에 덮어써져 전혀 추적 불가능한 상태였음 — shadow 모드로
+검증하기엔 관찰 가능성이 부족했음.
+
+**구현**: `infra/storage/logger.py`에 `PositionLifecycleLogger`
+신규 추가(`position_lifecycle.csv`, `StorageConfig.
+position_lifecycle_log_file`로 경로 설정 가능). `PositionStateMachine`
+생성자에 선택적 `logger` 인자를 추가하고, 모든 public 메서드
+(`sync_from_broker`/`on_buy_requested`/`on_buy_result`/
+`on_sell_requested`/`on_sell_result`/`check_invariant`)가 호출될
+때마다 이벤트를 기록하도록 내부에 `_log_event()` 헬퍼를 추가.
+`logger=None`이면(기본값) 기존과 동일하게 아무것도 기록하지
+않아 하위호환 유지 — 기존 `test_position_lifecycle_shadow.py`가
+`logger=None`으로 생성해서 쓰는 패턴이라 이 조건이 특히 중요했음.
+
+기록 원칙: 전이가 실제로 일어났는지 여부와 무관하게 "이 이벤트가
+호출됐다"는 사실 자체를 남김 — 예를 들어 매도 후 API 미반영으로
+`SELL_PENDING`이 유지되는 경우도 폴링마다 `PENDING_STILL_
+UNCONFIRMED`로 매번 기록되어, 몇 번의 폴링에 걸쳐 지연됐는지
+사후 분석 가능. 불변조건 위반은 `app_logger.critical()`과
+`position_lifecycle.csv` 양쪽에 모두 기록(전자는 실시간 알림용,
+후자는 정형화된 분석용 — 목적이 달라 둘 다 유지).
+
+컬럼: `timestamp, symbol, event, from_lifecycle, to_lifecycle,
+broker_quantity, pending_quantity, known_quantity, detail`
+
+**검증**: `test_position_lifecycle_logging.py` — 16건 전부 통과.
+`logger=None` 하위호환, 매수흐름 2단계 기록, 매도 부분체결 상세
+기록(known_quantity 갱신 포함), API 미반영이 폴링마다 반복
+기록되는지, 불변조건 위반 기록, 정상 상태는 위반 미기록까지 확인.
+추가로 `TradingService`를 실제로 조립해 `run_once()`를 2회 연속
+호출하는 통합 확인 — `010170` 종목이 손절되며
+`SELL_REQUESTED→SELL_RESULT(FILLED_FULL)→FLAT` 흐름이 실제
+`logs/position_lifecycle.csv` 파일에 그대로 기록되는 것까지 확인.
+전체 회귀(9개 기존 파일)도 재통과 확인 — 총 10개 파일 108건.
+
+**확인 방법**:
+```powershell
+Select-String -Path logs\position_lifecycle.csv -Pattern "INVARIANT_VIOLATION"
+Get-Content logs\position_lifecycle.csv -Tail 50
+```
+
 ---
 
 ## 8. 로깅 인프라 개선 (2026-07-14)
