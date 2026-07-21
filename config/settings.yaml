@@ -30,15 +30,21 @@ trading:
   price_refresh_seconds: 60
   order_cash_per_trade: 6000000
   max_positions: 5
-  allow_multiple_entries_per_symbol_per_day: true  # 2026-07-09: 1일1회(결과무관) 차단 대신
-                                                     # 아래 DAILY_LOSS_LIMIT(종목별 손실 2회)로 전환.
-                                                     # 근거: 7/9 058730 20분 순수익 +0.59%(제외후보 아님)인데도
-                                                     # 1일1회 제한으로 재진입 38건 전부 차단됨.
-                                                     # 028300/477850처럼 시스템이 WATCHLIST_EXCLUDE_CANDIDATE로
-                                                     # 판정한 종목은 여전히 손실 2회에서 차단되므로 보호는 유지.
+  allow_multiple_entries_per_symbol_per_day: false  # 2026-07-21: 1일1회로 재전환.
+                                                     # 2026-07-09에 무제한(결과무관 차단 대신
+                                                     # 손실2회 게이트)으로 풀었었으나, 7/21
+                                                     # 475150 사례로 재검토 — 트레일링 익절(수익)
+                                                     # 로 청산된 뒤 재진입해서 손실로 번지는
+                                                     # 패턴은 손실2회/트레일링손실 게이트가
+                                                     # "손실 실적"을 전제로 하므로 막지 못함.
+                                                     # ⚠️ 트레이드오프: 7/9 058730처럼 순수익
+                                                     # 재진입까지 함께 차단됨 — 결과와 무관하게
+                                                     # 하루 1entry로 제한하는 것을 의도적으로 선택.
   max_entries_per_symbol_per_day: 3   # 2026-07-16: allow_multi=true라도 무제한은 아님 —
                                         # 7/15 475150 사례(계속 수익 중이라 손실2회 게이트가
                                         # 안 걸려 7회 재진입, 41,766,000원 투입)로 상한 추가
+                                        # (2026-07-21: allow_multi=false 전환으로 사실상
+                                        # 항상 1회에서 멈추지만, 안전망으로 값은 유지)
   force_exit_before_market_close_minutes: 20  # 15:10부터 수익쿠션 없는 포지션 강제청산
   force_exit_cushion_pct: 0.3                 # +0.3% 이상이면 이월 허용
   reentry_cooldown_seconds: 600
