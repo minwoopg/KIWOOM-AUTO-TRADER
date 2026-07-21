@@ -48,6 +48,16 @@ class TradingConfig:
                                                # 종목당 진입 횟수 상한 (무제한 재진입으로 인한
                                                # 단일종목 과집중 방지 — 7/15 475150 사례:
                                                # 7회 재진입, 41,766,000원 투입)
+    # ── 보유종목 사이 폴링 간격 (2026-07-22) ──────────────────────
+    # 기존엔 보유/미보유 구분 없이 종목마다 1.0초씩 sleep해서, 보유종목이
+    # 여러 개면(최대 max_positions=5) 뒤쪽 보유종목의 손절판단이 그만큼
+    # 늦어졌음(GPT 검토 지적, 7.11절 우선순위 정렬로 1차 완화했으나
+    # 보유종목끼리는 여전히 1초씩 대기). API 레이트리밋 우려로 완전히
+    # 0으로는 두지 않고, 미보유종목(entry_poll_gap_seconds, 기존 1.0초
+    # 유지)보다 짧게 별도 설정. 기본값을 기존과 동일한 1.0으로 둬서
+    # 하위호환 유지 — settings.yaml에서 명시적으로 낮춰야 실제로 빨라짐.
+    held_symbol_poll_gap_seconds: float = 1.0
+    entry_poll_gap_seconds: float = 1.0
 
     def __post_init__(self):
         # frozen=True dataclass라 self.x = ... 직접 대입은 FrozenInstanceError.
@@ -187,6 +197,8 @@ class StorageConfig:
     app_log_file: str
     save_minute_bars: bool
     minute_bars_dir: str
+    # entry_watch 반사실적(counterfactual) 비교 로그 (2026-07-22)
+    entry_watch_shadow_log_file: str = "logs/entry_watch_shadow.csv"
 
 
 @dataclass(frozen=True)

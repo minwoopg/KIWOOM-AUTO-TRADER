@@ -26,6 +26,14 @@ targets:
     
 trading:
   poll_interval_seconds: 10
+  # ── 종목 순회 사이 폴링 간격 (2026-07-22) ────────────────────
+  # 보유종목 우선처리(7.11절)로 순서는 바꿨지만, 보유종목이 여러 개면
+  # 그 사이에도 여전히 1초씩 대기해 뒤쪽 보유종목의 손절판단이 늦어짐.
+  # 미보유(신규후보) 종목은 기존 1.0초 유지, 보유종목은 0.2초로 단축 —
+  # API 레이트리밋 안전마진은 유지하되 지연을 최소화. 실거래로 문제
+  # 없는지 확인 후 필요시 추가 조정.
+  held_symbol_poll_gap_seconds: 0.2
+  entry_poll_gap_seconds: 1.0
   balance_refresh_seconds: 180
   price_refresh_seconds: 60
   order_cash_per_trade: 6000000

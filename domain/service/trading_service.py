@@ -27,7 +27,7 @@ from domain.risk.risk_manager import RiskManager
 from domain.strategy.strategy_router import StrategyRouter
 from infra.broker.base import Broker
 from infra.storage.daily_reporter import DailyReporter
-from infra.storage.logger import AppLogger, TradeCsvLogger, SignalCsvLogger
+from infra.storage.logger import AppLogger, TradeCsvLogger, SignalCsvLogger, EntryWatchShadowLogger
 from infra.storage.minute_bar_saver import MinuteBarSaver
 from infra.storage.skip_reason import classify_skip_reason, SkipReason
 from infra.notify.kakao_notifier import KakaoNotifier, build_notifier
@@ -50,6 +50,7 @@ class TradingService:
         trade_logger: TradeCsvLogger,
         signal_logger: SignalCsvLogger,
         state_store: JsonStateStore,
+        entry_watch_shadow_logger: "EntryWatchShadowLogger | None" = None,
     ) -> None:
         self.settings = settings
         self.broker = broker
@@ -60,6 +61,11 @@ class TradingService:
         self.trade_logger = trade_logger
         self.signal_logger = signal_logger
         self.state_store = state_store
+        # 2026-07-22: 선택적 인자 — 기존 생성 코드(main.py, 테스트)를
+        # 안 건드리고 도입하기 위해 None이면 storage 설정에서 자동 생성
+        self.entry_watch_shadow_logger = entry_watch_shadow_logger or EntryWatchShadowLogger(
+            settings.storage.entry_watch_shadow_log_file
+        )
 
         self.state, loaded_highest = self.state_store.load()
 
@@ -114,6 +120,14 @@ class TradingService:
 
         # 동적 종목 목록 (조건검색 연동 시 갱신)
         self._dynamic_targets: list[str] | None = None
+
+        # entry_watch counterfactual 추적 (2026-07-22)
+        # {symbol: {trigger_at, trigger_type, entry_price, trigger_price,
+        #           actual_pnl_pct, checkpoints_done: set[int]}}
+        # 휘발성 관찰용 데이터라 state.json에 영속화하지 않음(다른 캐시와
+        # 동일 패턴). 프로세스 재시작 시 진행 중이던 추적은 유실되지만,
+        # 관찰 목적이라 손실 위험은 없음.
+        self._entry_watch_shadow_tracking: dict[str, dict] = {}
 
         # 일일 리포트 생성기
         self._reporter = DailyReporter(
@@ -628,9 +642,37 @@ class TradingService:
                 continue
 
             if order_idx > 0:
-                await asyncio.sleep(1.0)
+                # 2026-07-22: 직전 종목이 보유종목이었으면 짧은 간격
+                # (held_symbol_poll_gap_seconds), 미보유종목이었으면
+                # 기존과 동일한 간격(entry_poll_gap_seconds) 적용.
+                # "직전 종목 기준"인 이유: 보유종목 구간 내부(둘 다 held)
+                # 뿐 아니라 보유→미보유 전환 경계도 자연스럽게 커버하려면
+                # 이번에 처리할 종목이 아니라 방금 API를 호출한 종목의
+                # 성격을 봐야 함.
+                prev_symbol = ordered_targets[order_idx - 1][1]
+                if prev_symbol in held_symbols:
+                    gap = getattr(self.settings.trading, "held_symbol_poll_gap_seconds", 1.0)
+                else:
+                    gap = getattr(self.settings.trading, "entry_poll_gap_seconds", 1.0)
+                if gap > 0:
+                    await asyncio.sleep(gap)
 
             await self._process_symbol(symbol, balance)
+
+        # ── entry_watch counterfactual 체크포인트 확인 (2026-07-22) ──
+        # 청산된 종목은 balance.positions에 없어서 위 루프에서 가격을
+        # 못 얻으므로, 추적 중인 종목만 별도로 가격 조회 후 체크.
+        # targets에 없는 종목이 추적 대상일 수도 있으니(예: entry_watch
+        # 청산 후 targets에서 자연히 빠진 경우) 별도 순회가 필요함.
+        if self._entry_watch_shadow_tracking:
+            for shadow_symbol in list(self._entry_watch_shadow_tracking.keys()):
+                try:
+                    mp = self._get_market_price_with_cache(shadow_symbol)
+                    self._check_entry_watch_shadow_checkpoints(shadow_symbol, mp.current_price)
+                except Exception as exc:
+                    self.app_logger.warning(
+                        f"[EW_SHADOW] {shadow_symbol} | 가격 조회 실패로 체크포인트 스킵: {exc}"
+                    )
 
         self.state_store.save(self.state, self._highest_price)
 
@@ -1025,6 +1067,9 @@ class TradingService:
 
         # 1) 급락 즉시 청산
         if pnl_pct <= ew.fail_cut_pct:
+            self._start_entry_watch_shadow_tracking(
+                symbol, position, avg, current_price, ew, "급락청산",
+            )
             return Signal(
                 type=SignalType.SELL,
                 reason=(
@@ -1059,6 +1104,9 @@ class TradingService:
                 self.state.vwap_break_streak_by_symbol[symbol] = streak
                 confirm_count = getattr(ew, "vwap_break_confirm_count", 1)
                 if streak >= confirm_count:
+                    self._start_entry_watch_shadow_tracking(
+                        symbol, position, avg, current_price, ew, "VWAP이탈청산",
+                    )
                     return Signal(
                         type=SignalType.SELL,
                         reason=(
@@ -1070,6 +1118,9 @@ class TradingService:
 
         # 3) watch_minutes 경과 시점에 최소수익 미달 청산
         if elapsed_min >= ew.watch_minutes and pnl_pct < ew.min_profit_pct:
+            self._start_entry_watch_shadow_tracking(
+                symbol, position, avg, current_price, ew, "최소수익미달청산",
+            )
             return Signal(
                 type=SignalType.SELL,
                 reason=(
@@ -1079,6 +1130,78 @@ class TradingService:
             )
 
         return None
+
+    def _start_entry_watch_shadow_tracking(
+        self, symbol: str, position, entry_price: int, trigger_price: int,
+        ew, trigger_type: str,
+    ) -> None:
+        """entry_watch가 청산한 종목의 counterfactual 추적을 시작합니다.
+
+        "entry_watch가 개입 안 했다면 어떻게 됐을지"를 실제로 계속
+        관찰해서 5/10/20분 체크포인트마다 기록합니다. 같은 종목이 이미
+        추적 중이면(예: 짧은 시간 내 재진입 후 다시 청산) 기존 추적을
+        덮어씁니다 — 가장 최근 개입의 효과를 보는 게 목적이므로.
+        """
+        if entry_price <= 0:
+            return
+        # 방어적 초기화 — __init__을 거치지 않고 만들어진 인스턴스(단위테스트
+        # 등에서 TradingService.__new__로 속성만 채워 쓰는 경우) 대응
+        if not hasattr(self, "_entry_watch_shadow_tracking"):
+            self._entry_watch_shadow_tracking: dict[str, dict] = {}
+        actual_pnl_pct = (trigger_price - entry_price) / entry_price * 100
+        self._entry_watch_shadow_tracking[symbol] = {
+            "trigger_at": datetime.now(),
+            "trigger_type": trigger_type,
+            "entry_price": entry_price,
+            "trigger_price": trigger_price,
+            "actual_pnl_pct": actual_pnl_pct,
+            "checkpoints_done": set(),
+        }
+
+    def _check_entry_watch_shadow_checkpoints(self, symbol: str, current_price: int) -> None:
+        """추적 중인 종목의 체크포인트(5/10/20분) 도달 여부를 확인하고 기록합니다.
+
+        매 폴링마다 호출됩니다. 이 종목이 추적 대상이 아니면 즉시 반환.
+        모든 체크포인트(20분)를 다 기록하면 추적을 종료합니다. 종목이
+        재매수되어 실제 보유 중이어도 추적 자체는 별도로 계속됩니다 —
+        "그때 안 팔았다면"이라는 가정 자체가 재매수와 무관한 반사실적
+        질문이기 때문입니다.
+        """
+        tracking = self._entry_watch_shadow_tracking.get(symbol)
+        if tracking is None:
+            return
+
+        checkpoints = (5, 10, 20)
+        elapsed_min = (datetime.now() - tracking["trigger_at"]).total_seconds() / 60
+        entry_price = tracking["entry_price"]
+
+        for cp in checkpoints:
+            if cp in tracking["checkpoints_done"]:
+                continue
+            if elapsed_min < cp:
+                continue
+
+            counterfactual_pnl_pct = (
+                (current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0.0
+            )
+            effect_pct = counterfactual_pnl_pct - tracking["actual_pnl_pct"]
+
+            self.entry_watch_shadow_logger.append({
+                "trigger_at": tracking["trigger_at"].isoformat(),
+                "symbol": symbol,
+                "trigger_type": tracking["trigger_type"],
+                "entry_price": entry_price,
+                "trigger_price": tracking["trigger_price"],
+                "actual_pnl_pct": round(tracking["actual_pnl_pct"], 3),
+                "checkpoint_min": cp,
+                "checkpoint_price": current_price,
+                "counterfactual_pnl_pct": round(counterfactual_pnl_pct, 3),
+                "entry_watch_effect_pct": round(effect_pct, 3),
+            })
+            tracking["checkpoints_done"].add(cp)
+
+        if tracking["checkpoints_done"] >= set(checkpoints):
+            self._entry_watch_shadow_tracking.pop(symbol, None)
 
     def _run_end_of_day_tasks(self, now: datetime) -> None:
         """장 마감 후 작업 (리포트/검증). run_once 밖에서도 호출 가능."""

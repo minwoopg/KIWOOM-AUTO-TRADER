@@ -227,3 +227,46 @@ class SignalCsvLogger:
             for field in SIGNAL_FIELDS:
                 row.setdefault(field, "")
             writer.writerow(row)
+
+
+# ── entry_watch_shadow.csv ───────────────────────────────────────────────────
+# entry_watch가 SELL을 낸 시점의 반사실적(counterfactual) 효과를 측정하기
+# 위한 전용 로그. "entry_watch가 개입 안 했다면 어떻게 됐을지"를 각
+# 체크포인트(5/10/20분)마다 실제로 계속 관찰해 별도로 기록한다.
+# (2026-07-22: GPT 검토에서 지적된 "정적 관찰과 개입 효과는 다르다"는
+#  문제에 대응 — 기존엔 SELL 시점 이후를 전혀 추적하지 않았음)
+
+SHADOW_FIELDS = [
+    "trigger_at",           # entry_watch가 SELL을 낸 시각
+    "symbol",
+    "trigger_type",         # 급락청산 / VWAP이탈청산 / 최소수익미달청산
+    "entry_price",          # 매수 평균단가
+    "trigger_price",        # entry_watch 청산 체결가(추정 — 청산 시점 current_price)
+    "actual_pnl_pct",       # entry_watch 개입으로 실제 확정된 손익률(청산가 기준)
+    "checkpoint_min",       # 이 행이 몇 분 시점 관찰인지 (5/10/20)
+    "checkpoint_price",     # 그 시점 실제 가격 (entry_watch 없었다면의 시세)
+    "counterfactual_pnl_pct",  # 그 시점까지 계속 보유했다면의 손익률
+    "entry_watch_effect_pct",  # counterfactual_pnl_pct - actual_pnl_pct
+                                # 양수 = entry_watch가 손실을 줄임(도움됨)
+                                # 음수 = entry_watch가 좋은 거래를 잘라냄(손해)
+]
+
+
+class EntryWatchShadowLogger:
+    """entry_watch 반사실적 비교 로그를 CSV로 남기는 로거입니다."""
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.file_path.exists():
+            with self.file_path.open("w", newline="", encoding="utf-8") as fp:
+                writer = csv.DictWriter(fp, fieldnames=SHADOW_FIELDS)
+                writer.writeheader()
+
+    def append(self, row: dict[str, Any]) -> None:
+        """반사실적 비교 로그 한 줄을 추가합니다."""
+        with self.file_path.open("a", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=SHADOW_FIELDS, extrasaction="ignore")
+            for field in SHADOW_FIELDS:
+                row.setdefault(field, "")
+            writer.writerow(row)
