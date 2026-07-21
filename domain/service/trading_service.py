@@ -642,8 +642,24 @@ class TradingService:
         """
         try:
             position_check = next((p for p in balance.positions if p.symbol == symbol), None)
-            # 하루 매도 완료 종목은 직전 잔고 API 지연 시 잘못 보일 수 있으니 None 처리
-            if position_check is not None and symbol in getattr(self, '_sold_today', set()):
+            # ── 매도 직후 지연 방어를 수량 비교 기반으로 전환 (2026-07-22) ──
+            # 기존엔 "_sold_today에 있으면 무조건 미보유"였는데, 이게
+            # 두 가지 실제 사고를 냈음(순서대로):
+            #  1) 7/15: 강제청산 매도 접수 직후 브로커 API가 옛 잔고를
+            #     반환하는 지연 구간에서 중복 매도 재시도 (7.4절)
+            #  2) 7/21: 매도 성공 후 같은 날 재매수가 실제로 체결됐는데도
+            #     플래그가 그대로 남아 3시간+ 손절판단 자체가 마비 (7.12절)
+            # 두 경우 모두 "매도 시도 시점의 잔고 수량"과 "지금 잔고
+            # 수량"을 비교하면 구분된다: 수량이 그대로면 아직 API 미반영
+            # (진짜 지연 — 미보유로 간주 유지), 수량이 달라졌으면 브로커가
+            # 이미 새 상태(체결완료 또는 재매수)를 반영한 것이므로 그
+            # 잔고를 그대로 신뢰해야 함.
+            sold_qty_snapshot = getattr(self, '_sold_today_qty_snapshot', {})
+            if (
+                position_check is not None
+                and symbol in sold_qty_snapshot
+                and position_check.quantity == sold_qty_snapshot[symbol]
+            ):
                 position_check = None
             if position_check is not None:
                 try:
@@ -714,8 +730,14 @@ class TradingService:
             # 당일 매도 완료 종목은 잔고 API 지연으로 잘못 보일 수 있으니 None 처리
             # (2026-07-03: position_check에만 적용돼 있던 걸 실제 판단용 position에도 적용
             #  — 064290이 14:48 매도 성공 후 5번 추가 매도 시도한 원인)
+            # (2026-07-22: 수량 비교 기반으로 전환 — 위 _sold_today_qty_snapshot
+            #  주석 참고. 매도 시도 당시 수량과 지금 수량이 같을 때만 미보유로 간주)
             _forced_none_by_sold_today = False
-            if position is not None and symbol in getattr(self, '_sold_today', set()):
+            if (
+                position is not None
+                and symbol in sold_qty_snapshot
+                and position.quantity == sold_qty_snapshot[symbol]
+            ):
                 position = None
                 _forced_none_by_sold_today = True
 
@@ -744,6 +766,8 @@ class TradingService:
                     self.state.peak_price_by_symbol[symbol] = current
             else:
                 self._highest_price.pop(symbol, None)
+                # 청산 후 다음 진입에 옛 카운터가 이어지지 않도록 리셋
+                self.state.vwap_break_streak_by_symbol.pop(symbol, None)
 
             highest_price = self._highest_price.get(symbol, 0)
             # 볼린저 %B — 상단 돌파 시 진입 문턱 상향에 사용 (2026-07-02)
@@ -839,6 +863,8 @@ class TradingService:
         self.state.consecutive_losses = 0
         if hasattr(self, '_sold_today'):
             self._sold_today.clear()  # 당일 매도 완료 종목 초기화
+        if hasattr(self, '_sold_today_qty_snapshot'):
+            self._sold_today_qty_snapshot.clear()
         self._excluded_symbols.clear()  # 당일 제외 종목(매매제한 등) 초기화 — 익일 재시도 허용
         self.app_logger.info("[RESET] 당일 종목별 손실/진입 카운트 초기화 완료")
 
@@ -916,7 +942,11 @@ class TradingService:
             # 7/15 사례: 475150 664주 강제청산 접수 후, 모의투자 체결 반영
             # 지연으로 다음 폴링에도 포지션이 그대로 보여 11회 연속
             # "매도가능수량 부족" 재시도/실패가 발생. 동일 메커니즘 재사용.
-            if symbol in getattr(self, '_sold_today', set()):
+            # (2026-07-22: 수량 비교 기반으로 전환. 수량이 매도 시도 당시와
+            # 같을 때만 "아직 미반영"으로 보고 skip — 부분체결로 수량이
+            # 줄었다면 잔여수량에 대해 다시 강제청산을 시도해야 하므로)
+            sold_qty_snapshot = getattr(self, '_sold_today_qty_snapshot', {})
+            if symbol in sold_qty_snapshot and pos.quantity == sold_qty_snapshot[symbol]:
                 continue
             try:
                 market_price = self._get_market_price_with_cache(symbol)
@@ -1003,16 +1033,40 @@ class TradingService:
                 ),
             )
 
-        # 2) VWAP 이탈 청산
+        # 2) VWAP 이탈 청산 (히스테리시스 적용, 2026-07-22)
+        # 7/21 사고: 단일 폴링 시점 판단이라 노이즈에 취약했음
+        # (VWAP이탈청산 2건이 -4.83%/-0.43%). 유예시간 → 이탈폭 하한
+        # → 연속 확인 순으로 세 단계 필터를 거쳐야 청산됨. 세 값 모두
+        # 기본값(0, 0.0, 1)이면 기존과 동일하게 즉시 청산.
         if ew.fail_on_vwap_break and minute_analysis is not None:
-            if not minute_analysis.price_above_vwap:
-                return Signal(
-                    type=SignalType.SELL,
-                    reason=(
-                        f"entry_watch VWAP이탈청산 — 매수 후 {elapsed_min:.1f}분, "
-                        f"수익률 {pnl_pct:+.2f}%, VWAP {minute_analysis.vwap:,.0f}원 아래"
-                    ),
-                )
+            grace_sec = getattr(ew, "vwap_grace_seconds", 0)
+            in_grace_period = (elapsed_min * 60) < grace_sec
+
+            vwap = minute_analysis.vwap
+            below_vwap = not minute_analysis.price_above_vwap
+            min_break_pct = getattr(ew, "vwap_break_min_pct", 0.0)
+            vwap_gap_pct = (
+                (current_price - vwap) / vwap * 100 if vwap > 0 else 0.0
+            )
+            breaks_threshold = below_vwap and vwap_gap_pct <= -abs(min_break_pct)
+
+            if in_grace_period or not breaks_threshold:
+                # 유예시간 중이거나 이탈폭 기준 미달 → VWAP 위로 회복한
+                # 것과 동일하게 취급, 연속 카운터 리셋
+                self.state.vwap_break_streak_by_symbol[symbol] = 0
+            else:
+                streak = self.state.vwap_break_streak_by_symbol.get(symbol, 0) + 1
+                self.state.vwap_break_streak_by_symbol[symbol] = streak
+                confirm_count = getattr(ew, "vwap_break_confirm_count", 1)
+                if streak >= confirm_count:
+                    return Signal(
+                        type=SignalType.SELL,
+                        reason=(
+                            f"entry_watch VWAP이탈청산 — 매수 후 {elapsed_min:.1f}분, "
+                            f"수익률 {pnl_pct:+.2f}%, VWAP {vwap:,.0f}원 아래 "
+                            f"({vwap_gap_pct:+.2f}%, {streak}/{confirm_count}회 연속 확인)"
+                        ),
+                    )
 
         # 3) watch_minutes 경과 시점에 최소수익 미달 청산
         if elapsed_min >= ew.watch_minutes and pnl_pct < ew.min_profit_pct:
@@ -1393,8 +1447,14 @@ class TradingService:
             # 재매수가 성공했다는 건 브로커가 이미 새 포지션을 인지했다는
             # 뜻이므로, 이 시점에 바로 플래그를 지워도 원래 목적(직후 짧은
             # 지연 방어)에는 영향이 없음.
+            # (2026-07-22: 수량기반 판정으로 전환하면서 이 discard가 없어도
+            # 자동으로 안전해짐 — 재매수로 수량이 스냅샷과 달라지면 판정
+            # 로직이 알아서 실제 잔고를 신뢰함. 다만 이중 안전장치 겸
+            # 스냅샷 dict가 무한히 쌓이지 않도록 여기서도 정리.)
             if hasattr(self, '_sold_today'):
                 self._sold_today.discard(symbol)
+            if hasattr(self, '_sold_today_qty_snapshot'):
+                self._sold_today_qty_snapshot.pop(symbol, None)
 
             # ── 볼린저 상단 돌파 매수 경고 (2026-06-30 추가) ──────────
             # 볼린저 %B > 1.0(상단 돌파)에서의 매수는 추격매수 위험이 높음.
@@ -1501,6 +1561,19 @@ class TradingService:
             if not hasattr(self, '_sold_today'):
                 self._sold_today: set[str] = set()
             self._sold_today.add(symbol)
+
+            # ── 수량 스냅샷 기록 (2026-07-22) ──────────────────────
+            # 매도가 실제로 반영되면 브로커는 해당 종목을 잔고 목록에서
+            # 아예 제거한다(quantity=0으로 남기지 않음 — MockBroker와
+            # 실제 키움 API 모두 이 방식). 따라서 다음 폴링에서 여전히
+            # "매도 시도 당시와 같은 수량"으로 잔고에 남아있다면 그건
+            # API가 아직 매도를 반영하지 못한 것(진짜 지연), 수량이
+            # 달라졌다면(=신규 포지션) 재매수가 체결된 것이므로 그
+            # 잔고를 그대로 신뢰해야 함 — quantity 인자가 곧 매도 시도
+            # 당시 보유수량(이 시스템은 항상 전량매도만 함).
+            if not hasattr(self, '_sold_today_qty_snapshot'):
+                self._sold_today_qty_snapshot: dict[str, int] = {}
+            self._sold_today_qty_snapshot[symbol] = quantity
 
             # 매도 시각 기록 → 재진입 쿨다운에 사용
             now_iso = datetime.now().isoformat()

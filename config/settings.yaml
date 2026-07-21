@@ -160,6 +160,13 @@ entry_watch:
   min_profit_pct: 0.5            # 관찰 기간 중 최소 달성 수익률 (%)
   fail_cut_pct: -1.0             # 이 손실 이하면 즉시 청산 (%)
   fail_on_vwap_break: true       # VWAP 이탈 시 청산 여부
+  # ── VWAP 히스테리시스 (2026-07-22) ──────────────────────────
+  # 7/21 첫날 VWAP이탈청산 2건이 -4.83%/-0.43%로 손실이 컸음.
+  # 매수 직후 30초는 미적용 + 0.2%p 이상 이탈 + 2회 연속 확인
+  # (약 20~30초 간격 폴링 기준 최소 20~30초 지속 이탈)이 되어야 청산.
+  vwap_break_confirm_count: 2
+  vwap_break_min_pct: 0.2
+  vwap_grace_seconds: 30
 
 websocket:
   enabled: true

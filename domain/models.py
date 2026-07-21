@@ -191,3 +191,6 @@ class RuntimeState:
     symbol_trail_loss_at: dict[str, list] = field(default_factory=dict)
     # NEUTRAL 손절 발생 종목 — 당일 재진입 완전 금지
     symbol_block_today: set[str] = field(default_factory=set)
+    # entry_watch VWAP 연속 이탈 카운터 (히스테리시스용, 2026-07-22)
+    # 종목이 VWAP 위로 회복하면 이 값은 0으로 리셋됨
+    vwap_break_streak_by_symbol: dict[str, int] = field(default_factory=dict)

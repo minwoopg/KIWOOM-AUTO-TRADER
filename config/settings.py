@@ -159,6 +159,17 @@ class EntryWatchConfig:
     min_profit_pct: float
     fail_cut_pct: float
     fail_on_vwap_break: bool
+    # ── VWAP 이탈 히스테리시스 (2026-07-22) ──────────────────────
+    # 7/21 첫 실거래 4건 중 VWAP이탈청산 2건이 -4.83%/-0.43%로
+    # 손실 컸음. 단일 폴링 시점 판단(price_above_vwap 한 번만 False)
+    # 이라 노이즈에 취약 — 매수 직후 VWAP을 잠깐 밑돌았다가 반등하는
+    # 흔한 패턴에서도 바로 청산됨. 연속 확인 횟수/이탈폭 하한/매수
+    # 직후 유예시간 세 가지로 완화. 기본값은 기존 동작(즉시 1회
+    # 이탈로 청산)과 동일하게 둬서 하위호환 유지 — yaml에서 명시
+    # 조정해야 히스테리시스가 실제로 걸림.
+    vwap_break_confirm_count: int = 1     # 연속 이탈 확인 횟수 (1=즉시청산, 기존과 동일)
+    vwap_break_min_pct: float = 0.0       # VWAP 대비 이탈폭 하한(%). 0=이탈 즉시 카운트
+    vwap_grace_seconds: int = 0           # 매수 후 이 시간 동안은 VWAP 청산 미적용
 
 
 @dataclass
