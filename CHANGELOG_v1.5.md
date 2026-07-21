@@ -1106,6 +1106,55 @@ Select-String -Path logs\position_lifecycle.csv -Pattern "INVARIANT_VIOLATION"
 Get-Content logs\position_lifecycle.csv -Tail 50
 ```
 
+### 7.19 Ctrl+C 종료 시 웹소켓 watcher가 정리되지 않는 버그 (2026-07-22)
+
+**증상**: 7/21 16:49~16:54 실거래 로그 분석 중 발견. 웹소켓 조건검색
+로그인이 `CODE=8005 토큰이 유효하지 않습니다`로 계속 실패하며 5초
+간격 재연결을 반복하던 중, `16:49:57 | application stopped by user`
+(Ctrl+C로 종료)가 찍혔는데도 그 이후에도 `[WS] 연결 시도`가
+`16:54:32`까지(로그 마지막까지) 계속 이어짐 — 프로세스가 실제로는
+종료되지 않고 있었음.
+
+**원인 분석**: 토큰 인증 실패(CODE=8005) 자체는 사용자가 다른
+터미널에서 이미 같은 계정으로 프로세스를 띄워둔 상태에서 새
+프로세스를 또 실행해 세션이 충돌한 것으로 확인(로그상 최초 로그인은
+성공했다가 곧바로 서버가 정상 종료 코드로 세션을 끊음) — 이건 운영
+습관 문제이지 코드 버그가 아님. 다만 그 과정에서 **Ctrl+C로 종료해도
+웹소켓 재연결이 멈추지 않는 별개의 실제 버그**를 발견:
+
+`async_main()`이 `trading_loop()`와 `watcher_start_guarded()`를
+`asyncio.gather()`로 묶어 실행하는데, `trading_loop()`는
+`KeyboardInterrupt`를 자체적으로 잡아 `break`로 조용히 반환하는
+구조(장중 대기 루프에서 Ctrl+C 시 정상 종료 로그를 남기기 위한
+설계). `asyncio.gather()`는 **모든 태스크가 끝나야 반환**되므로,
+`trading_loop`가 끝나도 `watcher_start_guarded`(내부에서
+`KiwoomWebSocket.start()`가 `while self._running:` 무한 재연결
+루프를 돌림)는 계속 살아있는 채로 프로세스가 종료되지 않고
+5초마다 재연결을 시도하는 상태가 됨.
+
+**수정**: `app/main.py` — `asyncio.gather()`를 `asyncio.create_task()`
++ `asyncio.wait(return_when=asyncio.FIRST_COMPLETED)`로 교체. 두
+태스크 중 하나가 먼저 끝나면(정상/예외 불문) 나머지를 `task.cancel()`
+로 명시적으로 취소하고, `watcher.stop()`을 호출해 웹소켓 연결까지
+정리한 뒤 프로세스가 실제로 종료되도록 함. 어느 쪽이 먼저 죽든
+(trading_loop가 사용자 종료로 끝나는 경우 / watcher가 예외로 죽는
+경우) 양방향으로 서로를 정리하도록 대칭적으로 설계.
+
+`KiwoomWebSocket.stop()` 자체(`self._running = False` +
+`ws.close()`)는 이미 안전하게 구현되어 있었음 — 문제는 `stop()`을
+호출하는 지점 자체가 없었던 것.
+
+**검증**: `test_websocket_shutdown.py` — 10건 전부 통과.
+`asyncio.gather`와 동일한 상황을 재현해 (1) trading_loop가 먼저
+정상 종료되면 watcher_task가 실제로 취소되고 `watcher.stop()`이
+호출되는지, (2) 반대로 watcher가 예외로 먼저 죽으면 trading_loop도
+함께 취소되는지, (3) 먼저 죽은 태스크의 예외가 정확히 감지되어
+전파되는지 양방향 모두 확인. 추가로 `KiwoomWebSocket`을 실제로
+띄워 `websockets.connect`를 실패하도록 패치한 뒤, `stop()` 호출
+전후로 재연결 시도 횟수가 실제로 멈추는지 별도 통합 확인(5회
+시도 후 stop() → 이후 0.1초 대기해도 추가 시도 없음). 전체 회귀
+10개 파일 재통과 확인 — 총 11개 파일.
+
 ---
 
 ## 8. 로깅 인프라 개선 (2026-07-14)

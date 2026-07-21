@@ -28,7 +28,9 @@ from domain.risk.risk_manager import RiskManager
 from domain.strategy.strategy_router import StrategyRouter
 from infra.broker.base import Broker
 from infra.storage.daily_reporter import DailyReporter
-from infra.storage.logger import AppLogger, TradeCsvLogger, SignalCsvLogger, EntryWatchShadowLogger
+from infra.storage.logger import (
+    AppLogger, TradeCsvLogger, SignalCsvLogger, EntryWatchShadowLogger, PositionLifecycleLogger,
+)
 from infra.storage.minute_bar_saver import MinuteBarSaver
 from infra.storage.skip_reason import classify_skip_reason, SkipReason
 from infra.notify.kakao_notifier import KakaoNotifier, build_notifier
@@ -52,6 +54,7 @@ class TradingService:
         signal_logger: SignalCsvLogger,
         state_store: JsonStateStore,
         entry_watch_shadow_logger: "EntryWatchShadowLogger | None" = None,
+        position_lifecycle_logger: "PositionLifecycleLogger | None" = None,
     ) -> None:
         self.settings = settings
         self.broker = broker
@@ -66,6 +69,9 @@ class TradingService:
         # 안 건드리고 도입하기 위해 None이면 storage 설정에서 자동 생성
         self.entry_watch_shadow_logger = entry_watch_shadow_logger or EntryWatchShadowLogger(
             settings.storage.entry_watch_shadow_log_file
+        )
+        self.position_lifecycle_logger = position_lifecycle_logger or PositionLifecycleLogger(
+            settings.storage.position_lifecycle_log_file
         )
 
         self.state, loaded_highest = self.state_store.load()
@@ -135,7 +141,7 @@ class TradingService:
         # 아직 실제 매매 판정에는 쓰이지 않고, 기존 _sold_today_qty_snapshot
         # 판정과 병행 계산해 결과가 갈리는 경우만 로그로 남김(검증 단계).
         # 검증 완료 후 실제 교체 예정 — domain/position/lifecycle.py 참고.
-        self._position_state_machine = PositionStateMachine()
+        self._position_state_machine = PositionStateMachine(logger=self.position_lifecycle_logger)
         self._position_state_machine_initialized = False
 
         # 일일 리포트 생성기
