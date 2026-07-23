@@ -1155,6 +1155,599 @@ Get-Content logs\position_lifecycle.csv -Tail 50
 시도 후 stop() → 이후 0.1초 대기해도 추가 시도 없음). 전체 회귀
 10개 파일 재통과 확인 — 총 11개 파일.
 
+### 7.20 order_block_reason 오반환 수정 (2026-07-22)
+
+**배경**: GPT 검토(test_ 파일과 tests/ 폴더를 제외하고 운영 코드만
+정적 점검)에서 발견. `_try_buy()`가 실제 차단 사유와 무관한 고정
+문자열을 반환하고 있어서, `signal_analysis` 리포트의 BLOCKED 사유
+분포가 왜곡되어 왔음. 실제로 이전 세션에서 `TRAIL_LOSS_COOLDOWN`
+로그를 보고 원인 파악에 혼선을 겪었던 사례가 있었는데, 그 원인이
+바로 이 버그였음.
+
+**수정 지점 3곳**:
+```
+최대 보유 종목 수 초과   "STOPLOSS_COOLDOWN"(오반환) -> SkipReason.MAX_POSITIONS
+RiskManager 거부 전체    "TRAIL_LOSS_COOLDOWN"(고정) -> 실제 reason 그대로 반환
+BUY 신호 쿨다운(10분)    bare return(None)          -> "BUY_SIGNAL_COOLDOWN" 명시
+```
+
+`RiskManager.can_place_order()`는 이미 `SkipReason`(ALREADY_HOLDING/
+MAX_POSITIONS/RISK_LIMIT/DAILY_LOSS_LIMIT 등) 상수로 정확한 사유를
+반환하고 있었는데, `_try_buy()`가 그 `reason`을 무시하고 항상 같은
+문자열로 덮어써 왔던 것. bare return은 호출부의 `if block:` 체크에서
+"차단 없음"으로 오인되어, 실제로는 쿨다운으로 매수를 건너뛰었는데도
+`signal_log`에 `BLOCKED`로 기록조차 안 됐을 가능성이 있음 — docstring
+에는 원래 "차단이면 문자열, 아니면 빈 문자열"이라는 계약이 명시돼
+있었으므로 이 수정이 원래 의도에 맞게 정정한 것.
+
+**검증**: `test_order_block_reason.py` — 5건 전부 통과. 최대보유종목수
+초과/RiskManager RISK_LIMIT 거부/ALREADY_HOLDING 거부/BUY신호쿨다운
+네 시나리오에서 정확한 사유가 반환되는지, bare return 수정이
+`if block:` 평가를 True로 바꾸는지까지 확인.
+
+### 7.21 RiskManager 손익 계산을 FIFO로 통일 (2026-07-22)
+
+**배경**: GPT 검토에서 발견. `daily_reporter.py`와 `analyze_trades.py`는
+7/16(7.6절)에 "종목별 전체 매수/매도 평균가" 방식에서 진짜 FIFO
+로트매칭으로 이미 수정됐는데, 신규 매수를 실제로 막는
+`RiskManager._calc_daily_realized_pnl()`은 그 수정 대상에서 빠져
+있었음. 재진입과 부분매도가 섞인 날에는 실제 손실 한도를 초과했는데도
+계산상 미달로 나와 매수를 계속 허용할 위험이 있었음.
+
+**예시(GPT 제시)**로 실제 영향 확인:
+```
+100원 100주 매수
+200원 100주 매수
+150원 100주 매도
+
+기존(전체평균) 방식: avg_buy=150원 -> 손익 0원
+FIFO 방식: 첫 100주(100원)만 매칭 -> 손익 +5,000원
+```
+
+**구현**: `domain/service/pnl_calculator.py` 신규 — `daily_reporter.py`
+의 `_fifo_match()`와 동일한 알고리즘을 `fifo_match()`/
+`calculate_realized_pnl_fifo()`로 재사용 가능하게 분리.
+`RiskManager._calc_daily_realized_pnl()`을 이 함수로 교체.
+
+`daily_reporter.py`의 기존 `_fifo_match()`는 이번엔 그대로 둠 —
+반환 타입이 dict(9곳에서 `m["..."]`로 접근)라 dataclass 기반인 새
+함수로 그대로 교체하면 회귀 위험이 커서, 완전 통합은 이번 범위에서
+제외(GPT의 "완전 통합" 제안 중 리스크 대비 이득이 낮은 부분을
+의도적으로 보류 — 두 함수는 알고리즘이 동일해 계산 결과는 일치함).
+
+**검증**: `test_risk_manager_fifo_pnl.py` — 11건 전부 통과. GPT
+예시 재현(기존 0원 vs FIFO +5,000원, 실제로 다른 결과 확인),
+`fifo_match()` 자체의 매칭 정확성, 정상 케이스 회귀 확인(단순
+1매수-1매도는 기존과 동일 결과)까지 확인.
+
+### 7.22 손익 로그 파싱 실패 시 fail-close 전환 (2026-07-22)
+
+**배경**: GPT 검토에서 발견. 기존 `_calc_daily_realized_pnl()`은
+`trades.csv`가 없거나 읽기/파싱에 실패하면 손익을 0원으로 간주해
+반환했음(`except Exception: return 0`, 주석엔 "안전 방향"이라고
+적혀 있었음). 그런데 실거래 자동매매에서는 이게 반대 효과 —
+계산이 안 되면 손실 한도 체크가 통째로 무력화되어 신규매수를 계속
+허용하는 fail-open 구조였음.
+
+**구현**: `RiskManager`에 `DailyPnlUnavailableError` 신설.
+`_trade_log_file.exists()`가 `False`인 경우(장 시작 전이라 파일
+자체가 아직 없는 정상적인 경우)는 여전히 "오늘 거래 없음=손익
+0원"으로 안전하게 처리 — 이 경우는 실제로 손실 한도를 넘길 거래
+자체가 없었으므로 매수를 막을 이유가 없음. 반면 파일이 있는데
+읽기/파싱에 실패하는 경우(진짜 손상 — 오늘 거래 내역이 있는데
+믿을 수 없는 상태)는 `DailyPnlUnavailableError`를 발생시키고,
+`can_place_order()`가 이를 잡아 신규매수를 차단(fail-close).
+이미 보유 중인 포지션의 손절/트레일링(`_try_sell` 경로)에는 영향
+없음 — 이 지점은 오직 "신규 매수 허용 여부"만 판단하므로 매도는
+계속 정상 동작. `SkipReason.DAILY_PNL_UNAVAILABLE` 추가.
+
+**검증**: `test_risk_manager_fifo_pnl.py`(7.21절과 동일 파일)에
+포함 — 손상된 파일(UTF-8 디코드 불가능한 바이트)로 실제 예외
+재현, `can_place_order()`가 이를 잡아 매수를 차단하는지, 파일이
+아예 없는 정상 케이스는 여전히 매수를 허용하는지(대조군)까지 확인.
+
+### 7.23 시작 시 잔고 동기화 실패 처리 — 실전투자는 시작 자체를 중단 (2026-07-22)
+
+**배경**: GPT 검토에서 발견. `app/main.py`가 시작 시 실제 잔고를
+조회해 `state.json`과 동기화하는데, 실패하면 모의/실전 구분 없이
+경고 로그만 남기고 그대로 매매를 시작했음. 이 상태에서는 "실제로는
+보유 중인데 로컬엔 없음" 또는 "로컬엔 보유로 기록됐는데 실제
+계좌엔 없음" 같은 불일치를 안은 채 신규매매가 시작될 수 있음.
+
+**수정**: `settings.broker.is_paper_trading`으로 분기. 모의투자는
+기존처럼 경고만 남기고 진행(개발/디버깅 편의 유지, 실손실 위험
+없음). 실전투자는 `[STARTUP_BLOCK]` CRITICAL 로그를 남긴 뒤
+`RuntimeError`를 발생시켜 프로세스 시작 자체를 중단 — 실제 보유
+종목과 로컬 상태가 불일치한 채로 매매를 시작하지 않도록 의도적으로
+막음. `main()`의 최상위 예외 처리에도 `except Exception`을 추가해
+콘솔에 명확한 오류 메시지가 남도록 보강(기존엔 `KeyboardInterrupt`
+만 별도 처리하고 다른 예외는 스택트레이스로만 노출됐음).
+
+**검증**: `test_startup_reconcile_failure.py` — 10건 전부 통과.
+모의투자는 예외 없이 정상 진행하고 CRITICAL 로그가 안 남는지,
+실전투자는 `RuntimeError`로 중단되고 원인이 명확한 메시지와
+`__cause__`로 추적 가능한지, `main.py` 소스에 이 분기가 실제로
+구현되어 있는지(is_paper_trading 체크, STARTUP_BLOCK 로그,
+RuntimeError 발생 코드 존재 여부)까지 확인.
+
+**전체 회귀**: 이번 4개 항목(7.20~7.23절) 관련 신규 테스트
+3개 파일(order_block_reason 5건, risk_manager_fifo_pnl 11건,
+startup_reconcile_failure 10건) + 기존 회귀 11개 파일, 총 14개
+테스트 파일 전부 통과 확인.
+
+### 7.24 RiskManager BOM/이월포지션/미매칭매도 + watcher re-raise (2026-07-22, 긴급)
+
+**배경**: 7.21~7.23절 패치에 대한 GPT 2차 코드리뷰(운영 코드만
+재점검, `test_` 제외)에서 **7.21절 FIFO 전환이 실제로는 작동하지
+않고 있었다**는 치명적인 문제가 발견됨.
+
+**P0 — UTF-8 BOM 문제 (가장 시급)**: `RiskManager`가
+`encoding="utf-8"`로 파일을 열고 있었는데, 실제
+`logs/trades.csv` 헤더에는 UTF-8 BOM이 있어서(`daily_reporter.py`
+/`SignalCsvLogger`는 이미 `utf-8-sig`를 쓰고 있었는데 이 파일만
+빠져 있었음) 첫 컬럼명이 `"\ufefftimestamp"`로 읽혀 매 행마다
+`row["timestamp"]`가 `KeyError` → `except (ValueError, KeyError):
+continue`로 조용히 스킵 → **모든 거래 행이 무시되고 손익이 항상
+0원으로 계산되고 있었음**. 실제 `logs/trades.csv`로 직접 검증한
+결과도 수정 전 0원 → 수정 후(`encoding="utf-8-sig"`) 정확한 손익
+계산 확인. 7.21~7.22절에서 도입한 FIFO/fail-close 안전장치 전체가
+이 상태에서는 사실상 죽은 코드였음.
+
+**P0 — 이월 포지션 매도가 통째로 무시됨**: 당일 매수 기록이 없는
+종목의 매도(전일 이월 포지션 손절 등)가
+`if not buy_list: continue`로 완전히 건너뛰어져 손익 0원으로
+처리되고 있었음. `domain/service/pnl_calculator.py`를 보강 —
+매도 row의 `avg_buy_price`(매도 시점에 기록된 평균단가)를 이월
+원가로 사용해 계산에 포함하도록 `fifo_match()`/
+`calculate_realized_pnl_fifo()` 양쪽 다 수정.
+
+**P0 — 매도 수량 > 매수 수량 시 초과분 조용히 버려짐**: FIFO
+매칭 후 매수 큐를 다 소진했는데도 매도 수량이 남으면(이월 포지션,
+로그 누락, 외부 매매 등) 그 초과분이 그냥 버려지고 있었음. 매도
+row에 `avg_buy_price`가 있으면 그걸로 나머지를 메꾸고(위 이월
+포지션 처리와 동일 메커니즘), 그마저 없으면 신규 `PnlCalculationError`
+를 발생시킴 — `RiskManager`가 이를 `DailyPnlUnavailableError`로
+감싸 신규매수를 차단(fail-close, 7.22절과 동일 원칙을 손익 계산
+내부에도 일관 적용).
+
+```python
+def fifo_match(buy_list, sell_list, *, strict=True):
+    ...
+    if remaining > 0:
+        avg_buy = _avg_buy_price(sell)
+        if avg_buy > 0:
+            matched.append(FifoMatch(..., is_carryover=True))
+        elif strict:
+            raise PnlCalculationError(f"미매칭 매도수량: ...")
+```
+
+`strict=False` 옵션을 남겨 참고용/리포트용 호출에서는 기존처럼
+예외 없이 최대한 계산할 수 있게 함 — `RiskManager`는
+`strict=True`로 호출.
+
+**추가 — WebSocket watcher 예외 재전파**: `watcher_start_guarded()`
+가 예외를 잡아 로그만 남기고 조용히 반환하고 있었음(7.19절에서
+`asyncio.wait(FIRST_COMPLETED)`로 정리 로직 자체는 이미 고쳤지만,
+이 부분은 그대로 남아 있었음). `trading_task` 취소까지는 정확히
+동작하지만, 프로세스가 정상 종료 코드(0)로 끝날 수 있어 프로세스
+관리자나 모니터링에서 장애 종료를 구분하기 어려움. `except Exception`
+블록 끝에 `raise` 추가 — `asyncio.wait` 이후의
+`task.exception()` 재전파 로직이 이 예외를 그대로 살려 0이 아닌
+종료 코드로 끝나게 함.
+
+**이번에 보류한 것** (GPT 지적 중 리스크 대비 이득이 낮거나 범위가
+큰 부분):
+- 행 단위 필드 오류(price=0, side 오타 등)를 전부 하드 에러로
+  바꾸는 것 — `price=0`이 미체결 로그의 정상적인 흔적일 수 있어
+  그대로 예외로 던지면 정상적인 하루도 계산 불가로 만들 위험이
+  있다고 판단, 보류
+- gross → net(비용 차감) 전환 — 방향은 타당하나 별도 설정값
+  (`estimated_roundtrip_cost_pct`) 설계가 필요해 범위 밖
+- `analyze_trades.py`를 진짜 FIFO로 전환, `daily_reporter.py`와
+  완전 통합 — 리포트 정확성 문제이지 안전 문제가 아니라 우선순위
+  낮음, `daily_reporter.py`는 이번에도 그대로 둠(반환 타입이 달라
+  무리한 통합 시 회귀 위험)
+- 체결 로그(fills.csv) 분리, `SKIP_DAILY_LOSS_LIMIT (금액...)`의
+  코드/상세 분리 — 근본 설계 변경이라 다음 세션 논의 대상
+
+**검증**: `test_risk_manager_carryover_bom.py` — 9건 전부 통과.
+BOM 포함 CSV 정상 파싱(대조군: BOM 없는 파일도 여전히 정상),
+이월 포지션 단독 계산과 RiskManager 실제 흐름 반영, 매도>매수+
+avg_buy_price 있을 때 FIFO+이월 혼합 계산, avg_buy_price도 없을
+때 예외 발생과 RiskManager의 fail-close 반영(대조군: 정상 수량
+일치 케이스는 매수 허용 유지)까지 확인. `test_websocket_shutdown.py`
+에 6번 케이스 추가(2건) — `main.py` 소스에서 `watcher_start_guarded`
+가 실제로 예외를 재전파하는지 확인, 총 12건으로 갱신. 전체 회귀
+기존 13개 파일 재통과 확인 — 총 15개 테스트 파일.
+
+### 7.25 손익 계산 시간순 처리 전환 + main 종료코드 수정 (2026-07-22)
+
+**배경**: 7.24절 수정에 대한 GPT 3차 코드리뷰에서 BOM/이월포지션/
+미매칭 부분은 정상 확인됐지만("실제 logs/trades.csv도 이제 읽힘"),
+**두 가지 P0급 문제**가 새로 발견됨.
+
+**P0 — FIFO가 거래 발생 순서를 보존하지 않음**: `RiskManager`가
+매수/매도를 종목별로 미리 분리한 리스트(`buys_by_symbol`,
+`sells_by_symbol`)로 만들어 계산기에 넘기고 있었는데, 이러면 매도
+시점 **이후**에 발생한 미래 매수까지 그 매도의 매칭 큐에 이미
+포함되어 있음. 합성 데이터로 재현(10시 매수 → 11시 매도(이월분
+포함이어야 함) → 12시 재매수 순서일 때, 12시 매수가 11시 매도에
+쓰여버려 손익이 부정확하게 0원으로 계산됨). 실제 `logs/trades.csv`
+(7/21)는 매수-매도 페어가 우연히 시간순으로 딱 맞아떨어지는
+패턴이라 이 문제가 겉으로 드러나지 않았을 뿐, 다른 거래일이나
+종목에서는 언제든 발동할 수 있는 구조적 결함이었음.
+
+**수정**: `domain/service/pnl_calculator.py`에
+`calculate_realized_pnl_by_events()` 신규 추가. 매수/매도 이벤트를
+분리하지 않고 하나의 리스트로 모아 `timestamp` 오름차순으로 정렬한
+뒤, 이벤트를 하나씩 순서대로 적용 — 매도 시점에는 그 시점까지
+실제로 발생한 매수만 큐에 존재하도록 함. 기존 `calculate_realized_
+pnl_fifo()`/`fifo_match()`(매수·매도 분리형)는 `daily_reporter.py`
+등 "당일 전체를 뭉뚱그려 봐도 되는" 참고용 호출을 위해 그대로
+남겨두되, docstring에 이 구조적 한계를 명시. `RiskManager`는
+이제 파싱한 모든 거래를 이벤트 리스트로 모아
+`calculate_realized_pnl_by_events(events, strict=True)`를 호출.
+
+**함께 발견된 문제 — 이월+당일매수 혼합 시 avg_buy_price 오적용**:
+GPT 예시(이월 100주@100원 + 당일매수 100주@200원, 혼합평균단가
+150원인 상태에서 200주 전량매도 시, 기존 로직은 -7,000원으로
+계산했지만 정확한 값은 -2,000원)로 재현 확인. `avg_buy_price`가
+"이월 물량만의 단가"가 아니라 "이월+당일매수를 합친 전체 평균
+단가"일 가능성이 높아, 매수 큐 소진 후 남은 수량에 그대로 적용할
+수 없음. 근본 해결(장 시작 시점 실제 잔고를 opening position
+스냅샷으로 저장)은 범위가 커서 GPT의 "임시 대응" 제안을 채택 —
+`calculate_realized_pnl_by_events()`가 "이 매도 이전에 같은 종목의
+당일 매수가 이미 있었는지"를 추적해서, 매수 큐를 다 쓰고도 수량이
+남았는데 그 이전에 당일 매수 이력이 있었다면 `avg_buy_price`를
+신뢰하지 않고 `PnlCalculationError`로 fail-close. 당일 매수가
+아예 없던 순수 이월 전량매도는 `avg_buy_price`가 곧 이월 원가와
+동일하므로 여전히 정상 계산.
+
+**P0 — main()이 예외를 삼켜 프로세스 종료코드가 항상 0**:
+7.24절에서 `main()`에 `except Exception as exc: print(...)`를
+추가하며 발생한 회귀(직접 만든 버그) — watcher가 예외로 죽어
+`async_main()`까지 전파돼도 `main()`이 그걸 출력만 하고 정상
+반환해, 운영체제 입장에서는 종료코드 0(정상 종료)으로 끝남.
+7.19/7.24절에서 공들여 고친 "watcher 예외 재전파"가 이 지점에서
+무의미해지고 있었음. `main()`을 `-> int`로 바꿔 `exit_code`를
+반환하고, `if __name__` 블록에서 `sys.exit(main())`으로 실제
+프로세스 종료코드에 반영하도록 수정.
+
+**P1 — watcher.start()가 예외 없이 정상 반환해도 처리 안 됨**:
+`await watcher.start()`(원래 무한 재연결 루프) 이후 코드에
+도달한다는 건 내부 루프가 예상 밖으로 조용히 끝났다는 뜻인데,
+경고 로그만 남기고 넘어가고 있었음. 정상 반환 자체를
+`RuntimeError`로 처리하도록 변경 — 예상된 종료 경로는 오직
+`CancelledError`(명시적 task 취소)뿐임을 코드로 명확히 함.
+
+**P1 — trades.csv 파일 미존재 시 fail-open**: `TradeCsvLogger`가
+프로세스 시작 시 항상 헤더만 있는 빈 파일을 미리 생성한다는 사실을
+코드로 확인 — "정상 운영 중 파일이 아예 없는 상황" 자체가
+이례적이므로, 이 경우도 fail-close로 통일(기존엔 "장 시작 전
+정상 상황"으로 간주해 0원 반환).
+
+**P1 — avg_buy_price 파싱 실패가 예외 통일 안 됨**: 손상된 값
+(`"invalid_value"` 등)이 `bare int()`에서 `ValueError`를 그대로
+던져 `RiskManager`의 `PnlCalculationError` catch를 우회하던 문제.
+`_parse_positive_int()` 헬퍼로 모든 숫자 필드 파싱을
+`PnlCalculationError`로 통일.
+
+**보류한 것**: opening position 일일 스냅샷(근본 해결), 정수 원가
+기반 재설계(1원 절삭오차 — 이벤트 기반 재작성 과정에서 자연히
+개선됐으나 별도 검증은 안 함), 체결 로그(fills.csv) 분리는 여전히
+범위 밖.
+
+**기존 테스트 정책변경 대응**: 파일미존재가 fail-open→fail-close로
+바뀌며 `test_sold_today_and_reentry_fix.py`(빈 trades.csv 사전 생성
+추가)와 `test_risk_manager_fifo_pnl.py`(5번 케이스를 "허용" →
+"차단" 기대값으로 수정)가 회귀로 깨졌던 것을 정책 변경에 맞게 수정.
+
+**검증**: `test_risk_manager_time_ordering.py` — 13건 전부 통과.
+시간역전 시나리오가 더 이상 발생하지 않고 이월+당일매수 혼합으로
+정확히 감지되어 fail-close됨, 입력 순서가 뒤섞여도 timestamp
+재정렬로 동일하게 처리됨, 정상 시간순 매매는 회귀 없이 정확히
+계산됨, 순수 이월 전량매도 회귀 확인, avg_buy_price 파싱 실패
+통일 확인, `RiskManager` 실제 흐름에서 정상/이월혼합 케이스 모두
+확인, `main.py` 소스에 종료코드 반환과 watcher 정상반환 처리가
+실제로 구현됐는지까지 확인. 전체 회귀 기존 15개 파일 재통과
+확인 — 총 16개 테스트 파일.
+
+### 7.26 손상된 체결행 엄격검증 + 실제 CSV 손상이력 대응 (2026-07-22)
+
+**배경**: 7.25절 수정에 대한 GPT 4차 코드리뷰에서, 시간순 FIFO/이월
+처리/main 종료코드/watcher 정상반환 처리는 모두 정상 확인됐지만
+("실제 -479,949원도 정확히 -479,950원으로 수정됨"), **`strict=True`
+를 표방하면서도 accepted=true 행의 timestamp/side/price/qty가
+손상되면 여전히 조용히 `continue`로 스킵**되고 있다는 P0 지적을
+받음(합성 CSV로 재현: SELL price=0/side 오타/accepted 이상값이
+전부 손익 0원으로 조용히 처리됨). 실제 손실 매도 행이 손상되면
+당일 손실이 과소평가된 채로 매수가 계속 허용될 위험.
+
+**1차 수정**: `RiskManager._calc_daily_realized_pnl()`에서
+`accepted=true`인 행에 한해 `timestamp`/`side`/`symbol`/`price`/
+`quantity`를 전부 엄격 검증하도록 변경 — 하나라도 손상되면
+`DailyPnlUnavailableError`(P0). `accepted=false`(정상적인 주문
+거부)는 계속 정상 스킵 — 이건 손상이 아니라 정당한 값이므로 구분
+유지. `_parse_positive_int_or_raise()` 헬퍼 추가.
+`calculate_realized_pnl_by_events()`에도 동일 원칙을 방어적으로
+적용(price/qty 0이하, side 미상 시 `strict`면 `PnlCalculationError`).
+
+**2차 수정(1차 수정 직후 자체 발견)**: 위 1차 수정을 실제
+`logs/trades.csv` 전체(45일치)에 적용해봤더니 **34일 중 어느 하루도
+아니고 45일 전체가 fail-close**되는 것을 발견 — `accepted` 검증이
+`timestamp` 파싱보다 먼저 실행되는 순서였는데, 4~5월 데이터에
+필드가 밀린 손상 행(과거 인코딩 버그로 추정 — `price` 자리에
+`accepted` 값이, `accepted` 자리에 깨진 한글 메시지가 들어간 패턴)
+이 있어서, **오늘 날짜와 전혀 무관한 몇 달 전 손상 행 때문에 매일
+신규매수가 계속 막히는 결과**가 될 뻔했음(엄격검증의 취지 자체를
+무력화하는 심각한 회귀).
+
+**최종 구조**: 파싱 순서를 `timestamp` 우선으로 재배치 —
+1) `timestamp`를 가장 먼저 파싱해 `target_date`와 무관한 행(파싱
+자체가 안 되어 날짜를 모르는 행 포함)은 안전하게 스킵, 2) 그 다음
+`target_date` 소속으로 확인된 행에 한해 `accepted`/`side`/`symbol`/
+`price`/`qty`를 엄격 검증. "fail-close는 오늘 날짜 데이터를 못
+믿을 때를 위한 것이지, 파일 어딘가에 있는 아무 손상 행을 위한 게
+아니다"라는 원칙으로 재정리. 실제 `logs/trades.csv`(45일치)로
+재검증한 결과 34일 정상 계산(최근 7/14~7/21 전부 정상), 11일만
+fail-close — 이 11일은 실제로 그 날짜 자체의 데이터가 손상된
+경우라 정확한 동작.
+
+**P1 — 순수 이월 매도 중복 계산 방지**: 같은 종목의 순수 이월
+매도(당일 매수 전무 상태)가 여러 번 기록되면, 실제 opening
+position 수량을 모르는 채로 `avg_buy_price`를 반복 적용해 손익을
+중복 계산할 위험(합성 데이터로 재현: 이월 매도 2건이 각각
+`avg_buy_price`를 적용받아 실제보다 큰 수량을 판 것처럼 계산됨).
+`carryover_sell_seen` 세트로 종목당 순수 이월 매도는 1회만 신뢰,
+두 번째부터 `strict`면 `PnlCalculationError`.
+
+**P2 — main() 스택트레이스 보강**: `except Exception` 블록에
+`logging.getLogger(__name__).exception(...)` 추가 — `async_main()`
+내부의 예상 못한 예외가 여기서 처음 잡혀도 스택트레이스가 `app.log`
+에 확실히 남도록.
+
+**P2 — 레거시 함수명 명확화**: `calculate_realized_pnl_fifo`(시간
+순서 미보장 — daily_reporter.py 등 참고용)를
+`calculate_realized_pnl_grouped_legacy`로 이름 변경, 기존 이름은
+하위호환 별칭(`calculate_realized_pnl_fifo = calculate_
+realized_pnl_grouped_legacy`)으로 유지해 기존 호출부 무변경.
+"리포트니까 시간순서 오류가 허용된다"는 기존 가정이 틀렸다는
+지적을 받아들여 이름에 한계를 명시.
+
+**보류한 것**: opening position 일일 스냅샷(이월+당일매수 부분
+매도의 근본 해결 — 매도수량이 당일 매수 잔량 이하이면 이월 여부를
+아예 감지 못 하는 한계가 남아있음, GPT 지적 확인함), orders.csv/
+fills.csv 분리, gross→net 손실한도 전환. 전부 근본 설계 변경이라
+범위 밖으로 유지.
+
+**검증**: `test_risk_manager_strict_validation.py` — 12건 전부
+통과. accepted=true 행의 price=0/side오타/accepted손상/timestamp
+손상 각각 확인, accepted=false는 여전히 정상 스킵(회귀), **핵심
+시나리오로 "몇 달 전 손상 행이 있어도 오늘 계산은 정상 진행"과
+"오늘 날짜 손상 행은 여전히 fail-close"를 대조군으로 명시적 검증**,
+순수 이월 매도 중복 감지와 정상 1회 회귀, 서로 다른 종목은
+독립적으로 처리되는지, 하위호환 별칭 동작까지 확인. 실제
+`logs/trades.csv` 45일치 전체를 순회하며 34일 정상/11일
+fail-close(실제 손상 날짜)로 정확히 갈리는 것도 별도 확인. 전체
+회귀 기존 16개 파일 재통과 확인 — 총 17개 테스트 파일.
+
+### 7.27 logs/trades.csv 손상 행 정리 + timestamp 엄격검증 복원 (2026-07-22)
+
+**배경**: 7.26절 수정에 대한 GPT 5차 코드리뷰에서 P0 두 건이 새로
+발견됨. 두 번째는 GPT 리뷰 대응 도중 직접 자체 발견함.
+
+**P0-1 (GPT 지적) — 오늘 행의 timestamp 손상이 여전히 fail-open**:
+7.26절에서 "몇 달 전 손상 행이 오늘 계산을 막지 않도록" timestamp
+파싱 실패 시 무조건 스킵하게 했었는데, 이게 "오늘 행인데 timestamp
+만 우연히 손상된 경우"까지 조용히 누락시키는 새로운 안전 공백이었음
+(합성 데이터로 재현: 오늘 손실 SELL의 timestamp만 깨졌더니 그
+손실이 통째로 빠지고 0원 처리됨).
+
+**P0-2 (GPT 지적) — 빈 파일/헤더 누락도 fail-open**: 0바이트
+파일, 헤더가 없거나 완전히 다른 형식의 CSV가 전부 "당일 거래
+없음=0원"과 구분되지 않고 조용히 0원 처리되던 문제. 실제 재현 확인.
+
+**근본 조치 — logs/trades.csv 손상 행 archive 분리**: GPT가 제안한
+여러 대안(파일 분리/일별 파일/trade_date 별도 컬럼) 중, 스키마
+변경 없이 가장 빠르게 적용 가능한 "파일 분리"를 채택. 실제
+`logs/trades.csv`(758행)를 정밀 검사한 결과 **274건이 필드 밀림으로
+손상**되어 있었음(과거 인코딩 버그로 추정 — `price` 자리에 문자열
+"True"가, `accepted` 자리에 깨진 한글 메시지가 들어간 패턴, 4~5월에
+집중). 정상 행 484건만 `logs/trades.csv`에 남기고, 손상 274건은
+`logs/archive/trades_legacy_corrupted_until_20260722.csv`로 이동
+(분석 스크립트에서 참고용으로만 사용 가능, RiskManager는 정리된
+파일만 사용).
+
+**RiskManager 수정**: 파일이 정리됐으므로 GPT 제안대로 timestamp
+파싱 실패를 다시 무조건 fail-close로 복원(7.26절에서 도입했던
+"몰라서 스킵" 트레이드오프를 "모르면 차단"으로 되돌림). 헤더 검증
+추가 — `reader.fieldnames`가 없거나 필수 헤더(`timestamp`/`symbol`/
+`side`/`quantity`/`price`/`accepted`)가 누락되면 즉시
+`DailyPnlUnavailableError`. 정상 헤더에 데이터 행이 0개인 경우
+(진짜 "당일 거래 없음")는 계속 0원으로 안전하게 처리 — 이 구분을
+유지하는 게 핵심.
+
+**정리 직후 재발견 — 공백 오염 문제**: 파일 정리 후 timestamp
+엄격검증을 실제 `logs/trades.csv` 45일치에 다시 적용해봤더니
+**이번엔 34일 전체가 다시 fail-close**되는 걸 발견 — 원인은 415행의
+`timestamp` 필드 앞에 공백 2칸이 섞인 행(`"  2026-07-06T14:35:53...`)
+이었음. `datetime.fromisoformat()`이 앞뒤 공백에 민감해서 예외가
+나는데, 파일을 한 줄씩 순회하는 도중 이 한 줄에서 예외가 발생하면
+`target_date`가 무엇이든 그 즉시 함수 전체가 실패 — 정리 이전과
+같은 계열의 함정이 다른 형태로 재발한 것. `timestamp` 파싱 직전에
+`.strip()`을 추가해 흔한 공백 오염을 방어하고, 그래도 파싱이 안
+되는 "진짜" 손상만 fail-close하도록 조정.
+
+**P1 (GPT 지적) — symbol 형식 검증**: `symbol`이 비어있지 않은지만
+확인했었는데, 국내 종목코드가 항상 6자리 숫자인 것을 실제
+`logs/trades.csv` 전체로 확인 후 `re.fullmatch(r"\d{6}", symbol)`
+검증 추가.
+
+**P1 (GPT 지적) — 예외 이중 래핑 정리**: `DailyPnlUnavailableError`
+를 이미 명확히 분류해뒀는데 바깥의 `except Exception`이 다시
+"trade_log_file 파싱 실패: ..."로 감싸 메시지가 중첩되던 문제.
+`except DailyPnlUnavailableError: raise`를 앞에 둬서 이미 분류된
+예외는 그대로 통과, 진짜 예상 못한 예외(`OSError` 등)만 새로 감싸도록 정리.
+
+**P1 (GPT 지적) — watcher.stop() timeout**: `app/main.py`에서
+`await watcher.stop()`이 내부 네트워크 문제로 멈추면 프로세스
+종료 자체가 지연될 수 있어 `asyncio.wait_for(..., timeout=5.0)`로 제한.
+
+**보류한 것**: opening position 스냅샷, orders.csv/fills.csv
+분리, gross→net 전환, 일별 파일 구조로의 전면 전환(GPT의 "더 좋은
+장기 구조" 제안 — 스키마/운영 파일 구조 변경이라 범위가 크고,
+이번엔 archive 분리로 충분히 대응됨). archive로 옮긴 274건과
+별개로, 실제 `logs/trades.csv`(정리 후)에는 여전히 3개 날짜
+(5/29, 6/1, 6/22)에 각각 다른 이유(미매칭 매도, `avg_buy_price`
+소수점 파싱 실패, `symbol` 형식 오류)로 실제 데이터 손상이 남아있어
+fail-close됨 — 확인 결과 전부 실제로 데이터가 손상된 경우라
+정확한 동작. 최근 운영 기간(7/13~7/21)은 전부 정상 계산됨.
+
+**검증**: `test_risk_manager_strict_validation.py`를 새 정책에
+맞게 갱신 — 4/4-1번을 "timestamp 손상은 fail-close"로 재작성,
+4-2(오늘 손상 대조군) 유지, 4-3~4-5(빈파일/헤더누락/정상빈데이터
+대조군) 신규 3건, 4-6(symbol 형식) 신규 1건 추가 — 총 16건 전부
+통과. 실제 `logs/trades.csv`(정리 후, strip 적용 후)로 34일 중
+31일 정상/3일만 실제 손상으로 fail-close되는 것 재확인, 최근
+7/13~7/21 전부 정상 계산 확인. 전체 회귀 기존 16개 파일 재통과
+확인 — 총 17개 테스트 파일.
+
+### 7.28 timestamp 정규화 값 전파 수정 + 헤더/마이그레이션 보강 (2026-07-22)
+
+**배경**: 7.27절에서 "timestamp 공백 오염은 `.strip()`으로 방어"
+했다고 기록했는데, GPT 6차 코드리뷰에서 이 수정이 **반쪽짜리**였다는
+정확한 지적을 받음 — 별도 실행으로 직접 재현까지 제시.
+
+**P0 — strip 검증은 통과하지만 정작 이벤트에는 원본값을 전달**:
+`RiskManager._calc_daily_realized_pnl()`이 `ts_raw = row.get(
+"timestamp").strip()`로 검증(파싱 성공 여부, 날짜 일치 여부)은
+정상적으로 통과시켰지만, 그 다음 `events.append()`에는 `ts_raw`가
+아니라 `row["timestamp"]`(원본, strip 안 된 값)를 그대로 넣고
+있었음. 그 결과 `calculate_realized_pnl_by_events()`가 이 원본값을
+다시 파싱하려다 실패해서, **7.27절에서 "해결했다"고 기록한 공백
+오염 문제가 실제로는 여전히 fail-close를 일으키고 있었음**(GPT가
+별도 실행으로 재현, 이번 세션에서도 동일하게 재현 확인).
+
+**수정**: `events.append()`에서 `row["timestamp"]` 대신
+`ts.isoformat()`(위에서 이미 성공적으로 파싱된 `datetime` 객체를
+표준 ISO 형식 문자열로 재생성)을 전달하도록 변경 — 이후 어떤
+재파싱 시도에도 안전. `calculate_realized_pnl_by_events()` 쪽에도
+방어적으로 `.strip()`을 추가해 이중 방어(GPT가 "둘 다 넣어도
+과하지 않다"고 제안한 대로) — 이 함수를 직접 호출하는 다른 경로가
+생기더라도 안전하도록.
+
+**P1 — avg_buy_price 필수 헤더 누락**: 이월 손익 계산의 핵심
+필드인 `avg_buy_price`가 필수 헤더 검증 목록에서 빠져 있었음. 실제
+`TradeCsvLogger`(`infra/storage/logger.py`의 `TRADE_FIELDS`)는
+항상 이 컬럼을 포함하므로 필수로 강제해도 운영에 영향 없음 확인
+후 추가. 기존 테스트 2개 파일(`test_risk_manager_carryover_bom.py`,
+`test_risk_manager_fifo_pnl.py`, `test_sold_today_and_reentry_fix.py`)
+이 이 컬럼 없이 헤더를 쓰고 있어서 함께 깨졌던 것을 수정.
+
+**P1 — 헤더 중복 미검증**: `timestamp,...,price,...,price`처럼
+헤더가 중복되면 `DictReader`가 조용히 뒤 값으로 덮어써버리는데,
+이 상황도 감지하지 못했음. `len(fieldnames) != len(set(fieldnames))`
+검사 추가.
+
+**P2 — docstring 불일치**: "price=0인 행은 체결가 미기록으로 간주해
+제외"라는 낡은 설명이 실제 동작(price=0은 이제 오류)과 어긋나
+있었음. 실제 동작에 맞게 정정.
+
+**P1 3건 — `migrate_trades_csv.py` 보강**: (1) 실행 중 파일 변경
+감지 — 스크립트가 파일을 읽은 시점과 실제 쓰기 시점 사이에 봇이
+새 거래를 append했으면 mtime/size 스냅샷 비교로 감지해 안전하게
+중단(새 거래 유실 방지). (2) 원자적 교체 — 같은 디렉터리에 임시
+파일을 완전히 작성한 뒤 `os.replace()`로 교체, 쓰기 도중 중단돼도
+원본이 잘리지 않음. (3) 백업/archive 파일명에 초 단위 타임스탬프
+추가 — 같은 날 여러 번 실행해도 이전 결과를 덮어쓰지 않음. 추가로
+archive에 원본 줄 번호와 손상 사유를 함께 기록하고, 별도
+manifest(JSON)로 정리 이력(원본/정상/손상 건수, 백업·archive 경로,
+시각)을 남기도록 보강.
+
+**검증**: `test_risk_manager_timestamp_propagation.py` — 11건
+전부 통과. 1부(strip 전파, 4건): 앞쪽/뒤쪽 공백 timestamp가
+검증뿐 아니라 최종 계산까지 정상 완주하는지(P0 핵심 재현),
+`calculate_realized_pnl_by_events()` 자체의 이중 방어 확인. 2부
+(헤더 검증, 3건): `avg_buy_price` 누락 시 fail-close, 헤더 중복
+시 fail-close, 정상 헤더 회귀 확인. 3부(migrate 스크립트, 4건):
+`classify_row()`의 컬럼수불일치/accepted이상값/정상행 판정 정확성,
+`snapshot()`의 파일 변경 감지 정확성. 마이그레이션 스크립트는
+실제로 손상 데이터를 만들어 dry-run/apply/원자적 교체/manifest
+생성까지 전부 실행 검증(30건 합성 데이터로 정확히 분리 확인).
+전체 회귀 기존 17개 파일 재통과 확인(그 중 헤더 필수화로 깨졌던
+`test_sold_today_and_reentry_fix.py`를 함께 수정) — 총 18개
+테스트 파일.
+
+### 7.29 migrate_trades_csv.py 견고화 + 예외 범위 축소 (2026-07-22)
+
+**배경**: 7.28절까지로 `RiskManager`의 손익 계산 핵심 경로는 GPT
+7차 코드리뷰에서 "배포 가능한 수준"으로 평가받음. 이번 라운드
+지적은 전부 이미 실행 완료한 보조 도구(`migrate_trades_csv.py`)와
+사소한 견고성 개선에 집중됨 — 우선순위가 이전 라운드들보다 낮지만,
+스크립트를 다시 쓸 가능성이 있고 데이터 유실은 되돌릴 수 없으므로
+전부 반영.
+
+**P0 — 스냅샷 비교와 실제 교체 사이 경쟁 구간**: 파일을 읽은 직후
+한 번 스냅샷을 비교했지만, 그 뒤 백업 생성/archive 생성/manifest
+작성에 걸리는 시간 동안 봇이 새 거래를 append하면 감지하지 못하고
+그대로 유실될 수 있었음(코드 위치 확인으로 재현 가능함을 검증).
+`os.replace()` 직전에 스냅샷을 한 번 더 비교하도록 추가 — 경쟁
+구간을 최대한 좁힘(완전한 잠금은 아니라는 한계를 docstring에
+명시). 재검사에서 변경이 감지되면 임시 파일을 정리하고 manifest를
+`aborted_file_changed` 상태로 남긴 뒤 안전하게 중단.
+
+**P1 — 파일명 충돌 가능성**: 백업/archive 파일명이 초 단위
+타임스탬프만 써서 같은 초에 두 번 실행하면 겹칠 수 있었고,
+`shutil.copy2`는 존재 확인 없이 조용히 덮어씀. `make_unique_stamp()`
+로 마이크로초+짧은 UUID를 조합해 실질적으로 충돌 불가능하게 하고,
+백업 생성 전에도 `exists()` 검사를 추가(archive는 기존에 이미
+있었음 — 일관성 확보).
+
+**P1 — 스크립트 검증 기준과 RiskManager 검증 기준 혼동 가능성**:
+`classify_row()`가 "정상(good_rows)"으로 분류하는 기준(CSV 구조만
+확인)이 `RiskManager`의 엄격 검증(symbol 6자리, price 양수 등)보다
+느슨한데, 변수명이 `good_rows`라 "이 스크립트를 통과하면 다
+괜찮다"는 오해를 줄 수 있었음(실제로 symbol 형식 오류+price=0
+행이 이 스크립트에서는 정상으로 분류되는 것을 재현 확인).
+`structurally_valid_rows`/`structurally_corrupted_rows`로 변수명을
+바꾸고, 출력 메시지와 docstring에 "이 스크립트를 통과해도
+RiskManager에서 다시 걸릴 수 있고 그건 정상"이라는 설명을 명시.
+
+**P1 — manifest가 실제 교체 전에 "완료"로 기록됨**: 원자적 교체가
+성공하기도 전에 manifest를 작성해서, `os.replace()`가 실패하면
+manifest만 완료 상태로 남고 실제 파일은 안 바뀐 모순이 생길 수
+있었음. `status` 필드를 `prepared` → (재검사 실패 시)
+`aborted_file_changed` / (예외 시) `failed` → (성공 시) `completed`
+로 단계별로 갱신하도록 변경, `completed_at` 필드 추가.
+
+**P1 — RiskManager의 `except Exception`이 프로그래밍 버그까지
+감춤**: 5차 수정에서 `DailyPnlUnavailableError`의 이중 래핑은
+막았지만, 그 뒤의 `except Exception`은 여전히 모든 예외(진짜 코드
+버그 포함)를 "데이터 손상"으로 뭉개고 있었음. `(OSError,
+UnicodeError, csv.Error)`로 명시적으로 좁혀서, 예상 못한 예외는
+그대로 올라가 스택트레이스가 정확히 보이도록 함.
+
+**P2 — 레거시 함수가 조용히 재사용될 수 있음**: `calculate_
+realized_pnl_fifo`가 단순 별칭이라 새 코드에서 이 이름으로 호출해도
+경고 없이 시간순서 미보장 로직이 쓰일 수 있었음(7.21절에서 실제로
+문제를 일으켰던 함수). 호출 시 `DeprecationWarning`을 내는 얇은
+래퍼로 전환 — 결과는 동일하게 유지(하위 호환), 호출 자체는 눈에
+띄게 경고.
+
+**검증**: `test_migrate_script_hardening.py` — 15건 전부 통과.
+`make_unique_stamp()` 20회 연속 호출로 충돌 없음 확인,
+`classify_row()`가 구조적 손상만 판정하고 필드값 유효성은
+판정하지 않음을 명시적으로 재확인, 실제 서브프로세스로 스크립트를
+실행해 manifest가 `completed` 상태로 정확히 남는지, 정리 후
+`trades.csv`에 정상 행만 남는지 확인, 백업/archive 존재 검사와
+교체 직전 재검사 로직이 실제 소스에 있는지, `RiskManager`의
+예외 범위가 명시적으로 좁혀졌는지까지 확인. 기존
+`calculate_realized_pnl_fifo` 하위호환 테스트를 `is` 동일성
+검증에서 `DeprecationWarning` 발생 여부 검증으로 갱신, 헤더
+누락으로 함께 깨졌던 `test_risk_manager_carryover_bom.py`의
+누락 지점(BOM 수동 조립 부분)도 수정. 전체 회귀 기존 18개 파일
+재통과 확인 — 총 19개 테스트 파일.
+
 ---
 
 ## 8. 로깅 인프라 개선 (2026-07-14)

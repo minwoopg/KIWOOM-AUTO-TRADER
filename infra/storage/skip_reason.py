@@ -51,6 +51,9 @@ class SkipReason:
     DAILY_LOSS_LIMIT        = "SKIP_DAILY_LOSS_LIMIT"     # 일일 손실 한도 도달
     CONSECUTIVE_LOSS_LIMIT  = "SKIP_CONSECUTIVE_LOSS"     # 연속 손절 한도 도달
     ORDER_FAILED            = "SKIP_ORDER_FAILED"         # 주문 실패 (브로커 거부)
+    # 2026-07-22: trades.csv 파싱 실패로 당일 손익을 신뢰할 수 없어
+    # 신규매수를 차단(fail-close)한 경우. RiskManager.DailyPnlUnavailableError 참고.
+    DAILY_PNL_UNAVAILABLE   = "SKIP_DAILY_PNL_UNAVAILABLE"
 
     # ── 보유 중 포지션 관리 ──────────────────────────────────────
     HOLDING_TRAILING        = "HOLD_TRAILING"             # 트레일링 스탑 추적 중

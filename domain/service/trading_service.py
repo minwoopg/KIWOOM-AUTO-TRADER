@@ -1494,7 +1494,11 @@ class TradingService:
                 self.app_logger.debug(
                     f"[BUY_COOL] {symbol} | BUY 신호 쿨다운 중 ({remaining_sig}초 남음)"
                 )
-                return
+                # 2026-07-22: bare return(=None 반환)이었음 — 다른 차단
+                # 사유들은 전부 문자열을 반환하는데 이것만 None이라 호출부
+                # signal_log 기록에서 사유가 빈 값으로 남았을 것(GPT 검토로
+                # 발견). 다른 사유들과 일관되게 명시적 문자열로 정정.
+                return "BUY_SIGNAL_COOLDOWN"
 
         # ── 재진입 쿨다운 체크 ────────────────────────────────────
         cooldown_sec = self.settings.trading.reentry_cooldown_seconds
@@ -1580,7 +1584,12 @@ class TradingService:
                 f"[BLOCK] {symbol} | 최대 보유 종목 수 초과 "
                 f"({held_count}/{self.settings.trading.max_positions})"
             )
-            return "STOPLOSS_COOLDOWN"
+            # 2026-07-22: 여기 반환값이 "STOPLOSS_COOLDOWN"으로 잘못
+            # 고정되어 있었음 — 실제 사유(최대보유종목수)와 무관한 문자열이라
+            # signal_analysis의 BLOCKED 사유 분포를 왜곡시켜 왔음(GPT 검토로
+            # 발견). SkipReason.MAX_POSITIONS로 정정.
+            from infra.storage.skip_reason import SkipReason
+            return SkipReason.MAX_POSITIONS
         quantity = max(1, self.settings.trading.order_cash_per_trade // current_price)
         order = OrderRequest(
             symbol=symbol,
@@ -1595,7 +1604,15 @@ class TradingService:
             self.app_logger.warning(
                 f"[BLOCK] {symbol} | 매수 조건 충족했지만 주문 미실행 | 사유: {reason}"
             )
-            return "TRAIL_LOSS_COOLDOWN"
+            # 2026-07-22: 여기 반환값이 "TRAIL_LOSS_COOLDOWN"으로 무조건
+            # 고정되어 있었음. RiskManager.can_place_order()는 이미
+            # SkipReason(ALREADY_HOLDING/MAX_POSITIONS/RISK_LIMIT/
+            # DAILY_LOSS_LIMIT 등) 상수로 정확한 사유를 반환하는데, 그
+            # reason을 무시하고 항상 같은 문자열로 덮어써서 이 경로를 거친
+            # BLOCKED 사유가 전부 "트레일링 손실 쿨다운"으로 잘못 집계되고
+            # 있었음(GPT 검토로 발견 — signal_analysis 리포트 왜곡 원인).
+            # reason을 그대로 반환하도록 정정.
+            return reason
 
         # ── 포지션 상태머신 shadow 통지 (2026-07-22) ────────────────
         self._position_state_machine.on_buy_requested(symbol, order.quantity, "pending")

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import os
 import shutil
 import time
@@ -176,6 +177,23 @@ async def async_main() -> None:
         app_logger.info("[RECONCILE] state.json 동기화 완료")
     except Exception as e:
         app_logger.warning(f"[RECONCILE] 시작 시 state 동기화 실패: {e}")
+        # 2026-07-22: 기존엔 모의/실전 구분 없이 경고 로그만 남기고
+        # 그대로 매매를 시작했음 — 실제 보유 종목과 state.json이
+        # 불일치한 채로(예: 실제로는 보유 중인데 로컬에는 없음, 또는
+        # 그 반대) 신규매매를 시작할 위험이 있음(GPT 검토로 발견).
+        # 실전투자에서는 이 상태로 시작하는 것 자체가 위험하므로 프로세스
+        # 시작을 중단. 모의투자는 리스크가 없으므로 기존처럼 경고만
+        # 남기고 진행(개발/디버깅 편의를 위해 완전히 막지는 않음).
+        if not settings.broker.is_paper_trading:
+            app_logger.critical(
+                "[STARTUP_BLOCK] 실전투자 — 계좌 상태 동기화 실패로 "
+                "안전하게 시작할 수 없습니다. 프로그램을 시작하지 않습니다."
+            )
+            raise RuntimeError(
+                "실전투자 시작 시 잔고/state 동기화 실패 — 실제 보유"
+                "종목과 로컬 상태가 불일치한 채로 매매를 시작하지 않도록"
+                "의도적으로 중단합니다."
+            ) from e
 
     trading_service = build_trading_service(
         settings, broker, app_logger, trade_logger, signal_logger, state_store
@@ -298,14 +316,68 @@ async def async_main() -> None:
             try:
                 app_logger.info("[COND] watcher.start() 진입 — WebSocket 연결 시작")
                 await watcher.start()
-                app_logger.warning("[COND] watcher.start()가 정상 종료됨 (예상치 못함)")
+                # 2026-07-22 (GPT 코드리뷰): watcher.start()는 원래
+                # 무한 재연결 루프라 정상 운영 중 스스로 반환하는 일이
+                # 없어야 함 — 예상된 종료 경로는 오직 CancelledError
+                # (task.cancel()로 명시적으로 취소되는 경우)뿐. 여기까지
+                # 오는 건 내부 루프가 어떤 이유로 조용히 끝났다는 뜻이라
+                # 실패로 간주 — 로그만 남기고 넘어가면 asyncio.wait의
+                # done 집합에 "정상 완료"로 들어가 장애가 감춰짐.
+                raise RuntimeError(
+                    "ConditionWatcher가 예외 없이 예상보다 일찍 종료됐습니다"
+                )
+            except asyncio.CancelledError:
+                app_logger.info("[COND] watcher 태스크 취소됨 — 종료 처리 중")
+                raise
             except Exception as exc:
                 app_logger.exception(f"[COND] watcher.start() 예외로 중단: {exc}")
+                # 2026-07-22: 로그만 남기고 조용히 반환하고 있었음(GPT
+                # 코드리뷰로 발견) — 그러면 asyncio.wait의 done 집합에는
+                # watcher_task가 "정상 완료"로 들어가고, 뒤이은
+                # trading_task 취소까지는 정확히 동작하지만, 운영체제
+                # 입장에서는 프로세스가 정상 종료 코드(0)로 끝날 수 있어
+                # 프로세스 관리자나 모니터링에서 장애 종료를 구분하기
+                # 어려움. 예외를 다시 던져 task.exception()에 정확히
+                # 남도록 함 — 아래 asyncio.wait 이후의
+                # "for task in done: if task.exception()..." 로직이
+                # 이 예외를 그대로 재전파해 main()까지 도달, 0이 아닌
+                # 종료 코드로 끝나게 됨.
+                raise
 
-        await asyncio.gather(
-            trading_loop(trading_service, settings, app_logger),
-            watcher_start_guarded(),
+        # 2026-07-22: asyncio.gather는 모든 태스크가 끝나야 반환됨. 기존엔
+        # trading_loop가 KeyboardInterrupt를 자체적으로 잡아 break로 조용히
+        # 반환하는 구조라(위 111~113줄 참고), Ctrl+C를 눌러도 watcher 태스크는
+        # gather 안에서 계속 살아남아 5초마다 재연결을 반복 — "application
+        # stopped by user" 로그 이후에도 [WS] 연결 시도가 계속되던 원인.
+        # asyncio.wait(FIRST_COMPLETED)로 바꿔서, 어느 한쪽이 먼저 끝나면
+        # (정상/예외 불문) 나머지를 명시적으로 취소하고 정리한 뒤 반환하도록 함.
+        trading_task = asyncio.create_task(trading_loop(trading_service, settings, app_logger))
+        watcher_task = asyncio.create_task(watcher_start_guarded())
+
+        done, pending = await asyncio.wait(
+            {trading_task, watcher_task}, return_when=asyncio.FIRST_COMPLETED,
         )
+
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        # watcher가 소켓을 열어둔 채로 남지 않도록 명시적으로 정리
+        # 2026-07-22 (5차 수정, GPT 코드리뷰): timeout 없이 대기하면
+        # 내부 네트워크/소켓 문제로 stop()이 멈췄을 때 프로세스 종료
+        # 자체가 지연될 수 있음 — 5초 제한.
+        try:
+            await asyncio.wait_for(watcher.stop(), timeout=5.0)
+        except asyncio.TimeoutError:
+            app_logger.warning("[COND] watcher.stop() 5초 초과 — 정리를 포기하고 계속 진행")
+        except Exception as exc:
+            app_logger.warning(f"[COND] watcher.stop() 중 예외 (무시): {exc}")
+
+        # 먼저 끝난 태스크가 예외로 죽었다면 그 예외를 드러냄
+        for task in done:
+            if task.exception() is not None:
+                raise task.exception()
 
     else:
         # 기존 방식: settings.yaml의 targets 그대로 사용
@@ -313,18 +385,43 @@ async def async_main() -> None:
         await trading_loop(trading_service, settings, app_logger)
 
 
-def main() -> None:
+def main() -> int:
+    """프로그램 진입점. 반환값은 프로세스 종료 코드로 사용됩니다.
+
+    2026-07-22 (GPT 코드리뷰로 발견): 기존엔 이 함수가 -> None이었고
+    except Exception 블록이 print()만 하고 끝나서, watcher가 예외로
+    죽어 async_main()까지 예외가 전파돼도 main()이 그걸 삼키고 정상
+    반환 -> 프로세스 종료 코드가 0으로 남았음(7.19/7.24절에서 고친
+    "watcher 예외 재전파"가 무의미해지는 결과). 프로세스 관리자나
+    모니터링이 정상 종료와 장애 종료를 구분할 수 있도록 종료 코드를
+    명시적으로 반환하고, if __name__ 블록에서 sys.exit()로 실제
+    반영합니다.
+    """
+    exit_code = 0
     try:
         asyncio.run(async_main())
     except KeyboardInterrupt:
         print("\n[종료] Ctrl+C 감지 — 정상 종료 처리 중...")
+    except Exception as exc:
+        # 실전투자 시작 시 잔고동기화 실패(STARTUP_BLOCK)나 watcher
+        # 장애로 인한 예외 등이 여기까지 올라옴 — app.log에는 이미
+        # CRITICAL/exception으로 남지만, 콘솔에도 명확히 보이도록 출력.
+        # 2026-07-22 (4차 수정, GPT 코드리뷰): async_main() 내부에서
+        # 예상 못한 경로로 발생한 예외는 여기서 처음 잡힐 수도 있는데,
+        # 그런 경우 print()만으로는 스택트레이스가 app.log에 안 남을
+        # 수 있어 원인 추적이 어려움 — logging.exception()으로 한 번
+        # 더 명시적으로 기록.
+        logging.getLogger(__name__).exception("자동매매 프로그램 치명적 오류")
+        print(f"\n[오류] 프로그램이 비정상 종료됐습니다: {exc}")
+        exit_code = 1
     finally:
         # 파일 핸들러를 명시적으로 flush/close.
         # (Ctrl+C 시 close() 없이 종료되면 다음 실행 때 app.log에
         #  로그가 안 찍히는 것처럼 보이는 문제의 원인이었음)
         logging.shutdown()
         print("[종료] 로그 정리 완료. 프로그램을 종료합니다.")
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
