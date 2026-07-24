@@ -175,9 +175,9 @@ def calculate_realized_pnl_grouped_legacy(
 # pnl_fifo = calculate_realized_pnl_grouped_legacy)이었는데, 이러면
 # 누군가 이 이름으로 새로 호출해도 아무 경고 없이 "시간순서 미보장"
 # 함수가 조용히 쓰일 수 있음(7.21절에서 실제로 문제를 일으켰던
-# 바로 그 함수). 호출 시점에 DeprecationWarning을 내도록 얇은
-# 래퍼로 전환 — 하위 호환(같은 인자로 같은 결과)은 유지하되, 이
-# 이름으로 부르면 눈에 띄게 경고하도록 함.
+# 바로 그 함수). 호출 시점에 경고를 내도록 얇은 래퍼로 전환 —
+# 하위 호환(같은 인자로 같은 결과)은 유지하되, 이 이름으로 부르면
+# 눈에 띄게 경고하도록 함.
 def calculate_realized_pnl_fifo(
     buys_by_symbol: dict[str, list[dict]],
     sells_by_symbol: dict[str, list[dict]],
@@ -188,11 +188,15 @@ def calculate_realized_pnl_fifo(
     시간순서를 보장하지 않는 레거시 함수입니다 — 실시간이든 리포트든
     시점이 중요한 계산에는 calculate_realized_pnl_by_events를 쓰세요.
     """
+    # 2026-07-22 (8차 수정, GPT 코드리뷰): DeprecationWarning은 Python이
+    # 기본적으로 사용자 코드에서 숨김(라이브러리 코드로 취급되어
+    # 필터링됨) — "눈에 띄게 경고"라는 의도와 실제 동작이 안 맞았음.
+    # 기본적으로 항상 표시되는 FutureWarning으로 교체.
     warnings.warn(
         "calculate_realized_pnl_fifo는 시간순서를 보장하지 않는 레거시 "
         "함수입니다(매도 시점 이후 매수가 매칭에 섞일 수 있음). "
         "calculate_realized_pnl_by_events를 사용하세요.",
-        DeprecationWarning,
+        FutureWarning,
         stacklevel=2,
     )
     return calculate_realized_pnl_grouped_legacy(
