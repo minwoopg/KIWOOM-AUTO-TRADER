@@ -15,6 +15,7 @@ from __future__ import annotations
 """
 
 import asyncio
+import json
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -1239,6 +1240,17 @@ class TradingService:
         """
         psm = self._position_state_machine
 
+        # 2026-07-24 (12차 수정, GPT 코드리뷰): acknowledge_error()가
+        # 실전에서 실질적으로 호출 불가능한 문제 — 이 프로세스는 계속
+        # 도는 백그라운드 asyncio 프로세스라 REPL/디버거 연결 없이는
+        # 실행 중에 이 메서드를 부를 방법이 없었음. 사람이 사용할 수
+        # 있는 유일한 접점(파일 시스템)을 통해 명령을 전달하는 가장
+        # 단순한 방식으로 연결 — commands/ack_error_{symbol}.json
+        # 파일이 있으면 다음 폴링에서 읽어 처리하고 즉시 삭제(중복
+        # 처리 방지). 파일 형식:
+        #   {"broker_quantity": 100, "note": "HTS 직접 확인, 실제 100주"}
+        self._process_pending_ack_error_commands()
+
         # 프로세스(또는 이번 shadow 기능) 최초 실행 시 브로커 실제 잔고
         # 기준으로 초기화 — state.json 등 영속화된 옛 상태를 신뢰하지 않음
         if not self._position_state_machine_initialized:
@@ -1268,8 +1280,92 @@ class TradingService:
                 # 매도 요청 다음 폴링 — 브로커 잔고를 다시 조회해 실제로
                 # 전량/부분/미체결인지 판정 (on_sell_result 내부 로직)
                 psm.on_sell_result(symbol, accepted=True, broker_quantity=broker_qty)
-            elif state.lifecycle != PositionLifecycle.BUY_PENDING:
+            elif state.lifecycle == PositionLifecycle.BUY_PENDING:
+                # 2026-07-23: 매도와 대칭 — 매수 요청 다음 폴링에서
+                # 브로커 잔고를 다시 조회해 실제로 체결됐는지 확인.
+                # 기존엔 이 분기가 없어서 BUY_PENDING을 그냥 지나쳤음
+                # (매수는 _try_buy 안에서 즉시 확정했었으므로).
+                psm.confirm_buy_from_broker(symbol, broker_qty)
+            else:
                 psm.sync_from_broker(symbol, broker_qty)
+
+            # 2026-07-24 (9차 수정, GPT 코드리뷰): 이상치(예상 밖 수량)
+            # 감지 시 ERROR로 전이되는데, 이게 position_lifecycle.csv
+            # 에만 남으면 놓치기 쉬움 — POSITION_STATE_MISMATCH와
+            # 동일하게 app.log에도 CRITICAL로 노출해 실시간으로
+            # 눈에 띄게 함. 사람이 실제 계좌를 확인해야 하는 상황.
+            # ERROR는 sync_from_broker()에서도 자동 복구되지 않고
+            # 계속 유지되므로(위 수정 참고), 새로 진입했을 때뿐 아니라
+            # 이미 ERROR 상태로 남아있는 매 폴링에도 반복 알림 —
+            # 사람이 확인하기 전까지 계속 눈에 띄어야 하므로.
+            if psm.get(symbol).lifecycle == PositionLifecycle.ERROR:
+                self.app_logger.critical(
+                    f"[POSITION_STATE_ERROR][SHADOW] {symbol} | "
+                    f"{psm.get(symbol).last_error} | broker_qty={broker_qty} — "
+                    f"실제 계좌 상태를 확인하세요"
+                )
+
+    def _process_pending_ack_error_commands(self) -> None:
+        """commands/ack_error_{symbol}.json 파일을 확인해 ERROR 상태를 정정합니다.
+
+        2026-07-24 (12차 수정, GPT 코드리뷰): PositionStateMachine.
+        acknowledge_error()는 실제 매매 로직과 무관하게 관찰용
+        상태를 정정하는 안전한 메서드지만, 이 프로세스가 계속 도는
+        백그라운드 asyncio 프로세스라 REPL/디버거 연결 없이는 실행
+        중에 호출할 방법이 없었음. 파일 시스템을 통한 명령 전달로
+        연결.
+
+        사용법 (PowerShell):
+            $body = @{ broker_quantity = 100; note = "HTS 직접 확인" } | ConvertTo-Json
+            $body | Out-File -Encoding utf8 commands\\ack_error_475150.json
+
+        파일이 있으면 다음 폴링(최대 poll_interval_seconds 이내)에서
+        읽어 처리하고 즉시 삭제합니다 — 중복 처리 방지. 처리 결과는
+        app.log와 position_lifecycle.csv에 모두 남습니다. broker_
+        quantity가 음수이거나 note가 없으면 처리하지 않고 오류
+        로그만 남긴 뒤 파일을 삭제합니다(같은 잘못된 파일이 매
+        폴링마다 반복 실패하는 것을 막기 위해 — 대신 오류 사유를
+        app.log에서 확인 가능).
+        """
+        commands_dir = Path("commands")
+        if not commands_dir.is_dir():
+            return
+        # 2026-07-24 (13차 수정): Path.glob()은 파일시스템 순회 순서에
+        # 의존하며 정렬을 보장하지 않음 — 여러 명령 파일이 동시에
+        # 있을 때 처리/로그 순서가 예측 불가능해지는 것을 막기 위해
+        # 정렬해서 순회(파일명은 종목코드가 포함돼 있어 정렬하면
+        # 자연스럽게 종목코드순으로 처리됨).
+        for cmd_file in sorted(commands_dir.glob("ack_error_*.json")):
+            symbol = cmd_file.stem[len("ack_error_"):]
+            try:
+                payload = json.loads(cmd_file.read_text(encoding="utf-8"))
+                broker_quantity = int(payload["broker_quantity"])
+                note = str(payload["note"])
+                self._position_state_machine.acknowledge_error(symbol, broker_quantity, note)
+                self.app_logger.warning(
+                    f"[ACK_ERROR_COMMAND] {symbol} | 파일 명령으로 ERROR 해제 — "
+                    f"broker_quantity={broker_quantity}, note={note!r}"
+                )
+            except Exception as exc:
+                # 2026-07-24 (13차 수정, GPT 코드리뷰): 기존엔
+                # (OSError, JSONDecodeError, KeyError, ValueError,
+                # TypeError)만 나열해서 잡았음 — finally가 있어서
+                # "파일이 삭제된다"는 보장은 됐지만, 나열 안 된 예외
+                # 타입이 나오면 이 함수 자체가 예외를 던지며 중단돼
+                # for 루프 뒤에 남은 다른 명령 파일들은 이번 폴링에서
+                # 처리가 안 되고, run_once() 전체가 이 폴링 사이클을
+                # 통째로 실패할 위험이 있었음. acknowledge_error()가
+                # 앞으로 새로운 예외 타입을 던지게 바뀌거나
+                # PositionStateMachine 내부 구현이 달라져도 이 함수
+                # 하나 때문에 전체 루프가 끊기면 안 되므로, Exception
+                # 전체(KeyboardInterrupt/SystemExit는 BaseException만
+                # 상속해 여기 안 걸림, 의도적으로 유지)로 범위를 넓힘.
+                self.app_logger.error(
+                    f"[ACK_ERROR_COMMAND] {symbol} | 명령 파일 처리 실패, 무시하고 "
+                    f"삭제합니다: {exc} — 파일을 다시 만들어 재시도하세요"
+                )
+            finally:
+                cmd_file.unlink(missing_ok=True)
 
     def _run_end_of_day_tasks(self, now: datetime) -> None:
         """장 마감 후 작업 (리포트/검증). run_once 밖에서도 호출 가능."""
@@ -1614,13 +1710,15 @@ class TradingService:
             # reason을 그대로 반환하도록 정정.
             return reason
 
-        # ── 포지션 상태머신 shadow 통지 (2026-07-22) ────────────────
+        # ── 포지션 상태머신 shadow 통지 (2026-07-22→23) ──────────────
+        # BUY_PENDING → OPEN 실체결 확인: 이전엔 accepted=True이면
+        # 여기서 바로 OPEN으로 확정했는데(요청 수량을 그대로 신뢰),
+        # 이제 accepted 여부만 알리고 BUY_PENDING을 유지 — 실제 체결
+        # 확인은 다음 폴링의 confirm_buy_from_broker()가 담당(SELL과
+        # 대칭 구조, GPT 제안 반영).
         self._position_state_machine.on_buy_requested(symbol, order.quantity, "pending")
         result = self.broker.place_order(order)
-        self._position_state_machine.on_buy_result(
-            symbol, result.accepted,
-            order.quantity if result.accepted else 0,
-        )
+        self._position_state_machine.on_buy_result(symbol, result.accepted)
 
         # ── 매수 컨텍스트 구성 ────────────────────────────────────
         ctx = self._build_trade_context(

@@ -1748,6 +1748,325 @@ realized_pnl_fifo`가 단순 별칭이라 새 코드에서 이 이름으로 호�
 누락 지점(BOM 수동 조립 부분)도 수정. 전체 회귀 기존 18개 파일
 재통과 확인 — 총 19개 테스트 파일.
 
+**추가 반영 (GPT 8차 코드리뷰)**: `calculate_realized_pnl_fifo`의
+경고를 `DeprecationWarning`에서 `FutureWarning`으로 교체 —
+`DeprecationWarning`은 Python이 기본적으로 사용자 코드에서
+숨기므로 "눈에 띄게 경고"라는 의도와 실제 동작이 맞지 않았음.
+GPT 8차 리뷰에서 첫 번째 패치 묶음(RiskManager 손익계산 핵심
+경로) 전체가 "P0 없음, 승인 가능" 판정을 받음 — 남은 지적
+(manifest 원자적 기록, SHA-256 감사로그, csv strict 모드,
+RISK_ENGINE_ERROR 신규매수 중지)은 전부 P1~P2이며 다음 단계인
+포지션 상태머신/체결 로그 분리 작업과 함께 처리하는 것으로 보류.
+
+### 7.30 BUY_PENDING → 실제 잔고 확인 → OPEN 구조 전환 (2026-07-23)
+
+**배경**: GPT가 첫 번째 패치 묶음(RiskManager 손익계산) 승인 후
+제안한 다음 단계. 7.17절에서 상태머신을 도입할 때부터 `BUY_PENDING`
+이 사실상 한 함수 호출 시간(밀리초)만 존재하는 구조적 비대칭이
+있었음 — `SELL_PENDING`은 매도 요청 다음 폴링에서 실제 브로커
+잔고를 재조회해 전량/부분/미확정 체결을 구분하는데(7.14절 수량
+스냅샷 판정과 같은 원리), `BUY_PENDING`은 `place_order()`가
+`accepted=True`를 반환하자마자 그 자리에서 즉시 `OPEN`으로
+확정하고 요청 수량을 그대로 신뢰했음(실제 브로커 재조회 없음).
+
+**수정**: `domain/position/lifecycle.py`의 `on_buy_result()`를
+2단계로 분리.
+
+```python
+# 이전: 접수 성공하면 즉시 확정
+on_buy_result(symbol, accepted, broker_quantity)  # accepted=True면 바로 OPEN
+
+# 이후: 접수 확인과 체결 확인을 분리 (SELL과 대칭)
+on_buy_result(symbol, accepted)          # 접수 확인만, BUY_PENDING 유지
+confirm_buy_from_broker(symbol, broker_quantity)  # 다음 폴링에서 실제 체결 확인
+```
+
+`confirm_buy_from_broker()`는 매수 시도 당시 수량(`known_quantity`)
+과 요청 수량(`pending_quantity`)의 합을 기준으로 브로커 잔고와
+비교해 3가지로 분기: (1) 요청분 이상 늘어남 → 전량 체결로 `OPEN`
+확정, (2) 늘긴 했지만 요청분 미만 → 부분체결, `known_quantity`만
+갱신하고 `BUY_PENDING` 유지, (3) 변화 없음 → 아직 브로커 API 미반영,
+`BUY_PENDING` 유지(다음 폴링에서 재시도).
+
+`TradingService._try_buy()`가 `on_buy_result(symbol, result.accepted)`
+만 호출하도록 수정 — 이전처럼 그 자리에서 `OPEN` 확정을 안 함.
+`_sync_position_state_machine_shadow()`에 `BUY_PENDING` 분기 추가
+— 기존엔 이 분기가 아예 없어서(매수는 즉시 확정됐으므로) 그냥
+지나쳤는데, 이제 매도(`SELL_PENDING`)와 동일하게 다음 폴링에서
+`confirm_buy_from_broker()`를 호출하도록 배선.
+
+**여전히 shadow 모드**: 이번 수정도 실제 매매 판정에는 영향을
+주지 않습니다 — `_process_symbol()`의 실제 position 판정,
+`RiskManager`의 게이트 로직 모두 무변경. 상태머신은 여전히 관찰과
+검증 목적으로만 병행 계산됩니다.
+
+**검증**: `test_position_lifecycle_shadow.py` — 기존 22건에
+`BUY_PENDING`이 2단계로 정확히 전이되는지(접수확인 시점엔 여전히
+`BUY_PENDING`), 부분체결 시 `BUY_PENDING` 유지하며
+`known_quantity`만 갱신, API 미반영 시 아무 변화 없이 `BUY_PENDING`
+유지하는 시나리오 3건을 추가해 28건 전부 통과. `test_position_
+lifecycle_logging.py` — 로그 이벤트 구성이 `BUY_REQUESTED` +
+`BUY_CONFIRMED`(기존 `BUY_RESULT`에서 이름 변경, 접수확인 자체는
+상태 전이가 없어 로그를 안 남기므로) 2건으로 정확히 기록되는지
+갱신해 16건 통과. 실제 `TradingService`를 조립해 `run_once()`를
+연속 호출하는 통합 확인으로 예외 없이 안전하게 동작함을 확인.
+전체 회귀 기존 17개 파일 재통과 확인 — 총 19개 테스트 파일.
+
+**다음 단계**: 실거래로 며칠 운영하며 `BUY_PENDING`이 실제로 몇
+번의 폴링에 걸쳐 확정되는지, 부분체결이 실제로 얼마나 자주
+발생하는지 `position_lifecycle.csv`로 관찰. 문제없이 안정적으로
+동작하면 실제 판정 로직(현재 `_sold_today_qty_snapshot` 기반)을
+이 상태머신으로 교체하는 걸 검토.
+
+### 7.31 이상치(예상 밖 체결수량) 감지 + ERROR 상태 자동복구 방지 (2026-07-24)
+
+**배경**: 7.30절 수정에 대한 GPT 9차 코드리뷰에서 P0 하나가
+발견됨.
+
+**P0 — `confirm_buy_from_broker()`가 예상 초과 수량을 무조건
+"체결됨"으로 확정**: `broker_quantity >= expected_min`(요청분
+이상이면 전량 체결로 판단) 조건이 fail-open 방향이었음. 요청은
+100주였는데 브로커 잔고가 500주로 확인돼도 아무 경고 없이 그대로
+`OPEN`으로 확정하고 있었음(합성 데이터로 재현: 재매수 경합, 브로커
+응답 오류, 외부 매매 개입 등 여러 원인이 있을 수 있는데 전부
+조용히 넘어감). `expected_min`과 정확히 일치할 때만 `FILLED`로
+확정하고, 초과하면 `PositionLifecycle.ERROR`(정의는 있었지만
+실제로 쓰인 적이 없던 상태)로 전이시켜 자동 확정을 막음.
+
+**같은 계열 문제를 매도 쪽에서도 발견**: `on_sell_result()`의
+`else` 분기(부분체결 처리)에 "매도 중인데 잔고가 오히려 늘어난"
+이상 상황까지 섞여 있었음 — 매도 요청 중 잔고 증가는 부분체결일
+수 없는데도 그대로 부분체결로 오인해 `OPEN`으로 확정했음. 잔고가
+`known_quantity`보다 늘어난 경우를 별도 분기로 떼어 동일하게
+`ERROR`로 전이.
+
+**연쇄 발견 — ERROR가 다음 폴링에 조용히 자동 복구됨**: 위 수정을
+검증하던 중, `ERROR` 상태가 `sync_from_broker()`의 PENDING 제외
+목록에 없어서 다음 폴링에서 `OPEN`/`FLAT`으로 조용히 되돌아가
+버리는 것을 발견(재현 확인) — CRITICAL 로그가 한 번 찍히고 바로
+다음 폴링에 사라지는 셈이라 실질적으로 놓치기 매우 쉬운 구조였음.
+`ERROR`도 `BUY_PENDING`/`SELL_PENDING`과 함께 자동 동기화 제외
+목록에 추가 — 사람이 실제 계좌를 확인하고 명시적으로 처리하기
+전까지 유지됨.
+
+**TradingService 배선**: `_sync_position_state_machine_shadow()`
+에서 `ERROR` 전이를 `app_logger.critical()`로도 노출(기존엔
+`position_lifecycle.csv`에만 남아 놓치기 쉬웠음) — 새로 진입했을
+때뿐 아니라 이미 `ERROR` 상태로 남아있는 매 폴링마다 반복 알림
+(위 자동복구 방지 수정으로 `ERROR`가 유지되는 한 계속 알림 받음).
+
+**여전히 shadow 모드**: 이번 수정도 실제 매매 판정에는 영향을
+주지 않습니다 — `ERROR` 상태가 신규매수를 자동으로 막지는 않음.
+GPT가 함께 지적한 "ERROR 시 신규매수 전체 중지"는 이 상태머신을
+shadow에서 실제 판정으로 승격하는 큰 작업과 함께 처리하는 것으로
+계속 보류.
+
+**검증**: `test_position_lifecycle_error_state.py` — 16건 전부
+통과. 정확히 일치하는 정상 체결(회귀), 요청 초과 이상치의 `ERROR`
+전이, 재매수 중 이상치 감지, 정상 부분체결은 여전히 `BUY_PENDING`
+유지(회귀), 매도 중 잔고 증가 이상치의 `ERROR` 전이, 정상 매도
+부분체결 회귀, `ERROR` 상태가 여러 번의 `sync_from_broker()` 호출
+후에도 자동 복구되지 않고 유지되는지, `TradingService`를 실제로
+조립해 `ERROR` 전이 시 `app.log`에 CRITICAL 로그가 남고 다음
+폴링에도 반복 알림되는지까지 확인. 전체 회귀 기존 19개 파일
+재통과 확인 — 총 20개 테스트 파일.
+
+### 7.32 ERROR 상태가 재매수로 조용히 우회되는 경로 차단 (2026-07-24)
+
+**배경**: 7.31절에서 "ERROR는 사람이 확인하기 전까지 자동 복구되지
+않는다"를 만들었는데, GPT 10차 코드리뷰에서 이걸 우회하는 경로가
+하나 남아있다는 P0 지적을 받음.
+
+**P0 — `on_buy_requested()`가 ERROR 상태를 확인 없이 무조건
+`BUY_PENDING`으로 덮어씀**: `sync_from_broker()`는 `ERROR` 중
+자동 전이를 막도록 고쳤지만(7.31절), 새로운 매수 요청이 들어오면
+`on_buy_requested()`가 `ERROR` 여부와 상관없이 `BUY_PENDING`으로
+그냥 덮어쓰고 있었음. 재현 시나리오: (1) 이상치로 `ERROR` 진입 →
+(2) 다음 폴링에서 `sync_from_broker()` 호출(무시됨, 정상) → (3)
+재매수 신호로 `on_buy_requested()` 호출 → **여기서 `ERROR`가
+`BUY_PENDING`으로 조용히 풀림** → (4) `confirm_buy_from_broker()`
+가 새 `expected_min`을 기준으로 판단해 우연히 맞아떨어지면 그대로
+`OPEN`으로 확정 — 사람이 원래 이상치를 확인하기도 전에 `ERROR`
+이력 자체가 로그 상에서 사라지는 결과.
+
+**중요한 설계 판단**: `on_buy_requested()`가 호출되는 시점은 이미
+`place_order()`가 브로커에 전달된 **이후**이므로, 상태머신이 실제
+매수 자체를 막을 방법은 없음(shadow 모드의 근본적 한계 — 이건
+`RiskManager` 레벨에서 별도로 다뤄야 할 문제이지 상태머신이 해결할
+수 있는 범위가 아님). 상태머신이 할 수 있는 최선은 "지금 상황을
+정확히 반영하는 것" — `ERROR` 상태에서 매수 요청이 들어와도
+`lifecycle`은 `ERROR`로 유지하고, "ERROR 상태 중 매수 시도가
+있었다"는 사실만 로그에 남김.
+
+**매도는 다르게 처리**: 매도는 `ERROR`(불확실한 수량)를 정리하려는
+정상적인 시도일 수 있어 `on_sell_requested()`는 기존대로
+`SELL_PENDING` 전이를 허용 — 다만 "직전 `ERROR` 상태에서 매도
+시도"라는 맥락을 `detail`에 남겨, 나중에 로그를 볼 때 이 매도가
+이상치 정리 과정이었음을 알 수 있게 함.
+
+**보류(GPT P1 지적)**: "`ERROR` 상태 종목이 있으면 신규매수 전체를
+차단"하는 것은 `RiskManager`가 `PositionStateMachine`을 아예
+모르는 현재 구조상 shadow를 실제 판정으로 승격하는 큰 작업의
+일부라 계속 보류. 대신 이미 7.31절에서 `ERROR` 진입 시 및 유지되는
+동안 매 폴링마다 `app_logger.critical()`로 반복 알림하고 있어
+가시성은 이미 확보된 상태로 판단.
+
+**검증**: `test_position_lifecycle_error_bypass.py` — 11건 전부
+통과. `ERROR` 상태에서 매수 재요청해도 `BUY_PENDING`으로 안 풀리고
+유지되는지(P0 핵심), `sync→재매수→confirm` 전체 시나리오를 끝까지
+진행해도 `ERROR`가 유지되는지, 매도는 `ERROR` 상태에서도
+`SELL_PENDING`으로 정상 전이하고 이력이 로그에 남는지, 정상
+상태(`FLAT`/`OPEN`)에서의 기존 흐름은 회귀 없이 그대로 동작하는지
+확인. 전체 회귀 기존 20개 파일 재통과 확인 — 총 21개 테스트 파일.
+
+### 7.33 known_quantity 정확성 확보 + 사람의 명시적 정정 인터페이스 (2026-07-24)
+
+**배경**: 7.32절에서 "ERROR는 사람이 확인하기 전까지 우회되지
+않는다"를 만들었는데, GPT 11차 코드리뷰에서 두 가지 후속 문제를
+지적받음.
+
+**P0 — `known_quantity`가 이상치 감지 시점에 낡은 값으로 남아있음**:
+`confirm_buy_from_broker()`/`on_sell_result()`가 이상치를 감지해
+`lifecycle`은 `ERROR`로 바꿨지만, `known_quantity`는 건드리지
+않고 있었음(재현 확인: 요청 100주 상태에서 브로커 잔고가 500으로
+확인돼도 `known_quantity`는 매수 시도 전 값에 머묾). 이 시점에
+`CRITICAL` 로그나 다른 로직이 `known_quantity`를 참조하면 실제
+관찰된 값(500)이 아니라 부정확한 값을 보게 됨. `known_quantity`를
+실제 관찰값(`broker_quantity`)으로 갱신하도록 수정 — "우리가
+마지막으로 확인한 사실"을 정확히 반영. `pending_*`는 일부러
+지우지 않고 남겨서 "무엇을 기대했다가 어긋났는지"도 함께 보존.
+
+수정 과정에서 로그 메시지 순서 버그도 함께 발견 — `on_sell_result`
+에서 `known_quantity`를 먼저 갱신한 뒤 f-string으로 로그 메시지를
+만들면, "갱신 전 값"을 보여주려던 의도와 달리 이미 갱신된 값이
+찍힘. 갱신 전 값을 별도 변수(`known_before`)에 저장해 정확한
+이전값이 로그에 남도록 수정.
+
+**P1 — ERROR를 벗어나는 명시적 인터페이스 부재**: 지금까지
+`ERROR`를 벗어날 방법이 프로세스 재시작(시작 시 브로커 잔고로
+재초기화)뿐이었음 — 실전 운영 중 사람이 실제 계좌를 확인하고
+정정하려 해도 상태머신을 다시 정상 궤도로 되돌릴 방법이 없었음.
+`acknowledge_error(symbol, broker_quantity, note="")` 신규 추가 —
+사람이 확인한 실제 수량으로 `known_quantity`를 갱신하고 그 수량에
+맞는 `lifecycle`(`OPEN`/`FLAT`)로 전이, `pending_*`/`last_error`
+정리. `note`로 확인 근거를 남길 수 있어 `ERROR_ACKNOWLEDGED` 로그
+이벤트에 "누가 어떤 근거로 해제했는지" 이력이 남음. `ERROR`가
+아닌 상태에서 호출돼도 예외 없이 안전하게 재동기화하는 방어적
+처리 포함(오용 방지).
+
+**여전히 shadow 모드**: 이 메서드도 관찰용 상태만 정정하며 실제
+매매 판정에는 관여하지 않습니다.
+
+**검증**: `test_position_lifecycle_error_correction.py` — 16건
+전부 통과. 매수/매도 이상치 감지 시 `known_quantity`가 실제
+관찰값으로 정확히 갱신되는지, 로그 메시지에 순서버그 없이 갱신
+전 값이 정확히 남는지, `acknowledge_error()`로 `ERROR`를
+`OPEN`/`FLAT`(확인된 수량이 0인 경우)으로 정확히 전이시키는지,
+해제 이력이 `ERROR_ACKNOWLEDGED` 이벤트로 로그에 남는지, `ERROR`
+가 아닌 상태에서 호출해도 안전하게 처리되는지까지 확인. 전체
+회귀 기존 21개 파일 재통과 확인 — 총 22개 테스트 파일.
+
+### 7.34 acknowledge_error 입력검증 + 파일 기반 명령 인터페이스 (2026-07-24)
+
+**배경**: 7.33절에서 `acknowledge_error()`를 도입했는데, GPT 12차
+코드리뷰에서 실사용성 관점의 지적 두 건을 받음.
+
+**P1 — 입력값을 검증 없이 그대로 받아들임**: `broker_quantity`가
+음수여도(재현: `-100`을 넣으면 `known_quantity=-100`이라는 있을
+수 없는 값이 그대로 들어가고, `broker_quantity > 0` 판정에 우연히
+걸려 `FLAT`으로 확정됨), `note`가 빈 문자열이어도 예외 없이 조용히
+처리되고 있었음. 사람이 실제 계좌를 확인하고 부르는 마지막
+안전장치인 만큼 입력값 자체를 신뢰하지 않도록 강화 — `broker_
+quantity < 0`이면 `ValueError`로 거부, `note`를 필수 인자로
+전환(기본값 제거)해 근거 없는 해제를 원천 차단.
+
+**P1 — 실전에서 실질적으로 호출 불가능한 문제**: 이 프로세스는
+계속 도는 백그라운드 asyncio 프로세스(`app/main.py`의
+`asyncio.run(async_main())`)라, REPL이나 디버거 연결 없이는 실행
+중에 `acknowledge_error()`를 부를 방법이 전혀 없었음 — 있으나
+마나 한 인터페이스였다는 지적.
+
+**구현**: 파일 시스템을 통한 가장 단순한 명령 전달 방식 채택.
+`commands/ack_error_{symbol}.json` 파일을 두면 다음 폴링(최대
+`poll_interval_seconds` 이내)에서 읽어 처리하고 즉시 삭제(중복
+처리 방지).
+
+```json
+{"broker_quantity": 100, "note": "HTS 직접 확인, 실제 100주"}
+```
+
+```powershell
+$body = @{ broker_quantity = 100; note = "HTS 직접 확인" } | ConvertTo-Json
+$body | Out-File -Encoding utf8 commands\ack_error_475150.json
+```
+
+`TradingService._process_pending_ack_error_commands()` 신규 —
+`_sync_position_state_machine_shadow()` 시작 시 매 폴링마다 호출.
+잘못된 명령(음수/필드 누락/JSON 파싱 실패)도 안전하게 처리 —
+`ERROR` 상태는 그대로 유지한 채 오류 로그만 남기고 파일은 삭제
+(같은 잘못된 파일이 매 폴링마다 반복 실패하는 것을 방지, 오류
+사유는 `app.log`의 `[ACK_ERROR_COMMAND]`로 확인 가능). `commands/`
+디렉토리 자체가 없어도 안전하게 넘어감(정상 운영에서는 이 파일이
+없는 게 기본이므로).
+
+**여전히 shadow 모드**: 이번 수정도 관찰용 상태만 정정하며 실제
+매매 판정에는 관여하지 않습니다.
+
+**검증**: `test_position_lifecycle_ack_command.py` — 14건 전부
+통과. 음수/빈 문자열/공백만 있는 `note` 거부, 정상 입력 회귀
+확인, `note` 파라미터가 실제로 기본값 없이 필수화됐는지 시그니처
+검사, `commands/` 디렉토리 부재 시 안전 처리, 정상 명령 파일이
+실제 `TradingService`를 통해 처리되고(`ERROR`→`OPEN`,
+`known_quantity` 정정) 파일이 삭제되는지, 잘못된 명령(음수/필드
+누락)도 안전하게 처리되고 삭제되는지까지 확인. 실제
+`TradingService`로 `run_once()`를 연속 호출하는 통합 확인도
+추가로 수행. 전체 회귀 기존 22개 파일 재통과 확인 — 총 23개
+테스트 파일.
+
+### 7.35 명령 파일 처리 루프의 예외 방어 강화 + 처리 순서 보장 (2026-07-24)
+
+**배경**: 7.34절에서 도입한 파일 기반 명령 인터페이스에 대해 GPT
+13차 코드리뷰에서 P1 지적을 받음.
+
+**P1 — 나열되지 않은 예외가 나오면 for 루프 전체가 중단됨**:
+`_process_pending_ack_error_commands()`의 `except` 절이
+`(OSError, JSONDecodeError, KeyError, ValueError, TypeError)`로
+좁게 나열돼 있었음. `finally`가 있어서 "예외가 난 파일이 삭제된다"
+는 보장은 됐지만, 나열 안 된 예외 타입(`RuntimeError` 등)이
+나오면 함수 자체가 예외를 던지며 중단돼, for 루프 뒤에 남은
+**다른 명령 파일들은 이번 폴링에서 아예 처리되지 못하고**,
+`run_once()`가 그 폴링 사이클 전체를 실패로 끝낼 위험이 있었음
+(재현 확인: `RuntimeError`를 강제로 발생시켰더니 실제로 좁은
+예외 목록으로는 catch가 안 됨).
+
+**수정**: `except (OSError, ...)` → `except Exception`으로 범위
+확대. `KeyboardInterrupt`/`SystemExit`는 `BaseException`만
+상속하고 `Exception`은 상속하지 않으므로 의도적으로 여기 걸리지
+않음(시스템 종료 신호는 여전히 정상적으로 전파됨). `acknowledge_
+error()`가 앞으로 새로운 예외 타입을 던지게 바뀌거나
+`PositionStateMachine` 내부 구현이 달라져도, 명령 파일 하나
+때문에 전체 처리 루프가 끊기지 않도록 방어.
+
+**P1 — 여러 명령 파일의 처리 순서 미보장**: `Path.glob()`은
+파일시스템 순회 순서에 의존하며 정렬을 보장하지 않아, 명령 파일이
+여러 개일 때 처리/로그 순서가 예측 불가능했음. `sorted()`를 추가
+— 파일명에 종목코드가 포함돼 있어 자연스럽게 종목코드순으로
+처리됨.
+
+**여전히 shadow 모드**: 이번 수정도 관찰용 상태 정정 흐름의
+견고성만 높인 것이며 실제 매매 판정에는 관여하지 않습니다.
+
+**검증**: `test_position_lifecycle_ack_robustness.py` — 9건 전부
+통과. 나열되지 않은 예외(`RuntimeError`)를 강제로 발생시켜도
+함수 자체가 예외 없이 완료되는지(P1 핵심), 첫 번째 명령에서
+예외가 나도 두 번째 명령까지 정상 처리되는지, 예외난 파일도
+정상 처리된 파일도 모두 `finally`로 삭제되는지, 예외 상황이
+`app.log`에 기록되는지, 여러 명령 파일이 정렬된 순서로 처리되는지,
+정상 케이스 회귀까지 확인. 수정 전 예외 목록으로는 `RuntimeError`
+가 실제로 catch되지 않았을 것임을 별도로 검증해 이번 수정이
+실질적으로 의미 있었음을 확인. 전체 회귀 기존 23개 파일 재통과
+확인 — 총 24개 테스트 파일.
+
 ---
 
 ## 8. 로깅 인프라 개선 (2026-07-14)
