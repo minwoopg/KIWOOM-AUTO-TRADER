@@ -25,7 +25,7 @@ GPT 코드리뷰 설계 원칙:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
 # 2026-07-27 (실운영 크래시로 발견, 긴급 수정): 원래 zoneinfo.
@@ -50,9 +50,20 @@ KST = timezone(timedelta(hours=9), name="Asia/Seoul")
 # utils/time_utils.py의 MARKET_OPEN=09:00, MARKET_CLOSE=15:20을
 # 그대로 가져옴 — 다만 이 값은 "신규 매수/매도 중단 시각"(15:20)
 # 이지 실제 정규장 마감(통상 15:30)과는 다른 의미라는 점에 주의.
-# 진단 목적(장중 정규 시간대 밖 봉이 섞였는지 관찰)에는 기존 값을
-# 그대로 쓰는 게 프로젝트 전체의 시간 기준과 일관성이 있어 안전함.
 from utils.time_utils import MARKET_OPEN, MARKET_CLOSE  # noqa: E402
+
+# 2026-07-27 (2차 GPT 코드리뷰 지적): 위 MARKET_CLOSE(15:20)는
+# "프로그램이 신규 매수/매도를 중단하는 전략 거래창 종료 시각"이지
+# 실제 한국거래소 정규장 마감 시각(15:30)이 아님 — 두 의미를
+# outside_session_count 하나로 뭉뚱그리면, "봉이 전략 거래창 밖"인
+# 것과 "봉이 아예 정규장 밖(거래소 자체가 안 열린 시간)"인 것을
+# 구분할 수 없었음. 프로젝트에 15:30을 나타내는 기존 상수가 없어서
+# (utils/time_utils.py, config/settings.yaml 전체 검색 결과 없음
+# 확인) 진단 전용 상수로 새로 정의 — 한국거래소(KRX) 정규장은
+# 09:00~15:30이 공식 운영시간(동시호가 마감 포함)이라는 일반적으로
+# 알려진 기준을 근거로 함. 이 상수는 매매 로직에 전혀 쓰이지 않고
+# 오직 진단 목적으로만 사용됨.
+REGULAR_MARKET_CLOSE = time(15, 30)
 
 
 @dataclass(frozen=True)
@@ -100,7 +111,12 @@ class MinuteBarDiagnostics:
     next_key_present: bool               # next-key 비어있지 않음 (원문 미저장)
 
     other_date_count: int                # base_date와 다른 날짜의 봉 개수 (raw 전체 기준)
-    regular_session_outside_count: int   # 정규장 시간(MARKET_OPEN~MARKET_CLOSE) 밖 봉 개수
+    # 2026-07-27 (2차 GPT 코드리뷰 지적): 기존 regular_session_
+    # outside_count 하나였던 걸, "전략 거래창(09:00~15:20) 밖"과
+    # "실제 정규장(09:00~15:30) 밖"으로 명확히 분리. 전자는 프로그램
+    # 관점(신규매수/매도 중단 시각), 후자는 거래소 관점(정규장 자체).
+    outside_strategy_window_count: int   # MARKET_OPEN~MARKET_CLOSE(15:20) 밖 봉 개수
+    outside_regular_market_count: int    # MARKET_OPEN~REGULAR_MARKET_CLOSE(15:30) 밖 봉 개수
     duplicate_timestamp_count: int       # raw 전체에서 중복된 timestamp 개수
     invalid_timestamp_count: int         # cntr_tm 파싱 실패 개수 (raw_received_count - raw_timestamp_parseable_count와 동일할 수 있음)
 
@@ -123,9 +139,22 @@ def _parse_bar_timestamp(cntr_tm: str) -> datetime | None:
         return None
 
 
-def _infer_sort_direction(timestamps: list[str]) -> str:
-    """timestamp 리스트(파싱 가능한 것만)의 정렬 방향을 추정합니다."""
-    valid = [ts for ts in timestamps if ts and len(ts) == 14 and ts.isdigit()]
+def _infer_sort_direction(parsed_pairs: list[tuple[str, datetime | None]]) -> str:
+    """(원본 timestamp, 파싱된 datetime) 쌍 리스트에서 정렬 방향을 추정합니다.
+
+    2026-07-27 (2차 GPT 코드리뷰 지적, 재현 확인): 기존엔 이 함수와
+    _count_order_violations()가 각각 독립적으로 "14자리 숫자인가"
+    라는 얕은 형식 검사만 하고, _parse_bar_timestamp()가 실제로
+    파싱에 성공하는지(예: "20260230120000"처럼 2월 30일 같은 존재
+    하지 않는 날짜)는 확인하지 않았음 — 형식은 14자리 숫자로
+    맞지만 실제로는 유효하지 않은 날짜가 문자열 비교에 그대로
+    섞여 들어가 잘못된 정렬 판정을 내리는 것을 재현 확인. 이제
+    _parse_bar_timestamp()가 실제로 성공한(None이 아닌) 원소만,
+    원래 순서 그대로 필터링해서 사용 — 파싱 자체를 이 함수가
+    다시 하지 않고 호출부가 이미 계산해둔 결과를 재사용해 두 함수
+    간 판단 기준이 어긋나지 않도록 함.
+    """
+    valid = [ts for ts, dt in parsed_pairs if dt is not None]
     if len(valid) < 2:
         return "N/A"
     if all(a <= b for a, b in zip(valid, valid[1:])):
@@ -135,7 +164,7 @@ def _infer_sort_direction(timestamps: list[str]) -> str:
     return "UNKNOWN"
 
 
-def _count_order_violations(timestamps: list[str], direction: str) -> int:
+def _count_order_violations(parsed_pairs: list[tuple[str, datetime | None]], direction: str) -> int:
     """주어진 방향(ASC/DESC) 기준으로 어긋나는 인접 쌍의 개수를 셉니다.
 
     2026-07-27 (실운영 첫 로그 검토로 추가): raw_sort_direction=
@@ -143,8 +172,11 @@ def _count_order_violations(timestamps: list[str], direction: str) -> int:
     — 위반이 1건뿐이면 API 응답의 사소한 흔들림일 수 있고, 위반이
     수십 건이면 애초에 정렬 자체가 안 되어 있다는 뜻이라 원인이
     다름. 기준 방향은 전체 다수결(더 많이 만족하는 쪽)로 정함.
+
+    2026-07-27 (2차 GPT 코드리뷰 지적): _infer_sort_direction()과
+    동일하게, 파싱 성공한(dt is not None) 원소만 사용하도록 수정.
     """
-    valid = [ts for ts in timestamps if ts and len(ts) == 14 and ts.isdigit()]
+    valid = [ts for ts, dt in parsed_pairs if dt is not None]
     if len(valid) < 2:
         return 0
     if direction not in ("ASC", "DESC"):
@@ -195,31 +227,41 @@ def build_minute_bar_diagnostics(
     oldest_raw = min(valid_raw_timestamps) if valid_raw_timestamps else None
     newest_raw = max(valid_raw_timestamps) if valid_raw_timestamps else None
 
-    # raw 전체 순서 그대로의 정렬 방향(min/max가 아니라 원래 순서 기준)
-    raw_order_timestamps = [ts for ts in raw_timestamps_all if ts]
-    raw_sort_direction = _infer_sort_direction(raw_order_timestamps)
-    raw_order_violation_count = _count_order_violations(raw_order_timestamps, raw_sort_direction)
-    raw_order_head_sample = raw_order_timestamps[:5]
-    raw_order_tail_sample = raw_order_timestamps[-5:] if raw_order_timestamps else []
+    # 2026-07-27 (2차 GPT 코드리뷰 지적): raw 전체 순서 그대로의
+    # 정렬 방향을 판단할 때, 이미 위에서 계산해둔 parsed_dt_pairs
+    # (실제 파싱 성공 여부까지 반영된 결과)를 그대로 재사용 —
+    # _infer_sort_direction()/_count_order_violations()가 별도로
+    # "14자리 숫자인가"라는 얕은 검사를 다시 하지 않도록 함(중복
+    # 파싱을 피하고, 두 곳의 유효성 판단 기준이 어긋나지 않도록).
+    raw_sort_direction = _infer_sort_direction(parsed_dt_pairs)
+    raw_order_violation_count = _count_order_violations(parsed_dt_pairs, raw_sort_direction)
+    # head/tail 샘플도 파싱 성공한 timestamp만, 원본 순서 그대로 사용
+    valid_raw_timestamps_in_order = [ts for ts, dt in parsed_dt_pairs if dt is not None]
+    raw_order_head_sample = valid_raw_timestamps_in_order[:5]
+    raw_order_tail_sample = valid_raw_timestamps_in_order[-5:] if valid_raw_timestamps_in_order else []
 
-    returned_valid_timestamps = [ts for ts in returned_bars_timestamps if ts]
+    returned_parsed_pairs = [(ts, _parse_bar_timestamp(ts)) for ts in returned_bars_timestamps]
+    returned_valid_timestamps = [ts for ts, dt in returned_parsed_pairs if dt is not None]
     returned_oldest = min(returned_valid_timestamps) if returned_valid_timestamps else None
     returned_newest = max(returned_valid_timestamps) if returned_valid_timestamps else None
-    returned_sort_direction = _infer_sort_direction(returned_bars_timestamps)
+    returned_sort_direction = _infer_sort_direction(returned_parsed_pairs)
 
     other_date_count = sum(
         1 for ts in valid_raw_timestamps if len(base_date) == 8 and ts[:8] != base_date
     )
 
-    def _in_regular_session(ts: str) -> bool:
+    def _outside_window(ts: str, window_close: time) -> bool:
         dt = _parse_bar_timestamp(ts)
         if dt is None:
-            return True  # 파싱 실패는 "정규장 밖" 통계에 포함하지 않음(별도 invalid로 집계)
+            return False  # 파싱 실패는 "밖" 통계에 포함하지 않음(별도 invalid로 집계)
         t = dt.time()
-        return MARKET_OPEN <= t <= MARKET_CLOSE
+        return not (MARKET_OPEN <= t <= window_close)
 
-    regular_session_outside_count = sum(
-        1 for ts in valid_raw_timestamps if not _in_regular_session(ts)
+    outside_strategy_window_count = sum(
+        1 for ts in valid_raw_timestamps if _outside_window(ts, MARKET_CLOSE)
+    )
+    outside_regular_market_count = sum(
+        1 for ts in valid_raw_timestamps if _outside_window(ts, REGULAR_MARKET_CLOSE)
     )
 
     duplicate_timestamp_count = len(valid_raw_timestamps) - len(set(valid_raw_timestamps))
@@ -267,7 +309,8 @@ def build_minute_bar_diagnostics(
         continuation_available=continuation_available,
         next_key_present=next_key_present,
         other_date_count=other_date_count,
-        regular_session_outside_count=regular_session_outside_count,
+        outside_strategy_window_count=outside_strategy_window_count,
+        outside_regular_market_count=outside_regular_market_count,
         duplicate_timestamp_count=duplicate_timestamp_count,
         invalid_timestamp_count=invalid_count,
         newest_raw_bar_age_seconds=newest_raw_bar_age_seconds,
@@ -276,19 +319,47 @@ def build_minute_bar_diagnostics(
     )
 
 
+def _format_iso_or_na(dt: datetime | None) -> str:
+    """datetime을 ISO 8601(+09:00 형태)로 포맷하거나, 없으면 'N/A'를 반환합니다."""
+    if dt is None:
+        return "N/A"
+    try:
+        return dt.isoformat()
+    except (TypeError, ValueError):
+        return "N/A"
+
+
 def format_diagnostics_log_line(d: MinuteBarDiagnostics) -> str:
     """진단 결과를 한 줄 로그 문자열로 포맷합니다 (원문 민감정보 미포함)."""
     age = f"{d.newest_raw_bar_age_seconds:.1f}" if d.newest_raw_bar_age_seconds is not None else "N/A"
+
+    # 2026-07-27 (2차 GPT 코드리뷰 지적): 요청/응답 시각, 소요시간,
+    # 반환 분봉의 최고/최신 timestamp가 로그에 전혀 없었음 — 값이
+    # 있으면 ISO 8601(+09:00) 형태로, 없으면 'N/A'로 명시.
+    request_str = _format_iso_or_na(d.request_started_at)
+    response_str = _format_iso_or_na(d.response_received_at)
+    duration_ms = "N/A"
+    if d.request_started_at is not None and d.response_received_at is not None:
+        try:
+            duration_ms = f"{(d.response_received_at - d.request_started_at).total_seconds() * 1000:.1f}"
+        except (TypeError, ValueError):
+            pass
+
     return (
         f"[MIN_BOOTSTRAP] symbol={d.symbol} date={d.base_date} tick_scope={d.tick_scope} "
         f"requested={d.requested_count} raw_received={d.raw_received_count} "
         f"raw_excess={d.raw_excess_count} raw_exceeds_requested={d.raw_received_exceeds_requested} "
         f"raw_parseable={d.raw_timestamp_parseable_count} returned={d.returned_parsed_count} "
+        f"request_started_at={request_str} response_received_at={response_str} "
+        f"request_duration_ms={duration_ms} "
         f"oldest_raw={d.oldest_raw_timestamp} newest_raw={d.newest_raw_timestamp} "
+        f"returned_oldest={d.returned_oldest_timestamp} returned_newest={d.returned_newest_timestamp} "
         f"raw_order={d.raw_sort_direction} raw_order_violations={d.raw_order_violation_count} "
         f"returned_order={d.returned_sort_direction} "
         f"continuation={d.continuation_available} next_key_present={d.next_key_present} "
-        f"other_date={d.other_date_count} outside_session={d.regular_session_outside_count} "
+        f"other_date={d.other_date_count} "
+        f"outside_strategy_window={d.outside_strategy_window_count} "
+        f"outside_regular_market={d.outside_regular_market_count} "
         f"duplicates={d.duplicate_timestamp_count} invalid_ts={d.invalid_timestamp_count} "
         f"newest_bar_age_sec={age} "
         f"same_minute_as_response={d.newest_raw_bar_same_minute_as_response} "

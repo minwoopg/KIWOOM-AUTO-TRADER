@@ -132,23 +132,11 @@ class KiwoomBroker(Broker):
         base_dt = date.today().strftime("%Y%m%d")
 
         # 진단용 요청 시작 시각 (KST) — 기존 로직에는 영향 없음.
-        # 2026-07-27 (긴급 수정): 이전엔 여기서 zoneinfo.ZoneInfo를
-        # 직접 만들었는데, 이 지점이 아래 _maybe_log_minute_bar_
-        # diagnostics()를 감싸는 try/except보다 앞이라, tzdata 부재로
-        # 예외가 나면 fail-open 보호막 밖에서 get_minute_bars() 자체가
-        # 죽어버림(실제 재현됨 — Windows에서 tzdata 미설치 시
-        # ModuleNotFoundError로 분봉 조회 자체가 실패). minute_bar_
-        # diagnostics.KST(외부 tzdata 의존성 없는 고정 UTC+9)를 재사용
-        # 하고, 혹시 모를 예외에도 대비해 이 블록 자체도 try/except로
-        # 감싸 최악의 경우 시각 기록만 None으로 남기고 분봉 조회는
-        # 계속되도록 함.
-        _request_started_at = None
-        try:
-            from infra.broker.minute_bar_diagnostics import KST as _KST
-            from datetime import datetime as _dt
-            _request_started_at = _dt.now(_KST)
-        except Exception:
-            pass
+        # 2026-07-27 (2차 GPT 코드리뷰 지적): 요청/응답 시각을 각각
+        # try/except로 감싸는 동일한 코드가 두 번 중복되어 있었음 —
+        # _safe_diagnostic_now() 헬퍼로 정리. 예외가 나도 None을
+        # 반환할 뿐 절대 던지지 않으므로, 분봉 반환 로직을 막지 않음.
+        _request_started_at = self._safe_diagnostic_now()
 
         api_response = self._post(
             endpoint="/api/dostk/chart",
@@ -162,15 +150,34 @@ class KiwoomBroker(Broker):
         )
 
         # 진단용 응답 수신 시각 — 기존 로직에는 영향 없음
-        _response_received_at = None
-        try:
-            from infra.broker.minute_bar_diagnostics import KST as _KST
-            from datetime import datetime as _dt
-            _response_received_at = _dt.now(_KST)
-        except Exception:
-            pass
+        _response_received_at = self._safe_diagnostic_now()
 
         raw_bars = api_response.body.get("stk_min_pole_chart_qry", [])
+
+        # 2026-07-27 (2차 GPT 코드리뷰 지적): 기존엔 raw_bars가 비어
+        # 있으면 진단 로직(아래)에 도달하기도 전에 바로 return []해서,
+        # 빈 응답의 요청/응답 시각, raw_received=0, continuation
+        # 여부 등을 전혀 확인할 수 없었음. 진단을 먼저 남긴 뒤 기존
+        # "빈 응답 에러 로그 + return []" 로직은 그대로 유지 — 기존
+        # 반환값(빈 리스트)과 에러 로그 내용은 완전히 동일하게 보존.
+        try:
+            self._maybe_log_minute_bar_diagnostics(
+                symbol=symbol,
+                base_date=base_dt,
+                tick_scope=str(tick_scope),
+                requested_count=count,
+                raw_bars=raw_bars,
+                returned_bars=[],
+                headers=api_response.headers,
+                request_started_at=_request_started_at,
+                response_received_at=_response_received_at,
+            )
+        except Exception as diag_exc:
+            import logging
+            logging.getLogger("app").warning(
+                f"[MIN_BOOTSTRAP] {symbol} | 진단 로그 생성 실패(무시, 분봉 조회는 정상 진행): "
+                f"{diag_exc}"
+            )
 
         # 빈 응답이면 응답 body 키를 로그에 남겨 원인 파악
         if not raw_bars:
@@ -222,6 +229,23 @@ class KiwoomBroker(Broker):
             )
 
         return bars
+
+    @staticmethod
+    def _safe_diagnostic_now():
+        """진단용 현재 시각(KST)을 안전하게 반환합니다. 절대 예외를 던지지 않습니다.
+
+        2026-07-27 (2차 GPT 코드리뷰 지적): get_minute_bars()에서
+        요청 시작/응답 수신 두 지점이 각각 동일한 try/except
+        패턴을 중복하고 있었음 — 하나의 헬퍼로 정리. 실패 시 None을
+        반환하며, 이 반환값이 None이어도 이후 로직(분봉 파싱/반환)
+        은 전혀 영향받지 않음(진단 필드가 None으로 남을 뿐).
+        """
+        try:
+            from datetime import datetime as _dt
+            from infra.broker.minute_bar_diagnostics import KST as _KST
+            return _dt.now(_KST)
+        except Exception:
+            return None
 
     def _maybe_log_minute_bar_diagnostics(
         self,

@@ -768,3 +768,109 @@ zoneinfo`(모듈 자체 import, `tzdata` 없이도 항상 성공)와
 `run_regression_tests.py` — 27개 파일 전부 통과, 종료코드 0.
 
 ---
+
+## 1B.4: 진단 정밀도 보강 (2026-07-27)
+
+**배경**: 1B.3까지의 결과를 GPT가 재검토 — 운영 코드 방향(고정
+UTC+9, fail-open)은 승인하되, 1B 완료로 보기엔 이르다며 8가지
+보완을 요청. `test_minute_bar_diagnostics.py` 상단 `ZoneInfo`
+잔존 지적은 이번 세션 코드에서는 이미 1B.3에서 제거되어 있었음을
+재확인(민우님 로컬 반영 시점 차이로 추정) — 나머지 7가지를 실제로
+검증하고 반영.
+
+### 1. _infer_sort_direction 얕은 형식검사 버그 (가장 중요)
+
+GPT가 제시한 정확한 재현 케이스로 검증: `["20260721091600",
+"20260230120000"(2월 30일, 존재하지 않는 날짜), "20260721091400"]`
+— 기존 코드는 `_parse_bar_timestamp()`가 실제로 성공하는지 확인
+안 하고 "14자리 숫자인가"라는 얕은 검사만 해서, 무효한 날짜가
+문자열 비교에 섞여 `raw_sort_direction=UNKNOWN`으로 잘못 판정
+(재현 확인). `_infer_sort_direction()`/`_count_order_violations()`
+시그니처를 `(원본 timestamp, 파싱된 datetime)` 튜플 리스트로
+변경해 파싱 성공 여부를 명시적으로 반영 — 수정 후 동일 케이스가
+`invalid_timestamp_count=1`, `raw_sort_direction=DESC`(GPT 기대값과
+정확히 일치)로 계산됨을 확인. `build_minute_bar_diagnostics()`
+에서 이미 계산해둔 `parsed_dt_pairs`를 그대로 재사용하도록 해서
+중복 파싱과 판단 기준 불일치를 함께 제거.
+
+### 2. 로그 필드 확장
+
+`format_diagnostics_log_line()`에 `request_started_at`/`response_
+received_at`(ISO 8601 +09:00, 값 없으면 `N/A`), `request_duration_
+ms`, `returned_oldest_timestamp`/`returned_newest_timestamp` 추가.
+`_format_iso_or_na()` 헬퍼로 포맷 통일.
+
+### 3. (위 1번과 통합 처리)
+
+### 4. 빈 raw_bars에서도 진단 우선 실행
+
+기존엔 `if not raw_bars: return []`이 진단 로직보다 먼저 실행돼
+빈 응답의 요청/응답 시각·`raw_received=0`·continuation 여부를
+전혀 확인할 수 없었음(재현 확인). 진단을 먼저 남기도록 순서
+변경 — 기존 반환값(빈 리스트)과 에러 로그는 완전히 동일하게 보존.
+**보류한 부분**: 빈 응답 후 같은 조합으로 재시도해 정상 응답이
+오면, 최초 1회 키가 이미 등록되어 있어 두 번째 진단이 안 남는
+설계 — 이건 이번 지시 범위를 벗어나는 별도 설계 문제(빈 응답과
+정상 응답을 다르게 취급할지)라 확장하지 않고 현재 동작을 유지.
+
+### 5. MARKET_CLOSE(전략 거래창)와 정규장 마감 분리
+
+프로젝트 전체 검색 결과 15:30(정규장 마감)을 나타내는 기존
+상수가 없음을 확인 후, 진단 전용 상수 `REGULAR_MARKET_CLOSE =
+time(15, 30)`을 신설(근거: 한국거래소 정규장 공식 운영시간
+09:00~15:30 — 이 상수는 매매 로직에 전혀 쓰이지 않고 오직 진단
+목적으로만 사용). `regular_session_outside_count` 단일 필드를
+`outside_strategy_window_count`(09:00~15:20 밖)와 `outside_
+regular_market_count`(09:00~15:30 밖)로 분리. 15:25(전략거래창
+밖, 정규장 안)를 포함한 합성 데이터로 두 값이 서로 다르게
+계산됨(2건 vs 1건)을 확인.
+
+### 6. legacy_parse가 실제 _parse_abs_int 규칙을 재현하지 않던 문제
+
+기존 `legacy_parse()`가 단순 `int(item.get(...))`만 사용해, 실제
+`_parse_abs_int()`의 특수 규칙(`None`/빈문자열→0, 음수/`+`부호는
+절대값, 0 패딩, 잘못된 문자열→0)이 검증에서 전혀 드러나지 않고
+있었음(합성 데이터가 전부 깨끗한 양수 문자열이었기 때문). 실제
+구현을 그대로 복제한 `_legacy_parse_abs_int()`로 교체하고, 7가지
+엣지케이스(정상/음수/`+`부호/0패딩/빈문자열/`None`/잘못된문자열)
+로 `MinuteBar` 리스트 전체 equality를 검증.
+
+### 7. 테스트 22번 설명 정정
+
+"Windows tzdata 부재 완전 재현"이라는 설명이 부정확하다는 지적을
+받아들여, 이 테스트가 실제로 검증하는 것("진단 모듈 동적 import
+실패 시 broker fail-open")과 검증하지 않는 것("실제 Windows에서
+tzdata 미설치 시 무슨 일이 일어나는가")을 명확히 구분해 주석과
+변수명(`result_no_tzdata` → `result_diag_import_failed`)을 정정.
+KST가 zoneinfo에 의존하지 않는지는 별도 검증 항목으로 유지.
+
+### 8. get_minute_bars 시각 기록 중복 정리
+
+요청 시작/응답 수신 두 지점에서 동일한 `try/except` 패턴이
+중복되어 있던 것을 `KiwoomBroker._safe_diagnostic_now()`
+정적 메서드로 정리 — 예외가 나도 `None`을 반환할 뿐 절대 던지지
+않으므로 분봉 반환 로직에 영향 없음.
+
+**검증**: `test_minute_bar_diagnostics.py` — GPT의 정확한 재현
+케이스를 23번 테스트로 추가(`invalid=1, raw_sort_direction=DESC`
+정확히 확인), 로그 필드 확장을 24번 테스트로 추가(ISO8601 형식,
+`N/A` 대조군 포함), 빈 응답 진단을 10-1번 테스트로 추가, 엣지
+케이스 7건을 1-1번 테스트로 추가. 총 39→62건 전부 통과.
+
+**전체 회귀**: `run_regression_tests.py` — 27개 파일 전부 통과,
+종료코드 0.
+
+**실제 로그 예시**:
+```
+[MIN_BOOTSTRAP] symbol=475150 date=20260721 tick_scope=1 requested=60 raw_received=2 raw_excess=-58 raw_exceeds_requested=False raw_parseable=2 returned=2 request_started_at=2026-07-21T09:16:45.100000+09:00 response_received_at=2026-07-21T09:16:45.350000+09:00 request_duration_ms=250.0 oldest_raw=20260720143900 newest_raw=20260721091600 returned_oldest=20260720143900 returned_newest=20260721091600 raw_order=DESC raw_order_violations=0 returned_order=ASC continuation=False next_key_present=False other_date=1 outside_strategy_window=0 outside_regular_market=0 duplicates=0 invalid_ts=0 newest_bar_age_sec=45.4 same_minute_as_response=True is_future=False
+```
+
+**⚠️ 여전히 필요한 것**: 이 CHANGELOG는 합성 데이터 검증까지만
+반영합니다. GPT가 요청한 "Windows에서 직접 `python test_minute_
+bar_diagnostics.py`와 `python run_regression_tests.py`를 실행한
+결과, 실제 `[MIN_BOOTSTRAP]` 한 줄"은 민우님이 로컬에서 직접
+확인해주셔야 하는 부분으로 남아있습니다 — 이게 확인되어야 1C로
+진행합니다.
+
+---
+

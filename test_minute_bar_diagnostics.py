@@ -81,18 +81,42 @@ def make_raw_bars(n: int, start: datetime, desc: bool = True) -> list[dict]:
     return bars
 
 
+def _legacy_parse_abs_int(value) -> int:
+    """kiwoom_broker.py의 _parse_abs_int()를 정확히 재현한 비교 기준선.
+
+    2026-07-27 (2차 GPT 코드리뷰 지적): 기존 legacy_parse()가
+    단순히 int(item.get(...))만 써서, 합성 테스트 데이터가 전부
+    "58000"처럼 깨끗한 양수 문자열이라 실제 _parse_abs_int()의
+    특수 규칙(None/빈문자열->0, 음수/+부호는 절대값, 0 padding,
+    잘못된 문자열->0)이 검증에서 전혀 드러나지 않고 있었음. 실제
+    구현을 그대로 복사(원본이 바뀌면 이 사본도 함께 갱신 필요 —
+    이건 "복제해서 비교"하는 회귀 테스트의 근본적 한계이지만, 진단
+    추가 전후 byte-for-byte 동등성을 확인하는 목적에는 원본과
+    독립적인 재현이 필요함).
+    """
+    if value is None:
+        return 0
+    text = str(value).strip()
+    if not text:
+        return 0
+    try:
+        return abs(int(float(text)))
+    except ValueError:
+        return 0
+
+
 def legacy_parse(raw_bars: list[dict], count: int) -> list[MinuteBar]:
     """진단 추가 이전의 순수 로직을 정확히 재현 (비교 기준선)."""
     bars = []
     for item in raw_bars[:count]:
         bars.append(MinuteBar(
             cntr_tm=str(item.get("cntr_tm", "")),
-            open_price=int(item.get("open_pric")),
-            high_price=int(item.get("high_pric")),
-            low_price=int(item.get("low_pric")),
-            close_price=int(item.get("cur_prc")),
-            volume=int(item.get("trde_qty")),
-            acc_volume=int(item.get("acc_trde_qty")),
+            open_price=_legacy_parse_abs_int(item.get("open_pric")),
+            high_price=_legacy_parse_abs_int(item.get("high_pric")),
+            low_price=_legacy_parse_abs_int(item.get("low_pric")),
+            close_price=_legacy_parse_abs_int(item.get("cur_prc")),
+            volume=_legacy_parse_abs_int(item.get("trde_qty")),
+            acc_volume=_legacy_parse_abs_int(item.get("acc_trde_qty")),
         ))
     bars.reverse()
     return bars
@@ -128,6 +152,80 @@ identical = len(legacy_result) == len(actual_result) and all(
 )
 check("   반환된 MinuteBar 전체가 legacy 로직 결과와 byte-for-byte 동일함"
       "(진단 추가가 반환값에 전혀 영향 없음)", identical)
+
+# ── 1-1. _parse_abs_int의 실제 특수 규칙(음수/+부호/0패딩/빈문자열/
+#         None/잘못된문자열)까지 포함한 byte-for-byte 검증 ──────────
+# (2026-07-27, 2차 GPT 코드리뷰 지적 — 위 1번은 전부 깨끗한 양수
+#  문자열이라 이 규칙들이 검증에서 전혀 드러나지 않았음)
+edge_case_ts = base + timedelta(minutes=1)
+edge_raw_bars = [
+    {  # 정상 양수 문자열
+        "cntr_tm": edge_case_ts.strftime("%Y%m%d%H%M%S"),
+        "open_pric": "58000", "high_pric": "58200", "low_pric": "57900",
+        "cur_prc": "58100", "trde_qty": "1000", "acc_trde_qty": "50000",
+    },
+    {  # 음수 부호 (실제 키움 응답에서 자주 나타남 — 절대값으로 변환돼야 함)
+        "cntr_tm": (edge_case_ts + timedelta(minutes=1)).strftime("%Y%m%d%H%M%S"),
+        "open_pric": "-58000", "high_pric": "-58200", "low_pric": "-57900",
+        "cur_prc": "-58100", "trde_qty": "-1000", "acc_trde_qty": "-50000",
+    },
+    {  # + 부호
+        "cntr_tm": (edge_case_ts + timedelta(minutes=2)).strftime("%Y%m%d%H%M%S"),
+        "open_pric": "+58000", "high_pric": "+58200", "low_pric": "+57900",
+        "cur_prc": "+58100", "trde_qty": "+1000", "acc_trde_qty": "+50000",
+    },
+    {  # 0 패딩
+        "cntr_tm": (edge_case_ts + timedelta(minutes=3)).strftime("%Y%m%d%H%M%S"),
+        "open_pric": "000000058000", "high_pric": "000058200", "low_pric": "0057900",
+        "cur_prc": "00058100", "trde_qty": "0001000", "acc_trde_qty": "00050000",
+    },
+    {  # 빈 문자열 -> 0
+        "cntr_tm": (edge_case_ts + timedelta(minutes=4)).strftime("%Y%m%d%H%M%S"),
+        "open_pric": "", "high_pric": "", "low_pric": "",
+        "cur_prc": "", "trde_qty": "", "acc_trde_qty": "",
+    },
+    {  # None -> 0
+        "cntr_tm": (edge_case_ts + timedelta(minutes=5)).strftime("%Y%m%d%H%M%S"),
+        "open_pric": None, "high_pric": None, "low_pric": None,
+        "cur_prc": None, "trde_qty": None, "acc_trde_qty": None,
+    },
+    {  # 잘못된 문자열(숫자 아님) -> 0
+        "cntr_tm": (edge_case_ts + timedelta(minutes=6)).strftime("%Y%m%d%H%M%S"),
+        "open_pric": "N/A", "high_pric": "오류", "low_pric": "--",
+        "cur_prc": "abc123", "trde_qty": "null", "acc_trde_qty": "?",
+    },
+]
+
+legacy_edge_result = legacy_parse(edge_raw_bars, 60)
+broker_edge = make_broker()
+with patch.object(broker_edge, "_post", return_value=make_response(edge_raw_bars)):
+    actual_edge_result = broker_edge.get_minute_bars("475150", tick_scope=3, count=60)
+
+check("1-1) 엣지케이스(음수/+부호/0패딩/빈문자열/None/잘못된문자열) "
+      "7건 모두 정상 반환됨(예외 없음)", len(actual_edge_result) == 7)
+edge_identical = len(legacy_edge_result) == len(actual_edge_result) and all(
+    (l.cntr_tm, l.open_price, l.high_price, l.low_price, l.close_price, l.volume, l.acc_volume) ==
+    (a.cntr_tm, a.open_price, a.high_price, a.low_price, a.close_price, a.volume, a.acc_volume)
+    for l, a in zip(legacy_edge_result, actual_edge_result)
+)
+check("    엣지케이스 전체가 legacy(_parse_abs_int 실제규칙 재현) 결과와 "
+      "byte-for-byte 동일함", edge_identical)
+
+# 각 특수값이 실제로 기대한 대로 변환됐는지 개별 확인
+# reverse()로 순서가 뒤집히므로 인덱스 6이 첫번째(음수케이스)
+by_cntr_tm = {b.cntr_tm: b for b in actual_edge_result}
+neg_bar = by_cntr_tm[(edge_case_ts + timedelta(minutes=1)).strftime("%Y%m%d%H%M%S")]
+check("    음수 부호('-58000') -> 절대값 58000으로 정확히 변환됨", neg_bar.open_price == 58000)
+plus_bar = by_cntr_tm[(edge_case_ts + timedelta(minutes=2)).strftime("%Y%m%d%H%M%S")]
+check("    +부호('+58000') -> 58000으로 정확히 변환됨", plus_bar.open_price == 58000)
+pad_bar = by_cntr_tm[(edge_case_ts + timedelta(minutes=3)).strftime("%Y%m%d%H%M%S")]
+check("    0패딩('000000058000') -> 58000으로 정확히 변환됨", pad_bar.open_price == 58000)
+empty_bar = by_cntr_tm[(edge_case_ts + timedelta(minutes=4)).strftime("%Y%m%d%H%M%S")]
+check("    빈 문자열 -> 0으로 변환됨", empty_bar.open_price == 0)
+none_bar = by_cntr_tm[(edge_case_ts + timedelta(minutes=5)).strftime("%Y%m%d%H%M%S")]
+check("    None -> 0으로 변환됨", none_bar.open_price == 0)
+invalid_bar = by_cntr_tm[(edge_case_ts + timedelta(minutes=6)).strftime("%Y%m%d%H%M%S")]
+check("    잘못된 문자열('N/A') -> 0으로 변환됨", invalid_bar.open_price == 0)
 
 # ══════════════════════════════════════════════════════════════
 # 2. raw가 최신→과거(DESC) 순이면 진단이 DESC로 판단
@@ -274,6 +372,42 @@ check("10) 다른 종목/다른 count 조합은 각각 새 진단 키를 생성�
       len(broker4._minute_diagnostic_keys) == 3)
 
 # ══════════════════════════════════════════════════════════════
+# 10-1. 빈 응답(raw_bars=[])에서도 진단이 먼저 남는지 검증
+#       (2026-07-27, 2차 GPT 코드리뷰 지시 4번)
+#
+# 배경: 기존엔 `if not raw_bars: return []`이 진단 로직보다 먼저
+# 실행돼서, 빈 응답의 요청/응답 시각, raw_received=0, continuation
+# 여부를 전혀 확인할 수 없었음. 진단을 먼저 남기도록 순서를 바꿈
+# — 반환값(빈 리스트)과 기존 에러 로그는 그대로 유지.
+# ══════════════════════════════════════════════════════════════
+
+broker_empty = make_broker()
+empty_response = make_response([], cont_yn="N", next_key="")
+with patch.object(broker_empty, "_post", return_value=empty_response):
+    result_empty = broker_empty.get_minute_bars("475150", tick_scope=3, count=60)
+
+check("10-1) 빈 응답이어도 기존처럼 빈 리스트를 반환함(반환값 불변)",
+      result_empty == [])
+check("     빈 응답이어도 진단 키가 생성됨(진단이 실제로 먼저 실행됨을 증명)",
+      ("475150", "20260721", "3", 60) in broker_empty._minute_diagnostic_keys
+      or len(broker_empty._minute_diagnostic_keys) == 1)
+
+# 실제 진단 결과를 직접 계산해서 raw_received=0, 시각 정보가 남는지 확인
+d_empty = build_minute_bar_diagnostics(
+    symbol="475150", base_date="20260721", tick_scope="3", requested_count=60,
+    raw_bars=[], returned_bars_timestamps=[],
+    headers={"cont-yn": "N", "next-key": ""},
+    request_started_at=datetime(2026, 7, 21, 9, 0, 0, tzinfo=KST),
+    response_received_at=datetime(2026, 7, 21, 9, 0, 1, tzinfo=KST),
+)
+check("     빈 응답 진단에서 raw_received_count=0으로 정확히 계산됨",
+      d_empty.raw_received_count == 0)
+check("     빈 응답 진단에서도 요청/응답 시각이 보존됨(None이 아님)",
+      d_empty.request_started_at is not None and d_empty.response_received_at is not None)
+check("     빈 응답 진단에서도 continuation 정보를 확인할 수 있음",
+      d_empty.continuation_available is False)
+
+# ══════════════════════════════════════════════════════════════
 # 11. 기존 2026-07-21 fixture 구조 및 manifest 테스트는 여전히 통과
 #     (별도 test_legacy_fixture_structure.py에서 검증 — 여기서는
 #      import 가능 여부만 스모크 테스트)
@@ -325,13 +459,24 @@ d8 = build_minute_bar_diagnostics(
 check("15) 미래 timestamp 봉 -> newest_raw_bar_is_future=True로 이상 감지됨",
       d8.newest_raw_bar_is_future is True)
 
-# ── 정규장 시간 밖 봉 계산 (기존 utils.time_utils 상수 재사용 확인) ──
+# ── 정규장/전략거래창 시간 분리 계산 (2026-07-27, 2차 GPT 코드리뷰 지적) ──
+# 기존 utils.time_utils 상수(MARKET_OPEN, MARKET_CLOSE=15:20)는 그대로
+# 재사용하되, 실제 정규장 마감(REGULAR_MARKET_CLOSE=15:30)과 구분됨을
+# 검증. 15:25는 전략거래창(15:20) 밖이지만 정규장(15:30) 안이라는
+# 케이스로 두 값이 서로 다르게 계산됨을 명확히 보여줌.
 
 from utils.time_utils import MARKET_OPEN, MARKET_CLOSE
-outside_bar = datetime(2026, 7, 21, 16, 0, 0)  # MARKET_CLOSE(15:20) 이후
-inside_bar = datetime(2026, 7, 21, 10, 0, 0)
+from infra.broker.minute_bar_diagnostics import REGULAR_MARKET_CLOSE
+
+outside_both = datetime(2026, 7, 21, 16, 0, 0)      # 15:20도 15:30도 모두 밖
+between_strategy_and_market = datetime(2026, 7, 21, 15, 25, 0)  # 15:20 밖, 15:30 안
+inside_bar = datetime(2026, 7, 21, 10, 0, 0)         # 둘 다 안
+
 raw_session = [
-    {"cntr_tm": outside_bar.strftime("%Y%m%d%H%M%S"), "open_pric": "58000",
+    {"cntr_tm": outside_both.strftime("%Y%m%d%H%M%S"), "open_pric": "58000",
+     "high_pric": "58200", "low_pric": "57900", "cur_prc": "58100",
+     "trde_qty": "1000", "acc_trde_qty": "50000"},
+    {"cntr_tm": between_strategy_and_market.strftime("%Y%m%d%H%M%S"), "open_pric": "58000",
      "high_pric": "58200", "low_pric": "57900", "cur_prc": "58100",
      "trde_qty": "1000", "acc_trde_qty": "50000"},
     {"cntr_tm": inside_bar.strftime("%Y%m%d%H%M%S"), "open_pric": "58000",
@@ -344,9 +489,12 @@ d9 = build_minute_bar_diagnostics(
     headers={"cont-yn": "N", "next-key": ""},
     request_started_at=None, response_received_at=None,
 )
-check(f"16) 정규장 시간(MARKET_OPEN={MARKET_OPEN}~MARKET_CLOSE={MARKET_CLOSE}, "
-      f"기존 utils/time_utils.py 상수 재사용) 밖 봉 1건이 정확히 감지됨",
-      d9.regular_session_outside_count == 1)
+check(f"16) 전략거래창(MARKET_OPEN={MARKET_OPEN}~MARKET_CLOSE={MARKET_CLOSE}, "
+      f"기존 utils/time_utils.py 상수 재사용) 밖 봉 2건이 정확히 감지됨(16:00, 15:25)",
+      d9.outside_strategy_window_count == 2)
+check(f"    실제 정규장(REGULAR_MARKET_CLOSE={REGULAR_MARKET_CLOSE}, 신규 진단전용상수) "
+      f"밖 봉은 1건만(16:00) 감지됨 — 15:25는 정규장 안이라 전략거래창과 값이 다름",
+      d9.outside_regular_market_count == 1)
 
 # ══════════════════════════════════════════════════════════════
 # 17~20. 실운영 첫 로그 검토 이후 추가 (2026-07-27, GPT 코드리뷰)
@@ -423,16 +571,57 @@ check("    주 로그 라인에 raw_exceeds_requested=True가 실제로 출력�
       "raw_exceeds_requested=True" in main_log_line)
 
 # ══════════════════════════════════════════════════════════════
-# 22. tzdata 패키지 부재 환경 재현 (2026-07-27, 실제 크래시로 발견)
+# 23. 얕은 형식검사(14자리 숫자) vs 실제 파싱성공 여부 불일치 재현
+#     (2026-07-27, 2차 GPT 코드리뷰가 제시한 정확한 재현 케이스)
 #
-# 배경: Windows에는 OS 차원의 IANA 시간대 데이터베이스가 없어서
-# tzdata 패키지가 미설치면 zoneinfo.ZoneInfo("Asia/Seoul")가
-# ZoneInfoNotFoundError를 던짐. 기존엔 이게 모듈 최상단(import
-# 시점 즉시평가)과 get_minute_bars() 본문(fail-open try/except
-# 이전)에 있어서, 이 예외가 fail-open 보호막 밖에서 분봉 조회
-# 자체를 실패시켰음(실제 사용자 환경에서 재현됨). KST를 zoneinfo
-# 의존성 없는 고정 UTC+9 오프셋으로 교체하고, 혹시 모를 실패에도
-# 대비해 시각 기록 지점 자체도 try/except로 감쌈.
+# 배경: 기존 _infer_sort_direction()/_count_order_violations()가
+# 각각 독립적으로 "14자리 숫자인가"라는 얕은 검사만 하고,
+# _parse_bar_timestamp()가 실제로 파싱에 성공하는지는 확인하지
+# 않았음 — "20260230120000"(2월 30일, 존재하지 않는 날짜)처럼
+# 형식은 14자리 숫자로 맞지만 실제로는 유효하지 않은 값이 문자열
+# 비교에 그대로 섞여 잘못된 정렬 판정(UNKNOWN)을 내는 것을 재현.
+# ══════════════════════════════════════════════════════════════
+
+gpt_ts_list = ["20260721091600", "20260230120000", "20260721091400"]
+gpt_raw = [
+    {"cntr_tm": ts, "open_pric": "58000", "high_pric": "58200", "low_pric": "57900",
+     "cur_prc": "58100", "trde_qty": "1000", "acc_trde_qty": "50000"}
+    for ts in gpt_ts_list
+]
+d13 = build_minute_bar_diagnostics(
+    symbol="475150", base_date="20260721", tick_scope="1", requested_count=60,
+    raw_bars=gpt_raw, returned_bars_timestamps=[],
+    headers={"cont-yn": "N", "next-key": ""},
+    request_started_at=None, response_received_at=None,
+)
+check("23) GPT 재현케이스([20260721091600, 20260230120000(2월30일=존재안함), "
+      "20260721091400]) -> invalid_timestamp_count가 정확히 1",
+      d13.invalid_timestamp_count == 1)
+check("    같은 케이스 -> raw_sort_direction이 UNKNOWN이 아니라 정확히 DESC로 판단됨"
+      "(잘못된 날짜를 제외하면 09:16->09:14로 내림차순이 맞음)",
+      d13.raw_sort_direction == "DESC")
+check("    raw_order_violation_count는 0(유효한 두 timestamp만 보면 위반 없음)",
+      d13.raw_order_violation_count == 0)
+
+# ══════════════════════════════════════════════════════════════
+# 22. 진단 모듈 동적 import 실패 시 broker fail-open 검증
+#     (2026-07-27, 2차 GPT 코드리뷰 지적으로 설명 정정)
+#
+# ⚠️ 이 테스트가 실제로 검증하는 것: "get_minute_bars()가 진단
+# 모듈을 import하는 지점(_maybe_log_minute_bar_diagnostics 내부)
+# 에서 어떤 이유로든(ImportError든 다른 예외든) 실패해도, 분봉
+# 조회 자체는 fail-open으로 정상 완료된다"는 것입니다. builtins.
+# __import__를 패치해서 "minute_bar_diagnostics" 관련 import를
+# 강제로 ModuleNotFoundError로 실패시키는 방식으로 재현합니다.
+#
+# 이 테스트가 검증하지 않는 것: "Windows에서 tzdata 미설치 시
+# 실제로 무슨 일이 일어나는가"는 이 테스트의 대상이 아닙니다 —
+# 그건 별개로 테스트 21번 이전 구간(KST 상수 자체가 zoneinfo에
+# 의존하지 않는지)에서 검증합니다. 애초에 KST를 고정 UTC+9
+# 오프셋으로 교체한 뒤로는(1B.2절), 정상적인 실행 경로에서
+# tzdata 부재가 이 함수의 import를 실패시킬 이유가 없습니다 —
+# 이 테스트의 강제 실패는 "만약 미래에 다른 이유로 이 모듈의
+# import가 실패한다면"이라는 방어적 시나리오를 검증하는 것입니다.
 # ══════════════════════════════════════════════════════════════
 
 broker5 = make_broker()
@@ -452,17 +641,17 @@ _original_import = _builtins.__import__
 
 with patch.object(broker5, "_post", return_value=make_response(raw_bars5)):
     with patch("builtins.__import__", side_effect=failing_import):
-        result_no_tzdata = broker5.get_minute_bars("475150", tick_scope=3, count=60)
+        result_diag_import_failed = broker5.get_minute_bars("475150", tick_scope=3, count=60)
 
-check("22) 진단 모듈 import가 완전히 실패해도(tzdata 부재 재현) "
-      "분봉 조회는 정상적으로 60개를 반환함(fail-open 완전 검증)",
-      len(result_no_tzdata) == 60)
-legacy_for_tzdata_test = legacy_parse(raw_bars5, 60)
+check("22) 진단 모듈 import 실패(강제 재현) 시에도 "
+      "get_minute_bars()는 fail-open으로 정상 60개를 반환함",
+      len(result_diag_import_failed) == 60)
+legacy_for_diag_failure_test = legacy_parse(raw_bars5, 60)
 identical3 = all(
     (l.cntr_tm, l.close_price) == (a.cntr_tm, a.close_price)
-    for l, a in zip(legacy_for_tzdata_test, result_no_tzdata)
+    for l, a in zip(legacy_for_diag_failure_test, result_diag_import_failed)
 )
-check("    tzdata 부재 상황에서도 반환된 분봉 내용은 legacy와 완전히 동일함",
+check("    진단 import 실패 상황에서도 반환된 분봉 내용은 legacy와 완전히 동일함",
       identical3)
 
 # ── KST 상수 자체가 더 이상 zoneinfo에 의존하지 않는지 직접 확인 ──
@@ -477,6 +666,48 @@ check("   KST 상수가 datetime.timezone 고정 오프셋 인스턴스임",
       isinstance(KST, _timezone))
 check("   KST 오프셋이 정확히 UTC+9시간임",
       KST.utcoffset(None) == timedelta(hours=9))
+
+# ══════════════════════════════════════════════════════════════
+# 24. 로그 필드 확장 검증 (2026-07-27, 2차 GPT 코드리뷰 지시 2번)
+#
+# request_started_at/response_received_at/request_duration_ms/
+# returned_oldest_timestamp/returned_newest_timestamp가 실제로
+# 주 로그 라인에 ISO 8601(+09:00)/N/A 형태로 출력되는지 확인.
+# ══════════════════════════════════════════════════════════════
+
+log_ts_request = datetime(2026, 7, 21, 9, 16, 45, 100000, tzinfo=KST)
+log_ts_response = datetime(2026, 7, 21, 9, 16, 45, 350000, tzinfo=KST)  # 250ms 후
+raw_for_log_test = make_raw_bars(10, base, desc=True)
+d14 = build_minute_bar_diagnostics(
+    symbol="475150", base_date="20260721", tick_scope="1", requested_count=10,
+    raw_bars=raw_for_log_test,
+    returned_bars_timestamps=[b["cntr_tm"] for b in raw_for_log_test][::-1],
+    headers={"cont-yn": "N", "next-key": ""},
+    request_started_at=log_ts_request, response_received_at=log_ts_response,
+)
+log_line_with_times = format_diagnostics_log_line(d14)
+
+check("24) 주 로그에 request_started_at이 ISO8601(+09:00) 형태로 출력됨",
+      "request_started_at=2026-07-21T09:16:45.100000+09:00" in log_line_with_times)
+check("    주 로그에 response_received_at이 ISO8601(+09:00) 형태로 출력됨",
+      "response_received_at=2026-07-21T09:16:45.350000+09:00" in log_line_with_times)
+check("    주 로그에 request_duration_ms가 정확히 250.0으로 계산됨",
+      "request_duration_ms=250.0" in log_line_with_times)
+check("    주 로그에 returned_oldest/returned_newest가 출력됨",
+      "returned_oldest=" in log_line_with_times and "returned_newest=" in log_line_with_times)
+
+# ── (대조군) 시각 정보가 없으면 N/A로 표시되고 예외가 안 남 ────────
+d15 = build_minute_bar_diagnostics(
+    symbol="475150", base_date="20260721", tick_scope="1", requested_count=10,
+    raw_bars=raw_for_log_test, returned_bars_timestamps=[],
+    headers={"cont-yn": "N", "next-key": ""},
+    request_started_at=None, response_received_at=None,
+)
+log_line_no_times = format_diagnostics_log_line(d15)
+check("    (대조군) 시각 정보가 없으면 request_started_at=N/A로 표시됨(예외 없음)",
+      "request_started_at=N/A" in log_line_no_times)
+check("    (대조군) request_duration_ms도 N/A로 표시됨",
+      "request_duration_ms=N/A" in log_line_no_times)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
