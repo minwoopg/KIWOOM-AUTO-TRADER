@@ -68,6 +68,11 @@ class KiwoomBroker(Broker):
         self.session = requests.Session()
         self.access_token: str | None = None
         self.token_expires_at: str | None = None
+        # 2026-07-27 (1B단계): 분봉 진단 로그를 (symbol, base_date,
+        # tick_scope, count) 조합별 최초 1회만 남기기 위한 키 집합.
+        # 로그 기록이 실제로 성공한 뒤에만 키를 추가 — 로그 자체가
+        # 실패해도 다음 호출에서 재시도할 수 있게 함.
+        self._minute_diagnostic_keys: set[tuple[str, str, str, int]] = set()
 
     def authenticate(self) -> None:
         """키움 OAuth 토큰을 발급받아 저장합니다.
@@ -112,10 +117,24 @@ class KiwoomBroker(Broker):
         응답 배열 키: stk_min_pole_chart_qry
         체결시간(cntr_tm): 'YYYYMMDDHHmmSS' 형식
         가격에 -부호가 붙을 수 있으므로 _parse_abs_int로 처리합니다.
+
+        2026-07-27 (1B단계, GPT 코드리뷰): 종목·거래일·tick_scope·
+        count 조합별로 최초 1회 raw 응답 진단을 로그로 남김 —
+        아래 핵심 로직(raw_bars[:count] 슬라이싱, MinuteBar 파싱,
+        bars.reverse(), 반환값)은 이 진단 추가 이전과 완전히
+        동일하게 유지됨. 진단은 반환 직전에 "관찰"만 하고, 계산에
+        관여하지 않음. 진단 코드에서 예외가 나도 warning만 남기고
+        기존 분봉 반환은 그대로 계속됨(fail-open) — 진단 실패가
+        분봉 조회 실패로 이어지면 안 되므로.
         """
         from datetime import date
 
         base_dt = date.today().strftime("%Y%m%d")
+
+        # 진단용 요청 시작 시각 (KST, timezone-aware) — 기존 로직에는 영향 없음
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZoneInfo
+        _request_started_at = _dt.now(_ZoneInfo("Asia/Seoul"))
 
         api_response = self._post(
             endpoint="/api/dostk/chart",
@@ -127,6 +146,9 @@ class KiwoomBroker(Broker):
                 "base_dt": base_dt,
             },
         )
+
+        # 진단용 응답 수신 시각 — 기존 로직에는 영향 없음
+        _response_received_at = _dt.now(_ZoneInfo("Asia/Seoul"))
 
         raw_bars = api_response.body.get("stk_min_pole_chart_qry", [])
 
@@ -155,7 +177,74 @@ class KiwoomBroker(Broker):
 
         # 키움은 최신 → 과거 순이므로 뒤집어서 과거 → 최신 순으로 반환
         bars.reverse()
+
+        # ── 진단 로그 (관찰 전용, fail-open) ──────────────────────
+        # 위까지의 모든 로직(raw_bars[:count], MinuteBar 파싱,
+        # bars.reverse())은 이 블록 이전과 완전히 동일함. 아래는
+        # 오직 로그만 남기고, bars 값을 전혀 건드리지 않음.
+        try:
+            self._maybe_log_minute_bar_diagnostics(
+                symbol=symbol,
+                base_date=base_dt,
+                tick_scope=str(tick_scope),
+                requested_count=count,
+                raw_bars=raw_bars,
+                returned_bars=bars,
+                headers=api_response.headers,
+                request_started_at=_request_started_at,
+                response_received_at=_response_received_at,
+            )
+        except Exception as diag_exc:
+            import logging
+            logging.getLogger("app").warning(
+                f"[MIN_BOOTSTRAP] {symbol} | 진단 로그 생성 실패(무시, 분봉 조회는 정상 진행): "
+                f"{diag_exc}"
+            )
+
         return bars
+
+    def _maybe_log_minute_bar_diagnostics(
+        self,
+        *,
+        symbol: str,
+        base_date: str,
+        tick_scope: str,
+        requested_count: int,
+        raw_bars: list,
+        returned_bars: list[MinuteBar],
+        headers: dict[str, str],
+        request_started_at,
+        response_received_at,
+    ) -> None:
+        """(symbol, base_date, tick_scope, count) 조합별 최초 1회만 진단 로그를 남깁니다.
+
+        2026-07-27 (1B단계): 로그 기록이 실제로 성공한 뒤에만 키를
+        추가 — 로그 자체가 실패해도(디스크 문제 등) 다음 호출에서
+        재시도할 수 있음.
+        """
+        from infra.broker.minute_bar_diagnostics import (
+            build_minute_bar_diagnostics, format_diagnostics_log_line,
+        )
+
+        key = (symbol, base_date, tick_scope, requested_count)
+        if key in self._minute_diagnostic_keys:
+            return
+
+        diagnostics = build_minute_bar_diagnostics(
+            symbol=symbol,
+            base_date=base_date,
+            tick_scope=tick_scope,
+            requested_count=requested_count,
+            raw_bars=raw_bars,
+            returned_bars_timestamps=[b.cntr_tm for b in returned_bars],
+            headers=headers,
+            request_started_at=request_started_at,
+            response_received_at=response_received_at,
+        )
+
+        import logging
+        logging.getLogger("app").info(format_diagnostics_log_line(diagnostics))
+        self._minute_diagnostic_keys.add(key)
 
     def get_weekly_prices(self, symbol: str, weeks: int) -> list[WeeklyBar]:
         """키움 주봉 API(ka10082)로 종목의 최근 주봉 데이터를 가져옵니다.

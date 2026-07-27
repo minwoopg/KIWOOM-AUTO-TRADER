@@ -1,0 +1,222 @@
+app:
+  name: kiwoom-auto-trader-ver1
+  env: local
+  log_level: INFO
+
+broker:
+  provider: kiwoom
+  # true  -> 가짜 MockBroker 사용
+  # false -> 실제 Kiwoom REST API 사용
+  use_mock: false
+  # 키움 모의투자 REST 서버
+  # 실전투자로 바꿀 때는 https://api.kiwoom.com 으로 변경합니다.
+  base_url: https://mockapi.kiwoom.com
+  app_key: ${KIWOOM_APP_KEY}
+  secret_key: ${KIWOOM_SECRET_KEY}
+  account_number: ${KIWOOM_ACCOUNT_NUMBER}
+  is_paper_trading: true
+
+# 감시할 종목 목록 (조건검색 OFF 시 사용)
+targets:
+  symbols:
+    - "010170"
+    - "006260"
+    - "005930"
+    - "080220"
+    
+trading:
+  poll_interval_seconds: 10
+  # ── 종목 순회 사이 폴링 간격 (2026-07-22) ────────────────────
+  # 보유종목 우선처리(7.11절)로 순서는 바꿨지만, 보유종목이 여러 개면
+  # 그 사이에도 여전히 1초씩 대기해 뒤쪽 보유종목의 손절판단이 늦어짐.
+  # 미보유(신규후보) 종목은 기존 1.0초 유지, 보유종목은 0.2초로 단축 —
+  # API 레이트리밋 안전마진은 유지하되 지연을 최소화. 실거래로 문제
+  # 없는지 확인 후 필요시 추가 조정.
+  held_symbol_poll_gap_seconds: 0.2
+  entry_poll_gap_seconds: 1.0
+  balance_refresh_seconds: 180
+  price_refresh_seconds: 60
+  order_cash_per_trade: 6000000
+  max_positions: 5
+  allow_multiple_entries_per_symbol_per_day: false  # 2026-07-21: 1일1회로 재전환.
+                                                     # 2026-07-09에 무제한(결과무관 차단 대신
+                                                     # 손실2회 게이트)으로 풀었었으나, 7/21
+                                                     # 475150 사례로 재검토 — 트레일링 익절(수익)
+                                                     # 로 청산된 뒤 재진입해서 손실로 번지는
+                                                     # 패턴은 손실2회/트레일링손실 게이트가
+                                                     # "손실 실적"을 전제로 하므로 막지 못함.
+                                                     # ⚠️ 트레이드오프: 7/9 058730처럼 순수익
+                                                     # 재진입까지 함께 차단됨 — 결과와 무관하게
+                                                     # 하루 1entry로 제한하는 것을 의도적으로 선택.
+  max_entries_per_symbol_per_day: 3   # 2026-07-16: allow_multi=true라도 무제한은 아님 —
+                                        # 7/15 475150 사례(계속 수익 중이라 손실2회 게이트가
+                                        # 안 걸려 7회 재진입, 41,766,000원 투입)로 상한 추가
+                                        # (2026-07-21: allow_multi=false 전환으로 사실상
+                                        # 항상 1회에서 멈추지만, 안전망으로 값은 유지)
+  force_exit_before_market_close_minutes: 20  # 15:10부터 수익쿠션 없는 포지션 강제청산
+  force_exit_cushion_pct: 0.3                 # +0.3% 이상이면 이월 허용
+  reentry_cooldown_seconds: 600
+  trail_loss_cooldown_count: 1   # 트레일링 손실 N회 → 60분 쿨다운 (기존 2회 → 1회)
+  excluded_symbols:              # 신규매수 영구 차단 종목
+    - "080220"                   # 4일 연속 고위험
+    - "010170"                   # 2일 연속 고위험
+    - "001510"                   # 실제 손실 + 고위험
+    - "001740"                   # 2일 연속 실제 손실(6/9,6/15) + 리플레이 고위험
+    - "114800"                   # KODEX 인버스 ETF (2026-07-06: 개별주 전략과 성격 불일치, replay 310건 5분순수익 -0.34%)
+    - "252670"                   # KODEX 200선물인버스2X (2026-07-06: 레버리지 인버스 ETF, replay 238건 5분순수익 -0.33%)
+    - "009150"                   # 2026-07-16: 전체 13건 중앙값-0.65%/총손익-603,000원(전 종목 중 최대 손실)
+                                   # + NEUTRAL 장세 손실의 절반(5/10건)을 차지 — 두 각도에서 반복 확인됨
+
+strategy:
+  name: breakout
+  breakout_threshold_pct: 1.0
+  take_profit_pct: 15.0          # 안전망 익절 (+15%)
+  stop_loss_pct: 1.5             # 손절 기준
+  reference_price_type: previous_close
+  trailing_stop_pct: 2.0         # 최고가 대비 -2% 하락 시 매도
+  trailing_start_pct: 1.2        # 2026-06-22: 1.0→1.2 (본전권 조기청산 방지, 손익비 개선)
+  trend_reversal_rsi: 70.0       # 추세 꺾임 감지 RSI 기준
+  symbol_min_score_override:     # 종목별 진입 문턱 상향 (5점=최적타점만 허용)
+    "000660": 5                  # 2026-07-06 최초 제안 → 2026-07-14 재검증 후 활성화
+                                  # 실거래 12건(4/1~7/14) 평균-0.82%/중앙값-1.39%/승률25%,
+                                  # 클린홀드(<300분)만 5건도 평균-0.96%/승률20% (outlier 아님)
+                                  # replay 2,899건(34거래일 전체) A/B패턴 포함 전 패턴 일관되게
+                                  # 마이너스(평균-0.34%, 승률22.6%) — 7/6 초기 판단(67건 기준)이
+                                  # 표본 확대 후에도 그대로 재확인됨
+  # ── 진입 품질 게이트 (2026-07-09) ──────────────────────────────
+  # 근거: trades.csv 전체 이력
+  #   3점 진입      45건  승률50% 평균-0.21% (4점+58건 평균+0.25%, 5점 40건 평균+0.28%보다 열세)
+  #   상승여력<1%   95건  승률36% 평균-0.24% (1~2%구간 20건 승률60% 평균+0.03%보다 열세)
+  disable_score3_buy: true
+  low_upside_guard_enabled: true
+  min_upside_to_recent_high_pct: 1.0
+  low_upside_guard_apply_to_pattern_d: true
+  require_confirmation_for_score5: true   # 2026-07-14: 5점도 거래량급증/V자/PR/반등spike
+                                            # 중 최소 1개 요구 (동행지표만으로 채워진 5점의
+                                            # 성과가 확인지표 포함 5점보다 뚜렷이 열세임을 확인)
+  slow_v_enabled: false   # 2026-07-16: 느린 V자 탐지는 구현됐으나 34일 백테스트
+                            # (rising-edge 369건) 결과 전 구간 마이너스
+                            # (5분 승률25.1%/-0.64%, 10분 -0.27%, 20분 -0.37%,
+                            # 낙폭/반등폭/저점나이 어느 구간으로 잘라도 마이너스)
+                            # 라 실거래 반영은 비활성. 감지 필드는 계속 채워지므로
+                            # signal_log로 데이터 축적 후 재튜닝 가능.
+
+market_regime:
+  short_ma_days: 5
+  long_ma_days: 20
+  history_days: 50
+  rsi_period: 14
+  rsi_overbought: 80.0
+  rsi_oversold: 20.0
+  history_refresh_seconds: 3600
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  volume_surge_ratio: 1.5
+  minute_tick_scope: 1
+  minute_bar_count: 60
+  minute_refresh_seconds: 60
+  # V자 반등 감지 파라미터
+  v_bottom_lookback: 30
+  v_low_min_age: 1
+  v_low_max_age: 8
+  v_drop_threshold_pct: -2.5   # 2026-06-16: -3.0 → -2.5 완화 (V자 0건 지속, 낙폭부족 75.4%가 주원인)
+  v_rebound_threshold_pct: 0.5   # 2026-06-19: 1.2 → 0.5 완화 (V자 0건 지속, 반등부족 2위 사유)
+  v_max_rebound_pct: 6.0
+  v_volume_ratio: 1.2   # 2026-06-19: 1.5 → 1.2 완화 (거래량부족 3위 사유)
+  v_min_bar_amount: 30000000
+  v_bottom_spike_ratio: 1.5
+  v_ma5_slope_bars: 3
+  # 느린 V자(Slow V) 반등 감지 (2026-07-16) — 기존 V자는 저점이
+  # v_low_max_age(8분) 이내여야 해서 몇 시간짜리 완만한 반전을 구조적으로
+  # 못 잡음(7/14 SK하이닉스 -8.9%→+4.8%, 2시간+ 소요). 별도 탐색창으로 감지.
+  slow_v_bottom_lookback: 150      # low_max_age(120)보다 여유(버퍼 30분)있게 설정 —
+                                     # 버퍼 없으면 저점이 탐색창 맨 앞에 걸릴 때 "저점 이전
+                                     # 고점" 탐색 자체가 실패함 (테스트 중 실제로 발견)
+  slow_v_low_min_age: 9           # 기존 V자(최대 8봉)와 안 겹치게 9봉부터 시작
+  slow_v_low_max_age: 120
+  slow_v_drop_threshold_pct: -2.5   # fast-V와 동일 기준으로 시작
+  slow_v_rebound_threshold_pct: 0.5
+  slow_v_max_rebound_pct: 15.0      # 시간이 오래 걸린 반등이라 상한을 넉넉히
+  slow_v_volume_ratio: 1.0          # 넓은 구간 평균이라 기준 완화
+  min_trading_value: 50000000000  # 500억 이상
+  pullback_min_pct: -17.5  # 2026-07-14: -7.0 → -17.5 완화 (34거래일 리플레이 시뮬레이션 근거)
+                            # simulate_pullback_removal.py 결과: C조건 하한 개방 시 신규 180건
+                            # 5분 승률44.6%/+0.64% → 10분+1.01% → 20분+1.09% (시간 갈수록 개선)
+                            # -15%~-20%~무제한이 거의 동일(177~180건)해 -15%가 사실상 실질 상한이라
+                            # 판단, 여유를 두어 -17.5%로 설정. A조건 -2% 캡은 별도 시뮬레이션에서
+                            # 되레 악화(승률31.7%, 시간 갈수록 -0.34%→-0.41%)됨을 확인해 그대로 유지.
+  pullback_max_pct: -0.3   # 완화: 고가 대비 -0.3% 이내까지 허용
+  change_rate_min: 2.0
+  change_rate_max: 18.0
+  rebound_min_pct: 2.0
+  gap_pullback_min_pct: 5.0   # 패턴 D(갭급등 눌림목) 하한: 당일 +5% 이상
+  gap_pullback_max_pct: 10.0  # 2026-06-30: 패턴 D 상한 추가. +10% 초과 갭등은 고점추격으로 간주, D 비활성 (475150/141080 손절 방지)
+
+risk:
+  max_daily_loss_amount: 1000000  # 일일 손실 한도 (원)
+  max_consecutive_losses: 3      # 연속 손절 허용 횟수 (0=비활성)
+  max_order_amount: 6000000
+  min_cash_buffer: 100000
+
+entry_watch:
+  enabled: true                  # 2026-07-20: 구현 완료 후 활성화 (근거: trades.csv 171건
+                                   # 검증 결과 5분내 +0.5% 미달 128건 최종평균-0.41%/승률29.7%,
+                                   # 달성 40건 최종평균+0.40%/승률60.0% — 초반 5분 흐름과
+                                   # 최종결과 상관관계 뚜렷)
+  watch_minutes: 5               # 매수 후 관찰 시간 (분)
+  min_profit_pct: 0.5            # 관찰 기간 중 최소 달성 수익률 (%)
+  fail_cut_pct: -1.0             # 이 손실 이하면 즉시 청산 (%)
+  fail_on_vwap_break: true       # VWAP 이탈 시 청산 여부
+  # ── VWAP 히스테리시스 (2026-07-22) ──────────────────────────
+  # 7/21 첫날 VWAP이탈청산 2건이 -4.83%/-0.43%로 손실이 컸음.
+  # 매수 직후 30초는 미적용 + 0.2%p 이상 이탈 + 2회 연속 확인
+  # (약 20~30초 간격 폴링 기준 최소 20~30초 지속 이탈)이 되어야 청산.
+  vwap_break_confirm_count: 2
+  vwap_break_min_pct: 0.2
+  vwap_grace_seconds: 30
+
+websocket:
+  enabled: true
+  url: wss://api.kiwoom.com:10000/api/dostk/websocket
+  condition_seqs: [1, 2, 3]   # 동시 구독할 조건식 번호 목록 (단타 3개)
+  max_symbols: 10
+  app_key: ${KIWOOM_REAL_APP_KEY}
+  secret_key: ${KIWOOM_REAL_SECRET_KEY}
+
+  # ── 스윙 전용 조건검색 (2026-06-16 신규) ─────────────────
+  # 키움 HTS에서 직접 만든 스윙용 검색식(20일선 근처/충분히 눌린 종목)의
+  # 시퀀스 번호를 여기에 추가하면, 그 결과만 별도로 분리해서
+  # data/swing_condition_symbols.json에 저장 → main_swing.py가 읽어감.
+  # 검색식 만들기 전까지는 빈 리스트로 둬도 안전 (스윙은 watchlist만 사용).
+  swing_condition_seqs: []   # 예: [4] — 검색식 만든 후 seq 번호로 교체
+  swing_condition_output: data/swing_condition_symbols.json
+
+storage:
+  state_file: data/state.json
+  trade_log_file: logs/trades.csv
+  signal_log_file: logs/signal_log.csv
+  app_log_file: logs/app.log
+  save_minute_bars: true              # 1분봉 원본 저장 여부
+  minute_bars_dir: data/minute_bars   # 저장 경로
+
+# ── 카카오톡 알림 ──────────────────────────────────────────
+# .env 파일에 아래 키를 입력하세요 (.gitignore로 보호됨)
+kakao:
+  access_token:  "${KAKAO_ACCESS_TOKEN}"
+  refresh_token: "${KAKAO_REFRESH_TOKEN}"
+  rest_api_key:  "${KAKAO_REST_API_KEY}"
+
+# ── 실험적 기능 플래그 (2026-07-27) ──────────────────────────
+# 단계적 리팩터링(트레이딩 판단 구조 개편)을 위한 플래그.
+# 각 값은 off(비활성) / shadow(계산·로그만) / enforce(실제 반영) 중 하나.
+# 전부 off로 시작 — 이 섹션을 추가해도 지금은 아무 동작도 바뀌지 않음.
+# 각 단계 구현이 끝나면 이 문서의 CHANGELOG(1.6절)에 안내에 따라
+# shadow로 먼저 켜서 며칠 데이터를 관찰한 뒤 enforce로 전환하세요.
+experimental:
+  session_metrics_mode: "off"       # 1단계: 세션/롤링 데이터 의미 분리
+  decision_engine_mode: "off"       # 2단계: DecisionEngine 추출
+  position_lifecycle_mode: "off"    # 3단계: 체결 확인 상태머신 실제화
+  reward_risk_guard_mode: "off"     # 4단계: 상승여력·손익비 하드 게이트
+  candidate_ranking_mode: "off"     # 5단계: 후보 순위화
+  trailing_breakeven_mode: "off"    # 6단계: 순본전 트레일링
