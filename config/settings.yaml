@@ -206,3 +206,17 @@ kakao:
   access_token:  "${KAKAO_ACCESS_TOKEN}"
   refresh_token: "${KAKAO_REFRESH_TOKEN}"
   rest_api_key:  "${KAKAO_REST_API_KEY}"
+
+# ── 실험적 기능 플래그 (2026-07-27) ──────────────────────────
+# 단계적 리팩터링(트레이딩 판단 구조 개편)을 위한 플래그.
+# 각 값은 off(비활성) / shadow(계산·로그만) / enforce(실제 반영) 중 하나.
+# 전부 off로 시작 — 이 섹션을 추가해도 지금은 아무 동작도 바뀌지 않음.
+# 각 단계 구현이 끝나면 이 문서의 CHANGELOG(1.6절)에 안내에 따라
+# shadow로 먼저 켜서 며칠 데이터를 관찰한 뒤 enforce로 전환하세요.
+experimental:
+  session_metrics_mode: "off"       # 1단계: 세션/롤링 데이터 의미 분리
+  decision_engine_mode: "off"       # 2단계: DecisionEngine 추출
+  position_lifecycle_mode: "off"    # 3단계: 체결 확인 상태머신 실제화
+  reward_risk_guard_mode: "off"     # 4단계: 상승여력·손익비 하드 게이트
+  candidate_ranking_mode: "off"     # 5단계: 후보 순위화
+  trailing_breakeven_mode: "off"    # 6단계: 순본전 트레일링

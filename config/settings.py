@@ -204,6 +204,48 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class ExperimentalConfig:
+    """단계적 리팩터링을 위한 기능 플래그 (2026-07-27, GPT 설계 검토 반영).
+
+    각 플래그는 "off" / "shadow" / "enforce" 세 상태를 지원합니다.
+      off     : 새 로직을 아예 실행하지 않음 (완전 비활성)
+      shadow  : 새 로직을 계산·로그만 하고 실제 매매 판정에는 영향 없음
+      enforce : 새 로직이 실제 매매 판정에 반영됨
+
+    안전 원칙: 반드시 shadow를 거쳐 충분한 데이터로 기존 로직과의
+    차이를 검증한 뒤에만 enforce로 전환합니다. 각 리팩터링 단계는
+    이 플래그로 감싸서, 예상치 못한 문제가 생기면 이 값만 되돌려도
+    즉시 이전 동작으로 복귀할 수 있어야 합니다.
+    """
+    session_metrics_mode: str = "off"      # 1단계: 세션/롤링 데이터 의미 분리
+    decision_engine_mode: str = "off"      # 2단계: DecisionEngine 추출
+    position_lifecycle_mode: str = "off"   # 3단계: 체결 확인 상태머신 실제화
+    reward_risk_guard_mode: str = "off"    # 4단계: 상승여력·손익비 하드 게이트
+    candidate_ranking_mode: str = "off"    # 5단계: 후보 순위화
+    trailing_breakeven_mode: str = "off"   # 6단계: 순본전 트레일링
+
+    def __post_init__(self) -> None:
+        # 2026-07-27: YAML에서 off/on처럼 quote 없는 특정 단어는 YAML 1.1
+        # 스펙상 boolean으로 자동 해석됨(off->False, on->True, yes/no 등도
+        # 동일) — 실제로 이 버그를 이 자리에서 재현/확인함. 문자열이 아닌
+        # 값이 들어오면 즉시 명확한 오류로 잡아서, 설정 파일에 따옴표
+        # 누락이 있을 때 조용히 엉뚱한 값으로 동작하지 않도록 함.
+        valid = {"off", "shadow", "enforce"}
+        for field_name in (
+            "session_metrics_mode", "decision_engine_mode", "position_lifecycle_mode",
+            "reward_risk_guard_mode", "candidate_ranking_mode", "trailing_breakeven_mode",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or value not in valid:
+                raise ValueError(
+                    f"experimental.{field_name}는 {valid} 중 하나(문자열)여야 합니다: "
+                    f"{value!r} (타입: {type(value).__name__}) — settings.yaml에서 "
+                    f'따옴표를 빠뜨리면 "off"가 YAML boolean(False)으로 해석될 수 있습니다. '
+                    f'반드시 "off"처럼 따옴표로 감싸세요.'
+                )
+
+
+@dataclass(frozen=True)
 class Settings:
     """프로그램 전체 설정을 한 번에 담는 최상위 객체입니다."""
 
@@ -218,6 +260,16 @@ class Settings:
     websocket: WebSocketConfig
     entry_watch: EntryWatchConfig = None
     kakao: KakaoConfig = None
+    # 2026-07-27 (GPT 코드리뷰): 기존엔 = None이라 load_settings()를
+    # 거치지 않고 Settings(...)를 직접 생성하면(테스트 등) experimental
+    # 이 None으로 남아, 다음 단계 코드가 settings.experimental.xxx_mode
+    # 를 그대로 읽으면 AttributeError가 날 수 있었음(재현 확인). 매번
+    # "settings.experimental or ExperimentalConfig()"를 호출부에서
+    # 기억하게 하는 것보다 모델 자체가 항상 유효한 값을 보장하는 게
+    # 안전 — default_factory로 전환하면 Settings를 어떤 방식으로
+    # 생성하든(직접 생성/테스트 fixture/load_settings) 항상
+    # ExperimentalConfig()(전부 off)가 채워짐.
+    experimental: ExperimentalConfig = field(default_factory=ExperimentalConfig)
 
 
 def _substitute_env(value: Any) -> Any:
@@ -238,6 +290,7 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
 
     kakao_raw = raw.get("kakao", {})
     entry_watch_raw = raw.get("entry_watch", {})
+    experimental_raw = raw.get("experimental", {})
     return Settings(
         app=AppConfig(**raw["app"]),
         broker=BrokerConfig(**raw["broker"]),
@@ -250,4 +303,5 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
         websocket=WebSocketConfig(**raw["websocket"]),
         entry_watch=EntryWatchConfig(**entry_watch_raw) if entry_watch_raw else None,
         kakao=KakaoConfig(**kakao_raw) if kakao_raw else KakaoConfig(),
+        experimental=ExperimentalConfig(**experimental_raw) if experimental_raw else ExperimentalConfig(),
     )
