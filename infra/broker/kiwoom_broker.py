@@ -131,10 +131,24 @@ class KiwoomBroker(Broker):
 
         base_dt = date.today().strftime("%Y%m%d")
 
-        # 진단용 요청 시작 시각 (KST, timezone-aware) — 기존 로직에는 영향 없음
-        from datetime import datetime as _dt
-        from zoneinfo import ZoneInfo as _ZoneInfo
-        _request_started_at = _dt.now(_ZoneInfo("Asia/Seoul"))
+        # 진단용 요청 시작 시각 (KST) — 기존 로직에는 영향 없음.
+        # 2026-07-27 (긴급 수정): 이전엔 여기서 zoneinfo.ZoneInfo를
+        # 직접 만들었는데, 이 지점이 아래 _maybe_log_minute_bar_
+        # diagnostics()를 감싸는 try/except보다 앞이라, tzdata 부재로
+        # 예외가 나면 fail-open 보호막 밖에서 get_minute_bars() 자체가
+        # 죽어버림(실제 재현됨 — Windows에서 tzdata 미설치 시
+        # ModuleNotFoundError로 분봉 조회 자체가 실패). minute_bar_
+        # diagnostics.KST(외부 tzdata 의존성 없는 고정 UTC+9)를 재사용
+        # 하고, 혹시 모를 예외에도 대비해 이 블록 자체도 try/except로
+        # 감싸 최악의 경우 시각 기록만 None으로 남기고 분봉 조회는
+        # 계속되도록 함.
+        _request_started_at = None
+        try:
+            from infra.broker.minute_bar_diagnostics import KST as _KST
+            from datetime import datetime as _dt
+            _request_started_at = _dt.now(_KST)
+        except Exception:
+            pass
 
         api_response = self._post(
             endpoint="/api/dostk/chart",
@@ -148,7 +162,13 @@ class KiwoomBroker(Broker):
         )
 
         # 진단용 응답 수신 시각 — 기존 로직에는 영향 없음
-        _response_received_at = _dt.now(_ZoneInfo("Asia/Seoul"))
+        _response_received_at = None
+        try:
+            from infra.broker.minute_bar_diagnostics import KST as _KST
+            from datetime import datetime as _dt
+            _response_received_at = _dt.now(_KST)
+        except Exception:
+            pass
 
         raw_bars = api_response.body.get("stk_min_pole_chart_qry", [])
 
@@ -224,6 +244,7 @@ class KiwoomBroker(Broker):
         """
         from infra.broker.minute_bar_diagnostics import (
             build_minute_bar_diagnostics, format_diagnostics_log_line,
+            format_order_detail_log_line,
         )
 
         key = (symbol, base_date, tick_scope, requested_count)
@@ -243,7 +264,14 @@ class KiwoomBroker(Broker):
         )
 
         import logging
-        logging.getLogger("app").info(format_diagnostics_log_line(diagnostics))
+        app_logger = logging.getLogger("app")
+        app_logger.info(format_diagnostics_log_line(diagnostics))
+        # 2026-07-27: raw_sort_direction이 UNKNOWN(비단조)일 때만
+        # 원인 조사용 2차 로그를 추가로 남김 — 정상(ASC/DESC)이면
+        # None이 반환되어 로그를 남기지 않음.
+        order_detail = format_order_detail_log_line(diagnostics)
+        if order_detail is not None:
+            app_logger.warning(order_detail)
         self._minute_diagnostic_keys.add(key)
 
     def get_weekly_prices(self, symbol: str, weeks: int) -> list[WeeklyBar]:

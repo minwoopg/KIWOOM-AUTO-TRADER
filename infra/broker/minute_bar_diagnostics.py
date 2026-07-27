@@ -25,11 +25,25 @@ GPT 코드리뷰 설계 원칙:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo
 
-KST = ZoneInfo("Asia/Seoul")
+# 2026-07-27 (실운영 크래시로 발견, 긴급 수정): 원래 zoneinfo.
+# ZoneInfo("Asia/Seoul")을 썼는데, Windows에는 OS 차원의 IANA
+# 시간대 데이터베이스가 없어서 tzdata 패키지가 설치되어 있지 않으면
+# ZoneInfoNotFoundError가 남 — 게다가 이 줄이 모듈 최상단(import
+# 시점에 즉시 평가)에 있어서, 진단 로직을 감싸던 fail-open
+# try/except의 보호 범위 밖에서 모듈 import 자체가 실패했음(실제
+# 사용자 환경에서 재현: `python test_minute_bar_diagnostics.py`
+# 실행 시 ModuleNotFoundError: No module named 'tzdata'로 즉시
+# 크래시). 이건 1B 설계 원칙(진단 실패가 절대 분봉 조회를 막으면
+# 안 됨)을 이 지점에서 어긴 것.
+#
+# 한국 표준시(KST)는 서머타임이 없는 고정 UTC+9이므로, IANA
+# 시간대 데이터베이스(zoneinfo/tzdata)가 굳이 없어도
+# datetime.timezone(timedelta(hours=9))로 정확히 동일한 결과를
+# 얻을 수 있음 — 외부 데이터 의존성 자체를 제거.
+KST = timezone(timedelta(hours=9), name="Asia/Seoul")
 
 # 2026-07-27 (GPT 코드리뷰 지시 7번): 정규장 시간 기준을 임의로
 # 새로 정하지 않고, 기존 프로젝트에 이미 있던 상수를 재사용.
@@ -57,9 +71,26 @@ class MinuteBarDiagnostics:
     raw_timestamp_parseable_count: int   # raw 전체 중 cntr_tm 파싱 가능한 개수
     returned_parsed_count: int           # count 제한 + 기존 파싱 규칙 통과한 실제 반환 개수
 
+    # 2026-07-27 (실운영 첫 로그 검토로 추가, GPT 코드리뷰): 기존엔
+    # raw_received_count와 requested_count를 나란히 로그에 찍기만
+    # 하고 둘을 비교하는 필드가 없어서, 실제로 raw_received=63,
+    # requested=60처럼 API가 요청보다 많이 준 상황을 로그를 눈으로
+    # 계산해야만 알 수 있었음. 이 비교를 명시적인 필드로 승격.
+    raw_excess_count: int                # raw_received_count - requested_count (음수면 부족)
+    raw_received_exceeds_requested: bool  # raw_excess_count > 0
+
     oldest_raw_timestamp: str | None
     newest_raw_timestamp: str | None
     raw_sort_direction: str              # "ASC" | "DESC" | "UNKNOWN" | "N/A"
+    # 2026-07-27 (실운영 첫 로그 검토로 추가, GPT 코드리뷰): raw_sort_
+    # direction이 UNKNOWN일 때 "정확히 어디서 몇 번 순서가 깨졌는지"를
+    # 사람이 원본 API를 다시 조회하지 않고도 알 수 있도록 하는 필드들.
+    # 인접 쌍 검사에서 "증가/감소가 아닌" 경우의 개수와, 원본 순서
+    # 그대로의 앞/뒤 일부 timestamp를 남김(원문 전체를 남기면 로그가
+    # 너무 커지므로 앞뒤 5개씩만).
+    raw_order_violation_count: int       # 인접 쌍 중 정렬 방향에 안 맞는 전이 개수
+    raw_order_head_sample: list[str]     # raw 순서 그대로 앞 5개 timestamp
+    raw_order_tail_sample: list[str]     # raw 순서 그대로 뒤 5개 timestamp
 
     returned_oldest_timestamp: str | None
     returned_newest_timestamp: str | None
@@ -104,6 +135,28 @@ def _infer_sort_direction(timestamps: list[str]) -> str:
     return "UNKNOWN"
 
 
+def _count_order_violations(timestamps: list[str], direction: str) -> int:
+    """주어진 방향(ASC/DESC) 기준으로 어긋나는 인접 쌍의 개수를 셉니다.
+
+    2026-07-27 (실운영 첫 로그 검토로 추가): raw_sort_direction=
+    UNKNOWN이 나왔을 때 "얼마나 심하게" 어긋났는지 정량화하기 위함
+    — 위반이 1건뿐이면 API 응답의 사소한 흔들림일 수 있고, 위반이
+    수십 건이면 애초에 정렬 자체가 안 되어 있다는 뜻이라 원인이
+    다름. 기준 방향은 전체 다수결(더 많이 만족하는 쪽)로 정함.
+    """
+    valid = [ts for ts in timestamps if ts and len(ts) == 14 and ts.isdigit()]
+    if len(valid) < 2:
+        return 0
+    if direction not in ("ASC", "DESC"):
+        # UNKNOWN이면 다수결로 기준 방향을 정해 위반 개수를 계산
+        asc_ok = sum(1 for a, b in zip(valid, valid[1:]) if a <= b)
+        desc_ok = sum(1 for a, b in zip(valid, valid[1:]) if a >= b)
+        direction = "ASC" if asc_ok >= desc_ok else "DESC"
+    if direction == "ASC":
+        return sum(1 for a, b in zip(valid, valid[1:]) if a > b)
+    return sum(1 for a, b in zip(valid, valid[1:]) if a < b)
+
+
 def build_minute_bar_diagnostics(
     *,
     symbol: str,
@@ -137,12 +190,17 @@ def build_minute_bar_diagnostics(
     valid_raw_timestamps = [ts for ts, dt in parsed_dt_pairs if dt is not None]
     invalid_count = len(raw_timestamps_all) - len(valid_raw_timestamps)
 
+    raw_excess_count = len(raw_bars) - requested_count
+
     oldest_raw = min(valid_raw_timestamps) if valid_raw_timestamps else None
     newest_raw = max(valid_raw_timestamps) if valid_raw_timestamps else None
 
     # raw 전체 순서 그대로의 정렬 방향(min/max가 아니라 원래 순서 기준)
     raw_order_timestamps = [ts for ts in raw_timestamps_all if ts]
     raw_sort_direction = _infer_sort_direction(raw_order_timestamps)
+    raw_order_violation_count = _count_order_violations(raw_order_timestamps, raw_sort_direction)
+    raw_order_head_sample = raw_order_timestamps[:5]
+    raw_order_tail_sample = raw_order_timestamps[-5:] if raw_order_timestamps else []
 
     returned_valid_timestamps = [ts for ts in returned_bars_timestamps if ts]
     returned_oldest = min(returned_valid_timestamps) if returned_valid_timestamps else None
@@ -195,9 +253,14 @@ def build_minute_bar_diagnostics(
         raw_received_count=len(raw_bars),
         raw_timestamp_parseable_count=len(valid_raw_timestamps),
         returned_parsed_count=len(returned_bars_timestamps),
+        raw_excess_count=raw_excess_count,
+        raw_received_exceeds_requested=raw_excess_count > 0,
         oldest_raw_timestamp=oldest_raw,
         newest_raw_timestamp=newest_raw,
         raw_sort_direction=raw_sort_direction,
+        raw_order_violation_count=raw_order_violation_count,
+        raw_order_head_sample=raw_order_head_sample,
+        raw_order_tail_sample=raw_order_tail_sample,
         returned_oldest_timestamp=returned_oldest,
         returned_newest_timestamp=returned_newest,
         returned_sort_direction=returned_sort_direction,
@@ -219,13 +282,34 @@ def format_diagnostics_log_line(d: MinuteBarDiagnostics) -> str:
     return (
         f"[MIN_BOOTSTRAP] symbol={d.symbol} date={d.base_date} tick_scope={d.tick_scope} "
         f"requested={d.requested_count} raw_received={d.raw_received_count} "
+        f"raw_excess={d.raw_excess_count} raw_exceeds_requested={d.raw_received_exceeds_requested} "
         f"raw_parseable={d.raw_timestamp_parseable_count} returned={d.returned_parsed_count} "
         f"oldest_raw={d.oldest_raw_timestamp} newest_raw={d.newest_raw_timestamp} "
-        f"raw_order={d.raw_sort_direction} returned_order={d.returned_sort_direction} "
+        f"raw_order={d.raw_sort_direction} raw_order_violations={d.raw_order_violation_count} "
+        f"returned_order={d.returned_sort_direction} "
         f"continuation={d.continuation_available} next_key_present={d.next_key_present} "
         f"other_date={d.other_date_count} outside_session={d.regular_session_outside_count} "
         f"duplicates={d.duplicate_timestamp_count} invalid_ts={d.invalid_timestamp_count} "
         f"newest_bar_age_sec={age} "
         f"same_minute_as_response={d.newest_raw_bar_same_minute_as_response} "
         f"is_future={d.newest_raw_bar_is_future}"
+    )
+
+
+def format_order_detail_log_line(d: MinuteBarDiagnostics) -> str | None:
+    """raw_sort_direction이 UNKNOWN(비단조)일 때만 순서 상세를 보여주는 2차 로그.
+
+    2026-07-27 (실운영 첫 로그 검토로 추가, GPT 코드리뷰): 주 로그
+    한 줄에 원본 순서 전체를 넣으면 매번 로그가 너무 길어지므로,
+    "정렬 방향이 확실할 때"(ASC/DESC)는 이 로그를 생략하고
+    UNKNOWN일 때만 앞/뒤 일부 timestamp를 보여줘 원인 조사를 돕는다.
+    정상(ASC/DESC/N/A)이면 None을 반환 — 호출부가 None이면 로그를
+    남기지 않는다.
+    """
+    if d.raw_sort_direction != "UNKNOWN":
+        return None
+    return (
+        f"[MIN_BOOTSTRAP_ORDER_DETAIL] symbol={d.symbol} date={d.base_date} "
+        f"violations={d.raw_order_violation_count}/{max(d.raw_received_count - 1, 0)} "
+        f"head={d.raw_order_head_sample} tail={d.raw_order_tail_sample}"
     )

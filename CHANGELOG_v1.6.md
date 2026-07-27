@@ -636,3 +636,135 @@ diagnostics.py`가 자동으로 발견되어 총 27개 파일 전부 통과,
 테스트가 그대로 통과한 것 자체가 매매 로직 불변의 증거.
 
 ---
+
+## 1B.1: 실운영 첫 로그 기반 진단 보강 (2026-07-27)
+
+**배경**: 1B 배포 후 실제로 봇을 실행해 `[MIN_BOOTSTRAP]` 로그를
+확인 — `raw_received=63`(요청 60인데 초과), `raw_order=UNKNOWN`
+(정렬 방향 불명)이 실제로 관찰됨. GPT 코드리뷰로 두 가지 진단
+공백을 지적받음: (1) 초과분을 사람이 로그를 눈으로 계산해야
+알 수 있었음, (2) UNKNOWN이 왜 나왔는지 알 방법이 없었음.
+
+### 1. raw_excess_count / raw_received_exceeds_requested 추가
+
+`raw_received_count`와 `requested_count`를 나란히 로그에 찍기만
+하던 것을, `raw_excess_count = raw_received_count - requested_
+count`와 `raw_received_exceeds_requested: bool`로 명시적으로
+계산·노출. 요청보다 3개 많이 온 실제 상황을 재현해 `raw_excess=3,
+raw_exceeds_requested=True`가 정확히 계산되는지 확인, 대조군으로
+raw가 요청보다 적은 경우(`raw_excess_count=-20`, 음수)도 확인.
+
+### 2. raw_sort_direction=UNKNOWN 원인 진단
+
+`raw_order_violation_count`(다수결로 정한 기준 방향에서 어긋나는
+인접 쌍 개수), `raw_order_head_sample`/`raw_order_tail_sample`
+(원본 순서 그대로 앞/뒤 5개 timestamp) 3개 필드 추가. 정렬이
+정확히 2곳에서 스왑된 합성 데이터로 `raw_order_violation_count=2`
+가 정확히 계산되는지, head/tail 샘플이 실제 값과 일치하는지 확인.
+
+**2차 로그 분리**: 주 로그 한 줄에 원본 순서 전체를 넣으면 매번
+로그가 길어지므로, `format_order_detail_log_line()` 신규 —
+`raw_sort_direction`이 정확히 `UNKNOWN`일 때만
+`[MIN_BOOTSTRAP_ORDER_DETAIL]` 2차 로그(`violations=N/전체` 비율
++ head/tail)를 남기고, ASC/DESC/N/A(정상)면 `None`을 반환해 로그를
+안 남김. `kiwoom_broker.py`의 호출부에서 `None`이 아닐 때만
+`warning` 레벨로 출력하도록 연결. 정상 정렬 케이스는 2차 로그가
+생성되지 않음을 대조군으로 확인.
+
+**여전히 미확인(다음 실운영 로그로 확인 예정)**: `raw_order_
+violation_count`가 실제로 몇 건인지, 초과 3개가 매번 같은 패턴
+인지(우연인지 구조적인지), UNKNOWN이 특정 종목·시간대에서만
+발생하는지 — 이번 라운드는 "진단이 이 정보를 정확히 드러내는가"
+까지만 검증했고, 실제 값 자체는 추측하지 않음.
+
+**검증**: `test_minute_bar_diagnostics.py`에 5개 신규 검증 섹션
+(17~21번) 추가, 총 22→34건. 신규 필드 추가가 1번 테스트(byte-
+for-byte 반환값 불변)에 영향 없음을 재확인.
+
+**전체 회귀**: `run_regression_tests.py` — 27개 파일 전부 통과,
+종료코드 0.
+
+---
+
+## 1B.2: tzdata 미설치 환경 크래시 긴급 수정 (2026-07-27)
+
+**배경**: 민우님이 실제 Windows 환경에서 `python test_minute_bar_
+diagnostics.py`를 실행하자 `ModuleNotFoundError: No module named
+'tzdata'`로 즉시 크래시. Windows는 macOS/Linux와 달리 OS 차원의
+IANA 시간대 데이터베이스가 없어서, `zoneinfo.ZoneInfo("Asia/
+Seoul")`을 쓰려면 `tzdata` pip 패키지가 반드시 설치되어 있어야
+함 — 개발 환경(Linux 컨테이너)엔 시스템 tzdata가 있어서 이
+문제를 미처 발견하지 못했음.
+
+**근본 원인 — 1B 설계 원칙(fail-open)을 직접 어긴 지점 발견**:
+`KST = ZoneInfo("Asia/Seoul")`이 `minute_bar_diagnostics.py`
+모듈 **최상단**(import 시점에 즉시 평가)에 있어서, 이 줄에서
+예외가 나면 모듈 import 자체가 실패함 — 게다가 `get_minute_bars()`
+안에서 요청/응답 시각을 기록하던 두 지점(`_request_started_at`,
+`_response_received_at`)도 `_maybe_log_minute_bar_diagnostics()`
+를 감싸는 `try/except`보다 **앞**에 있어서, 이 예외가 fail-open
+보호막 완전히 밖에서 **분봉 조회 자체를 실패**시킬 수 있는
+구조였음. "진단 실패가 분봉 조회를 막으면 안 된다"는 1B의 핵심
+원칙을 시각 기록 지점에서 놓친 설계 결함.
+
+**수정**:
+1. `KST`를 `zoneinfo.ZoneInfo("Asia/Seoul")`에서 `datetime.
+   timezone(timedelta(hours=9), name="Asia/Seoul")`(고정 UTC+9
+   오프셋)로 교체 — 한국 표준시는 서머타임이 없는 고정 오프셋이라
+   IANA 시간대 데이터베이스 없이도 정확히 동일한 결과를 얻을 수
+   있음. 실제 `ZoneInfo("Asia/Seoul")` 값과 비교해 오차가
+   0.001초 미만(호출 시점 차이뿐)임을 확인. 이제 `tzdata` 패키지
+   의존성 자체가 제거됨(`requirements.txt`에 추가 안 함 — 애초에
+   불필요해짐).
+2. `get_minute_bars()`의 두 시각 기록 지점을 각각 개별
+   `try/except`로 감싸고 `minute_bar_diagnostics.KST`(고정
+   오프셋)를 재사용 — 혹시 모를 다른 예외 상황에서도 시각 기록만
+   `None`으로 남기고 분봉 조회는 계속됨.
+
+**검증**: `builtins.__import__`를 패치해 `minute_bar_diagnostics`
+모듈 관련 import 전체가 `ModuleNotFoundError`를 던지도록
+강제하는 최악의 시나리오(실제 사용자가 겪은 상황과 동일한 종류)
+로 재현 — 진단 모듈이 완전히 로드 불가능한 상태에서도
+`get_minute_bars()`가 정상적으로 60개 분봉을 반환하고, 그 내용이
+legacy 로직과 완전히 동일함을 확인(테스트 22번). `KST` 상수가
+더 이상 `zoneinfo.ZoneInfo` 인스턴스가 아니라 `datetime.timezone`
+고정 오프셋이며 정확히 UTC+9임을 직접 검증.
+
+**전체 회귀**: `test_minute_bar_diagnostics.py` — 34→39건 전부
+통과. `run_regression_tests.py` — 27개 파일 전부 통과, 종료코드 0.
+
+---
+
+## 1B.3: 테스트 파일에 남아있던 ZoneInfo 잔존분 수정 (2026-07-27)
+
+**배경**: 1B.2에서 운영 코드(`minute_bar_diagnostics.py`,
+`kiwoom_broker.py`)의 `ZoneInfo` 의존성은 제거했는데,
+`test_minute_bar_diagnostics.py`를 실행한 민우님이 동일한
+`ZoneInfoNotFoundError`를 다시 겪음 — 이번엔 운영 코드가 아니라
+**테스트 파일 37번째 줄** 자체가 `from zoneinfo import ZoneInfo`
++ `KST = ZoneInfo("Asia/Seoul")`을 독립적으로 다시 정의하고
+있었던 것을 놓쳤음(아이러니하게도 "KST가 더 이상 zoneinfo에
+의존하지 않는지 확인하는 테스트"를 그 파일 안에 작성하면서, 정작
+파일 상단 자체는 옛 방식을 그대로 남겨뒀던 실수).
+
+**수정**: 테스트 파일에서 `from zoneinfo import ZoneInfo`와 자체
+`KST` 정의를 제거하고, `infra.broker.minute_bar_diagnostics`가
+이미 export하는 `KST`(1B.2에서 고정 UTC+9 오프셋으로 교체된 것)
+를 그대로 import해서 재사용하도록 변경 — 앞으로 운영 모듈의
+`KST` 정의가 바뀌어도 테스트가 자동으로 동기화되어 같은 종류의
+불일치가 재발하지 않음. 파일 후반부에 중복으로 남아있던 `KST`
+재import도 정리.
+
+**전수 검사**: 프로젝트 전체(`grep -rln "ZoneInfo("`)에서 실제
+`ZoneInfo(...)` 호출이 있는지 재확인 — `test_minute_bar_
+diagnostics.py`와 `minute_bar_diagnostics.py` 두 파일에 문자열이
+검색되지만, AST 파싱과 정밀 필터링으로 둘 다 **주석에만** 남아있고
+실제 코드에는 `ZoneInfo(...)` 호출이 완전히 없음을 확인. `import
+zoneinfo`(모듈 자체 import, `tzdata` 없이도 항상 성공)와
+`ZoneInfo(key)`(실제 시간대 데이터 조회, `tzdata` 필요)를 구분해서
+후자만 문제가 됨을 재확인.
+
+**전체 회귀**: `test_minute_bar_diagnostics.py` — 39건 전부 통과.
+`run_regression_tests.py` — 27개 파일 전부 통과, 종료코드 0.
+
+---

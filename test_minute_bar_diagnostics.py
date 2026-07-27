@@ -20,7 +20,6 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timedelta
 from unittest.mock import patch
-from zoneinfo import ZoneInfo
 
 sys.path.insert(0, ".")
 
@@ -28,13 +27,25 @@ from config.settings import BrokerConfig
 from domain.models import MinuteBar
 from infra.broker.kiwoom_broker import KiwoomBroker, KiwoomApiResponse
 from infra.broker.minute_bar_diagnostics import (
-    build_minute_bar_diagnostics, format_diagnostics_log_line,
+    build_minute_bar_diagnostics, format_diagnostics_log_line, format_order_detail_log_line,
+    KST,
 )
+
+# 2026-07-27 (2차 긴급 수정): 이 테스트 파일이 자체적으로
+# `from zoneinfo import ZoneInfo` + `KST = ZoneInfo("Asia/Seoul")`
+# 를 다시 정의하고 있었음 — infra/broker/minute_bar_diagnostics.py
+# 의 KST는 이미 고정 UTC+9 오프셋으로 고쳤는데(1B.2절), 정작
+# "KST가 더 이상 zoneinfo에 의존하지 않는지 확인하는 테스트"를
+# 작성하면서 이 테스트 파일 상단에는 옛 방식을 그대로 남겨뒀던
+# 실수(실제 사용자 환경에서 동일한 ZoneInfoNotFoundError로 재현됨
+# — 이번엔 minute_bar_diagnostics.py 37번째 줄이 아니라 이 테스트
+# 파일 37번째 줄에서 발생). 이제 KST를 자체 정의하지 않고 실제
+# 운영 모듈에서 그대로 import — 앞으로 KST 정의가 바뀌어도 이
+# 테스트가 자동으로 동기화되어 같은 종류의 실수가 재발하지 않음.
 
 
 passed = 0
 failed = 0
-KST = ZoneInfo("Asia/Seoul")
 
 
 def check(label: str, condition: bool) -> None:
@@ -336,6 +347,136 @@ d9 = build_minute_bar_diagnostics(
 check(f"16) 정규장 시간(MARKET_OPEN={MARKET_OPEN}~MARKET_CLOSE={MARKET_CLOSE}, "
       f"기존 utils/time_utils.py 상수 재사용) 밖 봉 1건이 정확히 감지됨",
       d9.regular_session_outside_count == 1)
+
+# ══════════════════════════════════════════════════════════════
+# 17~20. 실운영 첫 로그 검토 이후 추가 (2026-07-27, GPT 코드리뷰)
+#
+# 실제 운영에서 raw_received=63, requested=60(초과분 미표시),
+# raw_order=UNKNOWN(원인 불명)이 그대로 관찰된 것을 계기로 추가.
+# ══════════════════════════════════════════════════════════════
+
+# ── 17. raw_excess_count가 명시적으로 계산됨 (요청보다 많이 온 경우) ──
+raw_63 = make_raw_bars(63, base, desc=True)
+d10 = build_minute_bar_diagnostics(
+    symbol="475150", base_date="20260721", tick_scope="1", requested_count=60,
+    raw_bars=raw_63, returned_bars_timestamps=[b.cntr_tm for b in legacy_parse(raw_63, 60)],
+    headers={"cont-yn": "N", "next-key": ""},
+    request_started_at=None, response_received_at=None,
+)
+check("17) raw 63개, requested 60개 -> raw_excess_count=3으로 명시 계산됨",
+      d10.raw_excess_count == 3)
+check("    raw_received_exceeds_requested=True", d10.raw_received_exceeds_requested is True)
+
+# ── 18. (대조군) raw가 요청보다 적거나 같으면 exceeds=False ────────
+raw_40 = make_raw_bars(40, base, desc=True)
+d11 = build_minute_bar_diagnostics(
+    symbol="475150", base_date="20260721", tick_scope="1", requested_count=60,
+    raw_bars=raw_40, returned_bars_timestamps=[],
+    headers={"cont-yn": "N", "next-key": ""},
+    request_started_at=None, response_received_at=None,
+)
+check("18) (대조군) raw 40개 < requested 60개 -> raw_excess_count=-20(음수), exceeds=False",
+      d11.raw_excess_count == -20 and d11.raw_received_exceeds_requested is False)
+
+# ── 19. UNKNOWN 정렬 시 위반 횟수와 head/tail 샘플이 정확히 계산됨 ──
+mostly_desc = [(base + timedelta(minutes=63 - i)) for i in range(63)]
+ts_list = [t.strftime("%Y%m%d%H%M%S") for t in mostly_desc]
+# 정확히 2곳을 스왑해 UNKNOWN 유발
+ts_list[10], ts_list[11] = ts_list[11], ts_list[10]
+ts_list[40], ts_list[41] = ts_list[41], ts_list[40]
+raw_unknown = [
+    {"cntr_tm": ts, "open_pric": "58000", "high_pric": "58200", "low_pric": "57900",
+     "cur_prc": "58100", "trde_qty": "1000", "acc_trde_qty": "50000"}
+    for ts in ts_list
+]
+d12 = build_minute_bar_diagnostics(
+    symbol="475150", base_date="20260721", tick_scope="1", requested_count=60,
+    raw_bars=raw_unknown, returned_bars_timestamps=[],
+    headers={"cont-yn": "N", "next-key": ""},
+    request_started_at=None, response_received_at=None,
+)
+check("19) 2곳을 스왑한 합성데이터 -> raw_sort_direction=UNKNOWN으로 감지됨",
+      d12.raw_sort_direction == "UNKNOWN")
+check("    raw_order_violation_count가 정확히 2로 계산됨(스왑 2곳)",
+      d12.raw_order_violation_count == 2)
+check("    raw_order_head_sample이 정확히 앞 5개를 담음",
+      d12.raw_order_head_sample == ts_list[:5])
+check("    raw_order_tail_sample이 정확히 뒤 5개를 담음",
+      d12.raw_order_tail_sample == ts_list[-5:])
+
+# ── 20. UNKNOWN일 때만 2차 로그가 생성되고, ASC/DESC/N/A는 생성 안 됨 ──
+order_detail_unknown = format_order_detail_log_line(d12)
+check("20) UNKNOWN 정렬 시 2차 로그(MIN_BOOTSTRAP_ORDER_DETAIL)가 생성됨",
+      order_detail_unknown is not None and "MIN_BOOTSTRAP_ORDER_DETAIL" in order_detail_unknown)
+check("    2차 로그에 violations 비율과 head/tail이 포함됨",
+      "violations=2/62" in order_detail_unknown)
+
+# (대조군) 정상 DESC 정렬(raw_63)은 2차 로그가 생성되지 않음
+order_detail_normal = format_order_detail_log_line(d10)
+check("    (대조군) 정상 DESC 정렬은 2차 로그가 None(생성 안 됨)",
+      order_detail_normal is None)
+
+# ── 21. 주 로그 라인에 raw_excess/violations가 실제로 포함되는지 확인 ──
+main_log_line = format_diagnostics_log_line(d10)
+check("21) 주 로그 라인에 raw_excess=3이 실제로 출력됨", "raw_excess=3" in main_log_line)
+check("    주 로그 라인에 raw_exceeds_requested=True가 실제로 출력됨",
+      "raw_exceeds_requested=True" in main_log_line)
+
+# ══════════════════════════════════════════════════════════════
+# 22. tzdata 패키지 부재 환경 재현 (2026-07-27, 실제 크래시로 발견)
+#
+# 배경: Windows에는 OS 차원의 IANA 시간대 데이터베이스가 없어서
+# tzdata 패키지가 미설치면 zoneinfo.ZoneInfo("Asia/Seoul")가
+# ZoneInfoNotFoundError를 던짐. 기존엔 이게 모듈 최상단(import
+# 시점 즉시평가)과 get_minute_bars() 본문(fail-open try/except
+# 이전)에 있어서, 이 예외가 fail-open 보호막 밖에서 분봉 조회
+# 자체를 실패시켰음(실제 사용자 환경에서 재현됨). KST를 zoneinfo
+# 의존성 없는 고정 UTC+9 오프셋으로 교체하고, 혹시 모를 실패에도
+# 대비해 시각 기록 지점 자체도 try/except로 감쌈.
+# ══════════════════════════════════════════════════════════════
+
+broker5 = make_broker()
+raw_bars5 = make_raw_bars(70, base, desc=True)
+
+
+def failing_import(name, *args, **kwargs):
+    """minute_bar_diagnostics 관련 import를 전부 실패시켜 tzdata
+    미설치 환경(모듈 로드 자체가 안 되는 최악의 상황)을 재현합니다."""
+    if "minute_bar_diagnostics" in name:
+        raise ModuleNotFoundError("No module named 'tzdata' (재현용 강제 실패)")
+    return _original_import(name, *args, **kwargs)
+
+
+import builtins as _builtins
+_original_import = _builtins.__import__
+
+with patch.object(broker5, "_post", return_value=make_response(raw_bars5)):
+    with patch("builtins.__import__", side_effect=failing_import):
+        result_no_tzdata = broker5.get_minute_bars("475150", tick_scope=3, count=60)
+
+check("22) 진단 모듈 import가 완전히 실패해도(tzdata 부재 재현) "
+      "분봉 조회는 정상적으로 60개를 반환함(fail-open 완전 검증)",
+      len(result_no_tzdata) == 60)
+legacy_for_tzdata_test = legacy_parse(raw_bars5, 60)
+identical3 = all(
+    (l.cntr_tm, l.close_price) == (a.cntr_tm, a.close_price)
+    for l, a in zip(legacy_for_tzdata_test, result_no_tzdata)
+)
+check("    tzdata 부재 상황에서도 반환된 분봉 내용은 legacy와 완전히 동일함",
+      identical3)
+
+# ── KST 상수 자체가 더 이상 zoneinfo에 의존하지 않는지 직접 확인 ──
+# (KST는 이미 파일 상단에서 실제 운영 모듈로부터 import했음 — 여기서
+# 다시 import하지 않고 그 값을 그대로 검증)
+import zoneinfo as _zoneinfo
+from datetime import timezone as _timezone
+
+check("   KST 상수가 zoneinfo.ZoneInfo 인스턴스가 아님(외부 tzdata 의존성 제거 확인)",
+      not isinstance(KST, _zoneinfo.ZoneInfo))
+check("   KST 상수가 datetime.timezone 고정 오프셋 인스턴스임",
+      isinstance(KST, _timezone))
+check("   KST 오프셋이 정확히 UTC+9시간임",
+      KST.utcoffset(None) == timedelta(hours=9))
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
