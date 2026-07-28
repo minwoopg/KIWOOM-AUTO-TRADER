@@ -137,6 +137,15 @@ class MarketRegimeConfig:
     slow_v_rebound_threshold_pct: float = 0.5
     slow_v_max_rebound_pct: float = 15.0
     slow_v_volume_ratio: float = 1.0
+    # 2026-07-28 (GPT 코드리뷰 지적, stale 분봉 안전장치 2단계): API
+    # 호출이 예외 없이 성공해도 반환된 최신 봉이 실제로 신선한지
+    # (오늘 날짜인지, 너무 오래된 봉이 아닌지)는 별도로 확인해야 함
+    # — 재현 확인: API가 정상적으로 과거(전거래일) 봉을 반환해도
+    # 예외가 없다는 이유만으로 신선하다고 오판정되고 있었음. 1분봉
+    # 기준 120초를 보수적인 기본값으로 사용(장중 지연·재시도를
+    # 고려한 여유). tick_scope가 커지면 이 값도 비례해서 늘려야
+    # 함(예: 3분봉이면 최소 180초 이상).
+    minute_bar_max_age_seconds: int = 120
 
 
 @dataclass(frozen=True)

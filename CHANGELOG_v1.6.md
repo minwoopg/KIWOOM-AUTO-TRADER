@@ -1031,3 +1031,123 @@ Windows 실환경에서 `python test_minute_bar_diagnostics.py`,
 
 ---
 
+## 1B.7: 빈 응답·과거 봉 우회 경로 차단 (2026-07-28, 안전 긴급 2단계)
+
+**배경**: 1B.6 결과에 대한 GPT 3차 재검토에서, 예외 발생 경로만
+막았을 뿐 두 가지 안전 우회 경로가 그대로 열려 있음을 실제 재현과
+함께 지적받음.
+
+### 발견한 두 우회 경로 (둘 다 재현 확인)
+
+1. **빈 응답 우회**: `get_minute_bars()`가 예외 없이 빈 리스트
+   `[]`를 "정상 반환"하면, 기존 코드는 `is_fresh=True`를 유지한
+   채 **기존 정상 캐시까지 빈 리스트로 덮어쓰고** `loaded_at`도
+   갱신했음. 재현 확인: 정상 캐시가 있는 상태에서 API가 빈 응답을
+   주면 그 캐시가 사라지고 `is_fresh=True`인 채 `None`이 반환됨.
+2. **과거 봉 우회**: API가 예외 없이 과거(전거래일) 분봉을 정상
+   반환해도, "예외가 없었다"는 이유만으로 `is_fresh=True`였음.
+   재현 확인: 7/21 봉 60개를 반환하도록 만들었더니 최신 봉이
+   `20260721095900`(전거래일)인데도 신선하다고 판정됨.
+
+### 수정: MinuteDataResult 명시적 결과 객체로 전면 재설계
+
+기존 `(analysis, is_fresh, reason)` 튜플이 "is_fresh"의 실제 의미
+(API 호출 성공 여부일 뿐 데이터 신선도가 아님)를 정확히 담지
+못한다는 지적을 받아들여, `domain/market_regime/minute_analyzer.py`
+에 `MinuteDataResult` dataclass 신설:
+
+```python
+@dataclass(frozen=True)
+class MinuteDataResult:
+    analysis: MinuteAnalysis | None
+    entry_safe: bool       # 신규 진입 판단에 안전한지
+    source: str             # LIVE | CACHE | EMPTY | LIVE_OLD_BAR | UNAVAILABLE
+    reason: str
+    latest_bar_timestamp: str | None
+    age_seconds: float | None
+```
+
+`_get_minute_analysis()`를 이 객체를 반환하도록 재작성:
+
+- **빈 응답 처리**: `if not new_bars:` 분기를 신설해, 기존 캐시와
+  `loaded_at`을 절대 건드리지 않고, 캐시가 있으면 `source="CACHE"`
+  /`STALE_MINUTE_DATA`, 없으면 `source="EMPTY"`/`MINUTE_DATA_
+  UNAVAILABLE`로 처리.
+- **과거 봉 처리**: API 호출이 성공해도, 반환된 최신 봉의
+  `cntr_tm`을 파싱해 (1) 파싱 자체가 성공하는지, (2) 오늘 날짜인지,
+  (3) age가 `minute_bar_max_age_seconds`(신규 설정, 기본 120초)
+  이내인지 확인. 셋 중 하나라도 실패하면 `source="LIVE_OLD_BAR"`
+  /`STALE_MINUTE_DATA`.
+- `entry_safe = (source == "LIVE" and reason == "")`로 최종 판정 —
+  둘 다 만족해야 신규 진입 가능.
+
+`config/settings.py`/`settings.yaml`에 `minute_bar_max_age_seconds:
+120` 신규 추가(1분봉 기준 보수적 기본값, 3분봉 등으로 바뀌면
+비례 조정 필요하다는 점을 주석에 명시).
+
+**재현 시나리오로 실제 수정 검증**: 두 우회 재현 코드를 그대로
+다시 실행 — 빈 응답 케이스는 `entry_safe=False`, `source="CACHE"`,
+기존 캐시 보존, `loaded_at` 미갱신 확인. 과거 봉 케이스는
+`entry_safe=False`, `source="LIVE_OLD_BAR"` 확인. 정상 케이스
+(MockBroker 기본 응답, 오늘 시각 기준)는 여전히 `entry_safe=True`
+임을 확인(회귀 없음).
+
+**호출부(`_process_symbol()`) 갱신**: `minute_data_fresh`/
+`minute_data_stale_reason` 지역변수를 `minute_data_entry_safe`/
+`minute_data_reason`으로 교체, `MinuteDataResult`의 필드를 그대로
+사용하도록 수정. 미보유 종목 + `entry_safe=False` + BUY 신호 →
+HOLD 강제 전환 로직 자체는 1B.6과 동일하게 유지(조건식만 갱신).
+
+**`test_stale_minute_data_safety.py` 전면 재작성**: 27건 전부 통과
+(기존 13건에서 확장). GPT가 제시한 12개 필수 테스트 중 이번
+라운드 범위(1, 2, 6, 7, 11번 — 빈 응답/과거 봉/파싱실패/age초과/
+회귀 케이스)를 포함:
+1. 정상 조회 → `entry_safe=True`
+2~3. 예외 발생(캐시 有/無) → `entry_safe=False`
+4~5. **빈 응답(예외 아님, 캐시 有/無)** → `entry_safe=False`,
+   기존 캐시·`loaded_at` 보존 검증
+6. **과거 봉 정상 반환** → `entry_safe=False`, `source=LIVE_OLD_BAR`
+7. 최신 봉 timestamp 파싱 실패 → `entry_safe=False`
+8. 최신 봉 age 초과(120초) → `entry_safe=False`
+9. 미보유+EMPTY응답+BUY신호 → `_process_symbol()` 통합 흐름에서
+   실제로 HOLD 강제 전환됨을 `signal_log.csv` 검증
+10. 보유+stale+SELL → 차단 없이 `_try_sell` 호출됨(이번 라운드는
+    SELL 세분화 없이 기존 동작 유지 — 아래 참고)
+11. 회귀: 미보유+fresh+BUY → `_try_buy` 정상 호출
+
+**전체 회귀**: `run_regression_tests.py` — 28개 파일 전부 통과,
+종료코드 0(GPT 지시 6번 — 이전 보고의 "27/27"을 정확한 파일 수
+"28/28"로 정정).
+
+### 이번 라운드에서 의도적으로 미루는 것 (GPT 지시 3, 4, 5번)
+
+범위가 크고 서로 독립적인 작업이라, 명확히 분리해서 별도 라운드로
+미룹니다 — 지금 한 번에 다 처리하면 각 변경의 영향 범위를 검증하기
+어려워짐:
+
+- **(GPT 3번) stale SELL 세분화**: 현재는 보유 종목의 모든
+  `stale` SELL을 차단 없이 허용 — 고정 손절/강제청산 같은 가격
+  기반 위험축소 SELL과, VWAP/MA 이탈 같은 분봉 지표 기반 SELL을
+  구분하지 않음. `Signal`에 `requires_fresh_minute_data`나
+  `exit_category` 필드를 추가하는 설계가 필요하며, 각 전략
+  (`breakout_strategy.py`, `neutral_strategy.py`, `bottom_
+  strategy.py` 등)의 SELL 신호 생성 지점을 전부 검토해야 하는
+  큰 작업.
+- **(GPT 4번) stale 데이터의 부수효과 상태 오염 방지**: 현재
+  `minute_analysis`가 stale이어도 `[MIN]`/`V_FAIL` 로그, 거래대금
+  부족 카운트, 감시종목 자동제외 카운트가 그대로 갱신됨 — stale
+  일 때 이 카운터들의 갱신을 멈추고 `[MIN_STALE]` 로그만 남기는
+  것으로 분리 필요.
+- **(GPT 5번) 14:50 시간 게이트의 Clock 의존성 주입**: `_try_buy()`
+  내부의 `datetime.now()`(타임존 미지정, 시스템 로컬시각)가 실제
+  운영 환경(UTC 서버)에서 KST 기준 시각과 어긋날 수 있고, 테스트도
+  실행 시각에 따라 flaky함(1B.6절에서 재현 확인). `TradingService`
+  에 `_now()` 메서드 또는 `Clock` 의존성을 두고 KST 기준으로
+  통일, 테스트에서 고정 시각을 주입하는 구조로 변경 필요 — 이건
+  `_try_buy()` 전체와 관련 테스트(`test_order_block_reason.py`
+  등)에 영향을 주는 별도 작업.
+
+이 세 가지는 다음 라운드에서 순서대로 처리 예정.
+
+---
+

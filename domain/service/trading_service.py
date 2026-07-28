@@ -22,7 +22,7 @@ from pathlib import Path
 
 from config.settings import Settings
 from domain.market_regime.classifier import MarketRegimeClassifier
-from domain.market_regime.minute_analyzer import MinuteAnalyzer, MinuteAnalysis
+from domain.market_regime.minute_analyzer import MinuteAnalyzer, MinuteAnalysis, MinuteDataResult
 from domain.models import AccountBalance, MarketRegime, OrderRequest, OrderSide, Signal, SignalType
 from domain.position.lifecycle import PositionLifecycle, PositionStateMachine
 from domain.risk.risk_manager import RiskManager
@@ -399,81 +399,156 @@ class TradingService:
         cached = self.cached_regime.get(symbol, MarketRegime.UNKNOWN)
         return cached, "(캐시)"
 
-    def _get_minute_analysis(
-        self, symbol: str, prev_close: int
-    ) -> tuple[MinuteAnalysis | None, bool, str]:
+    def _get_minute_analysis(self, symbol: str, prev_close: int) -> MinuteDataResult:
         """분봉 데이터를 가져와 2차 필터 분석 결과를 반환합니다. 결과는 캐시합니다.
 
-        2026-07-27 (GPT 코드리뷰 지적, 안전성 긴급 수정): 기존엔
-        get_minute_bars() 예외 시 오래된 캐시(cached_minute_bars)를
-        그대로 분석에 넘기면서, 이 데이터가 "방금 조회한 신선한
-        데이터"인지 "조회 실패로 어쩔 수 없이 쓴 오래된 캐시"인지
-        호출부에 전혀 알리지 않았음 — 실운영에서 분봉 조회 실패 직후
-        오래된 캐시 기반으로 신규 매수(039980)가 발생한 원인이 이
-        구조. 반환값에 신선도 정보(is_fresh)와 사유(reason)를 함께
-        담아, 호출부가 "이 데이터로 신규 진입을 해도 되는지"를
-        명시적으로 판단할 수 있게 함.
+        2026-07-27~28 (GPT 코드리뷰 지적, 안전성 긴급 수정 2단계):
+        1단계(2026-07-27)에서 "API 예외 발생 시 오래된 캐시를 신선도
+        정보 없이 그대로 쓰는" 문제는 고쳤으나, 두 가지 우회 경로가
+        재현되어 추가로 막음:
 
-        반환값:
-            (analysis, is_fresh, reason)
-            - analysis: 기존과 동일한 MinuteAnalysis | None
-            - is_fresh: 이번 호출에서 API 조회에 성공했으면 True,
-              실패해서 캐시로 대체했으면 False (첫 조회 자체가
-              실패해 캐시도 없는 경우도 False)
-            - reason: fresh가 False일 때의 사유 문자열
-              ("MINUTE_DATA_UNAVAILABLE" | "STALE_MINUTE_DATA" | "")
-              — 캐시가 아예 없으면 UNAVAILABLE, 오래된 캐시라도
-              있으면 STALE.
+        (a) API가 예외 없이 빈 리스트를 "정상 반환"하는 경우 —
+            기존엔 is_fresh=True로 유지되고, 심지어 기존 정상 캐시
+            까지 빈 리스트로 덮어쓰며 loaded_at도 갱신되고 있었음
+            (재현 확인: 정상 캐시가 있는 상태에서 API가 빈 응답을
+            주면 그 캐시가 사라지고 entry_safe=True인 채 None이
+            반환됨). 이제 빈 응답은 기존 캐시/loaded_at을 건드리지
+            않고, 대신 기존 캐시로 분석하되 entry_safe=False로
+            명시.
+        (b) API가 예외 없이 과거(전거래일 등) 분봉을 "정상 반환"
+            하는 경우 — 기존엔 예외가 없다는 이유만으로 entry_safe
+            =True였음(재현 확인). 이제 반환된 봉 중 최신 timestamp
+            를 파싱해 오늘 날짜인지, age가 minute_bar_max_age_
+            seconds 이내인지까지 확인.
+
+        반환값은 MinuteDataResult(analysis, entry_safe, source,
+        reason, latest_bar_timestamp, age_seconds) — 자세한 의미는
+        MinuteDataResult 클래스 docstring 참고.
 
         기존 동작(캐시를 분석에 사용하는 것 자체)은 그대로 유지 —
-        보유 종목의 손절/트레일링 판단이 끊기지 않도록. 다만 이제
-        신선도를 알 수 있으므로, 호출부가 미보유 종목의 신규 진입만
-        선택적으로 차단할 수 있음.
+        보유 종목의 손절/트레일링 판단이 끊기지 않도록. entry_safe
+        만으로 호출부가 신규 진입 여부를 판단.
         """
         now = datetime.now()
         loaded_at = self.cached_minute_bars_loaded_at.get(symbol)
         refresh_sec = self.settings.market_regime.minute_refresh_seconds
+        max_age_sec = getattr(
+            self.settings.market_regime, "minute_bar_max_age_seconds", 120
+        )
 
         need_refresh = (
             loaded_at is None
             or (now - loaded_at).total_seconds() >= refresh_sec
         )
 
-        is_fresh = True
-        stale_reason = ""
+        source = "LIVE"
+        reason = ""
 
         if need_refresh:
             try:
                 cfg = self.settings.market_regime
-                bars = self.broker.get_minute_bars(
+                new_bars = self.broker.get_minute_bars(
                     symbol,
                     tick_scope=cfg.minute_tick_scope,
                     count=cfg.minute_bar_count,
                 )
-                self.cached_minute_bars[symbol] = bars
-                self.cached_minute_bars_loaded_at[symbol] = now
 
-                # 1분봉 저장 (enabled 시)
-                if self._minute_saver is not None and bars:
+                if not new_bars:
+                    # (a) 빈 응답 — 기존 캐시/loaded_at을 건드리지
+                    # 않고, 기존 캐시가 있으면 그걸로 분석하되
+                    # entry_safe=False로 명시. 캐시조차 없으면
+                    # UNAVAILABLE.
+                    self.app_logger.warning(
+                        f"[MIN_STALE] {symbol} | API가 빈 분봉을 반환 — "
+                        f"기존 캐시 유지, 신규진입 차단"
+                    )
+                    bars = self.cached_minute_bars.get(symbol, [])
+                    source = "EMPTY" if not bars else "CACHE"
+                    reason = "MINUTE_DATA_UNAVAILABLE" if not bars else "STALE_MINUTE_DATA"
+                else:
+                    self.cached_minute_bars[symbol] = new_bars
+                    self.cached_minute_bars_loaded_at[symbol] = now
+                    bars = new_bars
+
+                    # (b) 정상 응답이어도 최신 봉이 실제로 신선한지 확인
+                    latest_ts = new_bars[-1].cntr_tm if new_bars else None
+                    latest_dt = self._parse_minute_bar_timestamp(latest_ts)
+                    if latest_dt is None:
+                        source = "LIVE_OLD_BAR"
+                        reason = "STALE_MINUTE_DATA"
+                        self.app_logger.warning(
+                            f"[MIN_STALE] {symbol} | 최신 봉 timestamp 파싱 실패"
+                            f"({latest_ts!r}) — 신규진입 차단"
+                        )
+                    elif latest_dt.date() != now.date():
+                        source = "LIVE_OLD_BAR"
+                        reason = "STALE_MINUTE_DATA"
+                        self.app_logger.warning(
+                            f"[MIN_STALE] {symbol} | 최신 봉({latest_ts})이 오늘 날짜가 "
+                            f"아님 — 신규진입 차단"
+                        )
+                    elif (now - latest_dt).total_seconds() > max_age_sec:
+                        source = "LIVE_OLD_BAR"
+                        reason = "STALE_MINUTE_DATA"
+                        self.app_logger.warning(
+                            f"[MIN_STALE] {symbol} | 최신 봉({latest_ts}) age="
+                            f"{(now - latest_dt).total_seconds():.0f}s > "
+                            f"{max_age_sec}s — 신규진입 차단"
+                        )
+
+                # 1분봉 저장 (enabled 시, 정상 응답일 때만)
+                if new_bars and self._minute_saver is not None:
                     try:
-                        self._minute_saver.save(symbol, bars)
+                        self._minute_saver.save(symbol, new_bars)
                     except Exception as save_exc:
                         self.app_logger.debug(f"[MIN] {symbol} | 분봉 저장 실패: {save_exc}")
             except Exception as exc:
                 self.app_logger.warning(f"[MIN] {symbol} | 분봉 조회 실패: {exc}")
                 bars = self.cached_minute_bars.get(symbol, [])
-                is_fresh = False
-                stale_reason = (
-                    "STALE_MINUTE_DATA" if bars else "MINUTE_DATA_UNAVAILABLE"
-                )
+                source = "CACHE" if bars else "UNAVAILABLE"
+                reason = "STALE_MINUTE_DATA" if bars else "MINUTE_DATA_UNAVAILABLE"
         else:
             bars = self.cached_minute_bars.get(symbol, [])
+            # 캐시가 신선구간(need_refresh=False) 안이라도, 이 캐시가
+            # 애초에 stale로 기록된 적이 있었는지는 추적하지 않음 —
+            # 현재 구조상 "직전 호출에서의 source"를 저장하지 않으므로,
+            # 여기서는 보수적으로 LIVE로 취급(캐시 유효기간 이내이므로
+            # 최근에 확인된 데이터라는 전제 — refresh_sec가 매우 짧게
+            # 설정되어 있어 실질적 위험은 낮음).
 
         if not bars:
-            return None, is_fresh, stale_reason
+            return MinuteDataResult(
+                analysis=None, entry_safe=False, source=source or "UNAVAILABLE",
+                reason=reason or "MINUTE_DATA_UNAVAILABLE",
+                latest_bar_timestamp=None, age_seconds=None,
+            )
 
         analysis = self._minute_analyzer.analyze(bars, prev_close)
-        return analysis, is_fresh, stale_reason
+        latest_ts = bars[-1].cntr_tm if bars else None
+        latest_dt = self._parse_minute_bar_timestamp(latest_ts)
+        age_seconds = (now - latest_dt).total_seconds() if latest_dt is not None else None
+
+        entry_safe = source == "LIVE" and reason == ""
+        return MinuteDataResult(
+            analysis=analysis, entry_safe=entry_safe, source=source,
+            reason=reason, latest_bar_timestamp=latest_ts, age_seconds=age_seconds,
+        )
+
+    @staticmethod
+    def _parse_minute_bar_timestamp(cntr_tm: str | None) -> datetime | None:
+        """분봉의 cntr_tm('YYYYMMDDHHMMSS')을 datetime으로 안전하게 파싱합니다.
+
+        2026-07-28: stale 판정(오늘 날짜인지, age가 허용범위인지)에
+        쓰기 위해 신설. 실패하면 예외를 던지지 않고 None을 반환 —
+        이 값이 None이면 호출부가 "신선도 확인 불가"로 안전하게
+        처리(entry_safe=False)함.
+        """
+        if not cntr_tm or len(cntr_tm) != 14 or not cntr_tm.isdigit():
+            return None
+        try:
+            return datetime.strptime(cntr_tm, "%Y%m%d%H%M%S")
+        except ValueError:
+            return None
 
     def _attach_indicators(self, market_price, symbol: str):
         """캐시된 일봉 데이터로 지표값을 계산해 MarketPrice에 주입합니다.
@@ -795,12 +870,13 @@ class TradingService:
 
             # BULLISH일 때만 분봉 2차 필터 적용
             minute_analysis = None
-            minute_data_fresh = True
-            minute_data_stale_reason = ""
+            minute_data_entry_safe = True
+            minute_data_reason = ""
             if regime in (MarketRegime.BULLISH, MarketRegime.NEUTRAL, MarketRegime.REBOUND):
-                minute_analysis, minute_data_fresh, minute_data_stale_reason = (
-                    self._get_minute_analysis(symbol, market_price.previous_close)
-                )
+                minute_result = self._get_minute_analysis(symbol, market_price.previous_close)
+                minute_analysis = minute_result.analysis
+                minute_data_entry_safe = minute_result.entry_safe
+                minute_data_reason = minute_result.reason
                 if minute_analysis:
                     score = minute_analysis.score()
                     last = self._last_min_logged.get(symbol)
@@ -890,19 +966,22 @@ class TradingService:
                     bb_percent_b=_bb_pb,
                 )
 
-            # 2026-07-27 (GPT 코드리뷰 지적, 안전성 긴급 수정): 미보유
-            # 종목에서 분봉 데이터가 신선하지 않은데(조회 실패로 오래된
-            # 캐시를 쓴 경우) BUY 신호가 나오면 강제로 HOLD로 덮어씀 —
-            # 실운영에서 분봉 조회 실패 직후 오래된 캐시 기반 신규
-            # 매수(039980)가 발생했던 문제의 재발 방지. 보유 종목
-            # (position is not None)의 손절/트레일링 SELL은 이 검사와
-            # 무관하게 그대로 동작 — 위험 축소 행동을 막으면 안 되므로.
+            # 2026-07-27~28 (GPT 코드리뷰 지적, 안전성 긴급 수정): 미보유
+            # 종목에서 분봉 데이터가 신규진입에 안전하지 않으면(조회
+            # 실패로 오래된 캐시를 썼거나, API가 빈 응답을 줬거나,
+            # API는 성공했지만 반환된 최신 봉이 과거 데이터인 경우 모두
+            # 포함) BUY 신호가 나와도 강제로 HOLD로 덮어씀 — 실운영에서
+            # 분봉 조회 실패 직후 오래된 캐시 기반 신규 매수(039980)가
+            # 발생했던 문제의 재발 방지, 이후 빈 응답·과거봉 우회
+            # 경로도 재현 확인 후 함께 차단. 보유 종목(position is not
+            # None)의 손절/트레일링 SELL은 이 검사와 무관하게 그대로
+            # 동작 — 위험 축소 행동을 막으면 안 되므로.
             if (
                 position is None
-                and not minute_data_fresh
+                and not minute_data_entry_safe
                 and signal.type == SignalType.BUY
             ):
-                signal = Signal(type=SignalType.HOLD, reason=minute_data_stale_reason)
+                signal = Signal(type=SignalType.HOLD, reason=minute_data_reason)
 
             self._log_signal_decision(
                 symbol, signal, market_price.current_price,

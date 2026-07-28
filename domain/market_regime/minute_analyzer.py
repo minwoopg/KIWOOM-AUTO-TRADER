@@ -16,7 +16,49 @@ from __future__ import annotations
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from domain.models import MinuteBar
+
+
+@dataclass(frozen=True)
+class MinuteDataResult:
+    """분봉 데이터 조회·분석 한 번의 결과를 명시적으로 담는 객체.
+
+    2026-07-28 (GPT 코드리뷰 지적, stale 분봉 안전장치 2단계):
+    기존 (analysis, is_fresh, reason) 튜플은 "is_fresh"의 의미가
+    모호했음(실제로는 "API 호출이 예외 없이 끝났는가"였는데,
+    호출부가 원하는 의미는 "실제 반환된 최신 분봉이 신규 진입에
+    쓸 만큼 최신인가"였음) — 재현 확인 결과 API가 예외 없이 빈
+    리스트나 과거(전거래일) 봉을 "정상 반환"해도 is_fresh=True로
+    잘못 판정되고 있었음. 명시적 필드를 가진 결과 객체로 교체해
+    이런 혼동을 원천 차단.
+
+    Attributes:
+        analysis: 분석 결과 (조회·분석 성공 시), 없으면 None.
+        entry_safe: 이 데이터로 "신규 진입(BUY)"을 판단해도 안전한지.
+            다음을 모두 만족해야 True:
+            - API 호출이 예외 없이 성공했고
+            - 반환된 봉이 비어있지 않고
+            - 최신 봉의 timestamp가 파싱 가능하고
+            - 최신 봉이 오늘 날짜이고
+            - 최신 봉의 age가 minute_bar_max_age_seconds 이내
+        source: 데이터 출처 — "LIVE"(방금 조회 성공, 신선함),
+            "CACHE"(조회 실패로 캐시 사용), "EMPTY"(조회는
+            성공했지만 빈 응답), "LIVE_OLD_BAR"(조회는 성공했지만
+            반환된 최신 봉이 오래됨/과거 날짜), "UNAVAILABLE"
+            (분석할 데이터 자체가 없음).
+        reason: entry_safe가 False일 때의 사유 문자열.
+        latest_bar_timestamp: 분석에 사용된 봉 중 가장 최신 것의
+            cntr_tm 문자열(진단/로그용), 없으면 None.
+        age_seconds: 최신 봉과 "지금" 사이의 경과 시간(초), 계산
+            불가능하면 None.
+    """
+    analysis: "MinuteAnalysis | None"
+    entry_safe: bool
+    source: str
+    reason: str
+    latest_bar_timestamp: str | None
+    age_seconds: float | None
 
 
 @dataclass

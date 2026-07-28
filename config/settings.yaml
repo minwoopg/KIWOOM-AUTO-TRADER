@@ -116,6 +116,10 @@ market_regime:
   minute_tick_scope: 1
   minute_bar_count: 60
   minute_refresh_seconds: 60
+  # 2026-07-28: API 호출이 예외 없이 성공해도 반환된 최신 봉이
+  # 실제로 신선한지(오늘 날짜, age 이내) 별도 확인하기 위한 기준.
+  # tick_scope(현재 1분)에 비례해 조정 필요 — 3분봉이면 180 이상 권장.
+  minute_bar_max_age_seconds: 120
   # V자 반등 감지 파라미터
   v_bottom_lookback: 30
   v_low_min_age: 1
