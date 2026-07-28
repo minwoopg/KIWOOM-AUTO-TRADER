@@ -146,6 +146,11 @@ class MarketRegimeConfig:
     # 고려한 여유). tick_scope가 커지면 이 값도 비례해서 늘려야
     # 함(예: 3분봉이면 최소 180초 이상).
     minute_bar_max_age_seconds: int = 120
+    # 2026-07-28 (GPT 코드리뷰 지적 5번): 분봉 조회 실패/빈응답이
+    # 연속될 때, 성공 캐시 시각(minute_refresh_seconds)과 무관하게
+    # 이 시간 동안은 재시도하지 않음 — 매 폴링마다 실패하는 API를
+    # 계속 두드리는 것을 방지(이전 HTTP 429 재발 방지 목적).
+    minute_fetch_backoff_seconds: int = 20
 
 
 @dataclass(frozen=True)

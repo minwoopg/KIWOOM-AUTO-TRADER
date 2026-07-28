@@ -1151,3 +1151,118 @@ HOLD 강제 전환 로직 자체는 1B.6과 동일하게 유지(조건식만 갱
 
 ---
 
+## 1B.8: 캐시 재사용 경로 우회 + KST timezone 계산 오류 수정 (2026-07-28, 안전 긴급 3단계)
+
+**배경**: 1B.7 결과에 대한 GPT 4차 재검토에서 두 가지 심각한 문제를
+실제 재현과 함께 지적받음.
+
+### 발견한 두 문제 (둘 다 재현 확인)
+
+1. **캐시 재사용 경로 우회 (가장 심각)**: 1회차 호출에서 과거 봉
+   으로 `entry_safe=False`가 정확히 나와도, 60초 캐시 구간 안의
+   2회차 즉시 재호출은 신선도 재검증이 전혀 없이 `source`가
+   초기값 `"LIVE"`로 남아 `entry_safe=True`가 되던 치명적 버그.
+   재현 확인: 동일한 `latest_bar_timestamp`인데 1회차는 `False`,
+   2회차는 `True`. 이건 1B.7에서 만든 "최초 호출 차단"이 사실상
+   무의미해지는 우회였음 — 실운영에서는 폴링 주기(10초)가 캐시
+   구간(60초)보다 짧아 대부분의 호출이 이 우회 경로를 탐.
+2. **naive datetime과 KST 봉 timestamp의 잘못된 비교**: 기존
+   `datetime.now()`가 시스템 로컬시각(서버가 UTC로 설정된 환경
+   에서는 UTC 그대로)을 반환하는데, 키움 API의 분봉 timestamp는
+   KST 기준 — 재현 확인: UTC 서버가 로컬시각 00:20을 가진 상태에서
+   KST 09:20 봉을 받으면 `age_seconds=-32400`(-9시간)으로 계산
+   되는데도 `entry_safe=True`로 판정됨(음수 age를 걸러내는 로직도
+   없었음).
+
+### 수정
+
+**1. `utils/time_utils.py`에 KST 전용 헬퍼 신설**: `KST_TZ =
+timezone(timedelta(hours=9), name="Asia/Seoul")`(1B.2절에서 이미
+검증된 tzdata 비의존 고정 오프셋 방식 재사용), `now_kst()`(항상
+정확한 KST 반환, 서버 로컬시각과 무관), `parse_kst_bar_timestamp()`
+(분봉 timestamp를 KST timezone-aware로 파싱). 기존 `now_local()`/
+`MARKET_OPEN`/`MARKET_CLOSE`(naive 기반, 14:50 게이트 등 다른
+코드 경로에서 여전히 사용 중)는 이번 라운드에서 건드리지 않음 —
+그걸 바꾸면 검증 범위가 지나치게 커짐(GPT 지적 5번의 14:50 게이트
+자체는 여전히 다음 라운드로 분리).
+
+**2. `_evaluate_bar_freshness()` 헬퍼로 신선도 검증 로직 통합**:
+API 응답 직후 검증과 캐시 재사용 시 검증이 완전히 동일한 함수를
+호출하도록 재구성 — 두 경로의 판정 기준이 어긋날 수 없는 구조로
+변경. 판정 기준: 최신 봉 `cntr_tm` 파싱 성공, `age_seconds >= -5`
+(미래 timestamp 방어, 약간의 시계 오차는 허용), `age_seconds <=
+minute_bar_max_age_seconds`.
+
+**3. `_get_minute_analysis()` 전면 재작성**:
+- 캐시 재사용(`need_refresh=False`) 경로에서도 `_evaluate_bar_
+  freshness()`를 호출해 매번 재검증 — `source`를 `"CACHE_FRESH"`
+  /`"CACHE_STALE"`으로 명확히 구분(GPT 지적: "캐시라는 이유만으로
+  LIVE로 취급하지 마라").
+- 신선도 검증에 실패한 응답으로는 `cached_minute_bars`/`cached_
+  minute_bars_loaded_at`을 절대 갱신하지 않음 — "성공 캐시 시각"
+  이 실패한 시도로 오염되지 않도록.
+- 새 API 응답의 최신 봉이 기존 캐시의 최신 봉보다 오래되면 기존
+  (더 신선한) 캐시를 보호하고 덮어쓰지 않음.
+- `cached_minute_bars_failed_at`(신규 딕셔너리)로 성공 캐시 시각과
+  분리해서 실패/빈응답 시각을 추적, `minute_fetch_backoff_seconds`
+  (신규 설정, 기본 20초) 동안은 재시도하지 않음 — 실패가 연속될
+  때 매 폴링(10초)마다 API를 계속 두드리지 않도록(이전 HTTP 429
+  재발 방지).
+
+`config/settings.py`/`settings.yaml`에 `minute_fetch_backoff_
+seconds: 20` 신규 추가.
+
+### 재현 시나리오로 실제 수정 검증
+
+두 우회를 정확히 재현했던 코드를 그대로 다시 실행:
+- 캐시 우회: 1회차 `entry_safe=False`, 2회차(즉시 재호출)도
+  `entry_safe=False`로 정확히 확인.
+- KST age: UTC 서버 환경 재현(시스템 로컬시각 00:20, KST 봉
+  09:20)에서 `age_seconds=0.0`으로 정확히 계산됨을 확인(수정
+  전엔 -32400).
+- refresh 구간(60초) 안이지만 `minute_bar_max_age_seconds`(테스트
+  값 30초)를 넘긴 캐시는 `source="CACHE_STALE"`으로 정확히 차단.
+- 새 응답이 기존 캐시보다 오래된 봉이면 기존 캐시가 보존됨.
+- 미래 timestamp(`age_seconds < -5`)가 정확히 차단됨.
+- 빈 응답이 3회 연속 즉시 호출돼도 실제 API 호출은 1회만 발생
+  (백오프 확인).
+
+### `test_stale_minute_data_safety.py` 확장 (27→44건)
+
+GPT가 제시한 8가지 필수 테스트를 모두 반영 — 과거 봉 1회차/즉시
+2회차 차단(12번, 핵심 버그 검증), 백오프 만료 후 재조회 시 재확인
+(12-1번, 추가), fresh 응답 후 cache hit(13번), refresh 구간 안
+이어도 max_age 초과 시 차단(14번), stale 응답이 최신 캐시를
+덮어쓰지 않음(15번), UTC host/KST bar age 정상 계산(16번), 미래
+timestamp 차단(17번), 빈 응답 반복 시 백오프(18번).
+
+기존 1~3번 테스트가 `MockBroker.get_minute_bars()`의 naive-UTC
+봉 생성 방식과 충돌하는 것을 발견(MockBroker가 `datetime.now()`
+로 봉을 만드는데, 이 테스트 환경 자체가 UTC를 로컬시각으로 써서
+그 결과가 실제 KST 관점에서 9시간 전 봉이 되어버림 — MockBroker의
+한계이지 운영 코드 버그 아님) — 해당 테스트들은 KST 기준으로
+명시적으로 신선한 봉을 구성해 주입하도록 수정.
+
+**전체 회귀**: `run_regression_tests.py` — 28개 파일 전부 통과,
+종료코드 0.
+
+### 이번 라운드에서도 미루는 것 (GPT 지시 3, 4, 5번 — 1B.7절과 동일 사유)
+
+이번 1B.8 라운드가 이미 매우 크고 위험도 높은 캐시 우회를 다뤘고,
+검증에 상당한 시간이 들었습니다. 아래 세 가지는 여전히 범위가
+크고 서로 독립적이라 다음 라운드로 순서대로 분리합니다:
+
+- **stale SELL 세분화**: `Signal`에 `requires_fresh_minute_data`
+  /`exit_category` 필드 추가, 각 전략의 SELL 신호 생성 지점 전체
+  검토 필요.
+- **stale 데이터의 부수효과 상태 오염 방지**: `[MIN]`/`V_FAIL`
+  로그, 거래대금 부족 카운트, 감시종목 자동제외 카운트가 stale
+  이어도 갱신되는 문제.
+- **14:50 게이트 KST Clock 주입**: `_try_buy()`의 `datetime.now()`
+  (naive)를 `now_kst()` 또는 `TradingService._now()`/`Clock`
+  의존성으로 교체, `MARKET_OPEN`/`MARKET_CLOSE`를 포함한
+  `utils/time_utils.py`의 naive 기반 함수들도 함께 정리 필요 —
+  이번 1B.8에서 만든 `now_kst()`를 재사용할 수 있는 지점.
+
+---
+
