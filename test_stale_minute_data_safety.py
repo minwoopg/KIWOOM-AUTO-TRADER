@@ -511,12 +511,19 @@ with tempfile.TemporaryDirectory() as tmpdir:
     service = build_service(tmpdir)
     # 서버 시스템 로컬시각이 UTC 00:20이어도, now_kst()는 항상 정확한
     # KST(09:20)를 반환해야 함 — parse_kst_bar_timestamp도 동일 기준.
+    # 2026-07-28 (1B.9): 최소개수(60) 검증이 추가되어 봉 1개로는
+    # 이 테스트의 본래 목적(age 계산 정확성)과 별개로 entry_safe가
+    # False가 되므로, 60개로 채우되 마지막 봉만 정확히 09:20으로
+    # 맞춰 age 계산 자체의 정확성 검증 목적은 그대로 유지.
     kst_bar_time = now_kst().replace(hour=9, minute=20, second=0, microsecond=0)
-    bars_at_0920 = [MinuteBar(
-        cntr_tm=kst_bar_time.strftime("%Y%m%d%H%M%S"),
-        open_price=58000, high_price=58100, low_price=57900,
-        close_price=58000, volume=1000, acc_volume=50000,
-    )]
+    bars_at_0920 = [
+        MinuteBar(
+            cntr_tm=(kst_bar_time - timedelta(minutes=59 - i)).strftime("%Y%m%d%H%M%S"),
+            open_price=58000, high_price=58100, low_price=57900,
+            close_price=58000, volume=1000, acc_volume=50000,
+        )
+        for i in range(60)
+    ]
     service.broker.get_minute_bars = lambda *a, **kw: bars_at_0920
 
     with patch(
@@ -527,7 +534,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     check("16) 봉 시각과 현재 시각이 동일할 때 age_seconds가 0에 가까움"
           "(UTC/KST 혼동 없이 정확히 계산됨)",
           result.age_seconds is not None and abs(result.age_seconds) < 1.0)
-    check("    entry_safe=True(신선함)", result.entry_safe is True)
+    check("    entry_safe=True(신선함, 최소개수도 충족)", result.entry_safe is True)
 
 # ── 17) 미래 timestamp(age < -5초) -> entry_safe=False ─────────────
 with tempfile.TemporaryDirectory() as tmpdir:
@@ -563,6 +570,157 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
     check("18) 빈 응답이 연속 반복돼도 백오프 구간 안에서는 API가 재호출되지 않음"
           "(3회 연속 호출, 실제 API 호출은 1회만)", call_count["n"] == 1)
+
+# ══════════════════════════════════════════════════════════════
+# 8부: 진입 품질 검증 (2026-07-28, 1B.9, GPT 5차 지적)
+#
+# 배경: 기존 _evaluate_bar_freshness()가 "최신 봉 1개의 age"만
+# 확인해서, API가 분봉을 1개만(또는 60개 전부 동일 timestamp로)
+# 반환해도 age 조건만 통과하면 entry_safe=True가 되던 우회를
+# 재현·수정. entry_safe 최종 조건에도 analysis is not None을 추가.
+# ══════════════════════════════════════════════════════════════
+
+
+def make_kst_bars(n: int, kst_now) -> list[MinuteBar]:
+    return [
+        MinuteBar(
+            cntr_tm=(kst_now - timedelta(minutes=n - 1 - i)).strftime("%Y%m%d%H%M%S"),
+            open_price=58000, high_price=58100, low_price=57900,
+            close_price=58000, volume=1000, acc_volume=50000,
+        )
+        for i in range(n)
+    ]
+
+
+# ── 19) 최신 분봉 1/10/59개(모두 최소개수 60 미만) -> entry_safe=False ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    kst_now_19 = now_kst()
+    for n in (1, 10, 59):
+        bars_n = make_kst_bars(n, kst_now_19)
+        service.broker.get_minute_bars = lambda *a, **kw: bars_n
+        service.cached_minute_bars.pop(symbol, None)
+        service.cached_minute_bars_loaded_at.pop(symbol, None)
+        service.cached_minute_bars_failed_at.pop(symbol, None)
+        result = service._get_minute_analysis(symbol, 58000)
+        check(f"19) 분봉 {n}개(최소 60 미만) -> entry_safe=False", result.entry_safe is False)
+
+# ── 20) 60개 정상 분봉 -> entry_safe=True(회귀 확인) ────────────────
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    kst_now_20 = now_kst()
+    bars_60 = make_kst_bars(60, kst_now_20)
+    service.broker.get_minute_bars = lambda *a, **kw: bars_60
+    result = service._get_minute_analysis(symbol, 58000)
+    check("20) 60개 정상(오름차순, 파싱가능, 신선함) -> entry_safe=True", result.entry_safe is True)
+    check("    analysis도 정상 계산됨", result.analysis is not None)
+
+# ── 21) 60개지만 전부 중복 timestamp -> entry_safe=False ────────────
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    kst_now_21 = now_kst()
+    dup_bars = [
+        MinuteBar(cntr_tm=kst_now_21.strftime("%Y%m%d%H%M%S"), open_price=58000,
+                  high_price=58100, low_price=57900, close_price=58000, volume=1000, acc_volume=50000)
+        for _ in range(60)
+    ]
+    service.broker.get_minute_bars = lambda *a, **kw: dup_bars
+    result = service._get_minute_analysis(symbol, 58000)
+    check("21) 60개지만 전부 동일(중복) timestamp -> entry_safe=False", result.entry_safe is False)
+
+# ── 22) 60개지만 일부 invalid timestamp 포함 -> entry_safe=False ────
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    kst_now_22 = now_kst()
+    invalid_mixed = make_kst_bars(60, kst_now_22)
+    invalid_mixed[30] = MinuteBar(
+        cntr_tm="INVALID_TS", open_price=58000, high_price=58100,
+        low_price=57900, close_price=58000, volume=1000, acc_volume=50000,
+    )
+    service.broker.get_minute_bars = lambda *a, **kw: invalid_mixed
+    result = service._get_minute_analysis(symbol, 58000)
+    check("22) 60개지만 1개가 invalid timestamp -> entry_safe=False", result.entry_safe is False)
+
+# ── 23) 60개지만 순서가 뒤섞임(MIXED) -> entry_safe=False ───────────
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    kst_now_23 = now_kst()
+    mixed_order = make_kst_bars(60, kst_now_23)
+    mixed_order[10], mixed_order[11] = mixed_order[11], mixed_order[10]  # 2곳 스왑
+    service.broker.get_minute_bars = lambda *a, **kw: mixed_order
+    result = service._get_minute_analysis(symbol, 58000)
+    check("23) 60개지만 순서가 뒤섞임(스왑) -> entry_safe=False", result.entry_safe is False)
+
+# ── 24) analysis=None(MinuteAnalyzer 자체 최소요건 미달) -> entry_safe=False ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    kst_now_24 = now_kst()
+    bars_60_short = make_kst_bars(60, kst_now_24)
+    service.broker.get_minute_bars = lambda *a, **kw: bars_60_short
+    with patch.object(service._minute_analyzer, "analyze", return_value=None):
+        result = service._get_minute_analysis(symbol, 58000)
+    check("24) MinuteAnalyzer.analyze()가 None을 반환하면 -> entry_safe=False",
+          result.entry_safe is False)
+    check("    reason=MINUTE_ANALYSIS_UNAVAILABLE로 명시됨",
+          result.reason == "MINUTE_ANALYSIS_UNAVAILABLE")
+
+# ── 25) 퇴행된 응답(REGRESSED_MINUTE_RESPONSE) 정책 확정 검증 ───────
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    kst_now_25 = now_kst()
+    bars_v1 = make_kst_bars(60, kst_now_25)
+    service.broker.get_minute_bars = lambda *a, **kw: bars_v1
+    r1 = service._get_minute_analysis(symbol, 58000)
+    check("25-준비) 최초 신선한 캐시 확보", r1.entry_safe is True)
+
+    service.cached_minute_bars_loaded_at[symbol] = kst_now_25 - timedelta(seconds=999)
+    bars_v2_regressed = make_kst_bars(60, kst_now_25 - timedelta(minutes=1))  # 1분 더 과거
+    service.broker.get_minute_bars = lambda *a, **kw: bars_v2_regressed
+    r2 = service._get_minute_analysis(symbol, 58000)
+    check("25) 새 응답이 기존 캐시보다 오래되면(둘 다 max_age 이내) "
+          "entry_safe=False(보수적 차단 정책 확정)", r2.entry_safe is False)
+    check("    reason=REGRESSED_MINUTE_RESPONSE로 명시됨",
+          r2.reason == "REGRESSED_MINUTE_RESPONSE")
+
+# ══════════════════════════════════════════════════════════════
+# 9부: _process_symbol() 통합 흐름 — 진입품질 미달 시 실제 BUY 차단
+# ══════════════════════════════════════════════════════════════
+
+# ── 26) 진입품질 미달(entry_safe=False, analysis=None) + BUY신호 -> HOLD 강제전환 ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    balance = AccountBalance(cash=100_000_000, total_asset=100_000_000, positions=[])
+
+    with patch.object(service, "_get_minute_analysis") as mock_get_analysis:
+        from domain.market_regime.minute_analyzer import MinuteDataResult
+        mock_get_analysis.return_value = MinuteDataResult(
+            analysis=None, entry_safe=False, source="LIVE",
+            reason="MINUTE_ANALYSIS_UNAVAILABLE", latest_bar_timestamp=None, age_seconds=None,
+        )
+        with patch(
+            "domain.strategy.breakout_strategy.BreakoutStrategy.generate_signal",
+            return_value=Signal(type=SignalType.BUY, reason="일봉4점 강제BUY"),
+        ), patch(
+            "domain.strategy.neutral_strategy.NeutralStrategy.generate_signal",
+            return_value=Signal(type=SignalType.BUY, reason="일봉4점 강제BUY"),
+        ), patch.object(
+            service, "_check_entry_watch", return_value=None,
+        ), patch.object(
+            service.regime_classifier, "classify",
+            return_value=(MarketRegime.BULLISH, "테스트"),
+        ):
+            import asyncio
+            asyncio.run(service._process_symbol(symbol, balance))
+
+    import csv
+    with open(service.settings.storage.signal_log_file, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    matching = [r for r in rows if r["symbol"] == symbol]
+    check("26) 진입품질 미달 + BUY신호 상황에서 signal_log에 기록이 남음", len(matching) >= 1)
+    if matching:
+        check("    final_decision이 BUY가 아니라 HOLD로 강제 전환됨"
+              "(GPT가 재현했던 '일봉 4점만으로 실제 BUY' 시나리오 차단 확인)",
+              matching[-1]["final_decision"] != "BUY")
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

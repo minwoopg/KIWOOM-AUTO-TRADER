@@ -481,10 +481,16 @@ class TradingService:
                     bars = self.cached_minute_bars.get(symbol, [])
                     source = "EMPTY" if not bars else "CACHE_STALE"
                     reason = "MINUTE_DATA_UNAVAILABLE" if not bars else "STALE_MINUTE_DATA"
-                    fresh_dt, fresh_age = None, None
                 else:
-                    fresh_ok, fresh_dt, fresh_age, fresh_detail = self._evaluate_bar_freshness(
-                        new_bars, now
+                    # 2026-07-28 (6차 GPT 코드리뷰 지적, "1B Safety
+                    # Closure"): 이전엔 구조 검증(_evaluate_bar_
+                    # freshness, OHLC 포함) 전에 이미 1분봉 저장
+                    # (_minute_saver.save)이 실행되고 있었음 — 검증
+                    # 실패/이상 데이터가 정상 리플레이용 CSV에
+                    # 조용히 섞여 들어갈 수 있었던 문제. 검증을
+                    # 저장보다 먼저 하도록 순서 변경.
+                    fresh_ok, fresh_dt, fresh_age, fresh_reason_code, fresh_detail = (
+                        self._evaluate_bar_freshness(new_bars, now)
                     )
                     if not fresh_ok:
                         self.app_logger.warning(
@@ -492,15 +498,20 @@ class TradingService:
                             f"(성공 캐시 시각은 갱신하지 않음)"
                         )
                         self.cached_minute_bars_failed_at[symbol] = now
-                        # 신선도 검증 실패 응답으로는 캐시/loaded_at을
-                        # 절대 갱신하지 않음(GPT 지적 2번) — 기존 캐시가
+                        # 신선도/구조 검증 실패 응답으로는 캐시/loaded_at을
+                        # 절대 갱신하지 않음(GPT 지적 2·3번) — 기존 캐시가
                         # 있으면 그걸 그대로 분석에 사용, 없으면 이번에
                         # 받은(오래된/이상한) new_bars로라도 분석 시도
-                        # (보유종목 판단이 끊기지 않도록).
+                        # (보유종목 판단이 끊기지 않도록 — 단, analyze()
+                        # 자체가 이 이상 데이터로 예외를 낼 수 있으므로
+                        # 아래에서 try/except로 감쌈).
                         existing_bars = self.cached_minute_bars.get(symbol, [])
                         bars = existing_bars if existing_bars else new_bars
                         source = "LIVE_OLD_BAR"
-                        reason = "STALE_MINUTE_DATA"
+                        reason = fresh_reason_code or "STALE_MINUTE_DATA"
+                        # 거부된 응답을 별도 경로(rejected)로 남김 —
+                        # 정상 minute_bars 저장 CSV에는 절대 섞지 않음.
+                        self._save_rejected_minute_bars(symbol, new_bars, reason, fresh_detail)
                     else:
                         # 2026-07-28 (GPT 지적 3번): 새 응답의 최신 봉이
                         # 기존 캐시의 최신 봉보다 오래되면 기존(더 최신인)
@@ -512,16 +523,33 @@ class TradingService:
                                 existing_bars[-1].cntr_tm
                             )
                         if existing_latest_dt is not None and fresh_dt is not None and fresh_dt < existing_latest_dt:
+                            # 2026-07-28 (5차 GPT 코드리뷰 지적 4번): 새
+                            # 응답이 기존 캐시보다 오래됐지만 그 자체는
+                            # max_age 이내(fresh_ok=True)인 경우 —
+                            # REGRESSED_MINUTE_RESPONSE로 명시하고
+                            # 신규 진입 차단(entry_safe=False, 보수적
+                            # 확정 정책). analysis는 기존(더 신선한)
+                            # 캐시로 계속 제공해 보유종목 판단 유지.
                             self.app_logger.warning(
                                 f"[MIN_STALE] {symbol} | 새 응답(최신봉={fresh_dt})이 "
-                                f"기존 캐시(최신봉={existing_latest_dt})보다 오래됨 — "
-                                f"기존 캐시 유지"
+                                f"기존 캐시(최신봉={existing_latest_dt})보다 오래됨 "
+                                f"(REGRESSED_MINUTE_RESPONSE) — 기존 캐시로 분석은 "
+                                f"계속하되 이번 사이클 신규진입은 차단"
                             )
                             self.cached_minute_bars_failed_at[symbol] = now
                             bars = existing_bars
                             source = "CACHE_FRESH"
-                            reason = ""
+                            reason = "REGRESSED_MINUTE_RESPONSE"
+                            self._save_rejected_minute_bars(
+                                symbol, new_bars, reason,
+                                f"새응답 최신봉={fresh_dt} < 기존캐시 최신봉={existing_latest_dt}",
+                            )
                         else:
+                            # 2026-07-28 (6차 GPT 코드리뷰 지적): 구조
+                            # 검증을 통과한 응답만 성공 캐시/loaded_at을
+                            # 갱신하고, 정상 리플레이용 CSV에도 이
+                            # 지점에서만 저장 — 검증 전 저장하던 순서를
+                            # 여기로 이동.
                             self.cached_minute_bars[symbol] = new_bars
                             self.cached_minute_bars_loaded_at[symbol] = now
                             self.cached_minute_bars_failed_at.pop(symbol, None)
@@ -529,12 +557,13 @@ class TradingService:
                             source = "LIVE"
                             reason = ""
 
-                # 1분봉 저장 (enabled 시, 정상 응답일 때만)
-                if new_bars and self._minute_saver is not None:
-                    try:
-                        self._minute_saver.save(symbol, new_bars)
-                    except Exception as save_exc:
-                        self.app_logger.debug(f"[MIN] {symbol} | 분봉 저장 실패: {save_exc}")
+                            if self._minute_saver is not None:
+                                try:
+                                    self._minute_saver.save(symbol, new_bars)
+                                except Exception as save_exc:
+                                    self.app_logger.debug(
+                                        f"[MIN] {symbol} | 분봉 저장 실패: {save_exc}"
+                                    )
             except Exception as exc:
                 self.app_logger.warning(f"[MIN] {symbol} | 분봉 조회 실패: {exc}")
                 self.cached_minute_bars_failed_at[symbol] = now
@@ -556,11 +585,13 @@ class TradingService:
                         f"재시도 스킵, 캐시도 없어 UNAVAILABLE"
                     )
             else:
-                fresh_ok, _, _, fresh_detail = self._evaluate_bar_freshness(bars, now)
+                fresh_ok, _, _, fresh_reason_code, fresh_detail = (
+                    self._evaluate_bar_freshness(bars, now)
+                )
                 if fresh_ok:
                     source, reason = "CACHE_FRESH", ""
                 else:
-                    source, reason = "CACHE_STALE", "STALE_MINUTE_DATA"
+                    source, reason = "CACHE_STALE", (fresh_reason_code or "STALE_MINUTE_DATA")
 
         if not bars:
             return MinuteDataResult(
@@ -569,61 +600,192 @@ class TradingService:
                 latest_bar_timestamp=None, age_seconds=None,
             )
 
-        analysis = self._minute_analyzer.analyze(bars, prev_close)
+        # 2026-07-28 (6차 GPT 코드리뷰 지적, "1B Safety Closure"):
+        # MinuteAnalyzer.analyze()가 내부적으로 예외를 던질 수 있음
+        # (재현: OHLC가 0인 봉으로 day_high=0 나눗셈 -> ZeroDivisionError
+        # 가 _process_symbol()까지 그대로 전파돼 해당 폴링에서 나머지
+        # 모든 종목 처리가 중단될 위험이 있었음). 이제 위에서 구조
+        # 검증을 먼저 통과시키므로 정상 경로에서는 이 예외가 이론상
+        # 발생하지 않아야 하지만, analyzer 로직 자체의 다른 버그나
+        # 예상 못한 입력에 대비해 이 호출 자체도 방어적으로 감쌈 —
+        # 예외가 나도 종목 처리 루프 전체를 막지 않고, 이 종목만
+        # MINUTE_ANALYSIS_ERROR로 안전하게 차단.
+        try:
+            analysis = self._minute_analyzer.analyze(bars, prev_close)
+        except Exception as analyze_exc:
+            self.app_logger.error(
+                f"[MIN_STALE] {symbol} | MinuteAnalyzer.analyze() 예외 발생"
+                f"(무시하고 계속 진행, 신규진입 차단): {analyze_exc}"
+            )
+            analysis = None
+            if reason == "":
+                reason = "MINUTE_ANALYSIS_ERROR"
+
         latest_ts = bars[-1].cntr_tm if bars else None
         latest_dt = parse_kst_bar_timestamp(latest_ts)
         age_seconds = (now - latest_dt).total_seconds() if latest_dt is not None else None
 
-        entry_safe = source in ("LIVE", "CACHE_FRESH") and reason == ""
+        # 2026-07-28 (5차 GPT 코드리뷰 지적): entry_safe 최종 조건에
+        # analysis is not None을 포함하지 않아서, 진입 품질 검증
+        # (_evaluate_bar_freshness)을 통과한 source/reason이어도
+        # MinuteAnalyzer.analyze()가 내부적으로 None을 반환하는
+        # 경우(예: 봉 개수가 v_low_max_age+1보다 적은 등 analyzer
+        # 자체 최소요건 미달)까지 entry_safe=True로 새는 우회가
+        # 있었음(재현 확인). analysis가 없으면 무조건 차단.
+        if analysis is None:
+            entry_safe = False
+            if reason == "":
+                reason = "MINUTE_ANALYSIS_UNAVAILABLE"
+        else:
+            entry_safe = source in ("LIVE", "CACHE_FRESH") and reason == ""
+
         return MinuteDataResult(
             analysis=analysis, entry_safe=entry_safe, source=source,
             reason=reason, latest_bar_timestamp=latest_ts, age_seconds=age_seconds,
         )
 
+    def _save_rejected_minute_bars(
+        self, symbol: str, bars: list, reason: str, detail: str,
+    ) -> None:
+        """구조/신선도 검증에 실패한 분봉 응답을 별도 경로에 사유와 함께 기록합니다.
+
+        2026-07-28 (6차 GPT 코드리뷰 지적, "1B Safety Closure"):
+        검증 실패·퇴행·과거 응답이 정상 리플레이용 minute_bars CSV에
+        조용히 섞이면 안 됨(1A 단계에서 이미 저장된 분봉이 "당시
+        실제 입력"이라는 전제로 fixture를 만든 적이 있었는데, 그
+        전제가 깨질 수 있는 문제). 정상 저장(_minute_saver.save)은
+        검증을 통과한 데이터에만 실행되도록 이미 위에서 순서를
+        옮겼고, 이 함수는 거부된 데이터를 참고용으로 별도 보관.
+
+        저장 실패는 fail-open — 예외가 나도 신규 진입 차단 로직에
+        영향을 주지 않음.
+        """
+        if self._minute_saver is None or not bars:
+            return
+        try:
+            reject_dir = Path(self.settings.storage.minute_bars_dir) / "rejected"
+            reject_dir.mkdir(parents=True, exist_ok=True)
+            today_str = now_kst().strftime("%Y%m%d")
+            reject_path = reject_dir / f"{symbol}_{today_str}.log"
+            with open(reject_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"{now_kst().isoformat()} | reason={reason} | detail={detail} | "
+                    f"bar_count={len(bars)} | first_ts={bars[0].cntr_tm if bars else None} | "
+                    f"last_ts={bars[-1].cntr_tm if bars else None}\n"
+                )
+        except Exception as exc:
+            self.app_logger.debug(f"[MIN] {symbol} | 거부 응답 기록 실패(무시): {exc}")
+
     def _evaluate_bar_freshness(
         self, bars: list, now: datetime,
-    ) -> tuple[bool, datetime | None, float | None, str]:
-        """분봉 리스트의 최신 봉이 신규 진입에 쓸 만큼 신선한지 판정합니다.
+    ) -> tuple[bool, datetime | None, float | None, str, str]:
+        """분봉 리스트가 신규 진입에 쓸 만큼 신선하고 품질이 충분한지 판정합니다.
 
         2026-07-28 (GPT 지적 1번): API 응답 직후 검증과 캐시 재사용
         시 검증이 서로 다른 기준을 쓰면 우회가 생기므로, 단일 헬퍼로
         통합해 양쪽에서 동일하게 호출. KST timezone-aware 비교만
         사용(GPT 지적 4번) — naive datetime 비교 금지.
 
-        판정 기준(하나라도 실패하면 False):
-        - 최신 봉의 cntr_tm이 파싱 가능
-        - age_seconds가 -5초보다 크거나 같음(미래 timestamp 방어 —
-          약간의 시계 오차는 허용하되, 명백히 미래인 봉은 이상치로
-          간주해 차단)
-        - age_seconds가 minute_bar_max_age_seconds 이내
+        2026-07-28 (5차 GPT 코드리뷰 지적, 진입 품질 검증): 최소
+        분봉 개수, timestamp 파싱 가능성, 엄격한 오름차순(중복 불허)
+        검증 추가.
 
-        반환값: (fresh_ok, latest_dt, age_seconds, detail_message)
+        2026-07-28 (6차 GPT 코드리뷰 지적, "1B Safety Closure"):
+        OHLC 구조 자체가 깨진 봉(high=0, low=0 등)을 검사하지
+        않아서, 신선도·개수·정렬 검증을 전부 통과해도 MinuteAnalyzer
+        .analyze() 내부에서 0으로 나누는 ZeroDivisionError가 그대로
+        _process_symbol()까지 전파되던 문제를 재현 확인(open=58000,
+        high=0, low=0, close=58000인 60개 봉 — fresh_ok=True인데
+        analyze()가 day_high=0으로 나누다가 예외). OHLC 검증을
+        신선도 검증의 일부로 추가 — 하나라도 위반하면 즉시 차단.
+
+        이 함수는 "진단"이 아니라 "진입 안전장치"입니다 — 기존
+        infra/broker/minute_bar_diagnostics.py의 진단 로거(raw_
+        order_violation_count 등)는 관찰 전용이라 이 안전장치와는
+        별개로 계속 관찰만 함(1B단계 원칙 유지).
+
+        판정 기준(하나라도 실패하면 False, 검사 순서대로):
+        1. 분봉 개수 >= minute_bar_min_count_for_entry
+        2. 전체 cntr_tm 파싱 가능
+        3. timestamp 엄격한 오름차순(중복/역순/뒤섞임 전부 차단)
+        4. OHLC 구조 정상: open/high/low/close 모두 > 0,
+           low <= open <= high, low <= close <= high,
+           volume >= 0, acc_volume >= 0 (전체 봉에 대해 검사)
+        5. 최신 봉 age_seconds가 -5초 이상, max_age_seconds 이하
+
+        반환값: (fresh_ok, latest_dt, age_seconds, reason_code, detail_message)
+        reason_code는 MinuteDataResult.reason에 그대로 쓰일 명시적
+        코드("" | STALE_MINUTE_DATA | INVALID_MINUTE_OHLC 등).
         """
         max_age_sec = getattr(
             self.settings.market_regime, "minute_bar_max_age_seconds", 120
         )
-        latest_ts = bars[-1].cntr_tm if bars else None
-        latest_dt = parse_kst_bar_timestamp(latest_ts)
+        min_count = getattr(
+            self.settings.market_regime, "minute_bar_min_count_for_entry", 60
+        )
 
-        if latest_dt is None:
-            return False, None, None, f"최신 봉 timestamp 파싱 실패({latest_ts!r})"
+        # 1) 최소 개수 확인
+        if len(bars) < min_count:
+            return False, None, None, "STALE_MINUTE_DATA", (
+                f"분봉 개수 부족({len(bars)}개 < 최소 {min_count}개)"
+            )
 
+        # 2) 전체 timestamp 파싱 가능 여부 + 3) 엄격한 오름차순(중복 불허)
+        parsed = [parse_kst_bar_timestamp(b.cntr_tm) for b in bars]
+        if any(dt is None for dt in parsed):
+            invalid_count = sum(1 for dt in parsed if dt is None)
+            return False, None, None, "STALE_MINUTE_DATA", (
+                f"분봉 중 {invalid_count}개 timestamp 파싱 실패"
+            )
+        if not all(parsed[i] < parsed[i + 1] for i in range(len(parsed) - 1)):
+            return False, None, None, "STALE_MINUTE_DATA", (
+                "분봉 timestamp가 엄격한 오름차순이 아님(중복 또는 뒤섞임)"
+            )
+
+        # 4) OHLC 구조 검증 (2026-07-28, 6차 GPT 코드리뷰 지적)
+        for idx, b in enumerate(bars):
+            if b.open_price <= 0 or b.high_price <= 0 or b.low_price <= 0 or b.close_price <= 0:
+                return False, None, None, "INVALID_MINUTE_OHLC", (
+                    f"{idx}번째 봉({b.cntr_tm})의 OHLC에 0 이하 값 존재 "
+                    f"(open={b.open_price}, high={b.high_price}, "
+                    f"low={b.low_price}, close={b.close_price})"
+                )
+            if not (b.low_price <= b.open_price <= b.high_price):
+                return False, None, None, "INVALID_MINUTE_OHLC", (
+                    f"{idx}번째 봉({b.cntr_tm})의 open이 low~high 범위 밖 "
+                    f"(low={b.low_price}, open={b.open_price}, high={b.high_price})"
+                )
+            if not (b.low_price <= b.close_price <= b.high_price):
+                return False, None, None, "INVALID_MINUTE_OHLC", (
+                    f"{idx}번째 봉({b.cntr_tm})의 close가 low~high 범위 밖 "
+                    f"(low={b.low_price}, close={b.close_price}, high={b.high_price})"
+                )
+            if b.volume < 0 or b.acc_volume < 0:
+                return False, None, None, "INVALID_MINUTE_OHLC", (
+                    f"{idx}번째 봉({b.cntr_tm})의 거래량이 음수 "
+                    f"(volume={b.volume}, acc_volume={b.acc_volume})"
+                )
+
+        # 2026-07-28 (버그 수정): OHLC 검증 블록을 추가하며 이 계산이
+        # 실수로 누락되어 NameError가 났던 것을 재발견·복구.
+        latest_ts = bars[-1].cntr_tm
+        latest_dt = parsed[-1]
         age_seconds = (now - latest_dt).total_seconds()
 
         # 2026-07-28 (GPT 지적 4번): age_seconds < -5인 미래 봉도
         # entry_safe=False — 시계 오차(수 초)는 허용하되, 명백히
         # 미래인 timestamp는 데이터 이상으로 간주.
         if age_seconds < -5:
-            return False, latest_dt, age_seconds, (
+            return False, latest_dt, age_seconds, "STALE_MINUTE_DATA", (
                 f"최신 봉({latest_ts})이 미래 시각(age={age_seconds:.0f}s)"
             )
 
         if age_seconds > max_age_sec:
-            return False, latest_dt, age_seconds, (
+            return False, latest_dt, age_seconds, "STALE_MINUTE_DATA", (
                 f"최신 봉({latest_ts}) age={age_seconds:.0f}s > {max_age_sec}s"
             )
 
-        return True, latest_dt, age_seconds, ""
+        return True, latest_dt, age_seconds, "", ""
 
     def _attach_indicators(self, market_price, symbol: str):
         """캐시된 일봉 데이터로 지표값을 계산해 MarketPrice에 주입합니다.
@@ -952,7 +1114,17 @@ class TradingService:
                 minute_analysis = minute_result.analysis
                 minute_data_entry_safe = minute_result.entry_safe
                 minute_data_reason = minute_result.reason
-                if minute_analysis:
+                # 2026-07-28 (6차 GPT 코드리뷰 지적 5번, "1B Safety
+                # Closure"): 기존엔 minute_analysis가 존재하기만
+                # 하면(캐시로 얻은 stale 데이터라도) [MIN]/[V_FAIL]
+                # 로그와 그 아래(1234번째 줄 부근)의 low_volume_count
+                # /자동제외 카운터가 entry_safe 여부와 무관하게 갱신
+                # 됐음 — stale 데이터로 관측 상태(점수 로그, V자 실패
+                # 누적, 거래대금 부족 누적)가 오염될 수 있었음. 이제
+                # entry_safe인 경우에만 이 블록 전체를 실행하고,
+                # stale이면 [MIN_STALE] 한 줄만 남기고 상태 갱신은
+                # 건너뜀.
+                if minute_analysis and minute_data_entry_safe:
                     score = minute_analysis.score()
                     last = self._last_min_logged.get(symbol)
                     now = datetime.now()
@@ -979,6 +1151,15 @@ class TradingService:
                                     f"[V_FAIL] {symbol} | " + " / ".join(v_fails)
                                 )
                                 self.last_hold_log_at_by_symbol[f"__vfail_{symbol}"] = now_dt
+                elif not minute_data_entry_safe:
+                    last_stale_log = self.last_hold_log_at_by_symbol.get(f"__minstale_{symbol}")
+                    now_dt = datetime.now()
+                    if last_stale_log is None or (now_dt - last_stale_log).total_seconds() >= 60:
+                        self.app_logger.info(
+                            f"[MIN_STALE] {symbol} | reason={minute_data_reason} "
+                            f"— 상태 갱신 없이 관찰만 함"
+                        )
+                        self.last_hold_log_at_by_symbol[f"__minstale_{symbol}"] = now_dt
 
             strategy = self.strategy_router.select(regime)
             position = next((p for p in balance.positions if p.symbol == symbol), None)
@@ -1058,27 +1239,61 @@ class TradingService:
             ):
                 signal = Signal(type=SignalType.HOLD, reason=minute_data_reason)
 
+            # 2026-07-28 (6차 GPT 코드리뷰 지적 5번, "1B Safety
+            # Closure"): 보유 종목의 SELL 신호 중 minute_analysis
+            # (VWAP/MA5 등 분봉 지표)를 실제로 참조한 것은
+            # requires_fresh_minute_data=True로 표시되어 있음(각
+            # 전략의 "추세 꺾임" 신호). 분봉 데이터가 stale이면 이
+            # 판단 자체를 신뢰할 수 없으므로 HOLD로 전환 — 단, 고정
+            # 손절/트레일링 스탑/안전망 익절처럼 현재가·평균단가·
+            # 최고가만으로 계산되는 hard-risk SELL(requires_fresh_
+            # minute_data=False, 기본값)은 이 검사와 무관하게 계속
+            # 허용 — 위험 축소 행동을 stale 데이터를 이유로 막으면
+            # 안 되므로.
+            if (
+                position is not None
+                and signal.type == SignalType.SELL
+                and getattr(signal, "requires_fresh_minute_data", False)
+                and not minute_data_entry_safe
+            ):
+                self.app_logger.info(
+                    f"[MIN_STALE] {symbol} | 지표 기반 SELL({signal.reason}) 차단 — "
+                    f"분봉 데이터 stale(reason={minute_data_reason}), HOLD로 대기"
+                )
+                signal = Signal(
+                    type=SignalType.HOLD,
+                    reason=f"지표기반 SELL 보류(stale) — {minute_data_reason}",
+                )
+
             self._log_signal_decision(
                 symbol, signal, market_price.current_price,
                 regime, position, minute_analysis
             )
 
             # 거래대금 부족 3회 연속이면 자동 제외
-            if (
-                signal.type == SignalType.HOLD
-                and minute_analysis is not None
-                and not minute_analysis.is_valid_trading_value
-            ):
-                self._low_volume_count[symbol] = self._low_volume_count.get(symbol, 0) + 1
-                if self._low_volume_count[symbol] >= 3:
-                    self._excluded_symbols.add(symbol)
-                    self.app_logger.warning(
-                        f"[EXCL] {symbol} | 거래대금 부족 3회 연속 "
-                        f"({minute_analysis.trading_value//100_000_000}억) — 감시 대상에서 제외합니다"
-                    )
-            else:
-                # 거래대금 충분하면 카운트 초기화
-                self._low_volume_count[symbol] = 0
+            # 2026-07-28 (6차 GPT 코드리뷰 지적 5번, "1B Safety
+            # Closure"): entry_safe 여부와 무관하게 minute_analysis가
+            # 있기만 하면 이 카운터가 갱신됐음 — stale 데이터로 우연히
+            # trading_value가 낮게 계산되면 실제로는 판단할 수 없는
+            # 상황인데도 자동제외 카운트가 올라갈 수 있었음. entry_safe
+            # 인 경우에만 카운터를 갱신·초기화(스킵 시엔 그대로 유지 —
+            # stale 사이클이 카운트를 임의로 리셋하지도, 올리지도 않음).
+            if minute_data_entry_safe:
+                if (
+                    signal.type == SignalType.HOLD
+                    and minute_analysis is not None
+                    and not minute_analysis.is_valid_trading_value
+                ):
+                    self._low_volume_count[symbol] = self._low_volume_count.get(symbol, 0) + 1
+                    if self._low_volume_count[symbol] >= 3:
+                        self._excluded_symbols.add(symbol)
+                        self.app_logger.warning(
+                            f"[EXCL] {symbol} | 거래대금 부족 3회 연속 "
+                            f"({minute_analysis.trading_value//100_000_000}억) — 감시 대상에서 제외합니다"
+                        )
+                else:
+                    # 거래대금 충분하면 카운트 초기화
+                    self._low_volume_count[symbol] = 0
 
             # ── BUY 신호면 주문 시도 후 결과를 signal_log에 반영 ──
             order_block_reason = ""
@@ -1780,11 +1995,19 @@ class TradingService:
             return "MAX_ENTRIES_PER_DAY"
 
         # ── 시간대 제한 — 14:50 이후 신규매수 차단 ─────────────
-        _now = datetime.now()
-        if _now.hour > 14 or (_now.hour == 14 and _now.minute >= 50):
+        # 2026-07-28 (6차 GPT 코드리뷰 지적 5번, "1B Safety Closure"):
+        # 기존 datetime.now()(naive, 시스템 로컬시각)는 서버가 UTC로
+        # 설정된 환경(AWS 등)에서 실제 KST 14:50과 어긋나는 시각을
+        # 기준으로 판정했고, 테스트도 실행 시각(예: 컨테이너가 UTC
+        # 23시대일 때)에 따라 우연히 걸리거나 안 걸리는 flaky 문제가
+        # 있었음(1B.6절에서 재현 확인). now_kst()(1B.8에서 신설한
+        # tzdata 비의존 고정 UTC+9)로 교체 — 이제 서버 로컬시각과
+        # 무관하게 항상 정확한 KST 14:50 기준으로 판정.
+        _now_kst = now_kst()
+        if _now_kst.hour > 14 or (_now_kst.hour == 14 and _now_kst.minute >= 50):
             self.app_logger.info(
                 f"[BLOCK] {symbol} | 14:50 이후 신규매수 차단 "
-                f"({_now.strftime('%H:%M')})"
+                f"({_now_kst.strftime('%H:%M:%S')} KST)"
             )
             return "AFTER_1450"
 

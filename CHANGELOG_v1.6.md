@@ -1266,3 +1266,263 @@ timestamp 차단(17번), 빈 응답 반복 시 백오프(18번).
 
 ---
 
+## 1B.9: 진입 품질 검증(개수·정렬·중복·analysis 존재) 추가 (2026-07-28, 안전 긴급 4단계)
+
+**배경**: 1B.8 결과에 대한 GPT 5차 재검토에서, 신선도(age)만
+확인하고 데이터의 실질적 품질은 전혀 확인하지 않던 새로운 우회를
+실제 재현과 함께 지적받음.
+
+### 발견한 문제 (재현 확인)
+
+`_evaluate_bar_freshness()`가 "최신 봉 1개의 age"만 검사하고,
+분봉 개수나 `MinuteAnalyzer` 분석 성공 여부는 전혀 검사하지
+않았음. 재현: API가 최신 분봉 **1개만** 반환하도록 만들면
+`MinuteDataResult(analysis=None, entry_safe=True, source="LIVE",
+reason="")`이 나옴 — timestamp 하나가 신선하기만 하면
+`entry_safe=True`가 되는데, `analysis`는 `None`(MinuteAnalyzer가
+내부적으로 이미 최소 봉 수 미달로 `None`을 반환하고 있었음에도
+호출부가 이를 무시). 60개 전부 동일 timestamp(중복)로 만들어도
+같은 우회가 발생. GPT가 실제 `BreakoutStrategy`로 일봉 조건
+4개를 충족시켜 `generate_signal()`을 호출하면 `SignalType.BUY`
+(`"강한 진입 4/8"`)가 실제로 나옴을 확인했다고 보고받음 — 분봉
+데이터가 사실상 없는데도 일봉 점수만으로 매수가 나갈 수 있는
+경로였음.
+
+### 수정
+
+**1. `_evaluate_bar_freshness()`를 진입 품질 검증으로 확장**:
+기존 age 검사에 다음을 추가(하나라도 실패하면 차단):
+- 분봉 개수가 `minute_bar_min_count_for_entry`(신규 설정, 기본
+  60 — `minute_bar_count`와 동일한 보수적 값) 이상
+- 전체 봉의 `cntr_tm`이 모두 파싱 가능
+- timestamp가 엄격한 오름차순(`a < b`, 중복이면 `a <= b`라
+  실패 — 정확히 GPT 지시대로 중복도 차단)
+
+**2. `entry_safe` 최종 조건에 `analysis is not None` 추가**:
+```python
+if analysis is None:
+    entry_safe = False
+    if reason == "":
+        reason = "MINUTE_ANALYSIS_UNAVAILABLE"
+else:
+    entry_safe = source in ("LIVE", "CACHE_FRESH") and reason == ""
+```
+진입 품질 검증을 통과한 `source`/`reason`이어도 `MinuteAnalyzer.
+analyze()`가 내부적으로 `None`을 반환하면(예: analyzer 자체의
+다른 최소요건 미달) 무조건 차단.
+
+**3. `REGRESSED_MINUTE_RESPONSE` 정책 확정**: 새 API 응답이
+기존 캐시보다 오래됐지만 그 자체는 `max_age` 이내인 경우
+(1B.8에서는 이 경우도 `source="CACHE_FRESH"`로 "정상 확인됨"처럼
+보였음), GPT가 요청한 대로 **보수적으로 차단**하는 정책을 확정 —
+`reason="REGRESSED_MINUTE_RESPONSE"`로 명시하고 `entry_safe=False`.
+`analysis` 자체는 기존(더 신선한) 캐시로 계속 제공해 보유종목
+판단은 유지.
+
+이 함수는 진단(`infra/broker/minute_bar_diagnostics.py`의
+`raw_order_violation_count` 등, 관찰 전용, 1B단계 원칙 유지)과는
+별개로 **실제 진입을 막는 안전장치**입니다 — 같은 종류의 이상
+(중복/비정렬/파싱실패)을 진단은 관찰만 하고, 이 함수는 신규
+진입 차단에 실제로 반영합니다.
+
+### 재현 시나리오로 실제 수정 검증
+
+- 최신 분봉 1개만 반환 → `entry_safe=False`(수정 전 `True`였음)
+- 60개 전부 동일 timestamp(중복) → `entry_safe=False`
+- 정상 60개 오름차순 → 여전히 `entry_safe=True`(회귀 없음)
+- 퇴행된 응답(기존 캐시보다 오래됨, 둘 다 max_age 이내) →
+  `entry_safe=False`, `reason=REGRESSED_MINUTE_RESPONSE`
+
+### `test_stale_minute_data_safety.py` 확장 (44→59건)
+
+GPT가 제시한 필수 통합 테스트 6가지를 모두 반영 — 최신 분봉
+1/10/59개(모두 최소 60 미만, 19번), 60개 정상(20번, 회귀 확인),
+60개지만 중복 timestamp(21번), 60개지만 invalid timestamp
+포함(22번), 60개지만 순서 뒤섞임(23번), `analysis=None`(24번,
+`MinuteAnalyzer.analyze()`를 직접 patch해서 재현), 퇴행 응답
+정책(25번), `_process_symbol()` 통합 흐름에서 진입품질 미달 +
+BUY신호가 실제로 HOLD로 강제 전환되는지(26번, GPT가 재현한
+"일봉 4점만으로 실제 BUY" 시나리오를 정확히 차단하는지 확인).
+
+기존 16번(UTC/KST age 정확성) 테스트가 봉 1개로 구성되어 있어
+새로 추가한 최소개수 검증에 걸리는 것을 발견 — 이 테스트의 본래
+목적(age 계산 정확성)과 최소개수 검증은 서로 다른 관심사이므로,
+60개로 채우되 마지막 봉만 정확히 목표 시각으로 맞춰 두 검증이
+서로 간섭하지 않게 수정.
+
+**전체 회귀**: `run_regression_tests.py` — 28개 파일 전부 통과,
+종료코드 0.
+
+### 이번 라운드에서도 미루는 것 (GPT 지시 5번 — 1B.7·1B.8절과 동일 사유로 계속 분리)
+
+이번 1B.9도 이미 상당히 크고 위험도 높은 우회(진입 품질 전무)를
+다뤘습니다. 아래 네 가지는 1B.7·1B.8에서 이미 두 차례 미뤄온
+것과 동일 항목으로, 여전히 범위가 크고 서로 다른 코드 경로를
+건드려야 해서 다음 라운드로 분리합니다:
+
+- **stale 데이터의 부수효과 상태 오염 방지**: `[MIN]`/`V_FAIL`
+  로그, 거래대금 부족 카운트, 감시종목 자동제외 카운트가 stale
+  이어도 그대로 갱신되는 문제 — 아직 미착수.
+- **stale SELL 세분화**: 가격 기반 hard-risk SELL(고정손절/
+  최대손실/강제청산)만 허용하고 VWAP/MA 등 지표 기반 SELL은
+  fresh 데이터 요구 — `Signal`에 `requires_fresh_minute_data`/
+  `exit_category` 추가 및 각 전략의 SELL 신호 생성 지점 전체
+  검토 필요, 아직 미착수.
+- **14:50 게이트 KST Clock 주입**: `_try_buy()`의 `datetime.
+  now()`(naive)를 `now_kst()` 기반으로 교체, 14:49:59/14:50:00
+  경계 및 UTC 서버 테스트 추가 — 이번 1B.9에서 만든 `now_kst()`
+  를 그대로 재사용 가능하나 아직 미착수.
+
+**다음 세션 착수 순서 제안**: 위 세 가지가 이제 세 라운드째
+연속으로 미뤄지고 있어, 다음 라운드는 이 중 하나만 골라 깊이
+있게 처리하기보다 **세 가지를 한 번에 순서대로 전부 마무리**하는
+것을 목표로 잡는 게 안전할 것 같습니다(GPT도 "1C 전에 모두
+완료"를 조건으로 제시함) — 다만 각 항목은 이번처럼 재현 검증부터
+시작해 별도 커밋으로 나눠 진행 예정.
+
+---
+
+## 1B.10: "1B Safety Closure" — 남은 안전 항목 전부 마감 (2026-07-28)
+
+**배경**: 1B.9 결과에 대한 GPT 6차 재검토에서 새로운 우회(OHLC
+구조 미검증)를 재현 지적받았고, 1B.7부터 세 라운드째 이월되던
+항목들도 "다음 라운드는 더 이상 나누지 말고 한 번에 마감"하라는
+지시를 받음. 이번 라운드에서 전부 처리.
+
+### 1. OHLC 구조 품질 검증 (새로 발견된 우회, 재현 확인)
+
+`_evaluate_bar_freshness()`가 신선도·개수·정렬만 확인하고 OHLC
+구조 자체는 검증하지 않아서, `open=58000, high=0, low=0, close=
+58000`인 60개 봉을 넣으면 신선도 검증은 통과(`fresh_ok=True`)하고
+`MinuteAnalyzer.analyze()`에서 `day_high=0`으로 나누다가
+`ZeroDivisionError`가 그대로 `_get_minute_analysis()` 밖까지
+전파되던 문제를 재현 확인. 더 심각하게는 예외 발생 **전에** 이미
+`cached_minute_bars`/`loaded_at`을 갱신하고 있어서, 잘못된 응답이
+성공 캐시를 오염시키는 구조였음.
+
+**수정**: `_evaluate_bar_freshness()`에 OHLC 검증 추가 —
+open/high/low/close 모두 `> 0`, `low <= open <= high`, `low <=
+close <= high`, `volume >= 0`, `acc_volume >= 0`을 전체 봉에 대해
+검사. 위반 시 `reason="INVALID_MINUTE_OHLC"`로 명시. 반환 튜플을
+`(fresh_ok, latest_dt, age_seconds, detail)` 4개에서
+`(fresh_ok, latest_dt, age_seconds, reason_code, detail)` 5개로
+확장해 명시적 reason 코드를 `MinuteDataResult.reason`에 그대로
+전달.
+
+**재작업 중 발견한 2차 버그**: OHLC 검증 블록을 삽입하며
+`latest_ts`/`latest_dt`/`age_seconds` 계산 코드를 실수로 삭제해
+`NameError`가 나던 것을 직접 재현 테스트로 발견·복구 — 정상
+케이스(analyzer 예외 검증용 60개 정상 봉)를 테스트하다가
+`NameError: name 'age_seconds' is not defined`가 나서 원인을
+추적해 고쳤음.
+
+### 2. `MinuteAnalyzer.analyze()` try/except 방어
+
+호출부를 `try/except`로 감싸 예외가 `_process_symbol()`까지
+전파되지 않도록 함 — 예외 시 `analysis=None`, `reason=
+"MINUTE_ANALYSIS_ERROR"`로 안전하게 처리하고 해당 종목만 차단,
+나머지 종목 처리 루프는 계속됨.
+
+### 3. 캐시 반영 순서 변경 (검증 통과 후에만 갱신)
+
+기존엔 `self.cached_minute_bars[symbol] = new_bars`와
+`self._minute_saver.save(symbol, new_bars)`가 신선도/구조 검증
+**이전**에 실행되고 있었음 — 이번에 순서를 뒤집어 구조 검증을
+통과한 응답만 성공 캐시·정상 저장 파일에 반영되도록 재구성.
+
+### 4. 거부 응답 별도 경로 저장
+
+`_save_rejected_minute_bars()` 신설 — 구조/신선도 검증에 실패한
+응답을 `{minute_bars_dir}/rejected/{symbol}_{날짜}.log`에 사유와
+함께 기록. 정상 리플레이용 CSV(`{minute_bars_dir}/{날짜}/
+{symbol}.csv`)에는 검증 통과 데이터만 저장되어 거부 데이터가
+조용히 섞이지 않음. 저장 자체는 fail-open(예외가 나도 진입 차단
+로직에 영향 없음).
+
+### 5. 1B.7부터 이월된 세 항목 전부 마무리
+
+**(a) stale 상태 카운터/로그 오염 방지**: `[MIN]`/`[V_FAIL]` 로그와
+`_low_volume_count`/자동제외 카운터 갱신을 `minute_data_entry_
+safe`인 경우에만 실행하도록 제한. stale이면 `[MIN_STALE]` 관찰
+로그만 남기고(60초 스로틀) 카운터는 그대로 유지(증가도 리셋도
+안 함).
+
+**(b) stale SELL 세분화**: `Signal`(`domain/models.py`)에
+`requires_fresh_minute_data: bool = False` 필드 신설. 17곳의
+SELL 신호 생성 지점 중, `breakout_strategy.py`/`neutral_
+strategy.py`의 "추세 꺾임"(VWAP/MA5 이탈을 점수에 반영하는 지표
+기반 SELL)에만 `True`로 표시. 나머지(고정 손절/트레일링 스탑/
+안전망 익절은 가격만 사용, `swing_strategy`의 추세꺾임은 RSI/
+MACD 같은 일봉 지표라 분봉 신선도와 무관, `bottom_strategy`/
+`hold_strategy`는 전부 가격 기반)는 건드리지 않음 — 실제 코드를
+읽고 각 SELL이 `minute_analysis`를 참조하는지 하나하나 확인한
+결과. `_process_symbol()`에 `position is not None and signal.
+type == SELL and requires_fresh_minute_data and not entry_safe`
+조건으로 지표 기반 SELL만 HOLD로 전환하는 로직 추가 — 가격 기반
+hard-risk SELL은 이 검사와 무관하게 계속 허용.
+
+**(c) 14:50 게이트 KST Clock 전환**: `_try_buy()`의 `datetime.
+now()`(naive)를 `now_kst()`(1B.8에서 신설한 tzdata 비의존 고정
+UTC+9)로 교체.
+
+### 6. 설정 검증 추가
+
+`MarketRegimeConfig.__post_init__()`에 4가지 검증 추가 —
+`minute_bar_count > 0`, `1 <= minute_bar_min_count_for_entry <=
+minute_bar_count`, `minute_bar_max_age_seconds > 0`,
+`minute_fetch_backoff_seconds >= 0`. 위반 시 `ValueError`로 설정
+로드 시점에 즉시 실패 — 잘못된 조합으로 안전장치가 항상
+차단되거나 항상 무력화되는 조용한 오설정을 방지.
+
+### 7. 테스트 파일 분리
+
+GPT 지시대로 관심사별로 신규 파일 2개 추가:
+- `test_minute_ohlc_quality_safety.py`(신규, 26건) — OHLC 구조
+  검증, analyzer 예외 방어, 캐시/저장 오염 방지.
+- `test_stale_sell_and_clock_safety.py`(신규, 11건) — stale
+  카운터 불변, SELL 세분화, 14:50 KST 경계·UTC 서버 검증.
+
+기존 `test_stale_minute_data_safety.py`(59건)는 그대로 유지 —
+캐시 재사용/신선도/진입 품질 검증 범위는 이미 정리되어 있어
+추가 분리하지 않음.
+
+### 재현 시나리오로 실제 수정 검증
+
+- OHLC(`high=0, low=0`) → 예외 없이 `entry_safe=False`,
+  `reason=INVALID_MINUTE_OHLC`, 캐시 완전 무오염
+- `low > high`, `close` 범위 밖, `volume` 음수 → 전부 정확히 차단
+- `MinuteAnalyzer.analyze()` 강제 예외 → `MINUTE_ANALYSIS_ERROR`로
+  안전 차단, `_process_symbol()` 예외 없이 완료
+- 거부 응답 → 정상 CSV 행 수 불변, `rejected/`에 사유 포함 기록
+- stale + hard-risk SELL(손절) → `_try_sell` 정상 호출(허용)
+- stale + indicator SELL(추세꺾임) → `_try_sell` 미호출(차단)
+- 14:49:59/14:50:00/14:50:01 KST 경계 → 정확히 판정
+- UTC 서버(로컬시각 UTC 05:50 = KST 14:50) → 정확히 `AFTER_1450`
+  차단, UTC 05:49:59(KST 14:49:59)는 정확히 허용
+
+**전체 회귀**: `run_regression_tests.py` — 30개 파일(기존 28 +
+신규 2) 전부 통과, 종료코드 0.
+
+### 이번 라운드로 GPT가 제시한 완료 기준 충족 현황
+
+```
+timestamp·개수 품질 검증: 완료 (1B.9)
+캐시·KST 신선도 검증: 완료 (1B.8)
+OHLC 데이터 품질 검증: 완료 (이번 1B.10)
+분석 예외 fail-close: 완료 (이번 1B.10)
+stale 상태 오염 차단: 완료 (이번 1B.10)
+stale SELL 세분화: 완료 (이번 1B.10)
+14:50 KST Clock: 완료 (이번 1B.10)
+설정값 검증: 완료 (이번 1B.10)
+Windows 실제 API 로그 확인: 미완료 — 사용자 확인 필요
+```
+
+**⚠️ 여전히 필요한 것**: 위 표의 마지막 항목만 남았습니다.
+Windows 실환경에서 `[MIN_BOOTSTRAP] outcome=SUCCESS`,
+`returned=60`, `returned_oldest`/`returned_newest`,
+`returned_order=ASC` 로그를 직접 확인하는 것은 여전히 민우님이
+해주셔야 합니다 — 이게 확인되면 1C(세션 지표 shadow 구현)로
+넘어갈 수 있습니다.
+
+---
+

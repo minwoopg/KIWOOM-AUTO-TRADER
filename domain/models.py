@@ -101,6 +101,16 @@ class Signal:
 
     type: SignalType
     reason: str
+    # 2026-07-28 (6차 GPT 코드리뷰 지적 5번, "1B Safety Closure"):
+    # 이 신호가 minute_analysis(분봉 지표: VWAP/MA5 등)를 실제로
+    # 참조해서 나온 것인지 표시. True면 신선한(entry_safe=True)
+    # 분봉 데이터가 있을 때만 이 신호를 신뢰할 수 있다는 뜻 —
+    # stale 상태에서 지표 기반 SELL(추세 꺾임 등)을 억제하고, 가격
+    # 기반 hard-risk SELL(고정 손절/트레일링/안전망 익절처럼
+    # current_price·average_price·highest_price만으로 계산되는
+    # 신호)은 계속 허용하기 위한 구분. 기본값 False — 기존 대부분의
+    # 신호(가격 기반 또는 BUY/HOLD)는 이 구분과 무관.
+    requires_fresh_minute_data: bool = False
 
 
 @dataclass(frozen=True)

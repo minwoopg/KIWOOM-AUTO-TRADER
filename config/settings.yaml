@@ -120,6 +120,8 @@ market_regime:
   # 실제로 신선한지(오늘 날짜, age 이내) 별도 확인하기 위한 기준.
   # tick_scope(현재 1분)에 비례해 조정 필요 — 3분봉이면 180 이상 권장.
   minute_bar_max_age_seconds: 120
+  # 2026-07-28: 신규 진입 판단용 최소 분봉 개수(minute_bar_count와 동일 권장).
+  minute_bar_min_count_for_entry: 60
   # 2026-07-28: 분봉 조회 실패/빈응답 연속 시 재시도 백오프(초).
   minute_fetch_backoff_seconds: 20
   # V자 반등 감지 파라미터

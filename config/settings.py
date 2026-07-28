@@ -146,11 +146,49 @@ class MarketRegimeConfig:
     # 고려한 여유). tick_scope가 커지면 이 값도 비례해서 늘려야
     # 함(예: 3분봉이면 최소 180초 이상).
     minute_bar_max_age_seconds: int = 120
+    # 2026-07-28 (5차 GPT 코드리뷰 지적): 신규 진입 판단에 쓰기 위한
+    # 최소 분봉 개수. minute_bar_count(60)와 동일하게 보수적으로
+    # 설정 — 재현 확인: 이 검증이 없으면 API가 분봉을 1개만
+    # 반환해도(또는 60개 전부 동일 timestamp라도) age 조건만
+    # 통과하면 entry_safe=True가 되어, MinuteAnalyzer.analyze()가
+    # None을 반환하는데도(또는 사실상 무의미한 분석 결과로) 신규
+    # 매수가 나갈 수 있었음.
+    minute_bar_min_count_for_entry: int = 60
     # 2026-07-28 (GPT 코드리뷰 지적 5번): 분봉 조회 실패/빈응답이
     # 연속될 때, 성공 캐시 시각(minute_refresh_seconds)과 무관하게
     # 이 시간 동안은 재시도하지 않음 — 매 폴링마다 실패하는 API를
     # 계속 두드리는 것을 방지(이전 HTTP 429 재발 방지 목적).
     minute_fetch_backoff_seconds: int = 20
+
+    def __post_init__(self):
+        # 2026-07-28 (6차 GPT 코드리뷰 지적 6번, "1B Safety Closure"):
+        # 이번 라운드에서 신설한 분봉 안전 설정들(minute_bar_count,
+        # minute_bar_min_count_for_entry, minute_bar_max_age_seconds,
+        # minute_fetch_backoff_seconds)이 서로 모순되거나 비상식적인
+        # 값으로 설정되면(예: 최소진입개수가 요청개수보다 큼) 안전
+        # 장치 자체가 항상 차단되거나 항상 무력화되는 상황이 생길 수
+        # 있음 — 설정 로드 시점에 즉시 검증해 조용한 오설정을 방지.
+        if self.minute_bar_count <= 0:
+            raise ValueError(
+                f"market_regime.minute_bar_count는 0보다 커야 합니다 "
+                f"(현재: {self.minute_bar_count})"
+            )
+        if not (1 <= self.minute_bar_min_count_for_entry <= self.minute_bar_count):
+            raise ValueError(
+                f"market_regime.minute_bar_min_count_for_entry는 "
+                f"1 이상 minute_bar_count({self.minute_bar_count}) 이하여야 합니다 "
+                f"(현재: {self.minute_bar_min_count_for_entry})"
+            )
+        if self.minute_bar_max_age_seconds <= 0:
+            raise ValueError(
+                f"market_regime.minute_bar_max_age_seconds는 0보다 커야 합니다 "
+                f"(현재: {self.minute_bar_max_age_seconds})"
+            )
+        if self.minute_fetch_backoff_seconds < 0:
+            raise ValueError(
+                f"market_regime.minute_fetch_backoff_seconds는 0 이상이어야 합니다 "
+                f"(현재: {self.minute_fetch_backoff_seconds})"
+            )
 
 
 @dataclass(frozen=True)

@@ -249,6 +249,9 @@ class NeutralStrategy(Strategy):
                         f"{'·'.join(sell_reasons)} "
                         f"(보유 {current_pnl_pct:+.1f}%)"
                     ),
+                    # 2026-07-28: VWAP/MA5 이탈을 점수에 반영하는
+                    # 지표 기반 SELL — stale 분봉 데이터로는 신뢰 불가.
+                    requires_fresh_minute_data=True,
                 )
 
         # ④ 안전망
