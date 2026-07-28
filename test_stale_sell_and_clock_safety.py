@@ -54,9 +54,15 @@ def check(label: str, condition: bool) -> None:
         failed += 1
 
 
-def build_service(tmpdir: str) -> TradingService:
+def build_service(tmpdir: str, fixed_price: int | None = None) -> TradingService:
     settings = build_minimal_settings(tmpdir)
     broker = MockBroker()
+    if fixed_price is not None:
+        # 2026-07-28 (entry_watch stale VWAP 핫픽스): MockBroker의
+        # 기본가(475150은 목록에 없어 10000원)를 명시적으로 고정 —
+        # entry_watch 급락청산(fail_cut_pct)이 우연히 먼저 발동하지
+        # 않도록 pnl_pct를 정확히 계산해 시나리오를 설계하기 위함.
+        broker._prices["475150"] = fixed_price
     app_logger = build_app_logger(settings.storage.app_log_file, settings.app.log_level)
     trade_logger = TradeCsvLogger(settings.storage.trade_log_file)
     signal_logger = SignalCsvLogger(settings.storage.signal_log_file)
@@ -72,8 +78,8 @@ def build_service(tmpdir: str) -> TradingService:
     )
 
 
-def make_minimal_minute_analysis() -> MinuteAnalysis:
-    return MinuteAnalysis(
+def make_minimal_minute_analysis(**overrides) -> MinuteAnalysis:
+    defaults = dict(
         vwap=58000.0, price_above_vwap=True, low_rising=False,
         pullback_pct=0.0, is_valid_pullback=False,
         change_rate_pct=0.0, is_valid_change_rate=False,
@@ -89,6 +95,8 @@ def make_minimal_minute_analysis() -> MinuteAnalysis:
         is_pulldown_recovery=False, pr_low_turning=False, pr_volume_expanding=False,
         is_slow_v_rebound=False, slow_v_drop_pct=0.0, slow_v_rise_pct=0.0, slow_v_bottom_k=0,
     )
+    defaults.update(overrides)
+    return MinuteAnalysis(**defaults)
 
 
 symbol = "475150"
@@ -329,6 +337,133 @@ with tempfile.TemporaryDirectory() as tmpdir:
         block = service._try_buy(symbol, 58000, balance, signal=None, regime=None, minute_analysis=None)
     check("10) UTC 서버(로컬시각 05:49:59 UTC = 14:49:59 KST) -> 차단되지 않음",
           block != "AFTER_1450")
+
+# ══════════════════════════════════════════════════════════════
+# 4부: entry_watch stale VWAP 핫픽스 (2026-07-28, GPT 7차 지적)
+#
+# 배경: _check_entry_watch()는 정규 strategy.generate_signal()보다
+# 먼저 실행되는 별도 경로인데, 여기에는 minute_analysis를 무조건
+# 그대로 넘기고 있었음 — 3부(2부 코드 기준)의 SELL 세분화 테스트는
+# 전부 _check_entry_watch를 patch(return_value=None)해서 이 경로
+# 자체를 검증하지 못했음. 재현 확인: entry_time 2분 전 + stale +
+# price_above_vwap=False 조합에서 실제로 SELL 신호와
+# vwap_break_streak=1이 발생.
+#
+# 수정: entry_watch에 넘기는 minute_analysis를 entry_safe일 때만
+# 전달(entry_safe=False면 None), stale이면 vwap_break_streak도
+# 명시적으로 리셋. entry_watch의 급락청산(fail_cut_pct)·시간초과
+# 청산(watch_minutes)은 가격/시간 기반이라 계속 허용.
+# ══════════════════════════════════════════════════════════════
+
+# ── 11) stale + entry_watch VWAP 이탈 -> SELL 없음, streak 없음 ──
+# (_check_entry_watch를 patch하지 않은 진짜 통합 테스트 — GPT 지시대로 필수)
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir, fixed_price=10000)
+    now = datetime.now()
+    service.state.entry_time_by_symbol[symbol] = (now - timedelta(minutes=2)).isoformat()
+    fake_analysis = make_minimal_minute_analysis(price_above_vwap=False, vwap=10020.0)
+    # 현재가 10000, average_price 9980 -> pnl 약 +0.2%(fail_cut_pct -1.0% 안 걸림)
+    balance = AccountBalance(cash=100_000_000, total_asset=100_000_000,
+        positions=[Position(symbol=symbol, quantity=10, average_price=9980)])
+    sell_calls = []
+
+    with patch.object(service, "_get_minute_analysis") as mock_get:
+        mock_get.return_value = MinuteDataResult(
+            analysis=fake_analysis, entry_safe=False, source="CACHE_STALE",
+            reason="STALE_MINUTE_DATA", latest_bar_timestamp="20260721091600", age_seconds=99999.0,
+        )
+        with patch.object(
+            service.regime_classifier, "classify", return_value=(MarketRegime.BULLISH, "테스트"),
+        ), patch.object(
+            service, "_try_sell", side_effect=lambda *a, **kw: sell_calls.append("sold"),
+        ):
+            # _check_entry_watch는 patch하지 않음 — 실제 경로 그대로 검증
+            import asyncio
+            asyncio.run(service._process_symbol(symbol, balance))
+
+    check("11) stale + entry_watch VWAP 이탈(patch 없는 진짜 통합 테스트) -> "
+          "_try_sell 호출 안 됨(차단)", len(sell_calls) == 0)
+    check("    vwap_break_streak_by_symbol이 갱신되지 않음(None 유지)",
+          service.state.vwap_break_streak_by_symbol.get(symbol) is None)
+
+# ── 12) fresh + entry_watch VWAP 이탈 -> SELL 유지(회귀 확인) ────
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir, fixed_price=10000)
+    now = datetime.now()
+    service.state.entry_time_by_symbol[symbol] = (now - timedelta(minutes=2)).isoformat()
+    fake_analysis = make_minimal_minute_analysis(price_above_vwap=False, vwap=10020.0)
+    balance = AccountBalance(cash=100_000_000, total_asset=100_000_000,
+        positions=[Position(symbol=symbol, quantity=10, average_price=9980)])
+    sell_calls = []
+
+    with patch.object(service, "_get_minute_analysis") as mock_get:
+        mock_get.return_value = MinuteDataResult(
+            analysis=fake_analysis, entry_safe=True, source="LIVE",
+            reason="", latest_bar_timestamp="20260728120000", age_seconds=5.0,
+        )
+        with patch.object(
+            service.regime_classifier, "classify", return_value=(MarketRegime.BULLISH, "테스트"),
+        ), patch.object(
+            service, "_try_sell", side_effect=lambda *a, **kw: sell_calls.append("sold"),
+        ):
+            import asyncio
+            asyncio.run(service._process_symbol(symbol, balance))
+
+    check("12) fresh + entry_watch VWAP 이탈 -> _try_sell 정상 호출됨(회귀 없음)",
+          len(sell_calls) == 1)
+
+# ── 13) stale + fail_cut_pct 급락 -> SELL 유지(가격 기반) ────────
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir, fixed_price=10000)
+    now = datetime.now()
+    service.state.entry_time_by_symbol[symbol] = (now - timedelta(minutes=1)).isoformat()
+    fake_analysis = make_minimal_minute_analysis()
+    balance = AccountBalance(cash=100_000_000, total_asset=100_000_000,
+        positions=[Position(symbol=symbol, quantity=10, average_price=11000)])  # 약 -9% 급락
+    sell_calls = []
+
+    with patch.object(service, "_get_minute_analysis") as mock_get:
+        mock_get.return_value = MinuteDataResult(
+            analysis=fake_analysis, entry_safe=False, source="CACHE_STALE",
+            reason="STALE_MINUTE_DATA", latest_bar_timestamp="20260721091600", age_seconds=99999.0,
+        )
+        with patch.object(
+            service.regime_classifier, "classify", return_value=(MarketRegime.BULLISH, "테스트"),
+        ), patch.object(
+            service, "_try_sell", side_effect=lambda *a, **kw: sell_calls.append("sold"),
+        ):
+            import asyncio
+            asyncio.run(service._process_symbol(symbol, balance))
+
+    check("13) stale + entry_watch 급락청산(fail_cut_pct, 가격 기반) -> "
+          "_try_sell 호출됨(허용)", len(sell_calls) == 1)
+
+# ── 14) stale + watch_minutes 경과 후 최소수익 미달 -> SELL 유지 ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir, fixed_price=10000)
+    now = datetime.now()
+    # watch_minutes(5분)는 넘었지만 +1분 버퍼(6분) 안쪽으로 안전하게 5.5분
+    service.state.entry_time_by_symbol[symbol] = (now - timedelta(minutes=5, seconds=30)).isoformat()
+    fake_analysis = make_minimal_minute_analysis()
+    balance = AccountBalance(cash=100_000_000, total_asset=100_000_000,
+        positions=[Position(symbol=symbol, quantity=10, average_price=9990)])  # +0.1%, min_profit(0.5%) 미달
+    sell_calls = []
+
+    with patch.object(service, "_get_minute_analysis") as mock_get:
+        mock_get.return_value = MinuteDataResult(
+            analysis=fake_analysis, entry_safe=False, source="CACHE_STALE",
+            reason="STALE_MINUTE_DATA", latest_bar_timestamp="20260721091600", age_seconds=99999.0,
+        )
+        with patch.object(
+            service.regime_classifier, "classify", return_value=(MarketRegime.BULLISH, "테스트"),
+        ), patch.object(
+            service, "_try_sell", side_effect=lambda *a, **kw: sell_calls.append("sold"),
+        ):
+            import asyncio
+            asyncio.run(service._process_symbol(symbol, balance))
+
+    check("14) stale + entry_watch 최소수익미달청산(시간+가격 기반) -> "
+          "_try_sell 호출됨(허용)", len(sell_calls) == 1)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

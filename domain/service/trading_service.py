@@ -647,7 +647,7 @@ class TradingService:
     def _save_rejected_minute_bars(
         self, symbol: str, bars: list, reason: str, detail: str,
     ) -> None:
-        """구조/신선도 검증에 실패한 분봉 응답을 별도 경로에 사유와 함께 기록합니다.
+        """구조/신선도 검증에 실패한 분봉 응답의 진단 메타데이터를 별도 경로에 기록합니다.
 
         2026-07-28 (6차 GPT 코드리뷰 지적, "1B Safety Closure"):
         검증 실패·퇴행·과거 응답이 정상 리플레이용 minute_bars CSV에
@@ -655,7 +655,17 @@ class TradingService:
         실제 입력"이라는 전제로 fixture를 만든 적이 있었는데, 그
         전제가 깨질 수 있는 문제). 정상 저장(_minute_saver.save)은
         검증을 통과한 데이터에만 실행되도록 이미 위에서 순서를
-        옮겼고, 이 함수는 거부된 데이터를 참고용으로 별도 보관.
+        옮겼고, 이 함수는 거부 사실을 참고용으로 별도 기록.
+
+        2026-07-28 (7차 GPT 코드리뷰 지적, 표현 정정): "거부 응답을
+        별도 경로에 저장"이라는 이전 표현이 부정확했음 — 실제로는
+        분봉 데이터 전체(OHLCV)가 아니라 reason/detail/bar_count/
+        first_ts/last_ts 같은 진단 메타데이터 한 줄만 기록함. 정상
+        리플레이 CSV를 오염시키지 않는다는 안전성 목표는 메타데이터
+        로그만으로도 달성되지만, 거부된 분봉의 실제 OHLCV 값을 사후
+        분석하려면(예: 어떤 값이 왜 이상했는지 원본을 다시 봐야 하는
+        경우) 이 로그만으로는 부족함 — 필요해지면 별도 JSON/CSV로
+        원본 봉 데이터까지 저장하는 확장을 고려.
 
         저장 실패는 fail-open — 예외가 나도 신규 진입 차단 로직에
         영향을 주지 않음.
@@ -1213,8 +1223,36 @@ class TradingService:
             # ── entry_watch: 정규 전략보다 먼저 체크 ──────────────
             # 매수 후 watch_minutes(+1분 버퍼) 이내에서만 작동. SELL을
             # 내면 정규 전략(손절/트레일링) 호출 자체를 건너뜀.
+            #
+            # 2026-07-28 (7차 GPT 코드리뷰 지적, "1B Safety Closure"
+            # 후속): _check_entry_watch()는 정규 strategy.generate_
+            # signal()보다 먼저 실행되는 별도 경로인데, 여기에는
+            # minute_analysis를 무조건 그대로 넘기고 있었음 —
+            # entry_watch 내부의 VWAP 이탈 청산이 requires_fresh_
+            # minute_data 표시 없이 SELL을 반환하고, stale 데이터로도
+            # vwap_break_streak_by_symbol을 증가시키던 우회를 재현
+            # 확인(entry_time 2분 전 + stale + price_above_vwap=False
+            # 조합에서 실제로 SELL 신호와 streak=1이 발생).
+            #
+            # entry_watch의 급락청산(fail_cut_pct)·시간초과청산
+            # (watch_minutes)은 가격/시간 기반이라 stale이어도 계속
+            # 허용해야 하므로 _check_entry_watch() 호출 자체는 그대로
+            # 유지 — 대신 VWAP 판단에만 쓰이는 minute_analysis를
+            # entry_safe일 때만 전달하고, stale이면 None을 넘겨서
+            # 함수 내부의 "if ... and minute_analysis is not None"
+            # 조건 자체가 거짓이 되도록 함(1531번째 줄 부근). 이러면
+            # VWAP 판단 로직 자체가 실행되지 않아 streak도 갱신되지
+            # 않음 — GPT 권장대로 "판단 자체를 실행하지 않는" 구조.
+            entry_watch_minute_analysis = (
+                minute_analysis if minute_data_entry_safe else None
+            )
+            if not minute_data_entry_safe:
+                # stale 구간에서는 VWAP 연속 이탈 확인이 이어지지
+                # 않도록 명시적으로 리셋(보수적 정책, GPT 권장).
+                self.state.vwap_break_streak_by_symbol.pop(symbol, None)
+
             signal = self._check_entry_watch(
-                symbol, position, market_price.current_price, minute_analysis,
+                symbol, position, market_price.current_price, entry_watch_minute_analysis,
             )
             if signal is None:
                 signal = strategy.generate_signal(
@@ -1559,6 +1597,14 @@ class TradingService:
                             f"수익률 {pnl_pct:+.2f}%, VWAP {vwap:,.0f}원 아래 "
                             f"({vwap_gap_pct:+.2f}%, {streak}/{confirm_count}회 연속 확인)"
                         ),
+                        # 2026-07-28 (7차 GPT 코드리뷰 지적): 이 SELL은
+                        # minute_analysis(VWAP)를 직접 참조하므로 지표
+                        # 기반 신호 — requires_fresh_minute_data=True로
+                        # 표시. 1차 방어(entry_watch_minute_analysis를
+                        # entry_safe일 때만 전달)로 이미 stale 상황
+                        #에서는 이 코드 지점 자체에 도달하지 않지만,
+                        # 방어적으로 2차 표시를 추가.
+                        requires_fresh_minute_data=True,
                     )
 
         # 3) watch_minutes 경과 시점에 최소수익 미달 청산

@@ -1430,14 +1430,20 @@ close <= high`, `volume >= 0`, `acc_volume >= 0`을 전체 봉에 대해
 **이전**에 실행되고 있었음 — 이번에 순서를 뒤집어 구조 검증을
 통과한 응답만 성공 캐시·정상 저장 파일에 반영되도록 재구성.
 
-### 4. 거부 응답 별도 경로 저장
+### 4. 거부 응답 진단 메타데이터 별도 경로 기록
 
 `_save_rejected_minute_bars()` 신설 — 구조/신선도 검증에 실패한
-응답을 `{minute_bars_dir}/rejected/{symbol}_{날짜}.log`에 사유와
-함께 기록. 정상 리플레이용 CSV(`{minute_bars_dir}/{날짜}/
+응답의 진단 메타데이터(`reason`/`detail`/`bar_count`/`first_ts`/
+`last_ts`)를 `{minute_bars_dir}/rejected/{symbol}_{날짜}.log`에
+한 줄로 기록. 정상 리플레이용 CSV(`{minute_bars_dir}/{날짜}/
 {symbol}.csv`)에는 검증 통과 데이터만 저장되어 거부 데이터가
 조용히 섞이지 않음. 저장 자체는 fail-open(예외가 나도 진입 차단
 로직에 영향 없음).
+
+**⚠️ 표현 정정 (1B.11절)**: 최초 보고 시 "거부 응답을 별도 경로에
+저장"이라고 표현했으나, 실제로는 분봉 데이터 전체(OHLCV)가 아니라
+위 5개 필드로 구성된 메타데이터 한 줄만 기록함 — GPT 7차 코드
+리뷰 지적으로 정정.
 
 ### 5. 1B.7부터 이월된 세 항목 전부 마무리
 
@@ -1523,6 +1529,129 @@ Windows 실환경에서 `[MIN_BOOTSTRAP] outcome=SUCCESS`,
 `returned_order=ASC` 로그를 직접 확인하는 것은 여전히 민우님이
 해주셔야 합니다 — 이게 확인되면 1C(세션 지표 shadow 구현)로
 넘어갈 수 있습니다.
+
+---
+
+## 1B.11: entry_watch의 stale VWAP 청산 경로 핫픽스 (2026-07-28)
+
+**배경**: 1B.10 결과에 대한 GPT 7차 재검토에서, `_process_symbol()`
+이 정규 `strategy.generate_signal()`보다 **먼저** 호출하는
+`_check_entry_watch()` 경로가 stale SELL 세분화(1B.10에서 구현)의
+사각지대에 있음을 재현과 함께 지적받음.
+
+### 발견한 문제 (재현 확인)
+
+`_check_entry_watch()`는 매수 후 `watch_minutes`(+1분 버퍼) 동안
+정규 전략보다 먼저 실행되는데, 내부의 VWAP 이탈 청산이
+`minute_analysis`를 직접 참조하면서도 `requires_fresh_minute_data`
+표시가 없었고, `_process_symbol()`도 이 함수에 `minute_analysis`를
+`entry_safe` 여부와 무관하게 그대로 전달하고 있었음. 1B.10에서
+추가한 stale SELL 세분화 테스트(`test_stale_sell_and_clock_
+safety.py` 3~5번)는 전부 `_check_entry_watch`를 `patch(return_
+value=None)`로 비활성화하고 정규 전략의 SELL만 검증했기 때문에,
+정규 전략보다 먼저 실행되는 이 경로 자체는 한 번도 검증되지
+않았음.
+
+재현: `entry_time_by_symbol`을 2분 전으로 설정, `MinuteDataResult
+.entry_safe=False`(`CACHE_STALE`), stale `minute_analysis.
+price_above_vwap=False`, 가격은 급락(`fail_cut_pct`) 조건에
+걸리지 않는 수준(+0.2%)으로 구성한 뒤 `_check_entry_watch()`를
+직접 호출 — `Signal(type=SELL, reason='entry_watch VWAP이탈청산
+...', requires_fresh_minute_data=False)`와
+`vwap_break_streak_by_symbol[symbol]=1`이 실제로 반환됨을 확인.
+
+### 수정
+
+**1. `_process_symbol()`에서 entry_watch에 전달하는 minute_
+analysis를 entry_safe 여부로 조건부 처리**:
+```python
+entry_watch_minute_analysis = (
+    minute_analysis if minute_data_entry_safe else None
+)
+if not minute_data_entry_safe:
+    self.state.vwap_break_streak_by_symbol.pop(symbol, None)
+
+signal = self._check_entry_watch(
+    symbol, position, market_price.current_price, entry_watch_minute_analysis,
+)
+```
+`_check_entry_watch()` 호출 자체는 그대로 유지(GPT 지시 3번 —
+급락청산/시간초과청산 같은 가격·시간 기반 판단은 stale이어도
+계속 필요하므로), VWAP 판단에만 쓰이는 인자를 stale이면 `None`
+으로 넘겨서 함수 내부의 `if ew.fail_on_vwap_break and minute_
+analysis is not None:` 조건 자체가 거짓이 되도록 함 — "판단 자체를
+실행하지 않는" 구조(GPT 권장 방식).
+
+**2. stale 구간 진입 시 `vwap_break_streak_by_symbol` 명시적
+리셋**: GPT 권장대로 보수적으로 0(제거)으로 리셋 — stale 구간이
+이전의 VWAP 연속 이탈 확인을 이어가지 않도록 함.
+
+**3. VWAP 이탈 SELL Signal에 `requires_fresh_minute_data=True`
+추가(2차 방어)**: 1번 수정으로 이미 stale 상황에서는 이 코드
+지점에 도달하지 않지만, 방어적으로 표시를 추가.
+
+**4. `_save_rejected_minute_bars()` 표현 정정**: docstring과
+CHANGELOG 4번 섹션의 "거부 응답을 별도 경로에 저장"이라는 표현이
+부정확하다는 지적을 받아들여 — 실제로는 분봉 데이터 전체가 아니라
+`reason`/`detail`/`bar_count`/`first_ts`/`last_ts` 메타데이터
+한 줄만 기록한다는 점을 명시하도록 정정.
+
+### 재현 시나리오로 실제 수정 검증
+
+GPT가 요구한 4가지 필수 시나리오를 정확히 재현:
+- stale + VWAP 이탈 → `_try_sell` 미호출, `vwap_break_streak_
+  by_symbol` 갱신 없음(`None` 유지)
+- fresh + VWAP 이탈 → `_try_sell` 정상 호출(회귀 없음)
+- stale + `fail_cut_pct` 급락 → `_try_sell` 호출(가격 기반이라
+  허용)
+- stale + `watch_minutes` 경과 후 최소수익 미달 → `_try_sell`
+  호출(시간+가격 기반이라 허용)
+
+**재현 과정에서 발견한 테스트 설계 문제**: `MockBroker`의 기본
+가격(`475150`은 목록에 없어 `10000원`)과 테스트가 설정한
+`average_price`(예: `58058원`)가 맞지 않아 `pnl_pct`가 의도치
+않게 급락 조건에 먼저 걸리는 문제를 발견 — `broker._prices`를
+명시적으로 고정하는 방식으로 정확한 시나리오를 구성하도록 수정.
+
+### `test_stale_sell_and_clock_safety.py` 확장 (11→16건)
+
+`make_minimal_minute_analysis()`가 `**overrides`를 받도록 확장,
+`build_service()`에 `fixed_price` 옵션 추가. GPT가 명시적으로
+요구한 대로 `_check_entry_watch`를 **patch하지 않은** 진짜
+`_process_symbol()` 통합 테스트를 11번으로 추가 — 이게 이번
+버그를 놓쳤던 근본 원인(entry_watch 경로 자체를 우회하고 있었던
+것)을 직접 해소.
+
+### 회귀 테스트 중 발견한 별개 문제 (제 변경으로 인한 회귀 아님, 확인 완료)
+
+`run_regression_tests.py` 실행 중 `test_order_block_reason.py`
+(4건)와 `test_sold_today_qty_based.py`(1건)가 실패 — 원인을
+직접 재현·확인한 결과, 이번 라운드 변경과 무관한 **1B.6절에서
+이미 발견하고 "범위 밖" 문제로 기록해뒀던 것과 정확히 같은
+근본 원인**임을 확인:
+
+두 테스트가 `TradingService._try_buy()`를 시각 고정 없이 직접
+호출하는데, 1B.10에서 `_try_buy()`의 14:50 게이트를 `datetime.
+now()`(naive)에서 `now_kst()`(정확한 KST 변환)로 교체한 결과,
+이번엔 실제 KST 현재 시각(테스트 실행 시점 기준 15:21경, 장 마감
+이후)이 정확하게 반영되어 두 테스트가 일관되게 `AFTER_1450`으로
+차단됨. 이전엔 naive `datetime.now()`가 컨테이너의 UTC 로컬시각을
+그대로 썼기 때문에 "우연히" 걸리거나 안 걸리는 flaky 상태였을
+뿐 — 이번 수정으로 KST 게이트 자체는 오히려 정확해졌고, 문제는
+두 테스트가 시각에 의존하는 설계 결함을 갖고 있었다는 점.
+
+**재현 검증**: `now_kst()`를 장중 시각(10:00 KST)으로 고정한 뒤
+두 테스트를 재실행하면 각각 5/5, 정상 통과함을 확인 — 이번 라운드
+변경으로 인한 회귀가 아님을 명확히 함. 두 테스트 자체를 고정
+시각을 주입받는 구조로 바꾸는 작업(1B.6절에서 이미 예고했던 항목)
+은 이번 범위를 벗어나므로 착수하지 않음.
+
+**전체 회귀**: `run_regression_tests.py` — 30개 파일 중 28개
+통과, 2개(`test_order_block_reason.py`, `test_sold_today_qty_
+based.py`)는 위에서 설명한 기존 시간대 의존성 문제로 인한 실패
+(제 변경으로 인한 회귀 아님, 장중 시각 고정 시 정상 통과 확인).
+`test_stale_sell_and_clock_safety.py`(16건, 신규 5건 포함)와
+이번 라운드가 건드린 다른 모든 관련 테스트는 정상 통과.
 
 ---
 
