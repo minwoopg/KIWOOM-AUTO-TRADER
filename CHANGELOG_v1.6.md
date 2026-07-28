@@ -1655,3 +1655,71 @@ based.py`)는 위에서 설명한 기존 시간대 의존성 문제로 인한 �
 
 ---
 
+## 1B.12: 시간대 의존 테스트 2건 수정 — 공식 회귀 30/30 확정 (2026-07-28)
+
+**배경**: 1B.11 결과에 대한 GPT 8차 재검토에서, entry_watch 핫픽스
+자체는 승인하되 "공식 회귀 30/30"이라는 표현이 부정확하다는 지적을
+받음 — 실제로는 `test_order_block_reason.py`/`test_sold_today_
+qty_based.py`가 실행 시각(KST 14:50 이후)에 따라 실패하는
+28/30이며, 이걸 30/30으로 보고하면 안 된다는 지적. 1B.11에서
+이미 원인은 규명했었으나(1B.10의 14:50 게이트 `now_kst()` 교체로
+인해 두 테스트가 시각 고정 없이 `_try_buy()`를 호출하면 실제 KST
+현재 시각이 정확히 반영되어 항상 차단됨) 수정은 다음 라운드로
+미뤄뒀던 것을, 이번에 정리.
+
+### 수정
+
+**`test_order_block_reason.py`**: `_try_buy()` 호출 4곳
+(최대보유종목수/RiskManager거부/ALREADY_HOLDING/BUY신호쿨다운
+시나리오) 전부를 `with patch("domain.service.trading_service.
+now_kst", return_value=FIXED_MARKET_TIME):`(장중 KST 10:00 고정)
+로 감싸도록 수정.
+
+**`test_sold_today_qty_based.py`**: 시나리오 6(쿨다운 제거 후
+실제 재매수)의 `_try_buy()` 호출 1곳을 동일한 방식으로 고정.
+
+두 파일 다 `from utils.time_utils import KST_TZ`를 추가하고
+`FIXED_MARKET_TIME = datetime(2026, 7, 28, 10, 0, 0, tzinfo=
+KST_TZ)` 상수를 신설 — 각 파일이 검증하려는 건 차단 사유
+(`SkipReason` 등)나 재매수 판정 로직이지 시간 게이트 자체가
+아니므로, 시간 게이트만 장중으로 고정해 본래 검증 목적과 무관한
+실행 시각 의존성을 제거.
+
+**작업 중 발견한 편집 실수**: `str_replace`로 3번 시나리오에
+patch를 추가하는 과정에서 실수로 다음 섹션 헤더 주석과 함께
+중복 호출 코드가 남는 사고가 있었음 — 파일 전체를 다시 열어
+`view`로 정확한 현재 상태를 확인한 뒤 정리해 복구.
+
+**재현 검증**: 두 파일을 각각 실행해 5/5, 9/9 통과 확인. 이후
+`run_regression_tests.py` 전체를 실행해 **정확히 30/30** 통과를
+확인. 같은 날 다른 시각(수정 전 실패를 재현했던 시각과 비슷한
+KST 16:31경, 장 마감 후)에 다시 실행해도 동일하게 30/30이 나옴을
+재확인 — 시각 의존성이 실제로 완전히 제거됐음을 실행 시각을
+바꿔가며 검증.
+
+**전체 회귀**: `run_regression_tests.py` — **30개 파일 전부
+통과, 종료코드 0**. 로그/데이터 디렉토리 오염 없음 재확인.
+
+### 1B 종료 조건 현황
+
+```
+timestamp·개수 품질 검증: 완료
+캐시·KST 신선도 검증: 완료
+OHLC 데이터 품질 검증: 완료
+분석 예외 fail-close: 완료
+stale 상태 오염 차단: 완료
+stale SELL 세분화(entry_watch 포함): 완료
+14:50 KST Clock: 완료
+설정값 검증: 완료
+공식 회귀 30/30: 완료(이번 1B.12)
+Windows 실제 API 로그 확인: 미완료 — 사용자 확인 필요
+```
+
+**⚠️ 여전히 필요한 것은 이제 마지막 하나뿐입니다.** Windows
+실환경에서 `[MIN_BOOTSTRAP] outcome=SUCCESS`, `returned=60`,
+`returned_oldest`/`returned_newest`, `returned_order=ASC` 로그를
+직접 확인하는 것 — 이게 확인되면 1B를 종료하고 1C(세션 지표
+shadow 구현)로 넘어갑니다.
+
+---
+
