@@ -17,6 +17,8 @@
 """
 from __future__ import annotations
 
+import io
+import logging
 import sys
 from datetime import datetime, timedelta
 from unittest.mock import patch
@@ -388,9 +390,20 @@ with patch.object(broker_empty, "_post", return_value=empty_response):
 
 check("10-1) 빈 응답이어도 기존처럼 빈 리스트를 반환함(반환값 불변)",
       result_empty == [])
-check("     빈 응답이어도 진단 키가 생성됨(진단이 실제로 먼저 실행됨을 증명)",
-      ("475150", "20260721", "3", 60) in broker_empty._minute_diagnostic_keys
-      or len(broker_empty._minute_diagnostic_keys) == 1)
+# 2026-07-27 (3차 GPT 코드리뷰 지적): 기존엔 구형 4요소 키
+# ("475150", "20260721", "3", 60)로 검사하면서 "or len(...) == 1"
+# 이 붙어 있어서, 실제 키가 5요소(outcome 포함)로 바뀐 뒤에도
+# 이 4요소 매칭은 항상 실패하지만 or 조건 덕분에 테스트가 계속
+# 통과하고 있었음(정확한 키 구조를 검증하지 못하는 상태). 실제
+# 5요소 키(마지막 요소가 "EMPTY")를 정확히 검증하도록 수정.
+check("     빈 응답이어도 EMPTY outcome 진단 키가 정확히 생성됨"
+      "(5요소 키: symbol, base_date, tick_scope, count, outcome)",
+      any(
+          key[0] == "475150" and key[2] == "3" and key[3] == 60 and key[4] == "EMPTY"
+          for key in broker_empty._minute_diagnostic_keys
+      ))
+check("     진단 키가 정확히 1개만 생성됨(중복 없음)",
+      len(broker_empty._minute_diagnostic_keys) == 1)
 
 # 실제 진단 결과를 직접 계산해서 raw_received=0, 시각 정보가 남는지 확인
 d_empty = build_minute_bar_diagnostics(
@@ -608,7 +621,7 @@ check("    raw_order_violation_count는 0(유효한 두 timestamp만 보면 위�
 #     (2026-07-27, 2차 GPT 코드리뷰 지적으로 설명 정정)
 #
 # ⚠️ 이 테스트가 실제로 검증하는 것: "get_minute_bars()가 진단
-# 모듈을 import하는 지점(_maybe_log_minute_bar_diagnostics 내부)
+# 모듈을 import하는 지점(_try_log_minute_bar_diagnostics 내부)
 # 에서 어떤 이유로든(ImportError든 다른 예외든) 실패해도, 분봉
 # 조회 자체는 fail-open으로 정상 완료된다"는 것입니다. builtins.
 # __import__를 패치해서 "minute_bar_diagnostics" 관련 import를
@@ -708,6 +721,184 @@ check("    (대조군) 시각 정보가 없으면 request_started_at=N/A로 표�
       "request_started_at=N/A" in log_line_no_times)
 check("    (대조군) request_duration_ms도 N/A로 표시됨",
       "request_duration_ms=N/A" in log_line_no_times)
+
+def _capture_app_logs():
+    """logging.getLogger('app')의 출력을 캡처하는 컨텍스트를 준비합니다."""
+    log_capture = io.StringIO()
+    handler = logging.StreamHandler(log_capture)
+    app_logger = logging.getLogger("app")
+    app_logger.addHandler(handler)
+    app_logger.setLevel(logging.INFO)
+    return log_capture, app_logger, handler
+
+
+def _main_bootstrap_lines(log_text: str) -> list[str]:
+    """캡처된 로그에서 주 진단 로그(ORDER_DETAIL 제외)만 추출합니다."""
+    return [
+        line for line in log_text.splitlines()
+        if "[MIN_BOOTSTRAP]" in line and "ORDER_DETAIL" not in line
+    ]
+
+
+# ══════════════════════════════════════════════════════════════
+# 25. 진단 로그 무효화 버그 수정 검증 (2026-07-27, 3차 GPT 코드리뷰)
+#
+# 배경: 실제로 get_minute_bars()를 호출해 logger.info가 실제로
+# 무엇을 로깅하는지 캡처 — build_minute_bar_diagnostics()를
+# 직접 호출하는 단위 테스트만으로는 이 버그(호출 순서로 인한
+# 진단 무효화)를 잡을 수 없었음. 반드시 get_minute_bars() 전체를
+# 통합 실행해서 실제 로그 문자열을 검증해야 함.
+# ══════════════════════════════════════════════════════════════
+
+# ── 25-1. 정상 raw 70/count 60 -> info 1회, returned=60, ASC, oldest/newest not None ──
+broker_success = make_broker()
+raw_success = make_raw_bars(70, base, desc=True)
+log_capture, app_logger, handler = _capture_app_logs()
+try:
+    with patch.object(broker_success, "_post", return_value=make_response(raw_success)):
+        result_success = broker_success.get_minute_bars("475150", tick_scope=3, count=60)
+finally:
+    app_logger.removeHandler(handler)
+
+log_text = log_capture.getvalue()
+main_lines = _main_bootstrap_lines(log_text)
+
+check("25-1) 정상 raw70/count60 -> 함수 반환이 60개", len(result_success) == 60)
+check("     주 진단 로그(logger.info)가 정확히 1회 기록됨", len(main_lines) == 1)
+if main_lines:
+    line = main_lines[0]
+    check("     로그에 outcome=SUCCESS가 출력됨", "outcome=SUCCESS" in line)
+    check("     로그에 returned=60이 정확히 출력됨(버그 수정 전엔 returned=0이었음)",
+          "returned=60" in line)
+    check("     로그에 returned_order=ASC가 출력됨(버그 수정 전엔 N/A였음)",
+          "returned_order=ASC" in line)
+    check("     로그에 returned_oldest가 None이 아닌 실제 timestamp로 출력됨",
+          "returned_oldest=None" not in line and "returned_oldest=202" in line)
+    check("     로그에 returned_newest가 None이 아닌 실제 timestamp로 출력됨",
+          "returned_newest=None" not in line and "returned_newest=202" in line)
+
+# ── 25-2. 동일 정상 키로 2회 호출 -> SUCCESS 로그 1회만(중복 방지 유지) ──
+broker_dup = make_broker()
+raw_dup = make_raw_bars(70, base, desc=True)
+log_capture2, app_logger2, handler2 = _capture_app_logs()
+try:
+    with patch.object(broker_dup, "_post", return_value=make_response(raw_dup)):
+        broker_dup.get_minute_bars("475150", tick_scope=3, count=60)
+        broker_dup.get_minute_bars("475150", tick_scope=3, count=60)  # 동일 조합 재호출
+finally:
+    app_logger2.removeHandler(handler2)
+
+dup_lines = _main_bootstrap_lines(log_capture2.getvalue())
+check("25-2) 동일 (symbol, base_date, tick_scope, count, SUCCESS) 재호출 시 "
+      "SUCCESS 로그가 1회만 기록됨(중복 방지 유지)", len(dup_lines) == 1)
+
+# ── 25-3. 첫 빈 응답 후 정상 응답 -> EMPTY 1회 + SUCCESS 1회 ──
+broker_mixed = make_broker()
+empty_resp = make_response([])
+raw_mixed = make_raw_bars(70, base, desc=True)
+normal_resp = make_response(raw_mixed)
+log_capture3, app_logger3, handler3 = _capture_app_logs()
+try:
+    with patch.object(broker_mixed, "_post", side_effect=[empty_resp, normal_resp]):
+        r1 = broker_mixed.get_minute_bars("475150", tick_scope=3, count=60)
+        r2 = broker_mixed.get_minute_bars("475150", tick_scope=3, count=60)
+finally:
+    app_logger3.removeHandler(handler3)
+
+check("25-3) 첫 빈 응답 -> 함수가 빈 리스트를 반환함(기존과 동일)", r1 == [])
+check("     두번째 정상 응답 -> 함수가 60개를 정상 반환함", len(r2) == 60)
+mixed_lines = _main_bootstrap_lines(log_capture3.getvalue())
+outcomes = [line.split("outcome=")[1].split(" ")[0] for line in mixed_lines]
+check("     주 진단 로그가 정확히 2회(EMPTY 1회 + SUCCESS 1회) 기록됨",
+      len(mixed_lines) == 2)
+check("     첫 로그가 EMPTY, 두번째가 SUCCESS로 서로 다르게 기록됨(핵심 수정 검증)",
+      outcomes == ["EMPTY", "SUCCESS"])
+
+# ── 25-4. 첫 logger.info 실패 -> 분봉 정상 반환, 키 미등록, 다음 호출에서 재시도 ──
+broker_flaky = make_broker()
+raw_flaky = make_raw_bars(70, base, desc=True)
+
+call_count = {"n": 0}
+original_info = logging.getLogger("app").info
+
+
+def flaky_info(msg, *args, **kwargs):
+    call_count["n"] += 1
+    if call_count["n"] == 1:
+        raise RuntimeError("logger.info 강제 실패(1회차)")
+    return original_info(msg, *args, **kwargs)
+
+
+with patch.object(broker_flaky, "_post", return_value=make_response(raw_flaky)):
+    with patch.object(logging.getLogger("app"), "info", side_effect=flaky_info):
+        result_first = broker_flaky.get_minute_bars("475150", tick_scope=3, count=60)
+        keys_after_first = set(broker_flaky._minute_diagnostic_keys)
+        result_second = broker_flaky.get_minute_bars("475150", tick_scope=3, count=60)
+        keys_after_second = set(broker_flaky._minute_diagnostic_keys)
+
+check("25-4) 첫 logger.info 실패해도 분봉은 정상 반환됨(60개, fail-open)",
+      len(result_first) == 60)
+check("     logger.info 실패로 키가 등록되지 않음(1차 시도 후 키 집합 비어있음)",
+      len(keys_after_first) == 0)
+check("     다음 호출(2차 시도)에서 재시도되어 키가 등록됨",
+      len(keys_after_second) == 1)
+check("     2차 시도에서도 분봉은 정상 반환됨(60개)", len(result_second) == 60)
+
+# ── 25-5. 정상 응답은 legacy와 MinuteBar 리스트 전체 동일 (byte-for-byte 재확인) ──
+legacy_25 = legacy_parse(raw_success, 60)
+identical_25 = len(legacy_25) == len(result_success) and all(
+    (l.cntr_tm, l.open_price, l.high_price, l.low_price, l.close_price, l.volume, l.acc_volume) ==
+    (a.cntr_tm, a.open_price, a.high_price, a.low_price, a.close_price, a.volume, a.acc_volume)
+    for l, a in zip(legacy_25, result_success)
+)
+check("25-5) outcome 분리 수정 이후에도 정상 응답 결과는 legacy와 "
+      "byte-for-byte 완전히 동일함(반환값 불변 재확인)", identical_25)
+
+# ══════════════════════════════════════════════════════════════
+# 26. format_order_detail_log_line() 분모 수정 검증
+#     (2026-07-27, 3차 GPT 코드리뷰 지시 6번)
+# ══════════════════════════════════════════════════════════════
+
+raw_mixed_invalid = [
+    {"cntr_tm": "20260721091000", "open_pric": "1", "high_pric": "1", "low_pric": "1",
+     "cur_prc": "1", "trde_qty": "1", "acc_trde_qty": "1"},
+    {"cntr_tm": "INVALID1", "open_pric": "1", "high_pric": "1", "low_pric": "1",
+     "cur_prc": "1", "trde_qty": "1", "acc_trde_qty": "1"},
+    {"cntr_tm": "20260721090800", "open_pric": "1", "high_pric": "1", "low_pric": "1",
+     "cur_prc": "1", "trde_qty": "1", "acc_trde_qty": "1"},
+    {"cntr_tm": "20260721090900", "open_pric": "1", "high_pric": "1", "low_pric": "1",
+     "cur_prc": "1", "trde_qty": "1", "acc_trde_qty": "1"},  # 순서 위반
+    {"cntr_tm": "INVALID2", "open_pric": "1", "high_pric": "1", "low_pric": "1",
+     "cur_prc": "1", "trde_qty": "1", "acc_trde_qty": "1"},
+]
+d16 = build_minute_bar_diagnostics(
+    symbol="475150", base_date="20260721", tick_scope="1", requested_count=5,
+    raw_bars=raw_mixed_invalid, returned_bars_timestamps=[],
+    headers={"cont-yn": "N", "next-key": ""},
+    request_started_at=None, response_received_at=None,
+)
+check("26) raw 5개 중 2개 invalid -> raw_timestamp_parseable_count=3",
+      d16.raw_timestamp_parseable_count == 3)
+detail_line = format_order_detail_log_line(d16)
+check("    violations 분모가 raw_received_count-1(4)이 아니라 "
+      "raw_timestamp_parseable_count-1(2)로 정확히 계산됨",
+      detail_line is not None and "violations=1/2" in detail_line)
+
+# ══════════════════════════════════════════════════════════════
+# 27. returned 진단 분리 검증 (2026-07-27, 3차 GPT 코드리뷰 지시 7번)
+# ══════════════════════════════════════════════════════════════
+
+returned_mixed_ts = ["20260721091000", "INVALID_RETURNED", "20260721091100"]
+d17 = build_minute_bar_diagnostics(
+    symbol="475150", base_date="20260721", tick_scope="1", requested_count=5,
+    raw_bars=raw_success, returned_bars_timestamps=returned_mixed_ts,
+    headers={"cont-yn": "N", "next-key": ""},
+    request_started_at=None, response_received_at=None,
+)
+check("27) returned_timestamp_parseable_count가 정확히 2로 계산됨(3개중 2개 유효)",
+      d17.returned_timestamp_parseable_count == 2)
+check("    returned_invalid_timestamp_count가 정확히 1로 계산됨",
+      d17.returned_invalid_timestamp_count == 1)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

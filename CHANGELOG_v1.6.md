@@ -874,3 +874,160 @@ bar_diagnostics.py`와 `python run_regression_tests.py`를 실행한
 
 ---
 
+## 1B.5: 진단 로그 무효화 버그 수정 (2026-07-27, 긴급)
+
+**배경**: 1B.4 결과를 GPT가 3차 재검토하며 진단 시스템 전체를
+사실상 무효화하는 심각한 버그를 발견 — 정상 raw 70개/count 60
+케이스를 실제로 로그 캡처까지 해서 재현 제시.
+
+**버그 내용**: `get_minute_bars()`가 `raw_bars`를 받은 직후, 응답이
+정상이든 비어있든 상관없이 항상 먼저 `_maybe_log_minute_bar_
+diagnostics(raw_bars=raw_bars, returned_bars=[])`를 호출해 키를
+등록했음. 이후 실제 파싱·`reverse()`를 완료한 뒤 `returned_bars=
+bars`로 다시 같은 함수를 불러도, 이미 등록된 (symbol, base_date,
+tick_scope, count) 키 때문에 최초 1회 방어 로직이 이 두 번째(진짜
+값을 담은) 호출을 조용히 스킵했음.
+
+**실제 재현 결과** (수정 전): 함수는 정상적으로 60개를 반환하는데,
+로그엔 `returned=0`, `returned_oldest=None`, `returned_newest=
+None`, `returned_order=N/A`로 찍혀 진단 로그가 완전히 거짓 정보를
+담고 있었음.
+
+**수정**:
+
+1. **`MinuteBarDiagnostics`에 `response_outcome`("EMPTY"|"SUCCESS")
+   필드 추가**, `format_diagnostics_log_line()`에도 `outcome=`으로
+   노출.
+2. **`get_minute_bars()`를 완전히 재구성** — 빈 응답 진단은
+   `if not raw_bars:` 분기 **안에서만** `response_outcome="EMPTY"`
+   로 호출, 정상 응답 진단은 파싱·`reverse()` 완료 후 **단 한
+   번만** `response_outcome="SUCCESS"`로 호출. 두 경로가 물리적으로
+   분리되어 서로를 밀어낼 수 없는 구조로 변경.
+3. **진단 키에 outcome 추가**: `(symbol, base_date, tick_scope,
+   requested_count, response_outcome)` 5-튜플로 확장 — EMPTY와
+   SUCCESS가 항상 서로 다른 키를 가져 독립적으로 기록됨.
+4. **`_maybe_log_minute_bar_diagnostics()` → `_try_log_minute_bar_
+   diagnostics()`로 개명**, `response_outcome` 파라미터 추가. 두
+   군데 중복되어 있던 `try/except` 호출부는 그대로 유지(이 함수
+   자체는 방어 로직을 추가하지 않고 예외를 그대로 전파 — fail-open
+   책임은 여전히 호출부가 짐).
+
+**재현 검증**: 버그 리포트와 정확히 동일한 시나리오(raw 70개,
+count 60)로 재검증한 결과, 수정 후 로그가 `outcome=SUCCESS
+returned=60 returned_oldest=20260721091100 returned_newest=
+20260721101000 returned_order=ASC`로 정확하게 기록됨을 확인.
+
+**추가 수정 (같은 라운드, GPT 지시 6·7번)**:
+- `format_order_detail_log_line()`의 violations 분모를
+  `raw_received_count - 1`에서 `max(raw_timestamp_parseable_
+  count - 1, 0)`로 수정 — invalid timestamp가 섞이면 실제 정렬
+  검사 대상보다 분모가 커져 비율이 부정확했던 문제(합성 데이터로
+  분모 4→2 정확한 계산 확인).
+- `returned_timestamp_parseable_count`/`returned_invalid_
+  timestamp_count` 필드 추가 — raw 쪽에 이미 있던 대칭 필드를
+  returned 쪽에도 추가.
+
+**검증**: `test_minute_bar_diagnostics.py`에 GPT가 요구한 5가지
+필수 테스트를 25-1~25-5번으로 추가 — (1) 정상 raw70/count60 시
+`logger.info` 실제 호출을 캡처해 1회만 기록되고 `outcome=SUCCESS,
+returned=60, returned_order=ASC, oldest/newest not None`을 확인,
+(2) 동일 정상 키 재호출 시 SUCCESS 로그가 1회만 유지되는지, (3)
+빈 응답 후 정상 응답 시 EMPTY 1회 + SUCCESS 1회로 정확히 분리
+기록되는지, (4) 첫 `logger.info` 자체가 예외를 던져도 분봉은
+정상 반환되고 키는 미등록되어 다음 호출에서 재시도되는지(fail-open
++ 재시도 가능성 동시 검증), (5) 이 모든 수정 이후에도 정상 응답
+결과가 legacy와 byte-for-byte 완전히 동일한지. 26번(분모 수정),
+27번(returned 진단 분리)도 추가. 총 62→83건 전부 통과.
+
+이전 라운드까지는 `build_minute_bar_diagnostics()`를 직접 호출하는
+단위 테스트만 있었는데, 이 버그는 `get_minute_bars()` 전체를
+통합 실행해서 `logger.info` 실제 출력을 캡처해야만 잡을 수 있는
+유형이었음 — 단위 테스트만으로는 발견 불가능했다는 점을 기록.
+
+**전체 회귀**: `run_regression_tests.py` — 27개 파일 전부 통과,
+종료코드 0.
+
+**최종 확인 (GPT 요구 조건)**:
+```
+[MIN_BOOTSTRAP] symbol=475150 date=20260727 tick_scope=3 outcome=SUCCESS requested=60 raw_received=70 raw_excess=10 raw_exceeds_requested=True raw_parseable=70 returned=60 returned_parseable=60 returned_invalid=0 request_started_at=2026-07-27T15:20:23.375720+09:00 response_received_at=2026-07-27T15:20:23.375772+09:00 request_duration_ms=0.1 oldest_raw=20260721090100 newest_raw=20260721101000 returned_oldest=20260721091100 returned_newest=20260721101000 raw_order=DESC raw_order_violations=0 returned_order=ASC continuation=False next_key_present=False other_date=70 outside_strategy_window=0 outside_regular_market=0 duplicates=0 invalid_ts=0 newest_bar_age_sec=537023.4 same_minute_as_response=False is_future=False
+```
+`returned=60`, `returned_oldest=`/`returned_newest=`(실제 값),
+`returned_order=ASC` 전부 정확히 출력됨을 확인 — GPT가 요구한
+1B 완료 조건 충족(합성 데이터 기준).
+
+**⚠️ 여전히 필요한 것**: 위 최종 확인은 합성 데이터 기준입니다.
+Windows 실환경에서 `python test_minute_bar_diagnostics.py`,
+`python run_regression_tests.py` 직접 실행과 실제 `[MIN_BOOTSTRAP]`
+로그 확인은 여전히 민우님이 해주셔야 합니다.
+
+---
+
+## 1B.6: 분봉 조회 실패 시 오래된 캐시 기반 신규매수 차단 (2026-07-27, 안전 긴급)
+
+**배경**: 1B.5 결과에 대한 GPT 재검토에서, 1B 진단 로깅과는 별개로
+`TradingService._get_minute_analysis()`가 `get_minute_bars()` 실패
+시 오래된 캐시를 그대로 분석에 넘기는 구조적 위험을 지적. 이건
+실운영에서 분봉 조회 실패 직후 오래된 캐시 기반 신규 매수(039980)
+가 발생했던 것과 같은 유형의 문제이며, 이번 1B 라운드 전체에서
+한 번도 손대지 않은 별개의 코드 경로였음(확인: 기존
+`except Exception: bars = self.cached_minute_bars.get(symbol, [])`
+가 신선도 정보 없이 그대로 정상 `MinuteAnalysis`를 반환).
+
+**수정**:
+
+1. **`_get_minute_analysis()` 반환 타입 변경**: 기존
+   `MinuteAnalysis | None` → `tuple[MinuteAnalysis | None, bool, str]`
+   (`analysis, is_fresh, reason`). 정상 조회 성공 시 `is_fresh=True`,
+   조회 실패했지만 캐시가 있어 그걸로 대체한 경우 `is_fresh=False,
+   reason="STALE_MINUTE_DATA"`, 캐시조차 없는 경우
+   `reason="MINUTE_DATA_UNAVAILABLE"`. **analysis 자체는 기존과
+   동일하게 캐시 기반으로 계속 계산됨** — 보유 종목의 손절/트레일링
+   판단이 끊기지 않도록.
+2. **`_process_symbol()`에 미보유 종목 전용 안전장치 추가**:
+   `position is None`(미보유)이고 `minute_data_fresh=False`인데
+   전략이 `BUY` 신호를 냈다면, 신호 생성 직후 로그 기록 이전에
+   `Signal(type=SignalType.HOLD, reason=minute_data_stale_reason)`
+   으로 강제 전환. **보유 종목(`position is not None`)은 이 검사와
+   완전히 무관하게 그대로 동작** — 위험 축소 SELL을 막으면 안
+   되므로.
+
+**검증**: 신규 `test_stale_minute_data_safety.py` — 13건 전부 통과.
+(1) fresh/stale(캐시있음)/unavailable(캐시없음) 3가지 반환값 케이스
+확인, (2) `_process_symbol()` 전체 흐름에서 미보유+stale+BUY신호가
+실제로 `signal_log.csv`에 `HOLD`(BUY 아님)로 강제 전환되어 기록됨을
+확인(핵심 안전장치 검증), (3) 보유종목+stale+SELL신호는 `_try_sell`
+이 그대로 호출됨을 확인(위험축소 미차단), (4) 미보유+fresh+BUY신호
+는 `_try_buy`가 정상 호출됨을 확인(회귀 없음).
+
+**추가 정리 (GPT 지시 1번)**: `test_minute_bar_diagnostics.py`
+10-1번의 진단 키 검증이 구형 4요소 키(`("475150", "20260721",
+"3", 60)`)로 매칭을 시도하면서 `or len(...) == 1`이 붙어있어,
+실제 키가 5요소(`outcome` 포함)로 바뀐 뒤에도 이 4요소 매칭은
+항상 실패하지만 `or` 조건 덕분에 테스트가 계속 통과하던 상태였음
+(정확한 키 구조를 검증 못 하고 있었음, 재현 확인). 정확한 5요소
+키(`outcome="EMPTY"`) 매칭으로 수정.
+
+**전체 회귀 확인 중 발견한 별개 문제 (범위 외, 미수정)**:
+`run_regression_tests.py` 실행 중 `test_order_block_reason.py`와
+`test_sold_today_qty_based.py` 일부가 실패 — 원인을 직접
+재현·확인한 결과, **이번 수정과 무관한 기존 테스트의 시각
+의존성 결함**이었음. 두 테스트가 `TradingService._try_buy()`를
+실제로 호출하는데, `_try_buy()` 내부의 "14:50 이후 신규매수
+차단" 로직이 `datetime.now()`(타임존 미지정, 시스템 로컬시각)를
+그대로 써서, 이번 검증을 실행한 컨테이너의 로컬 시각이 우연히
+23시대(UTC)였던 탓에 "14시 50분 이후"로 오판정됨. `datetime.now`
+를 10:00으로 고정한 뒤 재실행하면 두 테스트 모두 정상 통과함을
+직접 확인 — 즉 이번 1B.6 변경으로 인한 회귀가 아니라, 이전부터
+있었지만 지금까지 실행 시각이 우연히 이 구간을 안 지나서 드러나지
+않았던 별개의 취약점. 이번 라운드 범위(stale 캐시 안전장치)를
+벗어나므로 수정하지 않고 별도 이슈로 명확히 기록만 남김 — 향후
+`_try_buy()`의 시간 게이트를 테스트 가능하게 만들려면(예: 현재
+시각을 주입받는 구조로 변경) 별도 라운드가 필요.
+
+**전체 회귀**: `run_regression_tests.py` — 28개 파일 중 26개 통과,
+위에서 설명한 시각 의존성 문제 2건은 이번 변경과 무관함을 재현
+검증으로 확인. `test_stale_minute_data_safety.py`(신규, 13건)와
+관련된 다른 모든 테스트는 정상 통과.
+
+---
+

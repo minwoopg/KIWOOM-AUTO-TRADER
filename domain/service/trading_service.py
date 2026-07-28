@@ -399,8 +399,37 @@ class TradingService:
         cached = self.cached_regime.get(symbol, MarketRegime.UNKNOWN)
         return cached, "(캐시)"
 
-    def _get_minute_analysis(self, symbol: str, prev_close: int) -> MinuteAnalysis | None:
-        """분봉 데이터를 가져와 2차 필터 분석 결과를 반환합니다. 결과는 캐시합니다."""
+    def _get_minute_analysis(
+        self, symbol: str, prev_close: int
+    ) -> tuple[MinuteAnalysis | None, bool, str]:
+        """분봉 데이터를 가져와 2차 필터 분석 결과를 반환합니다. 결과는 캐시합니다.
+
+        2026-07-27 (GPT 코드리뷰 지적, 안전성 긴급 수정): 기존엔
+        get_minute_bars() 예외 시 오래된 캐시(cached_minute_bars)를
+        그대로 분석에 넘기면서, 이 데이터가 "방금 조회한 신선한
+        데이터"인지 "조회 실패로 어쩔 수 없이 쓴 오래된 캐시"인지
+        호출부에 전혀 알리지 않았음 — 실운영에서 분봉 조회 실패 직후
+        오래된 캐시 기반으로 신규 매수(039980)가 발생한 원인이 이
+        구조. 반환값에 신선도 정보(is_fresh)와 사유(reason)를 함께
+        담아, 호출부가 "이 데이터로 신규 진입을 해도 되는지"를
+        명시적으로 판단할 수 있게 함.
+
+        반환값:
+            (analysis, is_fresh, reason)
+            - analysis: 기존과 동일한 MinuteAnalysis | None
+            - is_fresh: 이번 호출에서 API 조회에 성공했으면 True,
+              실패해서 캐시로 대체했으면 False (첫 조회 자체가
+              실패해 캐시도 없는 경우도 False)
+            - reason: fresh가 False일 때의 사유 문자열
+              ("MINUTE_DATA_UNAVAILABLE" | "STALE_MINUTE_DATA" | "")
+              — 캐시가 아예 없으면 UNAVAILABLE, 오래된 캐시라도
+              있으면 STALE.
+
+        기존 동작(캐시를 분석에 사용하는 것 자체)은 그대로 유지 —
+        보유 종목의 손절/트레일링 판단이 끊기지 않도록. 다만 이제
+        신선도를 알 수 있으므로, 호출부가 미보유 종목의 신규 진입만
+        선택적으로 차단할 수 있음.
+        """
         now = datetime.now()
         loaded_at = self.cached_minute_bars_loaded_at.get(symbol)
         refresh_sec = self.settings.market_regime.minute_refresh_seconds
@@ -409,6 +438,9 @@ class TradingService:
             loaded_at is None
             or (now - loaded_at).total_seconds() >= refresh_sec
         )
+
+        is_fresh = True
+        stale_reason = ""
 
         if need_refresh:
             try:
@@ -430,13 +462,18 @@ class TradingService:
             except Exception as exc:
                 self.app_logger.warning(f"[MIN] {symbol} | 분봉 조회 실패: {exc}")
                 bars = self.cached_minute_bars.get(symbol, [])
+                is_fresh = False
+                stale_reason = (
+                    "STALE_MINUTE_DATA" if bars else "MINUTE_DATA_UNAVAILABLE"
+                )
         else:
             bars = self.cached_minute_bars.get(symbol, [])
 
         if not bars:
-            return None
+            return None, is_fresh, stale_reason
 
-        return self._minute_analyzer.analyze(bars, prev_close)
+        analysis = self._minute_analyzer.analyze(bars, prev_close)
+        return analysis, is_fresh, stale_reason
 
     def _attach_indicators(self, market_price, symbol: str):
         """캐시된 일봉 데이터로 지표값을 계산해 MarketPrice에 주입합니다.
@@ -758,9 +795,11 @@ class TradingService:
 
             # BULLISH일 때만 분봉 2차 필터 적용
             minute_analysis = None
+            minute_data_fresh = True
+            minute_data_stale_reason = ""
             if regime in (MarketRegime.BULLISH, MarketRegime.NEUTRAL, MarketRegime.REBOUND):
-                minute_analysis = self._get_minute_analysis(
-                    symbol, market_price.previous_close
+                minute_analysis, minute_data_fresh, minute_data_stale_reason = (
+                    self._get_minute_analysis(symbol, market_price.previous_close)
                 )
                 if minute_analysis:
                     score = minute_analysis.score()
@@ -850,6 +889,20 @@ class TradingService:
                     market_price, position, minute_analysis, highest_price,
                     bb_percent_b=_bb_pb,
                 )
+
+            # 2026-07-27 (GPT 코드리뷰 지적, 안전성 긴급 수정): 미보유
+            # 종목에서 분봉 데이터가 신선하지 않은데(조회 실패로 오래된
+            # 캐시를 쓴 경우) BUY 신호가 나오면 강제로 HOLD로 덮어씀 —
+            # 실운영에서 분봉 조회 실패 직후 오래된 캐시 기반 신규
+            # 매수(039980)가 발생했던 문제의 재발 방지. 보유 종목
+            # (position is not None)의 손절/트레일링 SELL은 이 검사와
+            # 무관하게 그대로 동작 — 위험 축소 행동을 막으면 안 되므로.
+            if (
+                position is None
+                and not minute_data_fresh
+                and signal.type == SignalType.BUY
+            ):
+                signal = Signal(type=SignalType.HOLD, reason=minute_data_stale_reason)
 
             self._log_signal_decision(
                 symbol, signal, market_price.current_price,
