@@ -23,6 +23,7 @@ from pathlib import Path
 from config.settings import Settings
 from domain.market_regime.classifier import MarketRegimeClassifier
 from domain.market_regime.minute_analyzer import MinuteAnalyzer, MinuteAnalysis, MinuteDataResult
+from domain.market_regime.session_metrics import merge_session_bars, build_session_metrics, format_session_metrics_log_line
 from domain.models import AccountBalance, MarketRegime, OrderRequest, OrderSide, Signal, SignalType
 from domain.position.lifecycle import PositionLifecycle, PositionStateMachine
 from domain.risk.risk_manager import RiskManager
@@ -99,6 +100,19 @@ class TradingService:
         # 연속될 때 매 폴링(10초)마다 API를 계속 두드리지 않고 짧은
         # 백오프를 두기 위함(이전 HTTP 429 재발 방지 목적).
         self.cached_minute_bars_failed_at: dict[str, datetime] = {}
+
+        # 2026-07-28 (1C단계, session_metrics_mode="shadow" 전용):
+        # 종목별 당일 세션 상태 — {symbol: SessionState}. SessionState
+        # 는 session_date(어느 거래일 것인지) + 필터를 통과한 봉만
+        # 담긴 딕셔너리 + 필터링 카운터를 함께 보관 — merge_session_
+        # bars()가 날짜가 바뀌면 자동으로 새 세션을 시작하므로,
+        # reset_daily_loss_counts() 호출이 누락되어도 전일 세션이
+        # 새 거래일 계산에 섞이지 않음(2차 GPT 코드리뷰 지적 3번).
+        # 기존 cached_minute_bars(최근 60개 롤링, 매 갱신마다 통째로
+        # 교체됨)와는 완전히 별개. session_metrics_mode가 "off"
+        # (기본값)면 이 저장소는 채워지지 않고 완전히 비어있는 채로
+        # 유지됨(불필요한 메모리 사용 없음).
+        self._session_state_by_symbol: dict = {}
 
         # 장세 분류 결과 캐시
         self.cached_regime: dict[str, MarketRegime] = {}
@@ -639,9 +653,85 @@ class TradingService:
         else:
             entry_safe = source in ("LIVE", "CACHE_FRESH") and reason == ""
 
+        # 2026-07-28 (1C단계, session_metrics_mode="shadow" 전용):
+        # 세션 지표를 계산·로그만 하고 이 함수의 반환값(analysis,
+        # entry_safe, source, reason 등)에는 절대 영향을 주지 않음 —
+        # 이 블록을 통째로 지워도 위의 return 문 결과가 바이트
+        # 단위로 동일해야 한다는 게 "shadow"의 핵심 안전 조건. 예외가
+        # 나도 fail-open(경고만 남기고 무시) — 신규 진입/청산 판단을
+        # 절대 막지 않음.
+        #
+        # 2026-07-28 (2차 GPT 코드리뷰 지적 4번): 이미 위에서 계산해둔
+        # analysis를 그대로 전달 — shadow 함수 내부가 MinuteAnalyzer.
+        # analyze()를 다시 호출하면 안 됨(MinuteAnalyzer는 _last_
+        # v_fail_reasons 같은 내부 상태를 바꾸는 상태성 객체라, 재호출
+        # 자체가 "shadow는 상태를 안 바꾼다"는 원칙을 어김 — 재현
+        # 확인: off는 analyze() 1회, shadow는 2회 호출되고 있었음).
+        try:
+            self._update_session_metrics_shadow(symbol, bars, analysis)
+        except Exception as shadow_exc:
+            self.app_logger.warning(
+                f"[SESSION_SHADOW] {symbol} | shadow 계산 실패(무시): {shadow_exc}"
+            )
+
         return MinuteDataResult(
             analysis=analysis, entry_safe=entry_safe, source=source,
             reason=reason, latest_bar_timestamp=latest_ts, age_seconds=age_seconds,
+        )
+
+    def _update_session_metrics_shadow(self, symbol: str, bars: list, analysis) -> None:
+        """세션 지표를 shadow 모드로 계산하고 관찰 로그만 남깁니다.
+
+        2026-07-28 (1C단계): session_metrics_mode가 "shadow"가
+        아니면 즉시 반환 — "off"(기본값)에서는 세션 누적 자체가
+        전혀 쌓이지 않아 메모리·CPU 부담이 없음. 이 함수는 로그
+        출력 외에 어떤 반환값도 없고(None), 호출부(_get_minute_
+        analysis)가 이 함수의 성공/실패와 무관하게 항상 동일한
+        MinuteDataResult를 반환하도록 fail-open으로 감싸져 있음.
+
+        2026-07-28 (2차 GPT 코드리뷰 지적 4번): analysis를 인자로
+        전달받아 사용 — 이 함수 내부에서 MinuteAnalyzer.analyze()를
+        다시 호출하지 않음. legacy_vwap/day_high/day_low는 전달받은
+        analysis에서 그대로 읽음.
+
+        2026-07-28 (2차 GPT 코드리뷰 지적 3번): 세션 상태를 종목별
+        SessionState로 관리 — merge_session_bars()가 날짜 변경을
+        자체적으로 감지해 자동 초기화하므로, reset_daily_loss_
+        counts() 호출이 누락돼도 전일 세션이 새 거래일 계산에 섞이지
+        않음.
+
+        로그 스로틀: 매 폴링(10초)마다 로그를 남기면 기존 [MIN]
+        로그와 마찬가지로 app.log 용량 문제가 재발할 수 있으므로,
+        60초 간격으로 제한(기존 [V_FAIL]/[MIN_STALE] 로그와 동일
+        cadence 원칙).
+        """
+        mode = getattr(self.settings.experimental, "session_metrics_mode", "off")
+        if mode != "shadow":
+            return
+        if not bars:
+            return
+
+        target_date = now_kst().strftime("%Y%m%d")
+        existing_state = self._session_state_by_symbol.get(symbol)
+        new_state = merge_session_bars(existing_state, bars, target_date)
+        self._session_state_by_symbol[symbol] = new_state
+
+        metrics = build_session_metrics(new_state)
+
+        last_log = self.last_hold_log_at_by_symbol.get(f"__session_shadow_{symbol}")
+        now_dt = datetime.now()
+        if last_log is not None and (now_dt - last_log).total_seconds() < 60:
+            return
+        self.last_hold_log_at_by_symbol[f"__session_shadow_{symbol}"] = now_dt
+
+        legacy_vwap = analysis.vwap if analysis is not None else None
+        legacy_day_high = analysis.day_high if analysis is not None else None
+        legacy_day_low = analysis.day_low if analysis is not None else None
+
+        self.app_logger.info(
+            format_session_metrics_log_line(
+                symbol, metrics, legacy_vwap, legacy_day_high, legacy_day_low,
+            )
         )
 
     def _save_rejected_minute_bars(
@@ -1391,6 +1481,10 @@ class TradingService:
         if hasattr(self, '_sold_today_qty_snapshot'):
             self._sold_today_qty_snapshot.clear()
         self._excluded_symbols.clear()  # 당일 제외 종목(매매제한 등) 초기화 — 익일 재시도 허용
+        # 2026-07-28 (1C단계): 세션 누적 분봉도 날짜 변경 시 초기화 —
+        # 전날 세션 데이터가 새 거래일의 session_vwap/session_high/
+        # session_low 계산에 섞여 들어가면 안 되므로.
+        self._session_state_by_symbol.clear()
         self.app_logger.info("[RESET] 당일 종목별 손실/진입 카운트 초기화 완료")
 
     def _update_indicators(self, symbol: str, current_price: int) -> None:

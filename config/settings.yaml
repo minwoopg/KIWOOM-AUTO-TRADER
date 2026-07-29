@@ -222,7 +222,7 @@ kakao:
 # 각 단계 구현이 끝나면 이 문서의 CHANGELOG(1.6절)에 안내에 따라
 # shadow로 먼저 켜서 며칠 데이터를 관찰한 뒤 enforce로 전환하세요.
 experimental:
-  session_metrics_mode: "off"       # 1단계: 세션/롤링 데이터 의미 분리
+  session_metrics_mode: "shadow"     # 1단계: 세션/롤링 데이터 의미 분리 (1C.2 검증 완료 후 shadow 전환, 2026-07-28)
   decision_engine_mode: "off"       # 2단계: DecisionEngine 추출
   position_lifecycle_mode: "off"    # 3단계: 체결 확인 상태머신 실제화
   reward_risk_guard_mode: "off"     # 4단계: 상승여력·손익비 하드 게이트

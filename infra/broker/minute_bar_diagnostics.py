@@ -25,7 +25,7 @@ GPT 코드리뷰 설계 원칙:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # 2026-07-27 (실운영 크래시로 발견, 긴급 수정): 원래 zoneinfo.
@@ -50,20 +50,13 @@ KST = timezone(timedelta(hours=9), name="Asia/Seoul")
 # utils/time_utils.py의 MARKET_OPEN=09:00, MARKET_CLOSE=15:20을
 # 그대로 가져옴 — 다만 이 값은 "신규 매수/매도 중단 시각"(15:20)
 # 이지 실제 정규장 마감(통상 15:30)과는 다른 의미라는 점에 주의.
-from utils.time_utils import MARKET_OPEN, MARKET_CLOSE  # noqa: E402
-
-# 2026-07-27 (2차 GPT 코드리뷰 지적): 위 MARKET_CLOSE(15:20)는
-# "프로그램이 신규 매수/매도를 중단하는 전략 거래창 종료 시각"이지
-# 실제 한국거래소 정규장 마감 시각(15:30)이 아님 — 두 의미를
-# outside_session_count 하나로 뭉뚱그리면, "봉이 전략 거래창 밖"인
-# 것과 "봉이 아예 정규장 밖(거래소 자체가 안 열린 시간)"인 것을
-# 구분할 수 없었음. 프로젝트에 15:30을 나타내는 기존 상수가 없어서
-# (utils/time_utils.py, config/settings.yaml 전체 검색 결과 없음
-# 확인) 진단 전용 상수로 새로 정의 — 한국거래소(KRX) 정규장은
-# 09:00~15:30이 공식 운영시간(동시호가 마감 포함)이라는 일반적으로
-# 알려진 기준을 근거로 함. 이 상수는 매매 로직에 전혀 쓰이지 않고
-# 오직 진단 목적으로만 사용됨.
-REGULAR_MARKET_CLOSE = time(15, 30)
+#
+# 2026-07-28 (1C단계): REGULAR_MARKET_CLOSE(15:30)는 원래 여기서
+# 자체 정의했었는데, 1C의 session_metrics.py(domain 레이어)도
+# 같은 상수가 필요해지면서 domain이 infra를 import하는 계층 역전이
+# 생기지 않도록 utils/time_utils.py(공통 레이어)로 옮김 — 여기서는
+# 그 정의를 그대로 재import.
+from utils.time_utils import MARKET_OPEN, MARKET_CLOSE, REGULAR_MARKET_CLOSE  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -75,12 +68,29 @@ class MinuteBarDiagnostics:
     tick_scope: str
     requested_count: int
 
+    # 2026-07-27 (3차 GPT 코드리뷰 지적, 진단 로그 무효화 버그 수정):
+    # 빈 응답 진단(returned_bars=[])과 정상 응답 진단(실제 파싱된
+    # bars)이 동일한 (symbol, base_date, tick_scope, count) 키를
+    # 공유해서, 먼저 실행된 빈 응답 진단이 키를 선점하면 실제 파싱
+    # 결과를 담은 정상 진단이 조용히 스킵되고 있었음(실제 재현:
+    # raw 70개/count 60 정상 응답인데 로그엔 returned=0으로 찍힘).
+    # "EMPTY"/"SUCCESS" 두 결과를 서로 다른 진단으로 명확히
+    # 구분하기 위한 필드 — 로그에도 그대로 노출됨.
+    response_outcome: str    # "EMPTY" | "SUCCESS"
+
     request_started_at: datetime | None   # KST, timezone-aware
     response_received_at: datetime | None  # KST, timezone-aware
 
     raw_received_count: int
     raw_timestamp_parseable_count: int   # raw 전체 중 cntr_tm 파싱 가능한 개수
     returned_parsed_count: int           # count 제한 + 기존 파싱 규칙 통과한 실제 반환 개수
+
+    # 2026-07-27 (3차 GPT 코드리뷰 지적): raw 쪽엔 이미
+    # raw_timestamp_parseable_count/invalid_timestamp_count가
+    # 있었는데 returned(실제 반환된 MinuteBar) 쪽엔 없었음 —
+    # 대칭적으로 추가.
+    returned_timestamp_parseable_count: int
+    returned_invalid_timestamp_count: int
 
     # 2026-07-27 (실운영 첫 로그 검토로 추가, GPT 코드리뷰): 기존엔
     # raw_received_count와 requested_count를 나란히 로그에 찍기만
@@ -200,6 +210,7 @@ def build_minute_bar_diagnostics(
     headers: dict[str, str],
     request_started_at: datetime | None,
     response_received_at: datetime | None,
+    response_outcome: str = "SUCCESS",
 ) -> MinuteBarDiagnostics:
     """raw API 응답과 실제 반환된 분봉으로부터 진단 결과를 계산합니다.
 
@@ -216,6 +227,11 @@ def build_minute_bar_diagnostics(
             cntr_tm만 뽑은 것 — 이 함수가 그 파싱을 다시 하지 않고
             호출부가 이미 만든 결과를 전달받음(byte-for-byte 동일성
             보장을 위해 이 함수가 별도로 파싱 로직을 재구현하지 않음).
+        response_outcome: "EMPTY"(raw_bars가 비어 응답을 그대로
+            반환한 경우) 또는 "SUCCESS"(정상 파싱까지 완료한 경우).
+            호출부(kiwoom_broker.py)가 어느 경로로 이 함수를
+            불렀는지 명시적으로 전달 — 로그와 진단 키 양쪽에
+            반영되어 두 결과가 서로 다른 진단으로 남도록 함.
     """
     raw_timestamps_all = [str(item.get("cntr_tm", "")) for item in raw_bars]
     parsed_dt_pairs = [(ts, _parse_bar_timestamp(ts)) for ts in raw_timestamps_all]
@@ -240,8 +256,12 @@ def build_minute_bar_diagnostics(
     raw_order_head_sample = valid_raw_timestamps_in_order[:5]
     raw_order_tail_sample = valid_raw_timestamps_in_order[-5:] if valid_raw_timestamps_in_order else []
 
+    # 2026-07-27 (3차 GPT 코드리뷰 지적): raw 쪽과 대칭으로 returned
+    # (실제 반환된 MinuteBar) 쪽의 파싱 성공/실패 개수도 별도 계산.
     returned_parsed_pairs = [(ts, _parse_bar_timestamp(ts)) for ts in returned_bars_timestamps]
     returned_valid_timestamps = [ts for ts, dt in returned_parsed_pairs if dt is not None]
+    returned_timestamp_parseable_count = len(returned_valid_timestamps)
+    returned_invalid_timestamp_count = len(returned_bars_timestamps) - returned_timestamp_parseable_count
     returned_oldest = min(returned_valid_timestamps) if returned_valid_timestamps else None
     returned_newest = max(returned_valid_timestamps) if returned_valid_timestamps else None
     returned_sort_direction = _infer_sort_direction(returned_parsed_pairs)
@@ -290,11 +310,14 @@ def build_minute_bar_diagnostics(
         base_date=base_date,
         tick_scope=tick_scope,
         requested_count=requested_count,
+        response_outcome=response_outcome,
         request_started_at=request_started_at,
         response_received_at=response_received_at,
         raw_received_count=len(raw_bars),
         raw_timestamp_parseable_count=len(valid_raw_timestamps),
         returned_parsed_count=len(returned_bars_timestamps),
+        returned_timestamp_parseable_count=returned_timestamp_parseable_count,
+        returned_invalid_timestamp_count=returned_invalid_timestamp_count,
         raw_excess_count=raw_excess_count,
         raw_received_exceeds_requested=raw_excess_count > 0,
         oldest_raw_timestamp=oldest_raw,
@@ -347,9 +370,12 @@ def format_diagnostics_log_line(d: MinuteBarDiagnostics) -> str:
 
     return (
         f"[MIN_BOOTSTRAP] symbol={d.symbol} date={d.base_date} tick_scope={d.tick_scope} "
+        f"outcome={d.response_outcome} "
         f"requested={d.requested_count} raw_received={d.raw_received_count} "
         f"raw_excess={d.raw_excess_count} raw_exceeds_requested={d.raw_received_exceeds_requested} "
         f"raw_parseable={d.raw_timestamp_parseable_count} returned={d.returned_parsed_count} "
+        f"returned_parseable={d.returned_timestamp_parseable_count} "
+        f"returned_invalid={d.returned_invalid_timestamp_count} "
         f"request_started_at={request_str} response_received_at={response_str} "
         f"request_duration_ms={duration_ms} "
         f"oldest_raw={d.oldest_raw_timestamp} newest_raw={d.newest_raw_timestamp} "
@@ -379,8 +405,15 @@ def format_order_detail_log_line(d: MinuteBarDiagnostics) -> str | None:
     """
     if d.raw_sort_direction != "UNKNOWN":
         return None
+    # 2026-07-27 (3차 GPT 코드리뷰 지적): 분모가 raw_received_count-1
+    # 이었는데, 정렬 검사 자체는 파싱 성공한(raw_timestamp_parseable_
+    # count) 원소만 대상으로 하므로 invalid timestamp가 섞여 있으면
+    # 분모가 실제 검사 대상보다 커져 비율이 부정확했음(예: raw 10개
+    # 중 2개가 invalid면 실제 검사 대상은 8개인데 분모는 9로 계산됨).
+    # max(raw_timestamp_parseable_count - 1, 0)으로 수정.
+    violation_denominator = max(d.raw_timestamp_parseable_count - 1, 0)
     return (
         f"[MIN_BOOTSTRAP_ORDER_DETAIL] symbol={d.symbol} date={d.base_date} "
-        f"violations={d.raw_order_violation_count}/{max(d.raw_received_count - 1, 0)} "
+        f"violations={d.raw_order_violation_count}/{violation_denominator} "
         f"head={d.raw_order_head_sample} tail={d.raw_order_tail_sample}"
     )

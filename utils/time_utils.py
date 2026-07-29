@@ -13,6 +13,18 @@ from datetime import datetime, time, timedelta, timezone
 MARKET_OPEN = time(9, 0)
 MARKET_CLOSE = time(15, 20)  # 15:20 이후 단일가 — 신규 매수/매도 중단
 
+# 2026-07-28 (1C단계, GPT 코드리뷰 지적): 세션 지표(SessionMetrics)
+# 가 "당일 정규장 09:00~15:30" 봉만 세션에 포함시켜야 하는데, 위
+# MARKET_CLOSE(15:20)는 "프로그램이 신규 매수/매도를 중단하는 전략
+# 거래창 종료 시각"이지 실제 한국거래소 정규장 마감(15:30)이 아님
+# — 애초에 infra/broker/minute_bar_diagnostics.py(1B단계 진단
+# 목적)에 같은 상수가 있었는데, domain 레이어(session_metrics.py)
+# 가 infra 레이어를 import하면 계층 방향이 역전되므로 공통 위치인
+# 여기로 옮김. 한국거래소(KRX) 정규장은 09:00~15:30이 공식 운영
+# 시간(동시호가 마감 포함)이라는 일반적으로 알려진 기준 — 매매
+# 로직에는 쓰이지 않고 오직 진단/세션 필터링 목적으로만 사용됨.
+REGULAR_MARKET_CLOSE = time(15, 30)
+
 # 2026-07-28 (GPT 코드리뷰 지적, stale 분봉 안전장치 3단계): 키움
 # API의 분봉 timestamp(cntr_tm)는 KST 기준인데, 기존 코드는
 # datetime.now()(타임존 미지정, 서버의 시스템 로컬시각)와 naive하게

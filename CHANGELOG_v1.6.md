@@ -1723,3 +1723,277 @@ shadow 구현)로 넘어갑니다.
 
 ---
 
+## 1C: 세션 지표(SessionMetrics) shadow 구현 (2026-07-28)
+
+**배경**: 민우님이 Windows 실환경에서 확보한 `[MIN_BOOTSTRAP]`
+로그를 검토한 결과, `outcome=` 필드가 없는 등 1B.5 이전 버전의
+로그(구버전, 최신 diff 미반영 추정)로 확인됨 — 로그가 보여주는
+실제 이상 증상(`returned=0`인데 `raw_received=900`으로 정상 수신)
+을 최신 코드로 동일 조건 재현한 결과 `outcome=SUCCESS, returned=
+60, returned_order=ASC`로 정확히 안전하게 처리됨을 확인. 이 결과와
+함께 GPT가 1B 코드 레벨 종료를 승인했고, 1C(세션 지표 shadow
+구현)로 진행하기로 합의.
+
+### 목표
+
+v1.5 종료 시점 GPT 구조 재검토에서 확인된 1번 문제 — `Minute
+Analysis.day_high`/`day_low`/`vwap`이 이름과 달리 실제로는 "최근
+60분"(`minute_bar_count=60` 고정) 값이지 "당일 전체" 값이 아님
+(1A 단계 fixture로 실제 데이터에서 확인한 바 있음) — 을 고치는 게
+아니라, 먼저 "진짜 당일 값"을 별도로 계산해 기존 "60분 롤링" 값과
+**나란히 관찰**하는 shadow 단계. `experimental.session_metrics_
+mode`가 `"off"`(기본값)면 완전 비활성, `"shadow"`일 때만 계산·
+로그만 하고 실제 매매 판정에는 절대 영향 없음. `"enforce"`(기존
+값을 세션 값으로 실제 교체)는 이번 단계 범위 밖.
+
+### 구현
+
+**`domain/market_regime/session_metrics.py` 신규**: 순수 함수와
+`SessionMetrics` dataclass.
+- `merge_session_bar()`: `{cntr_tm: MinuteBar}` 딕셔너리에 새 봉
+  하나를 병합 — 동일 timestamp면 교체(누적 아님), dict를 직접
+  변형하지 않고 새 dict를 반환하는 순수 함수.
+- `build_session_metrics()`: 세션 누적 봉으로부터 `session_vwap`
+  (세션 전체)/`session_high`/`session_low`/`rolling_vwap_20`/
+  `rolling_vwap_60`/`recent_high_30`/`session_bar_count`/
+  `session_metrics_ready`(빈 세션이면 `False`)를 계산. 딕셔너리
+  삽입 순서에 의존하지 않고 매번 `cntr_tm` 문자열 기준으로 정렬 —
+  재시도로 과거 봉이 나중에 도착해도 항상 올바르게 계산.
+- VWAP 계산 공식은 `MinuteAnalyzer.analyze()`의 기존 방식(typical
+  price = `(high+low+close)/3 * volume` 가중평균)을 그대로 재사용
+  — 계산 공식 자체는 이번 단계에서 바꾸지 않는다는 원칙("RSI/MACD/
+  진입점수/손절폭/트레일링 파라미터 이번 라운드 변경 금지"와 동일
+  취지)에 따름. 세션 지표든 롤링 지표든 같은 공식으로 비교해야
+  "무엇이 달라지는지"가 창(window) 차이만으로 명확해짐.
+- `format_session_metrics_log_line()`: 세션 값과 기존 60분 롤링
+  값(legacy)을 나란히 보여주는 관찰 로그 포맷팅.
+
+**`TradingService` 연결**:
+- `self._session_bars_by_symbol: dict[str, dict]` 신규 — 종목별
+  세션 전체 누적. `session_metrics_mode`가 `"off"`면 전혀 안 쌓임.
+- `_get_minute_analysis()`의 `MinuteDataResult` **반환 직전**에
+  `_update_session_metrics_shadow()` 호출 — 이 위치가 핵심 안전
+  설계: `analysis`/`entry_safe`/`source`/`reason` 등이 전부 계산된
+  뒤, 반환문 바로 앞에서 로그만 남기는 부수효과이므로 반환값을
+  건드릴 방법이 물리적으로 없음. `try/except`로 감싸 fail-open —
+  shadow 계산이 예외를 던져도 경고만 남기고 무시.
+- `_update_session_metrics_shadow()`: `session_metrics_mode !=
+  "shadow"`면 즉시 반환(off에서 완전 비활성), 아니면 세션 누적에
+  병합·계산 후 60초 스로틀(기존 `[V_FAIL]`/`[MIN_STALE]` 로그와
+  동일 cadence 원칙)로 `[SESSION_SHADOW]` 로그 출력.
+- `reset_daily_loss_counts()`(날짜 변경 감지 시 호출되는 기존
+  지점)에 `self._session_bars_by_symbol.clear()` 추가 — 전날
+  세션 데이터가 새 거래일 계산에 섞이지 않도록.
+
+### 검증
+
+**핵심 안전 조건 — off와 shadow의 반환값이 완전히 동일함**:
+시각을 고정한 뒤 `session_metrics_mode="off"`와 `"shadow"` 각각
+으로 `_get_minute_analysis()`를 호출해 `MinuteDataResult`를
+dataclass 전체 비교(`==`) — 완전히 동일함을 확인(`analysis`
+내부의 33개 필드 포함 전부 일치). shadow 계산이 강제로 예외를
+던지는 시나리오에서도 `entry_safe`/`analysis`가 정상 계산됨을
+확인(fail-open).
+
+**실제로 세션과 60분 롤링이 갈라지는 것을 재현 확인**: 1A fixture와
+유사한 시나리오(전날 44개 + 오늘 봉이 시간에 따라 16→70→130개로
+증가, API는 항상 최근 60개만 반환) 구성 — 시간이 지날수록 세션
+누적 개수가 계속 증가(60→114→174)하고, 충분히 시간이 지나면
+`rolling_vwap_60`(최근 60개, 기존 롤링과 유사한 개념)이 전날
+데이터 없이 오늘 값으로 수렴하는데, `session_vwap`(세션 전체)은
+전날 데이터의 영향이 남아 두 값이 실제로 벌어짐을 확인 — shadow
+관찰 메커니즘 자체가 의도대로 작동함을 실증.
+
+**⚠️ 이번 단계가 해결하지 않는 것 (명시적 한계)**: API 응답 자체가
+이미 전일 봉을 포함해서 오는 문제(1A에서 확인한 근본 원인) 자체는
+이번 1C shadow가 고치지 않습니다 — 세션 누적도 그 오염된 API
+응답을 그대로 받아 누적하므로, 세션 첫 시작 시점에 전일 데이터가
+한 번 섞여 들어가면 그 흔적이 `session_low`/`session_high`에
+계속 남을 수 있습니다(테스트 9번에서 `session_low=49900`(전날
+저가)이 계속 남는 것으로 실증). 이건 정확히 GPT 원래 8개 문제
+목록의 1번 항목 자체를 고치는 것이 아니라, "지금 실제로 60분
+롤링과 세션 전체가 이만큼 다르다"는 것을 정량적으로 드러내는
+관찰 도구 — 다음 단계(2단계 DecisionEngine 추출 이후, 또는 별도
+라운드)에서 이 관찰 데이터를 근거로 실제 교체(enforce) 여부를
+결정.
+
+**`test_session_metrics_shadow.py`(신규, 22건) 전부 통과**: 순수
+함수 검증(병합/교체/정렬무관/빈세션방어, 1~5번), off 모드 완전
+비활성(6번), off/shadow 반환값 완전동일(7번, 핵심), shadow
+예외방어(8번), 세션-롤링 실제 괴리 재현(9번), 날짜변경 초기화
+(10번), 로그 포맷 N/A 방어(11번).
+
+**전체 회귀**: `run_regression_tests.py` — **31개 파일(기존 30 +
+신규 1) 전부 통과**, 종료코드 0. 로그/데이터 디렉토리 오염 없음
+확인.
+
+**현재 설정**: `settings.yaml`의 `experimental.session_metrics_
+mode`는 여전히 `"off"` — 이번 커밋 자체는 실거래 동작을 전혀
+바꾸지 않음. `"shadow"`로 전환은 민우님이 직접 설정을 바꾸고
+Windows 실환경에서 `[SESSION_SHADOW]` 로그를 관찰하고 싶을 때
+수동으로 진행.
+
+---
+
+## 1C.2: 세션 필터링 누락 및 analyzer 중복 호출 수정 (2026-07-28)
+
+**배경**: 1C 최초 구현에 대한 GPT 코드리뷰에서, "SessionMetrics"
+라는 이름과 달리 실제로는 날짜/시간 필터링이 전혀 없어서 API가
+반환한 60개(전일 봉 포함 가능)를 필터링 없이 그대로 세션에
+병합하고 있었다는 지적을 받음 — 재현 확인: 전일 43개+오늘 17개
+입력 시 `session_bar_count`가 17이 아니라 60, `session_low`도
+전일 저가로 오염. 구 테스트 9번이 "전일 영향이 남는 것"을 PASS로
+인정하고 있던 것도 잘못된 기준이었음.
+
+### 발견·수정한 4가지 문제
+
+**1. 날짜·시간 필터 부재 (가장 심각)**: `_passes_session_filter()`
+신설 — 봉이 (a) KST 대상 거래일과 같은 날짜인지, (b) 정규장
+09:00~15:30 안인지 확인. 통과 못 한 봉은 `filtered_other_date_
+count`/`filtered_outside_market_count`로만 집계하고 세션에는
+들어가지 않음. `REGULAR_MARKET_CLOSE`(15:30) 상수는 원래 `infra/
+broker/minute_bar_diagnostics.py`(1B단계 진단 목적)에 있었는데,
+domain 레이어(`session_metrics.py`)가 infra를 import하면 계층
+방향이 역전되므로 공통 위치인 `utils/time_utils.py`로 옮기고
+양쪽이 재사용하도록 정리.
+
+**재현 검증**: 전일 43개+오늘 17개 입력 → `session_bar_count=17,
+session_low=59900(오늘 저가), filtered_other_date_count=43` —
+GPT가 명시한 기대값과 정확히 일치. 장전(08:30~08:34) 5개 봉 →
+`filtered_outside_market_count=5` 확인.
+
+**2. `session_metrics_ready` 의미 수정**: 기존 "봉이 하나라도
+있으면 True"에서 "세션 히스토리를 장 시작부터 확보했는가"로 변경
+— `readiness_reason`을 `"COMPLETE_FROM_OPEN"`(가장 오래된 세션
+봉이 09:00~09:01 구간)/`"PARTIAL_SESSION"`(중간부터 시작)/
+`"NO_SESSION_DATA"`(세션 봉 자체가 없음) 세 가지로 명시.
+
+**재현 검증**: 09:00부터 시작한 세션 → `ready=True, COMPLETE_
+FROM_OPEN`. 프로그램을 13시에 시작해 12:01~13:00만 가진 경우 →
+`ready=False, PARTIAL_SESSION`(정확히 GPT가 제시한 시나리오와
+일치).
+
+**3. 종목별 `session_date` 자동 추적**: `SessionState`(dataclass,
+`session_date` + `bars` 딕셔너리 + 필터링 카운터)를 신설해 종목별
+로 보관. `merge_session_bars()`가 기존 상태의 `session_date`와
+새로 계산 대상인 날짜가 다르면 **자동으로** 빈 세션부터 다시
+시작 — `reset_daily_loss_counts()` 호출이 누락되어도 이 함수
+레벨에서 전일 혼입을 방지.
+
+**재현 검증**: `reset_daily_loss_counts()`를 호출하지 않고 다음날
+봉을 바로 병합해도, 전일 17개가 섞이지 않고 새 세션(5개)만 남음을
+확인.
+
+**4. shadow 내부의 `MinuteAnalyzer.analyze()` 재호출 제거**: 기존
+`_update_session_metrics_shadow()`가 `legacy_analysis`를 얻기
+위해 `self._minute_analyzer.analyze()`를 다시 호출하고 있었음 —
+`MinuteAnalyzer`가 `_last_v_fail_reasons`를 바꾸는 상태성 객체라,
+이 재호출 자체가 "shadow는 상태를 안 바꾼다"는 원칙 위반(재현
+확인: off는 `analyze()` 1회, shadow는 2회 호출). 이미 `_get_
+minute_analysis()`에서 계산해둔 `analysis`를 그대로 인자로
+전달받도록 시그니처 변경(`_update_session_metrics_shadow(symbol,
+bars, analysis)`) — `legacy_vwap`/`day_high`/`day_low`는 전달받은
+`analysis`에서 읽고, 함수 내부의 재분석 코드를 완전히 제거.
+
+**재현 검증**: off/shadow 각각 `analyze()` 호출 횟수를 카운터로
+직접 측정 — 수정 후 둘 다 정확히 1회. `MinuteAnalyzer._last_v_
+fail_reasons`(analyzer 내부 상태)도 off/shadow에서 완전히 동일함을
+확인.
+
+### 5. 로그·SessionMetrics 필드 확장
+
+`SessionMetrics`에 `session_date`/`earliest_timestamp`/`latest_
+timestamp`/`rolling_20_count`/`rolling_60_count`/`filtered_
+other_date_count`/`filtered_outside_market_count`/`readiness_
+reason` 추가. `format_session_metrics_log_line()`도 이 필드들을
+전부 출력하도록 확장.
+
+### 6. `merge_session_bars` 배치 함수로 전환 (성능)
+
+기존 `merge_session_bar()`를 봉 개수만큼(최대 60회) 반복 호출하며
+매번 dict 전체를 복사하던 것을, `merge_session_bars()` 배치
+함수로 바꿔 dict 복사를 세션 갱신당 1회로 줄임.
+
+### 7. 구 테스트 9번(현재 12번) 기대값 반전
+
+"전일 영향이 `session_vwap`에 남는 것"을 PASS로 인정하던 기존
+기준을 GPT 지시대로 반전 — 이제 "전일 봉이 필터링되어 `session_
+vwap`/`session_low`에 전혀 영향을 주지 않는 것"이 성공 기준.
+
+### `test_session_metrics_shadow.py` 전면 재작성 (22→34건)
+
+GPT가 지시한 7가지 항목을 전부 반영해 재작성: 날짜·시간 필터링
+정확한 기대값 검증(1~2번), readiness 의미 수정 검증(3~5번),
+`session_date` 자동 초기화 검증(6번), off/shadow `analyze()` 호출
+횟수 동일성 검증(7~8번), `MinuteDataResult`와 analyzer 내부 상태
+완전 동일성 검증(9번), shadow 예외 방어(10번), off 완전 비활성
+(11번), 전일 오염 필터링 실제 확인(12번, 기대값 반전), 로그 필드
+확장 확인(13번).
+
+**전체 회귀**: `run_regression_tests.py` — **31개 파일 전부
+통과**, 종료코드 0. 로그/데이터 디렉토리 오염 없음 확인.
+
+**현재 설정**: `settings.yaml`의 `session_metrics_mode`는 여전히
+`"off"` — 이번 커밋도 실거래 동작을 전혀 바꾸지 않음. 이 수정이
+반영된 뒤에 `"shadow"`로 전환해 실제 관찰을 시작할 예정.
+
+---
+
+## 1C.3: session_metrics_mode를 shadow로 전환 (2026-07-28)
+
+**배경**: 1C.2의 필터링·readiness·analyzer 중복호출 수정이 전부
+검증된 후, GPT가 제시한 마지막 절차대로 `settings.yaml`의
+`experimental.session_metrics_mode`를 `"off"`에서 `"shadow"`로
+실제 전환.
+
+### 전환 후 발견한 테스트 정합성 문제
+
+`session_metrics_mode`를 `"shadow"`로 바꾸자 `test_experimental_
+config.py`의 2번 검증이 실패함 — 이 테스트는 원래 "리팩터링 시작
+전에는 모든 실험 플래그가 `off`"라는 것을 실제 `settings.yaml`
+에서 검증하는 용도로 작성되어 있었는데, 이제 1C가 의도적으로
+`shadow`로 전환되면서 그 전제 자체가 깨진 것 — **이건 회귀가
+아니라, 테스트가 "1단계 착수 전" 시점의 스냅샷을 검증하도록
+고정되어 있었던 것**.
+
+**수정**: 2번 검증을 "전부 off"라는 고정 기준에서 "각 플래그가
+해당 단계의 실제 진행 상황과 일치하는가"로 갱신 —
+`session_metrics_mode`만 `"shadow"`(1C.2 완료, 관찰 중)를 기대
+하고, 나머지 5개 플래그(`decision_engine_mode` 등, 아직 착수
+전인 2~6단계)는 여전히 `"off"`를 기대. 6번 검증(experimental
+섹션이 아예 없는 YAML의 기본값)은 그대로 유지 — 이건 `Experimental
+Config` dataclass 자체의 기본값 검증이라 `settings.yaml`의 실제
+값 변경과 무관하게 항상 "전부 off"가 맞아야 함(새 프로젝트를
+처음 세팅할 때의 안전한 기본 상태를 보장하는 것과, 지금 이
+프로젝트가 실제로 어느 단계까지 진행됐는지는 서로 다른 질문).
+
+**검증**: 수정 후 `test_experimental_config.py` 7/7 통과.
+`session_metrics_mode="shadow"`가 실제로 적용된 상태에서 전체
+회귀(`run_regression_tests.py`) **31/31 통과** — shadow가 매매
+판단에 전혀 영향을 주지 않는다는 걸 실제 설정 파일 레벨에서도
+재확인.
+
+### 현재 상태
+
+`config/settings.yaml`:
+```yaml
+experimental:
+  session_metrics_mode: "shadow"     # 1단계: 1C.2 검증 완료, shadow 관찰 중
+  decision_engine_mode: "off"        # 2단계: 착수 전
+  position_lifecycle_mode: "off"     # 3단계: 착수 전
+  reward_risk_guard_mode: "off"      # 4단계: 착수 전
+  candidate_ranking_mode: "off"      # 5단계: 착수 전
+  trailing_breakeven_mode: "off"     # 6단계: 착수 전
+```
+
+이제 `[SESSION_SHADOW]` 로그가 실제로 남기 시작합니다 — Windows
+실환경에서 며칠 관찰해, 실제 종목들의 세션 값(정규장 09:00~15:30
+기준 진짜 당일 VWAP/고가/저가)과 기존 60분 롤링 값이 얼마나
+차이 나는지 데이터를 쌓은 뒤, 그 결과를 근거로 다음 단계(실제
+교체 여부 결정, 또는 2단계 DecisionEngine 추출 착수)를 판단.
+
+**전체 회귀**: `run_regression_tests.py` — 31개 파일 전부 통과,
+종료코드 0. 로그/데이터 디렉토리 오염 없음 확인.
+
+---
+
