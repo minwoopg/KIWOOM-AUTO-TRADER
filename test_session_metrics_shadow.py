@@ -278,8 +278,18 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
 with tempfile.TemporaryDirectory() as tmpdir:
     service = build_service(tmpdir, session_mode="shadow")
-    kst_now = now_kst()
-    today_open2 = kst_now.replace(hour=9, minute=1, second=0, microsecond=0)
+    # 2026-07-28 (3차 GPT 코드리뷰 재검증 중 발견): 이 시나리오는
+    # "장 초반부터 시간이 흐르며 오늘 봉이 늘어나는 것"을 재현하는데,
+    # today_open2를 09:01로 고정한 채 now_kst()를 실제(테스트 실행)
+    # 시각 그대로 두면, 실행 시각이 09:01에서 많이 벗어난 경우
+    # 최신 봉의 age가 minute_bar_max_age_seconds(120초)를 초과해
+    # 신선도 검증 자체에서 걸려버림(재현: 실행 시각이 09:50경이면
+    # age=2043초로 STALE_MINUTE_DATA, entry_safe=False, 세션에
+    # 아무것도 안 쌓임 — 이 테스트가 실행 시각에 의존하는 flaky
+    # 문제였음을 발견). now_kst()를 각 단계의 "그 시점"으로 명시적
+    # 고정해 실행 시각과 무관하게 항상 동일한 결과를 내도록 함.
+    fixed_now = now_kst().replace(hour=11, minute=11, second=0, microsecond=0)
+    today_open2 = fixed_now.replace(hour=9, minute=1, second=0, microsecond=0)
 
     yesterday_bars2 = [MinuteBar(
         cntr_tm=f"2026072714{i:02d}00", open_price=50000, high_price=50100,
@@ -297,7 +307,9 @@ with tempfile.TemporaryDirectory() as tmpdir:
         service.broker.get_minute_bars = lambda *a, **kw: api_response_bars
         service.cached_minute_bars_loaded_at.pop(symbol, None)
         service.cached_minute_bars_failed_at.pop(symbol, None)
-        service._get_minute_analysis(symbol, 60000)
+        call_time = today_open2 + timedelta(minutes=minute_count)  # 매 단계를 그 시점의 "지금"으로 고정
+        with patch("domain.service.trading_service.now_kst", return_value=call_time):
+            service._get_minute_analysis(symbol, 60000)
         state_now = service._session_state_by_symbol.get(symbol)
         bar_counts_over_time.append(len(state_now.bars) if state_now else 0)
 
@@ -327,9 +339,148 @@ check("13) 로그에 session_date 포함됨", "date=20260728" in log_line)
 check("    로그에 earliest_timestamp 포함됨", "earliest=" in log_line)
 check("    로그에 latest_timestamp 포함됨", "latest=" in log_line)
 check("    로그에 rolling_20_count 포함됨(괄호 안)", "봉)" in log_line)
-check("    로그에 filtered_other_date 포함됨", "filtered_other_date=43" in log_line)
-check("    로그에 filtered_outside_market 포함됨", "filtered_outside_market=" in log_line)
+check("    로그에 filtered_other_date_batch/unique 둘 다 포함됨(3차 코드리뷰 수정)",
+      "filtered_other_date_batch=43" in log_line and "filtered_other_date_unique=43" in log_line)
+check("    로그에 filtered_outside_market_batch/unique 포함됨",
+      "filtered_outside_market_batch=" in log_line and "filtered_outside_market_unique=" in log_line)
 check("    로그에 readiness_reason 포함됨", "reason=" in log_line)
+
+# ══════════════════════════════════════════════════════════════
+# 9부: 검증 실패 OHLC의 세션 오염 방지 (2026-07-28, 3차 GPT 코드리뷰
+# 지적 1번, TradingService 통합 레벨)
+#
+# 배경: _get_minute_analysis()가 OHLC 구조 검증에 실패하면 entry_
+# safe=False로 안전하게 차단하지만, bars=new_bars(검증 실패한 원본)
+# 를 그대로 _update_session_metrics_shadow()에 넘기고 있어서 세션
+# 저장소가 오염되던 것을 재현 확인(session_bar_count=41, 저장된
+# high_price 전부 {0}). bars(분석용)와 session_ingest_bars(세션
+# 반영용)를 분리해 수정.
+# ══════════════════════════════════════════════════════════════
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir, session_mode="shadow")
+    kst_now2 = now_kst()
+    bad_ohlc_bars = [MinuteBar(
+        cntr_tm=(kst_now2 - timedelta(minutes=59 - i)).strftime("%Y%m%d%H%M%S"),
+        open_price=58000, high_price=0, low_price=0, close_price=58000,
+        volume=1000, acc_volume=50000,
+    ) for i in range(60)]
+    service.broker.get_minute_bars = lambda *a, **kw: bad_ohlc_bars
+
+    result = service._get_minute_analysis(symbol, 58000)
+    check("14) invalid OHLC(high=0,low=0) 60개 응답 -> entry_safe=False",
+          result.entry_safe is False)
+    check("    reason=INVALID_MINUTE_OHLC", result.reason == "INVALID_MINUTE_OHLC")
+
+    state_after_bad = service._session_state_by_symbol.get(symbol)
+    check("14) invalid OHLC 응답이 세션 상태에 전혀 들어가지 않음"
+          "(세션 저장소 자체가 생성 안 되거나 비어있음, 정확히 GPT 지시 필수 테스트)",
+          state_after_bad is None or len(state_after_bad.bars) == 0)
+
+# ── 15) invalid 응답이 기존 정상 세션을 오염시키지 않음 ────────────
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir, session_mode="shadow")
+    kst_now3 = now_kst()
+    good_bars_15 = [MinuteBar(
+        cntr_tm=(kst_now3 - timedelta(minutes=59 - i)).strftime("%Y%m%d%H%M%S"),
+        open_price=58000, high_price=58100, low_price=57900, close_price=58000,
+        volume=1000, acc_volume=50000,
+    ) for i in range(60)]
+    service.broker.get_minute_bars = lambda *a, **kw: good_bars_15
+    service._get_minute_analysis(symbol, 58000)
+    state_before_15 = service._session_state_by_symbol.get(symbol)
+    bars_before_15 = dict(state_before_15.bars)
+
+    service.cached_minute_bars_loaded_at[symbol] = kst_now3 - timedelta(seconds=999)
+    bad_bars_15 = [MinuteBar(
+        cntr_tm=(kst_now3 - timedelta(minutes=59 - i)).strftime("%Y%m%d%H%M%S"),
+        open_price=58000, high_price=0, low_price=0, close_price=58000,
+        volume=1000, acc_volume=50000,
+    ) for i in range(60)]
+    service.broker.get_minute_bars = lambda *a, **kw: bad_bars_15
+    result_15 = service._get_minute_analysis(symbol, 58000)
+
+    state_after_15 = service._session_state_by_symbol.get(symbol)
+    check("15) invalid 응답이 기존 정상 세션을 오염시키지 않음"
+          "(정확히 GPT 지시 필수 테스트) — 세션 봉이 그대로 유지됨",
+          state_after_15.bars == bars_before_15)
+    check("    세션에 high_price=0인 오염 데이터가 전혀 섞이지 않음",
+          0 not in set(b.high_price for b in state_after_15.bars.values()))
+    check("    이번 호출 자체는 entry_safe=False(안전 차단)", result_15.entry_safe is False)
+
+# ══════════════════════════════════════════════════════════════
+# 10부: filtered 카운터 unique/batch 정확성 (2026-07-28, 3차 GPT
+# 코드리뷰 지적 2번, TradingService 통합 레벨)
+# ══════════════════════════════════════════════════════════════
+
+# ── 16) 동일 오염 창을 반복 병합해도 unique count는 불변 ──────────
+yesterday_10 = [MinuteBar(
+    cntr_tm=f"2026072714{i:02d}00", open_price=50000, high_price=50100,
+    low_price=49900, close_price=50000, volume=500, acc_volume=5000,
+) for i in range(10)]
+today_10 = [MinuteBar(
+    cntr_tm=(datetime(2026, 7, 28, 9, 0) + timedelta(minutes=i)).strftime("%Y%m%d%H%M%S"),
+    open_price=60000, high_price=60100, low_price=59900, close_price=60000,
+    volume=500, acc_volume=5000,
+) for i in range(10)]
+
+state16 = None
+unique_counts = []
+batch_counts = []
+for _ in range(3):
+    state16 = merge_session_bars(state16, yesterday_10 + today_10, "20260728")
+    metrics16 = build_session_metrics(state16)
+    unique_counts.append(metrics16.filtered_other_date_count)
+    batch_counts.append(metrics16.last_batch_filtered_other_date_count)
+
+check("16) 동일 오염 창(전일10개+오늘10개)을 3회 반복 병합해도 "
+      "unique count는 계속 10으로 불변(정확히 GPT 지시 필수 테스트, "
+      "수정 전엔 10->20->30으로 증가했던 재현된 버그)",
+      unique_counts == [10, 10, 10])
+check("    반면 batch count는 매번 이번 병합에서 새로 걸러진 개수(10)를 그대로 보여줌",
+      batch_counts == [10, 10, 10])
+check("    session_bar_count(오늘 봉)는 정확히 10으로 유지됨(오염되지 않음)",
+      metrics16.session_bar_count == 10)
+
+# ── 17) 한 봉씩 이동하는 overlapping window에서 batch/unique count 정확 ──
+yesterday_43 = [MinuteBar(
+    cntr_tm=f"2026072714{i:02d}00", open_price=50000, high_price=50100,
+    low_price=49900, close_price=50000, volume=500, acc_volume=5000,
+) for i in range(43)]
+
+state17 = None
+for today_count in range(1, 18):
+    today_n = [MinuteBar(
+        cntr_tm=(datetime(2026, 7, 28, 9, 0) + timedelta(minutes=i)).strftime("%Y%m%d%H%M%S"),
+        open_price=60000, high_price=60100, low_price=59900, close_price=60000,
+        volume=500, acc_volume=5000,
+    ) for i in range(today_count)]
+    window17 = (yesterday_43 + today_n)[-60:]  # API가 항상 최근 60개만 반환
+    state17 = merge_session_bars(state17, window17, "20260728")
+
+metrics17 = build_session_metrics(state17)
+check("17) 한 봉씩 이동하는 overlapping window(1~17분) 끝에도 "
+      "filtered_other_date_unique가 정확히 43(전일 봉 실제 개수)으로 유지됨"
+      "(정확히 GPT 지시 필수 테스트)",
+      metrics17.filtered_other_date_count == 43)
+check("    session_bar_count가 정확히 17(오늘 실제 봉 개수)로 유지됨",
+      metrics17.session_bar_count == 17)
+
+# ══════════════════════════════════════════════════════════════
+# 11부: session_metrics 모듈 자체의 OHLC 2차 방어 확인
+# ══════════════════════════════════════════════════════════════
+
+bad_ohlc_direct = [MinuteBar(
+    cntr_tm=(datetime(2026, 7, 28, 9, 0) + timedelta(minutes=i)).strftime("%Y%m%d%H%M%S"),
+    open_price=58000, high_price=0, low_price=0, close_price=58000,
+    volume=1000, acc_volume=50000,
+) for i in range(10)]
+state18 = merge_session_bars(None, bad_ohlc_direct, "20260728")
+metrics18 = build_session_metrics(state18)
+check("18) session_metrics 모듈 자체의 2차 OHLC 방어 — "
+      "invalid OHLC 10개 -> session_bar_count=0", metrics18.session_bar_count == 0)
+check("    filtered_invalid_ohlc_count=10으로 정확히 집계됨",
+      metrics18.filtered_invalid_ohlc_count == 10)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

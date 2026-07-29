@@ -37,7 +37,7 @@ session_bar_count가 17이 아니라 60, session_low도 전일 저가로
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from domain.models import MinuteBar
 from utils.time_utils import MARKET_OPEN, REGULAR_MARKET_CLOSE, parse_kst_bar_timestamp
 
@@ -60,14 +60,27 @@ class SessionMetrics:
         rolling_60_count: rolling_vwap_60 계산에 실제로 쓰인 봉 개수.
         recent_high_30: 세션 내 최근 30개 봉만의 최고가.
         session_bar_count: 필터를 통과해 세션에 실제로 포함된 봉 개수.
-        filtered_other_date_count: 대상 거래일이 아니라서 걸러진
-            봉 개수(예: 전일 봉).
-        filtered_outside_market_count: 대상 거래일은 맞지만 정규장
-            시간(09:00~15:30) 밖이라 걸러진 봉 개수.
-        session_metrics_ready: 세션 히스토리가 장 시작부터 확보됐는지.
+        filtered_other_date_count: 세션 전체 기준 unique 전일(타
+            거래일) 필터링 개수(2026-07-28, set 기반 재설계 — 매
+            폴링마다 같은 봉을 중복으로 세지 않음).
+        filtered_outside_market_count: 세션 전체 기준 unique 정규장
+            밖(09:00~15:30 밖) 필터링 개수.
+        filtered_invalid_ohlc_count: 세션 전체 기준 unique OHLC
+            구조 오류 필터링 개수.
+        last_batch_filtered_other_date_count: 이번 병합 1회에서
+            새로 걸러진 전일 봉 개수(중복 포함 — "이번 폴링에 몇
+            개가 왔는지"를 보여줌, unique와 대비해서 로그로 관찰).
+        last_batch_filtered_outside_market_count: 이번 병합 1회
+            에서 새로 걸러진 정규장 밖 봉 개수.
+        last_batch_filtered_invalid_ohlc_count: 이번 병합 1회에서
+            새로 걸러진 OHLC 오류 봉 개수.
+        session_metrics_ready: 세션에 장 시작 구간(09:00~09:01)
+            봉이 포함되어 있는지 — "끊김없이 완전한 세션"까지
+            보장하는 것은 아니고, 최소한 장 시작 시점부터의 데이터를
+            포함하고 있는지만 확인하는 낮은 기준.
         readiness_reason: ready 판정의 근거 —
-            "COMPLETE_FROM_OPEN"(정상, 장 시작 구간부터 확보) |
-            "PARTIAL_SESSION"(중간부터 시작해 앞부분 결측) |
+            "COMPLETE_FROM_OPEN"(장 시작 구간 봉을 포함한 세션) |
+            "PARTIAL_SESSION"(장 시작 구간 없이 중간부터 시작) |
             "NO_SESSION_DATA"(대상 거래일 봉이 아예 없음).
     """
     session_date: str
@@ -84,6 +97,10 @@ class SessionMetrics:
     session_bar_count: int
     filtered_other_date_count: int
     filtered_outside_market_count: int
+    filtered_invalid_ohlc_count: int
+    last_batch_filtered_other_date_count: int
+    last_batch_filtered_outside_market_count: int
+    last_batch_filtered_invalid_ohlc_count: int
     session_metrics_ready: bool
     readiness_reason: str
 
@@ -108,8 +125,35 @@ def _typical_price_vwap(bars):
     return float(bars[-1].close_price)
 
 
+def _passes_ohlc_validity(bar) -> tuple[bool, str]:
+    """봉 하나의 OHLC/거래량 구조가 유효한지 확인합니다.
+
+    2026-07-28 (3차 GPT 코드리뷰 지적, 세션 오염 재현 확인):
+    _get_minute_analysis()가 OHLC 구조 검증(1B Safety Closure에서
+    _evaluate_bar_freshness에 추가됨)에 실패하면 entry_safe=False
+    로 안전하게 차단하지만, 정상 캐시가 없을 때 bars=new_bars(검증
+    실패한 그 원본)를 그대로 유지한 채 _update_session_metrics_
+    shadow()를 호출하고 있었음 — session_metrics 쪽 필터는 날짜/
+    시간만 검사해서, high=0/low=0인 60개가 그대로 세션에 들어가는
+    것을 재현 확인(session_bar_count=41, 저장된 high_price 집합이
+    전부 {0}). 호출부(TradingService)에서 이미 "구조 검증 통과
+    데이터만 세션에 전달"하도록 분리했지만(session_ingest_bars),
+    이 모듈 자체에도 방어선을 하나 더 둠 — 어떤 경로로든 이상한
+    봉이 들어와도 이 함수가 최종적으로 걸러냄.
+    """
+    if bar.open_price <= 0 or bar.high_price <= 0 or bar.low_price <= 0 or bar.close_price <= 0:
+        return False, "INVALID_OHLC"
+    if not (bar.low_price <= bar.open_price <= bar.high_price):
+        return False, "INVALID_OHLC"
+    if not (bar.low_price <= bar.close_price <= bar.high_price):
+        return False, "INVALID_OHLC"
+    if bar.volume < 0 or bar.acc_volume < 0:
+        return False, "INVALID_OHLC"
+    return True, ""
+
+
 def _passes_session_filter(bar, session_date):
-    """봉 하나가 세션 필터(대상 거래일 + 정규장 시간)를 통과하는지 확인합니다.
+    """봉 하나가 세션 필터(대상 거래일 + 정규장 시간 + OHLC 유효성)를 통과하는지 확인합니다.
 
     2026-07-28 (GPT 2차 코드리뷰 지적, 필터링 누락 재현 확인):
     이전 버전에는 이 필터 자체가 없어서 API가 반환한 60개 전부가
@@ -118,7 +162,8 @@ def _passes_session_filter(bar, session_date):
 
     Returns:
         (통과 여부, 사유 코드) — 통과하면 (True, ""), 실패하면
-        (False, "OTHER_DATE" | "OUTSIDE_MARKET" | "INVALID_TIMESTAMP").
+        (False, "OTHER_DATE" | "OUTSIDE_MARKET" | "INVALID_TIMESTAMP"
+        | "INVALID_OHLC").
     """
     dt = parse_kst_bar_timestamp(bar.cntr_tm)
     if dt is None:
@@ -127,6 +172,9 @@ def _passes_session_filter(bar, session_date):
         return False, "OTHER_DATE"
     if not (MARKET_OPEN <= dt.time() <= REGULAR_MARKET_CLOSE):
         return False, "OUTSIDE_MARKET"
+    ohlc_ok, ohlc_reason = _passes_ohlc_validity(bar)
+    if not ohlc_ok:
+        return False, ohlc_reason
     return True, ""
 
 
@@ -142,11 +190,44 @@ class SessionState:
     dict 전체를 복사해 60번 호출 시 O(n^2) 복사가 발생했음. 이제
     종목별로 SessionState(session_date + bars 딕셔너리)를 함께
     들고, 날짜가 바뀐 새 봉이 들어오면 자동으로 자체 초기화됨.
+
+    2026-07-28 (3차 GPT 코드리뷰 지적, filtered 카운터 중복 누적
+    재현 확인): filtered_other_date_count/filtered_outside_market_
+    count를 단순 정수 누적으로 관리하면, API 응답 창이 겹칠 때마다
+    (예: 매 폴링 최근 60개 롤링에 같은 전일 10개가 계속 포함되는
+    경우) 같은 봉을 매번 다시 세어 실제로는 10개인데 30, 40으로
+    끝없이 불어남을 재현 확인(동일 전일10개+오늘10개를 3회 병합
+    시 filtered_other가 10→20→30으로 증가, 실제 unique 전일 봉은
+    계속 10개인데도). timestamp를 set으로 관리해 "세션 전체
+    기준으로 실제 몇 개의 서로 다른 봉이 걸러졌는지"(unique)를
+    정확히 계산하고, 이번 한 번의 병합에서 새로 걸러진 개수(batch)
+    도 별도로 추적 — 로그에서 "이번 폴링에 몇 개가 새로 걸러졌는지"
+    와 "지금까지 총 몇 개의 서로 다른 봉이 걸러졌는지"를 둘 다
+    확인할 수 있도록 함.
     """
     session_date: str
     bars: dict
-    filtered_other_date_count: int = 0
-    filtered_outside_market_count: int = 0
+    filtered_other_date_timestamps: set = field(default_factory=set)
+    filtered_outside_market_timestamps: set = field(default_factory=set)
+    filtered_invalid_ohlc_timestamps: set = field(default_factory=set)
+    last_batch_filtered_other_date_count: int = 0
+    last_batch_filtered_outside_market_count: int = 0
+    last_batch_filtered_invalid_ohlc_count: int = 0
+
+    @property
+    def filtered_other_date_count(self) -> int:
+        """세션 전체 기준 unique 전일(타 거래일) 필터링 개수."""
+        return len(self.filtered_other_date_timestamps)
+
+    @property
+    def filtered_outside_market_count(self) -> int:
+        """세션 전체 기준 unique 정규장 밖 필터링 개수."""
+        return len(self.filtered_outside_market_timestamps)
+
+    @property
+    def filtered_invalid_ohlc_count(self) -> int:
+        """세션 전체 기준 unique OHLC 구조 오류 필터링 개수."""
+        return len(self.filtered_invalid_ohlc_timestamps)
 
 
 def merge_session_bars(state, new_bars, target_session_date):
@@ -158,10 +239,15 @@ def merge_session_bars(state, new_bars, target_session_date):
       안에서 한 번만 딕셔너리를 복사(호출부 관점에서는 여전히 새
       SessionState를 반환하는 순수 함수 스타일을 유지하되, 불필요한
       반복 복사를 피함 — 60개 봉을 병합해도 dict 복사는 1회).
-    - 대상 거래일 필터 + 정규장 시간 필터를 통과한 봉만 실제로
-      병합(동일 timestamp는 교체, 누적 아님).
-    - 필터를 통과하지 못한 봉은 filtered_other_date_count/
-      filtered_outside_market_count에 집계.
+    - 대상 거래일 필터 + 정규장 시간 필터 + OHLC 유효성 검증을
+      통과한 봉만 실제로 병합(동일 timestamp는 교체, 누적 아님).
+    - 필터를 통과하지 못한 봉은 timestamp를 set에 추가해 집계
+      (2026-07-28, 3차 GPT 코드리뷰 지적: 단순 정수 누적이던 이전
+      버전은 API 응답 창이 겹칠 때마다 같은 봉을 매번 다시 세어
+      끝없이 불어나는 것을 재현 확인 — 동일 전일10개+오늘10개를
+      3회 병합 시 filtered_other가 10→20→30으로 증가했었음. set
+      으로 관리하면 같은 timestamp가 몇 번 다시 들어와도 unique
+      count는 정확히 10을 유지).
     - 종목의 기존 세션 상태(state)가 다른 날짜의 것이면(즉 새
       target_session_date와 다르면), reset_daily_loss_counts()
       호출 여부와 무관하게 이 함수 자체가 자동으로 빈 세션부터
@@ -171,8 +257,11 @@ def merge_session_bars(state, new_bars, target_session_date):
     Args:
         state: 종목의 기존 SessionState. None이거나 session_date가
             target_session_date와 다르면 새로 시작.
-        new_bars: 이번에 API/캐시로부터 받은 분봉 목록(예: 최근
-            60개 롤링 — 필터링 전 원본 그대로 전달).
+        new_bars: 이번에 API/캐시로부터 받은 분봉 목록. **호출부가
+            이미 구조 검증(OHLC 등)을 통과시킨 데이터만 전달해야
+            함** — 이 함수 자체도 방어적으로 OHLC를 재검증하지만
+            (2차 방어선), "구조 검증 실패 응답은 애초에 이 함수를
+            호출하지 않는다"는 책임은 호출부(TradingService)에 있음.
         target_session_date: 지금 계산 대상인 거래일(YYYYMMDD,
             보통 now_kst()의 날짜).
 
@@ -182,28 +271,47 @@ def merge_session_bars(state, new_bars, target_session_date):
     """
     if state is None or state.session_date != target_session_date:
         bars_dict = {}
-        filtered_other = 0
-        filtered_outside = 0
+        filtered_other_ts = set()
+        filtered_outside_ts = set()
+        filtered_invalid_ohlc_ts = set()
     else:
         bars_dict = dict(state.bars)  # 한 번만 복사
-        filtered_other = state.filtered_other_date_count
-        filtered_outside = state.filtered_outside_market_count
+        filtered_other_ts = set(state.filtered_other_date_timestamps)
+        filtered_outside_ts = set(state.filtered_outside_market_timestamps)
+        filtered_invalid_ohlc_ts = set(state.filtered_invalid_ohlc_timestamps)
+
+    batch_other = 0
+    batch_outside = 0
+    batch_invalid_ohlc = 0
 
     for bar in new_bars:
         passed, reason_code = _passes_session_filter(bar, target_session_date)
         if not passed:
             if reason_code == "OTHER_DATE":
-                filtered_other += 1
+                if bar.cntr_tm not in filtered_other_ts:
+                    filtered_other_ts.add(bar.cntr_tm)
+                batch_other += 1
             elif reason_code == "OUTSIDE_MARKET":
-                filtered_outside += 1
+                if bar.cntr_tm not in filtered_outside_ts:
+                    filtered_outside_ts.add(bar.cntr_tm)
+                batch_outside += 1
+            elif reason_code == "INVALID_OHLC":
+                if bar.cntr_tm not in filtered_invalid_ohlc_ts:
+                    filtered_invalid_ohlc_ts.add(bar.cntr_tm)
+                batch_invalid_ohlc += 1
+            # INVALID_TIMESTAMP는 이전과 동일하게 별도 집계 없이 무시.
             continue
         bars_dict[bar.cntr_tm] = bar  # 동일 timestamp는 교체(누적 아님)
 
     return SessionState(
         session_date=target_session_date,
         bars=bars_dict,
-        filtered_other_date_count=filtered_other,
-        filtered_outside_market_count=filtered_outside,
+        filtered_other_date_timestamps=filtered_other_ts,
+        filtered_outside_market_timestamps=filtered_outside_ts,
+        filtered_invalid_ohlc_timestamps=filtered_invalid_ohlc_ts,
+        last_batch_filtered_other_date_count=batch_other,
+        last_batch_filtered_outside_market_count=batch_outside,
+        last_batch_filtered_invalid_ohlc_count=batch_invalid_ohlc,
     )
 
 
@@ -237,6 +345,10 @@ def build_session_metrics(state):
             session_bar_count=0,
             filtered_other_date_count=state.filtered_other_date_count if state else 0,
             filtered_outside_market_count=state.filtered_outside_market_count if state else 0,
+            filtered_invalid_ohlc_count=state.filtered_invalid_ohlc_count if state else 0,
+            last_batch_filtered_other_date_count=state.last_batch_filtered_other_date_count if state else 0,
+            last_batch_filtered_outside_market_count=state.last_batch_filtered_outside_market_count if state else 0,
+            last_batch_filtered_invalid_ohlc_count=state.last_batch_filtered_invalid_ohlc_count if state else 0,
             session_metrics_ready=False,
             readiness_reason="NO_SESSION_DATA",
         )
@@ -257,10 +369,15 @@ def build_session_metrics(state):
     rolling_vwap_60 = _typical_price_vwap(last_60)
     recent_high_30 = max(b.high_price for b in last_30)
 
-    # 2026-07-28 (GPT 코드리뷰 지적 2번): ready 판정 — 가장 오래된
-    # 세션 봉이 장 시작(09:00) 첫 1분 구간(09:00 또는 09:01, API가
-    # 09:00:xx를 09:01로 집계해서 줄 수도 있으므로 09:01까지 허용)
-    # 이어야 "장 시작부터 끊김없이 확보"로 인정.
+    # 2026-07-28 (GPT 코드리뷰 지적 2번, 4차 리뷰로 표현 완화):
+    # ready 판정 — 가장 오래된 세션 봉이 장 시작(09:00) 첫 1분
+    # 구간(09:00 또는 09:01, API가 09:00:xx를 09:01로 집계해서
+    # 줄 수도 있으므로 09:01까지 허용)이면 "장 시작 구간 봉을
+    # 포함한 세션"으로 인정. 다만 이건 "끊김없이 완전한 세션"까지
+    # 보장하는 검증은 아님 — 예를 들어 09:00~09:10, 09:20~현재
+    # 처럼 중간에 결측 구간이 있어도 earliest만 09:00~09:01이면
+    # ready=True가 됨(중간 결측 자체를 잡는 것은 이번 단계 범위
+    # 밖 — 필요해지면 별도로 연속성 검증을 추가할 수 있음).
     earliest_dt = parse_kst_bar_timestamp(earliest_ts)
     if earliest_dt is not None and earliest_dt.hour == 9 and earliest_dt.minute <= 1:
         ready = True
@@ -284,6 +401,10 @@ def build_session_metrics(state):
         session_bar_count=len(sorted_bars),
         filtered_other_date_count=state.filtered_other_date_count,
         filtered_outside_market_count=state.filtered_outside_market_count,
+        filtered_invalid_ohlc_count=state.filtered_invalid_ohlc_count,
+        last_batch_filtered_other_date_count=state.last_batch_filtered_other_date_count,
+        last_batch_filtered_outside_market_count=state.last_batch_filtered_outside_market_count,
+        last_batch_filtered_invalid_ohlc_count=state.last_batch_filtered_invalid_ohlc_count,
         session_metrics_ready=ready,
         readiness_reason=readiness_reason,
     )
@@ -321,8 +442,12 @@ def format_session_metrics_log_line(symbol, metrics, legacy_vwap, legacy_day_hig
         f"[SESSION_SHADOW] {symbol} | date={metrics.session_date} "
         f"ready={metrics.session_metrics_ready} reason={metrics.readiness_reason} "
         f"bar_count={metrics.session_bar_count} "
-        f"filtered_other_date={metrics.filtered_other_date_count} "
-        f"filtered_outside_market={metrics.filtered_outside_market_count} | "
+        f"filtered_other_date_batch={metrics.last_batch_filtered_other_date_count} "
+        f"filtered_other_date_unique={metrics.filtered_other_date_count} "
+        f"filtered_outside_market_batch={metrics.last_batch_filtered_outside_market_count} "
+        f"filtered_outside_market_unique={metrics.filtered_outside_market_count} "
+        f"filtered_invalid_ohlc_batch={metrics.last_batch_filtered_invalid_ohlc_count} "
+        f"filtered_invalid_ohlc_unique={metrics.filtered_invalid_ohlc_count} | "
         f"earliest={metrics.earliest_timestamp} latest={metrics.latest_timestamp} | "
         f"session_vwap={metrics.session_vwap:.2f} legacy_vwap(60min)={legacy_vwap_str} "
         f"diff={vwap_diff} | "

@@ -495,6 +495,13 @@ class TradingService:
                     bars = self.cached_minute_bars.get(symbol, [])
                     source = "EMPTY" if not bars else "CACHE_STALE"
                     reason = "MINUTE_DATA_UNAVAILABLE" if not bars else "STALE_MINUTE_DATA"
+                    # 2026-07-28 (4차 GPT 코드리뷰 지적, 세션 오염
+                    # 재현 확인): 빈 응답 자체는 세션에 넣을 새 데이터가
+                    # 없음 — 기존 캐시(이미 구조 검증을 통과한 데이터)
+                    # 가 있으면 그걸 다시 세션에 반영해도 안전(동일
+                    # timestamp는 merge_session_bars가 교체하므로 중복
+                    # 걱정 없음), 없으면 세션에 아무것도 안 넣음.
+                    session_ingest_bars = bars if bars else []
                 else:
                     # 2026-07-28 (6차 GPT 코드리뷰 지적, "1B Safety
                     # Closure"): 이전엔 구조 검증(_evaluate_bar_
@@ -526,6 +533,15 @@ class TradingService:
                         # 거부된 응답을 별도 경로(rejected)로 남김 —
                         # 정상 minute_bars 저장 CSV에는 절대 섞지 않음.
                         self._save_rejected_minute_bars(symbol, new_bars, reason, fresh_detail)
+                        # 2026-07-28 (4차 GPT 코드리뷰 지적, 세션 오염
+                        # 재현 확인): 구조 검증에 실패한 new_bars(예:
+                        # OHLC가 0인 60개)가 그대로 bars에 담겨 세션에
+                        # 전달되고 있었음(재현: session_bar_count=41,
+                        # 저장된 high_price 집합이 전부 {0}). 세션에는
+                        # "구조 검증을 통과한 적이 있는" existing_bars
+                        # (있다면)만 반영 — new_bars(이번에 검증 실패한
+                        # 원본)는 절대 세션에 넣지 않음.
+                        session_ingest_bars = existing_bars if existing_bars else []
                     else:
                         # 2026-07-28 (GPT 지적 3번): 새 응답의 최신 봉이
                         # 기존 캐시의 최신 봉보다 오래되면 기존(더 최신인)
@@ -558,6 +574,9 @@ class TradingService:
                                 symbol, new_bars, reason,
                                 f"새응답 최신봉={fresh_dt} < 기존캐시 최신봉={existing_latest_dt}",
                             )
+                            # 퇴행된(더 과거) 응답도 세션에는 안 넣음 —
+                            # 기존(더 신선한) 캐시만 다시 반영.
+                            session_ingest_bars = existing_bars if existing_bars else []
                         else:
                             # 2026-07-28 (6차 GPT 코드리뷰 지적): 구조
                             # 검증을 통과한 응답만 성공 캐시/loaded_at을
@@ -570,6 +589,11 @@ class TradingService:
                             bars = new_bars
                             source = "LIVE"
                             reason = ""
+                            # 2026-07-28 (4차 GPT 코드리뷰 지적): 구조
+                            # 검증을 실제로 통과한 이 new_bars만 세션에
+                            # 반영 — 유일하게 "새로 검증된 데이터"이므로
+                            # session_ingest_bars = new_bars.
+                            session_ingest_bars = new_bars
 
                             if self._minute_saver is not None:
                                 try:
@@ -584,6 +608,10 @@ class TradingService:
                 bars = self.cached_minute_bars.get(symbol, [])
                 source = "CACHE_STALE" if bars else "UNAVAILABLE"
                 reason = "STALE_MINUTE_DATA" if bars else "MINUTE_DATA_UNAVAILABLE"
+                # 조회 자체가 예외를 던진 경우도 세션에 새로 반영할
+                # 데이터가 없음 — 기존(구조 검증을 통과했던) 캐시만
+                # 다시 반영.
+                session_ingest_bars = bars if bars else []
         else:
             # 2026-07-28 (GPT 지적 1번, 가장 심각한 버그): 캐시 재사용
             # 경로에서도 매번 최신 timestamp의 날짜·age·파싱 여부를
@@ -606,6 +634,16 @@ class TradingService:
                     source, reason = "CACHE_FRESH", ""
                 else:
                     source, reason = "CACHE_STALE", (fresh_reason_code or "STALE_MINUTE_DATA")
+            # 2026-07-28 (4차 GPT 코드리뷰 지적): 캐시 재사용 경로는
+            # cached_minute_bars 자체가 "구조 검증을 통과했던 시점의
+            # 데이터"이므로(567번째 줄 부근에서 fresh_ok일 때만 캐시가
+            # 갱신됨), 여기서 다시 검증할 필요 없이 bars 그대로 세션에
+            # 반영해도 안전 — 다만 이 경로에서 fresh_ok가 False(예:
+            # max_age 초과)이면 "신선하지 않다"는 의미이지 "구조가
+            # 잘못됐다"는 의미가 아니므로, 세션에는 여전히 반영해도
+            # 됨(세션 목적 자체가 "당일 전체 누적"이라 오래된 데이터도
+            # 유효한 세션 데이터임 — 신선도와 세션 소속 여부는 별개 개념).
+            session_ingest_bars = bars if bars else []
 
         if not bars:
             return MinuteDataResult(
@@ -667,8 +705,19 @@ class TradingService:
         # v_fail_reasons 같은 내부 상태를 바꾸는 상태성 객체라, 재호출
         # 자체가 "shadow는 상태를 안 바꾼다"는 원칙을 어김 — 재현
         # 확인: off는 analyze() 1회, shadow는 2회 호출되고 있었음).
+        #
+        # 2026-07-28 (4차 GPT 코드리뷰 지적, 세션 오염 재현 확인):
+        # 여기서 bars(분석용, 구조 검증에 실패해도 보유종목 판단을
+        # 위해 오염된 데이터를 그대로 담을 수 있음)를 그대로 세션에
+        # 넘기면 안 됨 — session_ingest_bars(구조 검증을 실제로
+        # 통과한 데이터만, 위에서 각 경로별로 명시적으로 결정됨)를
+        # 대신 전달. 재현 확인: high=0/low=0인 60개 응답을 넣으면
+        # entry_safe=False로 안전하게 차단되면서도 세션 저장소에는
+        # 그 오염된 60개가 그대로 들어가고 있었음(session_bar_count
+        # =41, 저장된 high_price가 전부 {0}) — session_ingest_bars
+        # 분리로 이 경로 자체를 차단.
         try:
-            self._update_session_metrics_shadow(symbol, bars, analysis)
+            self._update_session_metrics_shadow(symbol, session_ingest_bars, analysis)
         except Exception as shadow_exc:
             self.app_logger.warning(
                 f"[SESSION_SHADOW] {symbol} | shadow 계산 실패(무시): {shadow_exc}"

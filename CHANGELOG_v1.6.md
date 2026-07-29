@@ -1997,3 +1997,122 @@ experimental:
 
 ---
 
+## 1C.4: 세션 오염 방지 및 filtered unique count 핫픽스 (2026-07-28)
+
+**배경**: 1C.3(shadow 실제 전환) 승인 직후, GPT 3차 코드리뷰로 실제
+다일 관찰 시작 전에 반드시 고쳐야 할 두 가지 데이터 신뢰성 버그가
+재현과 함께 지적됨.
+
+### 1. 검증 실패 OHLC가 세션 저장소에 그대로 들어가던 문제 (재현 확인)
+
+`_get_minute_analysis()`가 OHLC 구조 검증(1B Safety Closure)에
+실패하면 `entry_safe=False, reason=INVALID_MINUTE_OHLC`로 안전하게
+차단하지만, 정상 캐시가 없을 때 `bars=new_bars`(검증에 실패한 원본
+그대로)를 유지한 채 `_update_session_metrics_shadow(symbol, bars,
+analysis)`를 무조건 호출하고 있었음 — `session_metrics`의 필터는
+날짜/시간만 검사해서 OHLC 오류는 걸러내지 못하니, 잘못된 60개가
+그대로 세션에 들어갔음. 재현: `high=0, low=0`인 60개 응답 →
+`_session_state_by_symbol[symbol].bars`에 41개(정규장 시간 필터만
+통과)가 들어가고, 저장된 `high_price` 집합이 전부 `{0}`.
+
+**수정**: `bars`(분석용 — 보유종목 판단이 끊기지 않도록 오염된
+데이터라도 `MinuteAnalyzer.analyze()`에는 여전히 전달)와 `session_
+ingest_bars`(세션 반영용 — 구조 검증을 실제로 통과한 데이터만)를
+명확히 분리. `_get_minute_analysis()`의 각 코드 경로(빈 응답/구조
+검증 실패/퇴행 응답/정상 응답/예외/캐시 재사용)마다 `session_
+ingest_bars`를 명시적으로 결정 — 정상 응답(`source="LIVE"`)일
+때만 `new_bars`(이번에 검증을 통과한 데이터)를 세션에 넘기고,
+나머지 모든 실패 경로는 "기존(구조 검증을 통과했던) 캐시가 있으면
+그걸 다시 반영, 없으면 세션에 아무것도 안 넣음"으로 통일. `_update_
+session_metrics_shadow()` 호출부도 `bars` 대신 `session_ingest_
+bars`를 전달하도록 변경.
+
+`session_metrics.py` 모듈 자체에도 2차 방어선 추가 — `_passes_
+ohlc_validity()` 신설(open/high/low/close > 0, low≤open≤high,
+low≤close≤high, volume/acc_volume ≥ 0), `_passes_session_filter()`
+가 날짜·시간 필터에 더해 이 OHLC 검증도 함께 확인하도록 통합.
+어떤 경로로든 이상한 봉이 들어와도 이 모듈 레벨에서 최종적으로
+걸러짐.
+
+**재현 시나리오로 실제 수정 검증**: 캐시가 없는 상태에서 OHLC
+오류 60개 응답 → 세션 저장소 자체가 생성 안 됨(`session_ingest_
+bars=[]`). 기존 정상 세션(49개)이 있는 상태에서 같은 오염 응답이
+들어와도 → 세션 봉이 정확히 그대로 유지(`state_after.bars ==
+bars_before`), `high_price` 집합에 0이 전혀 섞이지 않음.
+
+### 2. filtered 카운터가 overlapping API 창에서 중복 누적되던 문제 (재현 확인)
+
+`filtered_other_date_count`/`filtered_outside_market_count`를
+단순 정수로 누적하고 있어서, API 응답 창이 겹칠 때마다(예: 최근
+60개 롤링에 같은 전일 10개가 매 폴링 계속 포함되는 정상적인
+상황) 같은 봉을 매번 다시 세어 끝없이 불어남을 재현 확인 — 동일
+전일10개+오늘10개를 같은 `SessionState`에 3회 병합 시 `filtered_
+other`가 10→20→30으로 증가(실제 unique 전일 봉은 계속 10개인데도).
+
+**수정**: `SessionState`의 필터링 카운터를 `set`(timestamp 기준)
+으로 재설계 — `filtered_other_date_timestamps`/`filtered_outside_
+market_timestamps`/`filtered_invalid_ohlc_timestamps`. `filtered_
+*_count`는 이제 이 set의 길이(`len()`)로 계산되는 property라
+같은 timestamp가 몇 번 다시 들어와도 unique 값은 정확. 동시에
+`last_batch_filtered_*_count`(이번 병합 1회에서 새로 걸러진 개수,
+중복 포함)도 별도 필드로 추가 — "이번 폴링에 몇 개가 새로
+걸러졌는지"와 "지금까지 총 몇 개의 서로 다른 봉이 걸러졌는지"를
+로그에서 둘 다 확인 가능. 로그 포맷을 GPT가 제시한 예시대로
+`filtered_other_date_batch=43 filtered_other_date_unique=43` 형태로
+변경.
+
+**재현 시나리오로 실제 수정 검증**: 동일 전일10개+오늘10개를 3회
+반복 병합 → `unique`는 계속 정확히 10 유지, `batch`는 매번 10을
+그대로 보여줌. 한 봉씩 이동하는 overlapping window(전일 43개
+고정, 오늘 봉이 1~17분으로 늘어나며 API가 항상 최근 60개만 반환)
+→ `filtered_other_date_unique`가 끝까지 정확히 43으로 유지.
+
+### 부수 발견: `REGULAR_MARKET_CLOSE` import 정리
+
+`_passes_session_filter()`에 OHLC 검증을 통합하며 `_passes_ohlc_
+validity()`를 별도 함수로 분리 — 기존 1B Safety Closure의 OHLC
+검증 로직(`_evaluate_bar_freshness` 내부)과 검증 기준을 동일하게
+맞춤(중복 코드지만 계층이 달라 공유 함수로 묶지 않음 — `domain/
+service/trading_service.py`와 `domain/market_regime/session_
+metrics.py`가 서로 다른 재사용 맥락이라 각자 유지하는 편이 결합도
+관점에서 더 안전하다고 판단).
+
+### readiness 문서 표현 완화
+
+GPT 지시대로 `session_metrics_ready`/`readiness_reason`의 docstring
+표현을 "끊김없이 완전한 세션"에서 "장 시작 구간 봉을 포함한 세션"
+으로 완화 — 현재 구현은 `earliest_timestamp`가 09:00~09:01
+구간인지만 확인하고, 중간 결측 구간(예: 09:00~09:10, 09:20~현재)
+은 검증하지 않는다는 것을 명시.
+
+### `test_session_metrics_shadow.py` 확장 (34→47건)
+
+GPT가 명시한 4가지 필수 신규 테스트를 정확히 반영: invalid OHLC
+응답이 세션 상태에 안 들어감(14번), invalid 응답이 기존 정상
+세션을 오염시키지 않음(15번), 동일 오염 창 반복 병합 시 unique
+count 불변(16번), 한 봉씩 이동하는 overlapping window에서 batch/
+unique count 정확(17번). `session_metrics` 모듈 자체의 2차 OHLC
+방어 확인(18번)도 추가. 로그 필드 검증(13번)을 새 필드명(`_batch`/
+`_unique` 접미사)에 맞게 갱신.
+
+**재검증 중 발견한 기존 테스트의 시간 의존성 결함**: 12번 테스트
+(세션-60분 롤링 실제 괴리 재현)가 `today_open2`를 09:01로 고정한
+채 `now_kst()`를 실제 테스트 실행 시각 그대로 두고 있어서, 실행
+시각이 09:01에서 많이 벗어나면(예: 09:50경) 최신 봉의 age가
+`minute_bar_max_age_seconds`(120초)를 초과해 신선도 검증 자체에서
+막혀버리는 flaky 문제를 발견(재현: entry_safe=False, 세션에
+아무것도 안 쌓임). `now_kst()`를 각 단계의 "그 시점"으로 명시적
+고정하도록 수정 — 실행 시각과 무관하게 항상 동일한 결과가 나오도록
+함(1B.6/1B.12절에서 이미 다룬 것과 같은 유형의 결함을 이번엔 1C
+테스트에서 발견·직접 수정).
+
+**전체 회귀**: `run_regression_tests.py` — 31개 파일 전부 통과,
+종료코드 0. 로그/데이터 디렉토리 오염 없음 확인.
+
+**현재 상태**: `settings.yaml`의 `session_metrics_mode`는 여전히
+`"shadow"` — 이번 핫픽스로 세션 데이터의 신뢰성이 확보됐으므로,
+이제 실제 다일 관찰(Windows 실환경에서 `[SESSION_SHADOW]` 로그
+누적)을 시작해도 안전합니다.
+
+---
+
