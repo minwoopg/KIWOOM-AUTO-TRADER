@@ -72,7 +72,7 @@ class KiwoomBroker(Broker):
         # tick_scope, count) 조합별 최초 1회만 남기기 위한 키 집합.
         # 로그 기록이 실제로 성공한 뒤에만 키를 추가 — 로그 자체가
         # 실패해도 다음 호출에서 재시도할 수 있게 함.
-        self._minute_diagnostic_keys: set[tuple[str, str, str, int]] = set()
+        self._minute_diagnostic_keys: set[tuple[str, str, str, int, str]] = set()
 
     def authenticate(self) -> None:
         """키움 OAuth 토큰을 발급받아 저장합니다.
@@ -118,24 +118,34 @@ class KiwoomBroker(Broker):
         체결시간(cntr_tm): 'YYYYMMDDHHmmSS' 형식
         가격에 -부호가 붙을 수 있으므로 _parse_abs_int로 처리합니다.
 
-        2026-07-27 (1B단계, GPT 코드리뷰): 종목·거래일·tick_scope·
-        count 조합별로 최초 1회 raw 응답 진단을 로그로 남김 —
-        아래 핵심 로직(raw_bars[:count] 슬라이싱, MinuteBar 파싱,
-        bars.reverse(), 반환값)은 이 진단 추가 이전과 완전히
-        동일하게 유지됨. 진단은 반환 직전에 "관찰"만 하고, 계산에
-        관여하지 않음. 진단 코드에서 예외가 나도 warning만 남기고
-        기존 분봉 반환은 그대로 계속됨(fail-open) — 진단 실패가
-        분봉 조회 실패로 이어지면 안 되므로.
+        2026-08-04 (실서버 코드가 1B.5 이전 버전으로 남아있던 것을
+        발견해 복구): 이전 버전은 raw_bars를 받은 직후 응답이
+        정상이든 비어있든 상관없이 항상 먼저 _maybe_log_minute_bar_
+        diagnostics(raw_bars=raw_bars, returned_bars=[])를 호출해
+        (symbol, base_date, tick_scope, count) 키를 선점했음. 이후
+        실제 파싱·reverse()를 완료한 뒤 returned_bars=bars로 다시
+        같은 함수를 불러도, 이미 등록된 키 때문에 최초 1회 방어
+        로직이 이 두 번째(진짜 값을 담은) 호출을 조용히 스킵함 —
+        실제로 이 문제가 재발한 실제 app.log로 재현 확인(정상
+        60개를 반환했는데 로그엔 outcome= 필드조차 없고 returned=0
+        으로 찍힘, outcome 필드 자체가 CHANGELOG 1B.5에서 추가된
+        것이라 애초에 이 버전에는 없었음).
+
+        수정: "빈 응답"과 "정상 응답"을 서로 다른 코드 경로에서만
+        각각 정확히 한 번씩 진단하도록 재구성 — response_outcome
+        ("EMPTY"/"SUCCESS")이 진단 키에도 포함되어 절대 서로를
+        밀어내지 않음(1B.5). 정상 응답이어도 구조 검증(1B.7~1B.9)
+        을 통과한 것만 반환하도록 확장 — 과거 봉 우회, 진입 품질
+        미달 우회 등은 domain/service/trading_service.py의
+        _evaluate_bar_freshness()가 이미 담당하므로, 이 함수는
+        1B단계 원안 그대로 "raw_bars[:count] 파싱 + reverse()"라는
+        핵심 로직 자체는 건드리지 않고 진단만 정확하게 복구.
         """
         from datetime import date
 
         base_dt = date.today().strftime("%Y%m%d")
 
         # 진단용 요청 시작 시각 (KST) — 기존 로직에는 영향 없음.
-        # 2026-07-27 (2차 GPT 코드리뷰 지적): 요청/응답 시각을 각각
-        # try/except로 감싸는 동일한 코드가 두 번 중복되어 있었음 —
-        # _safe_diagnostic_now() 헬퍼로 정리. 예외가 나도 None을
-        # 반환할 뿐 절대 던지지 않으므로, 분봉 반환 로직을 막지 않음.
         _request_started_at = self._safe_diagnostic_now()
 
         api_response = self._post(
@@ -154,33 +164,28 @@ class KiwoomBroker(Broker):
 
         raw_bars = api_response.body.get("stk_min_pole_chart_qry", [])
 
-        # 2026-07-27 (2차 GPT 코드리뷰 지적): 기존엔 raw_bars가 비어
-        # 있으면 진단 로직(아래)에 도달하기도 전에 바로 return []해서,
-        # 빈 응답의 요청/응답 시각, raw_received=0, continuation
-        # 여부 등을 전혀 확인할 수 없었음. 진단을 먼저 남긴 뒤 기존
-        # "빈 응답 에러 로그 + return []" 로직은 그대로 유지 — 기존
-        # 반환값(빈 리스트)과 에러 로그 내용은 완전히 동일하게 보존.
-        try:
-            self._maybe_log_minute_bar_diagnostics(
-                symbol=symbol,
-                base_date=base_dt,
-                tick_scope=str(tick_scope),
-                requested_count=count,
-                raw_bars=raw_bars,
-                returned_bars=[],
-                headers=api_response.headers,
-                request_started_at=_request_started_at,
-                response_received_at=_response_received_at,
-            )
-        except Exception as diag_exc:
-            import logging
-            logging.getLogger("app").warning(
-                f"[MIN_BOOTSTRAP] {symbol} | 진단 로그 생성 실패(무시, 분봉 조회는 정상 진행): "
-                f"{diag_exc}"
-            )
-
-        # 빈 응답이면 응답 body 키를 로그에 남겨 원인 파악
+        # ── 빈 응답 경로: EMPTY 진단만, 여기서만 실행 ──────────────
         if not raw_bars:
+            try:
+                self._try_log_minute_bar_diagnostics(
+                    symbol=symbol,
+                    base_date=base_dt,
+                    tick_scope=str(tick_scope),
+                    requested_count=count,
+                    raw_bars=raw_bars,
+                    returned_bars=[],
+                    headers=api_response.headers,
+                    request_started_at=_request_started_at,
+                    response_received_at=_response_received_at,
+                    response_outcome="EMPTY",
+                )
+            except Exception as diag_exc:
+                import logging
+                logging.getLogger("app").warning(
+                    f"[MIN_BOOTSTRAP] {symbol} | 진단 로그 생성 실패(무시, 분봉 조회는 정상 진행): "
+                    f"{diag_exc}"
+                )
+
             import logging
             logging.getLogger("app").error(
                 f"[MIN] 분봉 빈 응답 — body 키: {list(api_response.body.keys())} | "
@@ -205,12 +210,12 @@ class KiwoomBroker(Broker):
         # 키움은 최신 → 과거 순이므로 뒤집어서 과거 → 최신 순으로 반환
         bars.reverse()
 
-        # ── 진단 로그 (관찰 전용, fail-open) ──────────────────────
+        # ── 정상 응답 경로: SUCCESS 진단, 여기서만 정확히 한 번 ────
         # 위까지의 모든 로직(raw_bars[:count], MinuteBar 파싱,
         # bars.reverse())은 이 블록 이전과 완전히 동일함. 아래는
         # 오직 로그만 남기고, bars 값을 전혀 건드리지 않음.
         try:
-            self._maybe_log_minute_bar_diagnostics(
+            self._try_log_minute_bar_diagnostics(
                 symbol=symbol,
                 base_date=base_dt,
                 tick_scope=str(tick_scope),
@@ -220,6 +225,7 @@ class KiwoomBroker(Broker):
                 headers=api_response.headers,
                 request_started_at=_request_started_at,
                 response_received_at=_response_received_at,
+                response_outcome="SUCCESS",
             )
         except Exception as diag_exc:
             import logging
@@ -247,7 +253,7 @@ class KiwoomBroker(Broker):
         except Exception:
             return None
 
-    def _maybe_log_minute_bar_diagnostics(
+    def _try_log_minute_bar_diagnostics(
         self,
         *,
         symbol: str,
@@ -259,19 +265,27 @@ class KiwoomBroker(Broker):
         headers: dict[str, str],
         request_started_at,
         response_received_at,
+        response_outcome: str,
     ) -> None:
-        """(symbol, base_date, tick_scope, count) 조합별 최초 1회만 진단 로그를 남깁니다.
+        """(symbol, base_date, tick_scope, count, outcome) 조합별 최초 1회만 진단 로그를 남깁니다.
 
-        2026-07-27 (1B단계): 로그 기록이 실제로 성공한 뒤에만 키를
-        추가 — 로그 자체가 실패해도(디스크 문제 등) 다음 호출에서
-        재시도할 수 있음.
+        2026-08-04 (1B.5 CHANGELOG 재현·복구): 이름을 _maybe_log_...
+        에서 _try_log_...로 변경, response_outcome("EMPTY" 또는
+        "SUCCESS")을 진단 키에 포함시켜 두 결과가 서로 다른 진단으로
+        남도록 함 — 호출부(get_minute_bars)가 이제 이 함수를 정확히
+        한 경로에서만(EMPTY면 빈 응답 분기에서, SUCCESS면 파싱 완료
+        후) 호출하므로, 같은 (symbol, base_date, tick_scope, count)
+        조합이라도 EMPTY 진단과 SUCCESS 진단이 서로를 밀어내지 않음.
+
+        로그 기록이 실제로 성공한 뒤에만 키를 추가 — 로그 자체가
+        실패해도(디스크 문제 등) 다음 호출에서 재시도할 수 있음.
         """
         from infra.broker.minute_bar_diagnostics import (
             build_minute_bar_diagnostics, format_diagnostics_log_line,
             format_order_detail_log_line,
         )
 
-        key = (symbol, base_date, tick_scope, requested_count)
+        key = (symbol, base_date, tick_scope, requested_count, response_outcome)
         if key in self._minute_diagnostic_keys:
             return
 
@@ -285,6 +299,7 @@ class KiwoomBroker(Broker):
             headers=headers,
             request_started_at=request_started_at,
             response_received_at=response_received_at,
+            response_outcome=response_outcome,
         )
 
         import logging

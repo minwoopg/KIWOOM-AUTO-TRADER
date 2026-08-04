@@ -2116,3 +2116,123 @@ unique count 정확(17번). `session_metrics` 모듈 자체의 2차 OHLC
 
 ---
 
+## 1D: 테스트 인프라 유실 발견 및 kiwoom_broker.py 버전 복구 (2026-08-04)
+
+**배경**: 1C.4 승인 이후 여러 세션이 지나며 확보된 프로젝트 zip에서
+`test_run_once_integration.py`(프로젝트 루트본)와 `run_regression_
+tests.py`가 실제로 유실된 상태임을 발견 — CHANGELOG 0.5단계에는
+"`tests/` 안의 중복 사본만 `legacy_tests/`로 옮겼다"고 기록되어
+있으나, 실제로는 루트 원본 자체도 함께 사라진 상태였음(경위 불명).
+8개 이상의 최신 안전 테스트(`test_stale_minute_data_safety.py`
+등)가 전자에서 `build_minimal_settings()`를 가져다 쓰고 있어,
+이 파일 없이는 회귀 스위트 대부분이 아예 실행 자체가 불가능했음.
+
+### 더 심각한 발견: kiwoom_broker.py가 1B.5 이전 버전으로 되돌아가 있었음
+
+`test_run_once_integration.py`를 복구하고 전체 회귀를 처음 돌려본
+결과, `test_minute_bar_diagnostics.py`가 `IndexError: tuple index
+out of range`로 실패 — 진단 키가 5요소(`response_outcome` 포함)를
+기대하는데 실제 코드는 4요소를 반환하고 있었음. `infra/broker/
+kiwoom_broker.py`를 직접 열어 확인한 결과, `_maybe_log_minute_bar_
+diagnostics`(1B.5에서 `_try_log_minute_bar_diagnostics`로 개명되고
+`response_outcome` 파라미터가 추가되기 **이전** 이름)가 그대로
+남아있었고, `get_minute_bars()`도 1B.5에서 고쳤던 정확히 그 버그
+(빈 응답 진단이 항상 먼저 실행되어 정상 응답 진단이 키 선점으로
+스킵되는 구조)를 그대로 갖고 있었음.
+
+**이건 이전 세션(2026-08-04 이전)에서 민우님이 공유해주신 실제
+운영 `app.log`가 `outcome=` 필드 없이 `returned=0`으로 찍혔던
+것과 정확히 같은 증상** — 그때는 "구버전 로그일 것"이라고 추정만
+했었는데, 이번에 실제 프로젝트 zip으로 그 추정이 사실이었음을
+확인. 파일 내부 타임스탬프로도 `kiwoom_broker.py`만 7/27(1B.5
+이전)이고 `domain/service/trading_service.py`(1C.4까지 반영, 7/29)
+등 다른 핵심 파일은 최신이라는 게 명확히 드러남 — 즉 diff를
+Windows에 적용하는 과정에서 이 파일 하나만 여러 차례에 걸쳐
+누락됐던 것으로 추정.
+
+**참고로 `minute_bar_diagnostics.py`(진단 데이터클래스·포맷팅
+함수) 자체는 최신 상태였음** — `response_outcome` 필드가 이미
+존재. 즉 딱 `kiwoom_broker.py`가 이 새 인터페이스를 호출하는
+방식만 구버전으로 남아있던, 부분적 불일치였음.
+
+**중요**: `domain/service/trading_service.py`는 `get_minute_bars()`
+의 반환 타입(`list[MinuteBar]`)만 사용하고 내부 진단 로직과는
+무관하므로, 이 버전 불일치가 실제 매매 판단(신규 진입 차단, stale
+데이터 처리 등)에는 영향을 주지 않았음 — 영향 범위는 순수하게
+"운영 모니터링 로그의 정확성"에 한정됨. 다만 이건 GPT가 여러
+차례 코드리뷰로 재현·수정했던 버그가 실서버에서 계속 재발하고
+있었다는 뜻이라, 로그를 근거로 한 향후 판단(예: 실제 raw 데이터
+품질 확인)이 매번 왜곡된 정보를 보고 있었다는 문제.
+
+### 수정
+
+`kiwoom_broker.py`의 `get_minute_bars()`를 CHANGELOG 1B.5절 기록
+그대로 재현해 복구:
+- 빈 응답 진단(`response_outcome="EMPTY"`)과 정상 응답 진단
+  (`response_outcome="SUCCESS"`)을 물리적으로 분리된 코드 경로
+  에서만 각각 정확히 한 번씩 호출하도록 재구성.
+- `_maybe_log_minute_bar_diagnostics` → `_try_log_minute_bar_
+  diagnostics`로 개명, `response_outcome` 파라미터 추가.
+- 진단 키를 `(symbol, base_date, tick_scope, count)` 4요소에서
+  `(symbol, base_date, tick_scope, count, response_outcome)` 5요소
+  로 확장 — EMPTY와 SUCCESS가 서로 다른 키를 가져 절대 서로를
+  밀어내지 않음.
+- `__init__`의 `_minute_diagnostic_keys` 타입 힌트도 5요소로 갱신.
+
+**재현 시나리오로 실제 수정 검증**: raw 70개/count 60 정상 응답을
+그대로 넣어 확인 — 수정 전이었다면 `returned=0, returned_order=
+N/A`로 찍혔을 상황에서, 수정 후 `outcome=SUCCESS, returned=60,
+returned_oldest`/`newest`가 실제 값으로 채워지고 `returned_order=
+ASC`로 정확히 확인됨. 빈 응답 → 정상 응답 연속 호출 시나리오도
+`EMPTY` 1회 + `SUCCESS` 1회로 정확히 분리됨을 재확인.
+
+`test_minute_bar_diagnostics.py` 84/84 전부 통과 확인.
+
+### test_run_once_integration.py 재작성
+
+기존 파일을 되찾지 못해, 이 시점의 `config/settings.py`(1B.9~1C.4
+반영, `MarketRegimeConfig`에 `minute_bar_min_count_for_entry`/
+`minute_bar_max_age_seconds`/`minute_fetch_backoff_seconds` 등
+신규 필드 다수 포함)의 모든 dataclass 필드를 하나씩 대조해 `build_
+minimal_settings()`를 새로 작성. `run_once()` 통합 테스트 본체
+(보유 종목 우선 처리 순서 검증)도 함께 복원. 이 헬퍼에 의존하던
+6개 최신 안전 테스트(`test_stale_minute_data_safety.py` 등)가
+전부 정상 실행됨을 확인.
+
+`run_regression_tests.py`도 순수 실행기(테스트 로직 없이 `test_
+*.py`를 찾아 subprocess로 순차 실행)라 그대로 재사용.
+
+### 정식 실행 불가로 판단해 스킵 처리한 것
+
+`test_legacy_fixture_structure.py`가 요구하는 `tests/fixtures/
+legacy_20260721/end_of_capture_runtime_state.json`(1A 단계에서
+실제로 캡처한 `data/state.json` 스냅샷 — README.md에 "개별 판단
+시점 재현에는 못 쓰는 캡처 종료 시점 데이터"라고 명시된 별도
+목적의 실데이터 파일, 같은 디렉토리의 `runtime_state.json`으로
+대체 불가)이 실제로 존재하지 않음. 이 파일은 실제 캡처 데이터라
+임의로 재생성하면 검증 자체가 무의미해지므로, 원본을 다시 확보
+하기 전까지 `run_regression_tests.py`에서 명시적으로 스킵하도록
+`SKIP_TEST_FILES` 상수와 안내 메시지 추가(왜 스킵하는지 실행 시
+마다 출력).
+
+### 이번 라운드에서 다루지 않은 것
+
+시간 관계상 `MACD 골든 필수`/`눌림목 VWAP+2% 차단`(GPT의 최근
+매매 데이터 분석에서 나온 개선안)은 이번에 착수하지 않음 — 먼저
+테스트 인프라와 실제 코드 버전을 정확히 맞추는 게 선행되어야
+그 다음 작업의 검증도 신뢰할 수 있다고 판단.
+
+**전체 회귀**: `run_regression_tests.py` — 9개 파일 전부 통과,
+1개(`test_legacy_fixture_structure.py`) 명시적 스킵, 종료코드 0.
+로그/데이터 디렉토리 오염 없음 확인.
+
+**⚠️ 여전히 필요한 것**: `test_legacy_fixture_structure.py`의
+`end_of_capture_runtime_state.json` 원본을 다시 확보하거나(1A
+단계 작업 당시의 다른 백업이 있다면), 없으면 이 테스트를 완전히
+폐기하고 README.md도 함께 정리할지 판단 필요. 또한 이번에 발견한
+"파일별 버전 불일치"가 `kiwoom_broker.py` 외에 다른 파일에도
+있을 수 있으므로, 다음 기회에 CHANGELOG의 각 단계별 수정 내용과
+실제 파일 상태를 전수 대조하는 작업을 권장.
+
+---
+
