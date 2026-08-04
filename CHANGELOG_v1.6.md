@@ -2236,3 +2236,98 @@ legacy_20260721/end_of_capture_runtime_state.json`(1A 단계에서
 
 ---
 
+## 1E: MACD 상태 shadow 관측 필드 추가 (2026-08-04)
+
+**배경**: 7/30~8/4 실제 매매 성과 분석에서 체결 10건 중 MACD 데드
+3건이 전부 손실이었음을 `trades.csv`의 `entry_reason` 텍스트
+파싱으로 확인했으나, 이건 실제 체결된 극소수 케이스에만 있는
+정보 — 매수로 안 이어진 수만 건의 HOLD/SKIP 판단에는 MACD 상태가
+`signal_log.csv`에 전혀 기록되지 않아(재현 확인: 원본 컬럼에
+`macd`/`macd_signal` 자체가 없었음) "MACD 데드 요구 게이트를 넣으면
+몇 건이 추가로 막혔을지"를 과거 데이터로 계산할 방법이 없었음.
+GPT 코드리뷰 지시대로, 실제 게이트를 넣기 전에 먼저 관측 필드부터
+쌓기로 함 — 신호 판단 로직은 전혀 바꾸지 않음.
+
+### 발견: 완전 신규 게이트가 아니라 기존 게이트 확장이 정확한 방향
+
+코드를 먼저 읽어본 결과(GPT 지시), `domain/strategy/breakout_
+strategy.py`에 이미 `chasing_overheated`(당일 등락률 >= 3% AND
+MACD 데드 → `min_score`를 3에서 5로 상향)라는 게이트가 존재했음.
+이전 분석에서 "PR 조건이 VWAP+2% 기준"이라고 정리했던 건 부정확
+— 실제로는 "고가 대비 -1%~-7% 눌림" 기준. MACD 데드 3건 중
+005930(5점)/047040(6점)은 이미 5점 이상이라 기존 게이트를 통과할
+자격이 있었고, 002990(4점)만 등락률이 3% 미만이라 게이트 자체가
+발동 안 했던 것으로 추정 — 즉 "MACD 데드 완전 차단"을 새로
+만들면 기존 게이트와 중복/상충되므로, 이 프로젝트의 기존 컨벤션
+(`min_score` 상향 방식)을 따라 조건을 확장하는 게 안전.
+
+### 구현
+
+`infra/storage/logger.py`의 `SIGNAL_FIELDS`에 5개 필드 추가:
+- `macd_golden`: `cond_macd_cross`(`macd > macd_signal`)와 정확히
+  동일한 계산.
+- `macd_dead`: `not macd_golden`.
+- `macd_hist_dir`: `MarketPrice.indicator_macd_hist_direction`
+  원시값 그대로.
+- `chasing_overheated`: `breakout_strategy.py`의 실제 게이트
+  조건(`당일등락 >= 3% AND MACD 데드`)과 한 글자도 다르지 않게
+  재사용 — 다른 계산식을 쓰면 로그와 실제 동작이 미묘하게
+  어긋나는 위험이 있어, 정확히 같은 식을 그대로 복사.
+- `would_be_blocked_if_macd_dead_required`: "MACD 데드면 등락률과
+  무관하게 무조건 5점 요구"였다면 이번 판단(`score < 5`)이
+  막혔을지 여부 — shadow 전용, 실제 판단에는 미반영.
+
+지표가 없는 경우(`macd is None`)나 이 필드가 애초에 의미가 없는
+경우(MACD 골든일 때의 `would_be_blocked`)는 `False`로 단정하지
+않고 빈 값으로 남김 — "관측 불가"와 "조건이 거짓"을 혼동하지
+않도록.
+
+`domain/service/trading_service.py`의 `_write_signal_log()`에
+`market_price` 파라미터 추가(기본값 `None`, 하위 호환 유지),
+`_process_symbol()`의 호출부에서 이미 스코프에 있던 `market_price`
+를 그대로 전달. 신호 판단(`Signal` 생성)은 이 함수 호출 이전에
+이미 끝나 있으므로, 이 로깅 추가가 판단 로직에 물리적으로
+개입할 방법이 없음.
+
+기존 `SignalCsvLogger._migrate_header_if_needed()`가 이미 "헤더에
+없는 새 필드를 자동으로 추가"하도록 설계되어 있어(0.5단계에서
+`atr_14` 등 추가 시 만든 로직), 별도 마이그레이션 코드 없이도
+53MB 규모의 기존 실서버 `signal_log.csv`가 재시작 시 자동으로
+새 헤더를 갖추도록 재확인(시뮬레이션으로 검증).
+
+### 검증
+
+- MACD 데드 + 당일등락 4% → `chasing_overheated=True`(실제 게이트
+  조건과 정확히 일치).
+- MACD 데드 + `score=4`(5점 미만) → `would_be_blocked=True`.
+- MACD 데드 + `score=6`(5점 이상) → `would_be_blocked=False`(이미
+  기존 게이트를 통과할 자격이 있었다는 뜻).
+- MACD 골든 → `would_be_blocked`는 빈 값(관측 대상 아님).
+- 지표 없음(`macd=None`) → 5개 필드 전부 빈 값(관측 불가를
+  명확히 구분).
+- `market_price` 생략(하위 호환) → 예외 없이 정상 기록, 5개
+  필드 전부 빈 값.
+- **핵심 안전 조건**: `_process_symbol()` 통합 흐름에서 `strategy.
+  generate_signal()`이 반환한 `Signal`을 그대로 `patch`로 고정한
+  뒤, `signal_log.csv`의 `skip_reason`이 그 원본 `reason`과 정확히
+  일치함을 확인 — 관측 필드 계산 로직이 신호 자체를 조금도 바꾸지
+  않음을 통합 레벨에서 재확인.
+- 기존 대용량 CSV(구버전 헤더)에 대해서도 헤더 마이그레이션이
+  정상 동작해 새 5개 필드가 추가됨을 시뮬레이션으로 확인.
+
+`test_macd_shadow_observation.py`(신규, 19건) 전부 통과.
+
+**전체 회귀**: `run_regression_tests.py` — 10개 파일 전부 통과,
+1개(`test_legacy_fixture_structure.py`) 명시적 스킵, 종료코드 0.
+로그/데이터 디렉토리 오염 없음 확인.
+
+**다음 단계**: 이 관측 필드가 실서버에서 며칠(GPT 권장 최소 3~5
+거래일) 쌓이면, `chasing_overheated=True`인 경우와 `would_be_
+blocked_if_macd_dead_required=True`인 경우가 실제로 몇 건인지,
+그리고 그 판단들이 만약 매수로 이어졌다면 어떤 성과를 냈을지를
+데이터로 계산할 수 있음. 그 결과를 보고 실제 게이트를 shadow로
+넣을지, 그대로 관측만 계속할지 판단. 이번 라운드에서는 실거래
+동작을 전혀 바꾸지 않음.
+
+---
+

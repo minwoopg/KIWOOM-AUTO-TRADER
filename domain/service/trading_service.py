@@ -1505,6 +1505,7 @@ class TradingService:
                 minute_analysis=minute_analysis,
                 final_decision=final_decision,
                 order_block_reason=order_block_reason,
+                market_price=market_price,
             )
 
         except Exception as exc:
@@ -2692,14 +2693,66 @@ class TradingService:
         order_block_reason: str = "",
         atr_result=None,
         bb_result=None,
+        market_price=None,
     ) -> None:
         """시그널 판단 결과를 signal_log.csv에 기록합니다.
 
         BUY뿐 아니라 HOLD/SKIP도 모두 기록합니다.
+
+        2026-08-04 (GPT 코드리뷰 지시, MACD shadow 관측 1단계):
+        market_price(MACD 원시 지표를 담은 객체)를 받아 5개 관측
+        필드를 추가로 기록 — 신호 판단 로직(어떤 Signal이 반환
+        됐는지)은 전혀 바꾸지 않고, 순수하게 "만약 이랬다면"을
+        계산해서 로그에만 남김. 배경: trades.csv의 entry_reason
+        텍스트 파싱으로는 실제 체결된 10건만 볼 수 있어서, 매수로
+        안 이어진 수만 건의 HOLD/SKIP 판단에서 MACD 상태가 몇 건
+        이나 있었는지, 새 게이트를 넣으면 몇 건이 추가로 막혔을지
+        전혀 알 수 없었음(signal_log.csv 원본에 macd/macd_signal
+        자체가 없었던 것 재현 확인). 이 필드들이 며칠 쌓이면 그때
+        비로소 "MACD 데드 요구" 게이트의 실제 영향 범위를 데이터로
+        계산할 수 있음 — 이번 라운드에서는 로그만 남기고 실제
+        매매 판단에는 절대 영향 없음(강제 아님, 관측 전용).
         """
         import re
         m = re.search(r'(\d+)/8', signal.reason)
         score = m.group(1) if m else ""
+
+        # ── MACD 상태 관측 (2026-08-04) ──────────────────────────
+        # domain/strategy/breakout_strategy.py의 cond_macd_cross,
+        # chasing_overheated와 정확히 동일한 계산식을 그대로 재사용
+        # — 실제 매수 판단에 쓰이는 조건과 한 글자도 다르지 않아야
+        # "이 로그가 실제로 그 판단을 정확히 반영한다"고 신뢰할 수
+        # 있음(다른 계산식을 쓰면 로그와 실제 동작이 미묘하게
+        # 어긋나는 위험이 생김).
+        macd_golden_val = ""
+        macd_dead_val = ""
+        macd_hist_dir_val = ""
+        chasing_overheated_val = ""
+        would_be_blocked_val = ""
+        if market_price is not None and market_price.indicator_macd is not None \
+                and market_price.indicator_macd_signal is not None:
+            cond_macd_cross = market_price.indicator_macd > market_price.indicator_macd_signal
+            macd_golden_val = cond_macd_cross
+            macd_dead_val = not cond_macd_cross
+            macd_hist_dir_val = market_price.indicator_macd_hist_direction
+
+            change_rate_pct = (
+                minute_analysis.change_rate_pct if minute_analysis is not None else None
+            )
+            chasing_overheated_val = (
+                minute_analysis is not None
+                and change_rate_pct is not None
+                and change_rate_pct >= 3.0
+                and macd_dead_val
+            )
+
+            # "MACD 데드면 등락률과 무관하게 무조건 5점 요구"였다면
+            # 이번 판단(score < 5)이 막혔을지 여부. score가 파싱 안
+            # 되는 경우(HOLD 등으로 8점 체계 자체가 안 돌아간 경우)
+            # 는 판단 불가이므로 빈 값으로 남김 — "아니오"로 단정하지
+            # 않음(관측 불가와 "차단 안 됨"을 구분).
+            if macd_dead_val and score:
+                would_be_blocked_val = int(score) < 5
 
         patterns = []
         row: dict = {
@@ -2713,6 +2766,11 @@ class TradingService:
             "final_decision":    final_decision or signal.type.value,
             "order_block_reason": order_block_reason,
             "condition_name": self._symbol_to_condition.get(symbol, ""),
+            "macd_golden": macd_golden_val,
+            "macd_dead": macd_dead_val,
+            "macd_hist_dir": macd_hist_dir_val,
+            "chasing_overheated": chasing_overheated_val,
+            "would_be_blocked_if_macd_dead_required": would_be_blocked_val,
         }
         if minute_analysis is not None:
             ma = minute_analysis

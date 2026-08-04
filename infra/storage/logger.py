@@ -151,6 +151,22 @@ SIGNAL_FIELDS = [
     "bb_percent_b",       # 볼린저 %B (0=하단, 1=상단)
     "bb_bandwidth_pct",   # 볼린저 밴드폭 (%)
     "bb_position",        # 볼린저 위치 (LOWER_ZONE / MID_UPPER 등)
+    # ── MACD 상태 관측 필드 (2026-08-04, GPT 코드리뷰 지시) ─────
+    # 배경: trades.csv의 entry_reason 텍스트 파싱으로 "MACD 데드
+    # 3건 전부 손실"을 확인했으나, 이건 실제 체결된 극소수 케이스
+    # (10건)에만 있는 정보 — 매수로 안 이어진 수만 건의 HOLD/SKIP
+    # 판단에는 MACD 상태가 전혀 기록되지 않아, "새 게이트를 넣으면
+    # 몇 건이 추가로 막혔을지"를 과거 데이터로 계산할 방법이 없었음
+    # (재현 확인: signal_log.csv 원본 컬럼에 macd/macd_signal 자체가
+    # 없음). 아래 필드는 이후 관측을 쌓기 위한 것 — 신호 판단 로직
+    # 자체는 전혀 바꾸지 않고 순수 관측치만 기록.
+    "macd_golden",        # cond_macd_cross(macd > macd_signal) 그대로
+    "macd_dead",           # not macd_golden (True/False/빈값=지표없음)
+    "macd_hist_dir",       # macd_hist_dir 원시값(모멘텀 가속/둔화 부호)
+    "chasing_overheated",  # 기존 추격매수 차단 게이트(당일등락≥3%+MACD데드) 발동 여부
+    "would_be_blocked_if_macd_dead_required",  # "MACD 데드면 무조건 5점
+                                                 # 요구"였다면 이 판단이
+                                                 # 막혔을지 여부(shadow only)
 ]
 
 
