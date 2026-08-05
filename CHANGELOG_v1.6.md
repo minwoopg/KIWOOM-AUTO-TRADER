@@ -2331,3 +2331,261 @@ blocked_if_macd_dead_required=True`인 경우가 실제로 몇 건인지,
 
 ---
 
+## 1E.2: MACD shadow 필드 재설계 — hard gate/min5 분리 (2026-08-04)
+
+**배경**: 1E 1차 구현에 대한 GPT 코드리뷰에서 필드 의미 자체가
+검증 대상과 다르다는 지적을 받음. 원래 검증하려던 가설은 "MACD가
+Signal 이하이면 점수와 무관하게 완전 차단"(hard gate)이었는데,
+1차 구현의 `would_be_blocked_if_macd_dead_required`는 실제로
+`macd_dead and score < 5`(기존 `chasing_overheated`의 min-score-5
+확장판)를 계산하고 있었음 — 재현 확인: "MACD 데드 + 6점" 케이스가
+hard gate 기준에서는 `True`(6점이어도 완전 차단 대상)여야 하는데,
+1차 필드는 6점이 이미 5점을 넘으므로 `False`로 나오고 있었음.
+
+### 발견·수정한 4가지 문제
+
+**1. hard gate와 min-score-5를 하나의 필드로 뭉뚱그림**: `would_
+block_macd_dead_min_score5`(기존 게이트 확장판)와 `would_block_
+macd_above_signal_required`(원래 검증 대상, 점수 무관 완전 차단)
+두 필드로 분리. 재현 검증: dead+BUY+6점 → `hard=True, min5=False`
+(1차 버전이었다면 여기서 `False`가 나왔을 정확히 그 케이스),
+dead+BUY+4점 → `hard=True, min5=True`.
+
+**2. HOLD 행에서도 "차단됐을 것"을 계산**: legacy 전략이 실제로
+BUY를 반환하지 않은 판단(HOLD 등)을 "차단"이라고 부르는 건
+counterfactual의 정의 자체가 안 맞음 — `legacy_buy_candidate`
+(`signal.type == SignalType.BUY`) 조건을 추가해, 이 조건이 참일
+때만 hard/min5를 계산하고 그 외엔 빈 값으로 남김. MACD 상태 관측
+값(`macd_above_signal` 등)은 HOLD에도 계속 기록.
+
+**3. 원시값(`macd`, `macd_signal`) 누락**: Boolean만 남기면 향후
+임계값을 바꾸거나 계산 오류를 재검증할 방법이 없다는 지적에 따라
+`macd`, `macd_signal` 원시 필드 추가.
+
+**4. `latest_bar_timestamp` 없음**: 같은 1분봉에서 10~15초마다
+반복 기록되는 `signal_log.csv`의 특성상, 정확한 dedup을 위해
+필요 — `_process_symbol()`에서 `minute_result.latest_bar_
+timestamp`를 안전하게 초기화(BEARISH/UNKNOWN 등 `minute_result`
+자체가 정의 안 되는 경로에서도 `NameError` 없이 빈 값 처리)한 뒤
+`_write_signal_log()`로 전달.
+
+**5. `chasing_overheated`가 NEUTRAL에서도 계산됨**: 이 게이트는
+`BreakoutStrategy`(BULLISH 전용)에만 실제로 존재하는데, NEUTRAL
+등 다른 장세에서도 조건식만 계산해 "적용되지도 않는 게이트가
+발동했다"는 거짓 신호를 낼 위험이 있었음 — `chasing_overheated_
+applies`(`regime == MarketRegime.BULLISH`) 필드를 신설해 구분.
+NEUTRAL이면 `applies=False`이고 `chasing_overheated` 자체는 빈 값.
+
+**6. 이름 변경**: `macd_golden`/`macd_dead` → `macd_above_signal`
+로 통일 — "골든크로스"(방금 교차가 일어났는지)가 아니라 "지금
+`macd > macd_signal`인 상태"를 뜻하므로, 실제 이벤트처럼 들리는
+이름을 정확한 이름으로 교체.
+
+**7. 53MB급 CSV 마이그레이션이 원본을 직접 덮어쓰는 위험**:
+`SignalCsvLogger._migrate_header_if_needed()`가 기존엔 전체 파일을
+메모리에 읽어 `self.file_path`를 `"w"` 모드로 직접 재작성하고
+있었음 — 재작성 도중 프로세스가 죽거나 디스크 문제가 생기면
+원본이 훼손될 위험. 이제 (1) 재작성 전 `.bak`으로 원본 백업,
+(2) 임시 파일(`.tmp`)에 한 행씩 스트리밍으로 재작성(메모리 부담
+없음), (3) `os.replace()`로 원자적 교체(중간 상태 없이 교체 전
+아니면 교체 후만 존재) — 세 단계로 재작성.
+
+### `SIGNAL_FIELDS` 최종 구조 (10개 필드)
+
+```text
+macd, macd_signal, macd_above_signal, macd_hist_direction,
+legacy_buy_candidate, latest_bar_timestamp,
+chasing_overheated_applies, chasing_overheated,
+would_block_macd_dead_min_score5, would_block_macd_above_signal_required
+```
+
+### 재검증 (직접 코드 실행으로 확인)
+
+- dead+BUY+6점 → `hard=True, min5=False`(1차 버그였던 정확히 그
+  케이스, 이제 정확).
+- dead+BUY+4점 → `hard=True, min5=True`.
+- dead+HOLD+4점 → `macd_above_signal=False`는 기록되지만 `hard`/
+  `min5`는 빈 값.
+- golden+BUY → `hard=False`.
+- NEUTRAL → `chasing_overheated_applies=False`, `chasing_
+  overheated=`빈 값.
+- BULLISH+등락4%+MACD데드 → `chasing_overheated=True`(실제
+  `breakout_strategy.py` 조건과 정확히 일치).
+- BULLISH+등락2%(<3%)+MACD데드 → `chasing_overheated=False`
+  (002990 4점 케이스처럼 실제 게이트가 발동 안 하는 상황 재현).
+- 원시 `macd`/`macd_signal` 정확히 기록.
+- BEARISH 경로에서도 `NameError` 없이 `latest_bar_timestamp` 빈
+  값 처리.
+- 통합 흐름(`_process_symbol()`)에서 `latest_bar_timestamp`가
+  실제 최신 분봉과 일치.
+- 마이그레이션 시 `.bak` 생성, 원본과 내용 일치, `.tmp` 정리됨,
+  행 수 보존, 새 헤더 반영 — 전부 확인.
+
+### `test_macd_shadow_observation.py` 전면 재작성 (19→39건)
+
+GPT 2차 지시 내용을 전부 반영: `SIGNAL_FIELDS` 필드명 확인(1차
+폐기 이름이 더 이상 없는지 포함), hard/min5 분리 4케이스, 원시값·
+타임스탬프, `chasing_overheated_applies` 구분, BULLISH 실제조건
+일치, 지표없음/하위호환, 신호판단 무영향 통합테스트, CSV 마이
+그레이션 안전성 8케이스(백업/임시파일/행수보존/헤더반영) 포함.
+
+**전체 회귀**: `run_regression_tests.py` — 10개 파일 전부 통과,
+1개(`test_legacy_fixture_structure.py`) 명시적 스킵, 종료코드 0.
+로그/데이터 디렉토리 오염 없음 확인.
+
+**현재 상태**: 이번 라운드도 실거래 동작을 전혀 바꾸지 않음 —
+순수 관측 필드 재설계. 다음은 GPT가 제안한 1E.1(VWAP shadow:
+`would_block_pr_only_vwap`, `would_block_c_or_pr_vwap`, `would_
+block_pullback_condition_vwap`, `would_block_pr_or_pullback_
+condition_vwap`)로, PR 조건이 실제로는 "고가 대비 -1%~-7% 눌림"
+기준이지 VWAP 기준이 아니므로(1E 1차절 참고) `is_pulldown_
+recovery`/`is_valid_pulldown`/조건검색식명 세 가지 범위를 각각
+따로 관찰해야 함.
+
+---
+
+## 1E.3: minute_bar_saver.py 타임존 버그 발견 및 수정 (2026-08-04)
+
+**배경**: 1E.2 전체 회귀 재확인 중 `test_minute_ohlc_quality_
+safety.py`의 12번(정상 응답이 minute_bars CSV에 저장되는지 확인)
+이 `FileNotFoundError`로 실패 — 이번 라운드의 코드 변경과 무관한
+기존 버그를 우연히 발견.
+
+**원인**: `infra/storage/minute_bar_saver.py`의 `MinuteBarSaver.
+save()`가 저장 폴더의 날짜를 `datetime.now().date()`(시스템 로컬
+시각)로 계산하고 있었음 — 이 프로젝트 전체가 KST 거래일 기준으로
+동작하는데, 이 파일만 `now_kst()`를 쓰지 않고 있었음. Windows
+실서버(시스템 로컬 시각이 이미 KST)에서는 우연히 문제가 드러나지
+않았지만, 컨테이너처럼 시스템 로컬 시각이 UTC인 환경에서는 저장
+폴더 날짜가 KST 기준 날짜와 최대 9시간까지 어긋날 수 있음(재현:
+UTC 23:39=KST 08:39 시점에 테스트를 실행하면, 봉 자체는 KST
+기준으로 만들어졌는데 저장 폴더는 UTC 날짜로 계산되어 하루 전
+폴더에 저장됨 — 테스트가 `now_kst()` 기준 경로를 찾다가 실패).
+
+**영향 범위**: 이 문제 자체는 실제 Windows 운영 환경에는 영향이
+없었을 가능성이 높음(시스템 로컬 시각이 이미 KST이므로 `datetime.
+now()`와 `now_kst()`가 사실상 같은 값을 반환). 다만 향후 이
+프로젝트를 다른 시간대 서버(예: UTC 기준 클라우드 인스턴스)로
+옮기게 되면 실제로 재현될 잠재적 버그였음 — 이번에 우연히
+발견해 미리 차단.
+
+**수정**: `datetime.now().date()` → `now_kst().date()`로 교체,
+`utils.time_utils.now_kst` import 추가. 재현 시나리오(UTC 23:39
+시점)로 실제 수정 검증 — 봉 생성과 경로 확인이 모두 KST 기준으로
+일치해 정상 저장 확인.
+
+`test_minute_ohlc_quality_safety.py` 26/26 재확인(수정 전 12번
+실패, 수정 후 전부 통과).
+
+**전체 회귀**: `run_regression_tests.py` — 10개 파일 전부 통과,
+1개(`test_legacy_fixture_structure.py`) 명시적 스킵, 종료코드 0.
+로그/데이터 디렉토리 오염 없음 확인.
+
+---
+
+## 1E.4: chasing_overheated 관측범위 확장, 분봉 리플레이 날짜분리, timestamp KST 통일 (2026-08-04)
+
+**배경**: 1E.2/1E.3 승인 직후, 데이터 수집을 시작하기 전 GPT 3차
+코드리뷰로 4가지 보완사항이 지적됨 — 하나는 관측 의미 문제, 하나는
+분봉 리플레이 데이터 오염 문제, 나머지 둘은 타임존 일관성.
+
+### 1. `chasing_overheated`가 BUY 후보에만 계산되어 정작 실제 차단 사례를 못 봄 (재현 확인)
+
+기존 `chasing_overheated_val`이 `legacy_buy_candidate_val`(신호가
+BUY)일 때만 계산되고 있었는데, 실제 `BreakoutStrategy`의 `chasing_
+overheated` 게이트가 진짜로 차단한 사례("등락4%+MACD데드+4점")는
+전략 자체가 이미 `HOLD`를 반환함 — 그 HOLD 행에서는 `legacy_buy_
+candidate_val=False`가 되어 `chasing_overheated`가 빈 값으로
+남고, "기존 게이트가 실제로 몇 건을 막았는가"를 이 필드로 전혀
+집계할 수 없었음(재현: 등락4%+MACD데드+4점 입력 → `legacy_buy_
+candidate=False, chasing_overheated=""`).
+
+**수정**: 조건 자체(`chasing_overheated_condition`)와 그 조건이
+실제로 기존 게이트를 발동시켰는지(`would_block_existing_chasing_
+gate`)를 `legacy_buy_candidate`와 무관하게(BUY든 HOLD든) 계산하도록
+분리 — `chasing_overheated_applies`(BULLISH 여부)가 True일 때는
+항상 계산됨. 신규 가상 게이트 두 필드(`would_block_macd_dead_
+min_score5`, `would_block_macd_above_signal_required`)는 기존
+정책대로 `legacy_buy_candidate=True`일 때만 계산 유지 — 이건
+"새 규칙이 있었다면 이번 BUY 시도가 막혔을지"를 묻는 질문이라
+BUY 후보 한정이 맞음, 반대로 `chasing_overheated_condition`은
+"기존에 이미 있는 게이트가 지금 발동 중인지"를 묻는 질문이라
+BUY/HOLD와 무관해야 함 — 두 질문의 성격이 다름.
+
+재현 시나리오로 재검증: 등락4%+MACD데드+4점(HOLD) → `legacy_buy_
+candidate=False`인 채로 `chasing_overheated_condition=True, would_
+block_existing_chasing_gate=True`로 정확히 집계됨. 조건 자체가
+거짓인 경우(MACD 골든 등)는 `would_block_existing_chasing_gate=
+False`로 명시(빈 값 아님 — "발동 안 함"이 명확한 사실이므로).
+
+### 2. `MinuteBarSaver`가 전일 봉을 오늘 리플레이 CSV에 섞어 저장 (재현 확인)
+
+`save()`가 `target_date = now_kst().date()` 하나만 정해서 `bars`
+전체를 같은 오늘 날짜 폴더에 저장하고 있었음 — 키움 최근 60봉
+응답은 장 초반에 전일 봉과 오늘 봉이 섞여 오는 경우가 흔한데(예:
+09:01에 전일 43개+오늘 17개), 그 60개가 전부 오늘 리플레이 CSV
+파일 하나에 뒤섞여 저장되고 있었음(재현: 20260804 15:29 봉과
+20260805 09:00 봉을 함께 넣으면 둘 다 `20260805/{symbol}.csv`
+안에 섞여 들어감). 이건 1C단계 세션 지표에서 이미 재현·차단했던
+것과 정확히 같은 유형의 오염이 리플레이용 원본 CSV에는 그대로
+남아있던 것 — 오늘 폴더에 전일 봉이 섞이면 그 리플레이 파일로
+계산하는 당일 고가·저가·VWAP과 A/B/C/V/PR 패턴의 장 초반 판정이
+전부 왜곡될 수 있음.
+
+**수정**: `save()`가 봉을 받으면 `cntr_tm`을 `parse_kst_bar_
+timestamp()`로 파싱해 실제 날짜별로 그룹핑한 뒤, 각 날짜의
+폴더에 나눠 저장하도록 재작성(`_save_for_date()` 헬퍼로 분리).
+파싱 불가능한 timestamp(형식이 깨진 봉)는 조용히 건너뜀 — 저장
+자체를 막지 않되 어느 날짜 폴더에도 잘못된 데이터를 넣지 않음.
+
+재현 시나리오로 재검증: 전일43+오늘17 입력 → `20260804/{symbol}.
+csv`에 정확히 43개, `20260805/{symbol}.csv`에 정확히 17개로
+분리 저장, 각 파일에 다른 날짜 timestamp 0개 확인.
+
+### 3. `signal_log.csv`의 `timestamp`가 시스템 로컬 시각 (재현 확인)
+
+`_write_signal_log()`의 `timestamp` 필드가 `datetime.now().
+isoformat()`(시스템 로컬 시각)을 쓰고 있어서, UTC 컨테이너 등
+KST가 아닌 환경에서는 같은 행 안의 `latest_bar_timestamp`(KST
+기준)와 최대 9시간까지 어긋날 수 있었음(재현: UTC 00:45 환경에서
+`datetime.now()`는 00:45대인데 `now_kst()`는 09:45대). MACD
+shadow가 신호를 시간대·분봉별로 묶어 분석할 예정이므로 함께 통일.
+
+**수정**: `now_kst().replace(tzinfo=None).isoformat()`로 교체 —
+기존 CSV의 timestamp 컬럼 포맷(타임존 표기 없는 ISO 문자열)과의
+호환을 유지하면서 값 자체는 KST 벽시계 시각으로 통일.
+
+재현 시나리오로 재검증: UTC 00:45(KST 09:45) 환경에서 기록된
+`timestamp`가 정확히 KST 09시대로 확인.
+
+### 4. (선택 개선, 함께 반영) CSV 마이그레이션에 flush+fsync 추가
+
+`os.replace()` 자체는 이미 원자적이지만, 그 직전 `.tmp` 파일의
+내용이 OS 캐시에만 있고 디스크에 아직 안 쓰인 상태에서 강한
+장애(정전 등)가 나면 교체 후에도 불완전한 파일이 될 위험이
+있어, `.tmp` 파일 close 전에 `flush()` + `os.fsync()`를 추가해
+디스크 반영을 보장.
+
+### 테스트 갱신
+
+`test_macd_shadow_observation.py`를 GPT 3차 지시대로 갱신(39→55
+건): `read_last_row()`를 `split(",")` 대신 `csv.DictReader`로
+교체(향후 필드값에 쉼표가 섞여도 안전), `chasing_overheated` →
+`chasing_overheated_condition`으로 필드명 갱신, HOLD 행에서도
+기존 게이트가 정확히 집계되는지(17~18번), `MinuteBarSaver` 날짜
+분리 저장(19~21번), `signal_log` timestamp KST 통일(22번) 신규
+테스트 추가.
+
+**전체 회귀**: `run_regression_tests.py` — 10개 파일 전부 통과,
+1개(`test_legacy_fixture_structure.py`) 명시적 스킵, 종료코드 0.
+로그/데이터 디렉토리 오염 없음 확인.
+
+**현재 상태**: 이번 라운드도 실거래 동작을 전혀 바꾸지 않음 —
+순수 관측 필드 재설계 + 리플레이 데이터 저장 버그 수정. 이제
+MACD shadow 관측을 실서버에서 시작해도 안전한 상태로 판단.
+다음은 GPT가 제안한 VWAP shadow — PR 조건이 실제로는 "고가 대비
+-1%~-7% 눌림" 기준이므로 `is_pulldown_recovery`/`is_valid_
+pulldown`/조건검색식명 세 범위를 각각 따로 관찰.
+
+---
+

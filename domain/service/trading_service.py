@@ -1258,11 +1258,18 @@ class TradingService:
             minute_analysis = None
             minute_data_entry_safe = True
             minute_data_reason = ""
+            # 2026-08-04 (GPT 코드리뷰 지시, MACD shadow 관측):
+            # minute_result는 regime이 BULLISH/NEUTRAL/REBOUND일
+            # 때만 정의되므로(BEARISH/UNKNOWN 경로는 이 블록 자체를
+            # 안 탐), _write_signal_log()에 latest_bar_timestamp를
+            # 안전하게 넘기기 위해 별도 변수로 미리 초기화.
+            latest_bar_timestamp = None
             if regime in (MarketRegime.BULLISH, MarketRegime.NEUTRAL, MarketRegime.REBOUND):
                 minute_result = self._get_minute_analysis(symbol, market_price.previous_close)
                 minute_analysis = minute_result.analysis
                 minute_data_entry_safe = minute_result.entry_safe
                 minute_data_reason = minute_result.reason
+                latest_bar_timestamp = minute_result.latest_bar_timestamp
                 # 2026-07-28 (6차 GPT 코드리뷰 지적 5번, "1B Safety
                 # Closure"): 기존엔 minute_analysis가 존재하기만
                 # 하면(캐시로 얻은 stale 데이터라도) [MIN]/[V_FAIL]
@@ -1506,6 +1513,7 @@ class TradingService:
                 final_decision=final_decision,
                 order_block_reason=order_block_reason,
                 market_price=market_price,
+                latest_bar_timestamp=latest_bar_timestamp,
             )
 
         except Exception as exc:
@@ -2694,69 +2702,142 @@ class TradingService:
         atr_result=None,
         bb_result=None,
         market_price=None,
+        latest_bar_timestamp=None,
     ) -> None:
         """시그널 판단 결과를 signal_log.csv에 기록합니다.
 
         BUY뿐 아니라 HOLD/SKIP도 모두 기록합니다.
 
         2026-08-04 (GPT 코드리뷰 지시, MACD shadow 관측 1단계):
-        market_price(MACD 원시 지표를 담은 객체)를 받아 5개 관측
-        필드를 추가로 기록 — 신호 판단 로직(어떤 Signal이 반환
-        됐는지)은 전혀 바꾸지 않고, 순수하게 "만약 이랬다면"을
-        계산해서 로그에만 남김. 배경: trades.csv의 entry_reason
-        텍스트 파싱으로는 실제 체결된 10건만 볼 수 있어서, 매수로
-        안 이어진 수만 건의 HOLD/SKIP 판단에서 MACD 상태가 몇 건
-        이나 있었는지, 새 게이트를 넣으면 몇 건이 추가로 막혔을지
-        전혀 알 수 없었음(signal_log.csv 원본에 macd/macd_signal
-        자체가 없었던 것 재현 확인). 이 필드들이 며칠 쌓이면 그때
-        비로소 "MACD 데드 요구" 게이트의 실제 영향 범위를 데이터로
-        계산할 수 있음 — 이번 라운드에서는 로그만 남기고 실제
-        매매 판단에는 절대 영향 없음(강제 아님, 관측 전용).
+        market_price(MACD 원시 지표를 담은 객체)를 받아 관측 필드를
+        추가로 기록 — 신호 판단 로직(어떤 Signal이 반환됐는지)은
+        전혀 바꾸지 않고, 순수하게 "만약 이랬다면"을 계산해서
+        로그에만 남김.
+
+        2026-08-04 (2차 GPT 코드리뷰 지적, 필드 재설계): 1차
+        구현에서 두 가지 문제가 발견됨 —
+        (a) "MACD 데드면 최소 5점 요구"(min-score-5, breakout_
+            strategy.py에 이미 있는 chasing_overheated 확장판)와
+            "MACD가 Signal 이하이면 점수와 무관하게 완전 차단"
+            (hard gate, 원래 검증하려던 대상)을 would_be_blocked_
+            if_macd_dead_required 필드 하나로 뭉뚱그렸음 — hard
+            gate 기준에서는 True여야 할 "데드+6점" 케이스가 min5
+            기준(6점이면 이미 통과)으로 계산되어 False로 나오고
+            있었음.
+        (b) legacy signal이 BUY가 아닌(HOLD 등) 행에서도 "차단됐을
+            것"을 계산하고 있었음 — HOLD였던 판단을 "차단"이라고
+            부르는 건 counterfactual의 정의 자체가 안 맞음(애초에
+            매수 후보가 아니었던 것과, 매수 후보였는데 새 게이트가
+            막은 것은 다른 질문).
+
+        이제 두 가지 hard-vs-min5 필드로 명확히 분리하고, 두 필드
+        모두 "legacy_buy_candidate(전략이 실제로 BUY를 반환한
+        경우)"일 때만 계산 — HOLD 행은 MACD 상태만 기록하고 두
+        차단 필드는 빈 값으로 남김.
         """
         import re
         m = re.search(r'(\d+)/8', signal.reason)
         score = m.group(1) if m else ""
 
-        # ── MACD 상태 관측 (2026-08-04) ──────────────────────────
-        # domain/strategy/breakout_strategy.py의 cond_macd_cross,
-        # chasing_overheated와 정확히 동일한 계산식을 그대로 재사용
-        # — 실제 매수 판단에 쓰이는 조건과 한 글자도 다르지 않아야
-        # "이 로그가 실제로 그 판단을 정확히 반영한다"고 신뢰할 수
-        # 있음(다른 계산식을 쓰면 로그와 실제 동작이 미묘하게
-        # 어긋나는 위험이 생김).
-        macd_golden_val = ""
-        macd_dead_val = ""
+        # ── MACD 상태 관측 (2026-08-04, 2차 개정) ────────────────
+        # 원시값(macd/macd_signal)과 breakout_strategy.py의 실제
+        # 계산식(macd > macd_signal)을 그대로 재사용 — 다른 계산식을
+        # 쓰면 로그와 실제 동작이 미묘하게 어긋나는 위험이 있음.
+        macd_val = ""
+        macd_signal_val = ""
+        macd_above_signal_val = ""
         macd_hist_dir_val = ""
-        chasing_overheated_val = ""
-        would_be_blocked_val = ""
-        if market_price is not None and market_price.indicator_macd is not None \
-                and market_price.indicator_macd_signal is not None:
-            cond_macd_cross = market_price.indicator_macd > market_price.indicator_macd_signal
-            macd_golden_val = cond_macd_cross
-            macd_dead_val = not cond_macd_cross
+        legacy_buy_candidate_val = ""
+        chasing_overheated_applies_val = False
+        chasing_overheated_condition_val = ""
+        would_block_existing_chasing_gate_val = ""
+        would_block_macd_dead_min_score5_val = ""
+        would_block_macd_above_signal_required_val = ""
+        latest_bar_timestamp_val = latest_bar_timestamp or ""
+
+        has_macd = (
+            market_price is not None
+            and market_price.indicator_macd is not None
+            and market_price.indicator_macd_signal is not None
+        )
+        if has_macd:
+            macd_val = market_price.indicator_macd
+            macd_signal_val = market_price.indicator_macd_signal
+            macd_above_signal_val = market_price.indicator_macd > market_price.indicator_macd_signal
             macd_hist_dir_val = market_price.indicator_macd_hist_direction
 
+        # legacy_buy_candidate: 전략이 이번 폴링에서 실제로 BUY를
+        # 반환했는지(entry_watch/stale 데이터 차단 등 1B~1C 안전
+        # 장치를 이미 전부 거친 이 함수 호출 시점의 signal 기준).
+        legacy_buy_candidate_val = signal.type == SignalType.BUY
+
+        # 2026-08-04 (GPT 코드리뷰 지적): chasing_overheated는
+        # BreakoutStrategy(BULLISH 장세)에만 실제 존재하는 게이트 —
+        # NEUTRAL 등 다른 전략에는 이 로직 자체가 없으므로, 그
+        # 장세에서 계산하면 "적용되지도 않는 게이트가 발동했다"는
+        # 거짓 신호가 됨. regime이 정확히 BULLISH일 때만 계산.
+        chasing_overheated_applies_val = (regime == MarketRegime.BULLISH)
+
+        # 2026-08-04 (2차 GPT 코드리뷰 지적, 재현 확인): 기존
+        # chasing_overheated_val을 legacy_buy_candidate_val(신호가
+        # BUY인 경우)일 때만 계산했었는데, 실제 BreakoutStrategy의
+        # chasing_overheated 게이트가 진짜로 차단한 사례는 이미
+        # signal=HOLD로 나옴 — "등락4%+MACD데드+4점"을 넣으면 전략
+        # 자체가 HOLD를 반환하는데, 그 HOLD 행에서 legacy_buy_
+        # candidate_val=False가 되어 chasing_overheated가 빈 값으로
+        # 남고 있었음(재현 확인). 이러면 "기존 게이트가 실제로 몇
+        # 건을 막았는가"를 이 필드로 전혀 집계할 수 없음.
+        #
+        # chasing_overheated_condition(조건 자체의 충족 여부)과
+        # would_block_existing_chasing_gate(그 조건이 실제로 기존
+        # 게이트를 발동시켰을지)를 BUY/HOLD와 무관하게 계산하도록
+        # 분리 — legacy_buy_candidate 조건은 신규 가상 게이트
+        # (would_block_macd_dead_min_score5 / would_block_macd_
+        # above_signal_required)에만 그대로 유지.
+        if chasing_overheated_applies_val and has_macd:
             change_rate_pct = (
                 minute_analysis.change_rate_pct if minute_analysis is not None else None
             )
-            chasing_overheated_val = (
+            chasing_overheated_condition_val = (
                 minute_analysis is not None
                 and change_rate_pct is not None
                 and change_rate_pct >= 3.0
-                and macd_dead_val
+                and not macd_above_signal_val
             )
+            if chasing_overheated_condition_val and score:
+                would_block_existing_chasing_gate_val = int(score) < 5
+            elif chasing_overheated_condition_val:
+                # 조건은 충족했는데 score를 파싱 못 한 경우(8점
+                # 체계 자체가 안 돌아간 특수 케이스) — 판단 불가이므로
+                # "차단 안 됨(False)"으로 단정하지 않고 빈 값 유지.
+                would_block_existing_chasing_gate_val = ""
+            else:
+                # 조건 자체가 거짓이면 기존 게이트가 발동할 여지가
+                # 없으므로 False로 명시(빈 값이 아님 — "발동 안 함"
+                # 이 명확한 사실이므로).
+                would_block_existing_chasing_gate_val = False
 
-            # "MACD 데드면 등락률과 무관하게 무조건 5점 요구"였다면
-            # 이번 판단(score < 5)이 막혔을지 여부. score가 파싱 안
-            # 되는 경우(HOLD 등으로 8점 체계 자체가 안 돌아간 경우)
-            # 는 판단 불가이므로 빈 값으로 남김 — "아니오"로 단정하지
-            # 않음(관측 불가와 "차단 안 됨"을 구분).
-            if macd_dead_val and score:
-                would_be_blocked_val = int(score) < 5
+        if legacy_buy_candidate_val and has_macd:
+            # (1) hard gate: MACD가 Signal 이하이면 점수와 무관하게
+            # 완전 차단됐을지 — 원래 검증 대상.
+            would_block_macd_above_signal_required_val = not macd_above_signal_val
+
+            # (2) min-score-5: "MACD 데드면 최소 5점 요구"(기존
+            # chasing_overheated 확장판) — score가 파싱 안 되는
+            # 경우(8점 체계 자체가 안 돌아간 특수 케이스)는 판단
+            # 불가이므로 빈 값으로 남김.
+            if not macd_above_signal_val and score:
+                would_block_macd_dead_min_score5_val = int(score) < 5
 
         patterns = []
         row: dict = {
-            "timestamp": datetime.now().isoformat(),
+            # 2026-08-04 (GPT 코드리뷰 지적): datetime.now()는 시스템
+            # 로컬 시각 — UTC 컨테이너 등에서는 latest_bar_timestamp
+            # (KST 기준 분봉 시각)와 최대 9시간까지 어긋날 수 있음
+            # (재현 확인). now_kst()로 통일하되, 기존 CSV의 timestamp
+            # 컬럼 포맷(타임존 표기 없는 ISO 문자열)과의 호환을 위해
+            # tzinfo는 제거하고 기록 — 값 자체는 KST 벽시계 시각.
+            "timestamp": now_kst().replace(tzinfo=None).isoformat(),
             "symbol":    symbol,
             "price":     price,
             "regime":    regime.value if regime else "",
@@ -2766,11 +2847,17 @@ class TradingService:
             "final_decision":    final_decision or signal.type.value,
             "order_block_reason": order_block_reason,
             "condition_name": self._symbol_to_condition.get(symbol, ""),
-            "macd_golden": macd_golden_val,
-            "macd_dead": macd_dead_val,
-            "macd_hist_dir": macd_hist_dir_val,
-            "chasing_overheated": chasing_overheated_val,
-            "would_be_blocked_if_macd_dead_required": would_be_blocked_val,
+            "macd": macd_val,
+            "macd_signal": macd_signal_val,
+            "macd_above_signal": macd_above_signal_val,
+            "macd_hist_direction": macd_hist_dir_val,
+            "legacy_buy_candidate": legacy_buy_candidate_val,
+            "latest_bar_timestamp": latest_bar_timestamp_val,
+            "chasing_overheated_applies": chasing_overheated_applies_val,
+            "chasing_overheated_condition": chasing_overheated_condition_val,
+            "would_block_existing_chasing_gate": would_block_existing_chasing_gate_val,
+            "would_block_macd_dead_min_score5": would_block_macd_dead_min_score5_val,
+            "would_block_macd_above_signal_required": would_block_macd_above_signal_required_val,
         }
         if minute_analysis is not None:
             ma = minute_analysis

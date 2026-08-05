@@ -5,6 +5,8 @@ from __future__ import annotations
 import csv
 import logging
 import logging.handlers
+import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -151,7 +153,7 @@ SIGNAL_FIELDS = [
     "bb_percent_b",       # 볼린저 %B (0=하단, 1=상단)
     "bb_bandwidth_pct",   # 볼린저 밴드폭 (%)
     "bb_position",        # 볼린저 위치 (LOWER_ZONE / MID_UPPER 등)
-    # ── MACD 상태 관측 필드 (2026-08-04, GPT 코드리뷰 지시) ─────
+    # ── MACD 상태 관측 필드 (2026-08-04, GPT 코드리뷰 지시, 2차 개정) ──
     # 배경: trades.csv의 entry_reason 텍스트 파싱으로 "MACD 데드
     # 3건 전부 손실"을 확인했으나, 이건 실제 체결된 극소수 케이스
     # (10건)에만 있는 정보 — 매수로 안 이어진 수만 건의 HOLD/SKIP
@@ -160,13 +162,59 @@ SIGNAL_FIELDS = [
     # (재현 확인: signal_log.csv 원본 컬럼에 macd/macd_signal 자체가
     # 없음). 아래 필드는 이후 관측을 쌓기 위한 것 — 신호 판단 로직
     # 자체는 전혀 바꾸지 않고 순수 관측치만 기록.
-    "macd_golden",        # cond_macd_cross(macd > macd_signal) 그대로
-    "macd_dead",           # not macd_golden (True/False/빈값=지표없음)
-    "macd_hist_dir",       # macd_hist_dir 원시값(모멘텀 가속/둔화 부호)
-    "chasing_overheated",  # 기존 추격매수 차단 게이트(당일등락≥3%+MACD데드) 발동 여부
-    "would_be_blocked_if_macd_dead_required",  # "MACD 데드면 무조건 5점
-                                                 # 요구"였다면 이 판단이
-                                                 # 막혔을지 여부(shadow only)
+    #
+    # 2026-08-04 (2차 GPT 코드리뷰 지적): 1차 구현의 macd_golden/
+    # macd_dead 명칭이 실제 cross 이벤트(골든/데드 크로스가 방금
+    # 일어났는지)가 아니라 "지금 macd > macd_signal인 상태"를
+    # 뜻했음에도 크로스처럼 들려 오해 소지가 있었음 — macd_above_
+    # signal로 이름 변경. 또한 would_be_blocked_if_macd_dead_
+    # required 필드 하나가 "최소 5점 요구"(min-score-5, 기존
+    # chasing_overheated 확장판)와 "점수 무관 완전 차단"(hard gate,
+    # 원래 검증 대상)을 뭉뚱그리고 있어서 둘로 분리. 이 두 필드와
+    # chasing_overheated는 legacy_buy_candidate(전략이 실제로 BUY를
+    # 반환한 경우)일 때만 계산 — HOLD였던 판단을 "차단"이라고
+    # 부르는 건 counterfactual의 정의 자체가 안 맞음.
+    "macd",                 # MACD 원시값
+    "macd_signal",          # MACD Signal 원시값
+    "macd_above_signal",    # macd > macd_signal (True/False/빈값=지표없음).
+                             # "골든크로스"가 아니라 "지금 이 상태"를 뜻함.
+    "macd_hist_direction",  # 히스토그램 방향(+1 확대/-1 축소/0 보합)
+    "legacy_buy_candidate", # 이번 폴링에서 전략이 실제로 BUY를 반환했는지
+                             # (entry_watch/stale데이터 차단 등을 이미 거친
+                             # 이 함수 호출 시점의 signal 기준)
+    "latest_bar_timestamp", # 이 판단에 쓰인 분봉 데이터의 최신 timestamp
+    "chasing_overheated_applies",  # chasing_overheated 게이트가 이 장세에
+                                     # 실제로 존재하는지(BreakoutStrategy/
+                                     # BULLISH 전용 — NEUTRAL 등에는 로직
+                                     # 자체가 없어 False)
+    "chasing_overheated_condition",  # 기존 게이트 발동 조건(당일등락≥3%+
+                                       # MACD데드) 자체의 충족 여부.
+                                       # 2026-08-04 (2차 GPT 코드리뷰 지적,
+                                       # 재현 확인): 기존 게이트가 실제로
+                                       # 차단한 사례는 이미 signal=HOLD로
+                                       # 나오므로, 이 필드는 legacy_buy_
+                                       # candidate와 무관하게(BUY든 HOLD든)
+                                       # 계산 — applies=True일 때만 유효값.
+    "would_block_existing_chasing_gate",  # chasing_overheated_condition이
+                                            # 충족됐고 score<5이면 기존
+                                            # 게이트가 실제로 차단했을지.
+                                            # 이것도 BUY/HOLD와 무관하게
+                                            # 계산 — "기존 게이트가 몇 건을
+                                            # 막았는가"를 집계하기 위함.
+    "would_block_macd_dead_min_score5",         # (min-score-5, 신규 가상
+                                                  # 게이트) MACD 데드면 최소
+                                                  # 5점 요구였다면 이번 BUY
+                                                  # 후보가 막혔을지 —
+                                                  # legacy_buy_candidate=True
+                                                  # 일 때만 계산.
+    "would_block_macd_above_signal_required",   # (hard gate, 신규 가상
+                                                  # 게이트) MACD가 Signal
+                                                  # 이하이면 점수와 무관하게
+                                                  # 완전 차단이었다면 이번
+                                                  # BUY 후보가 막혔을지 —
+                                                  # legacy_buy_candidate=True
+                                                  # 일 때만 계산. 원래
+                                                  # 검증하려던 대상.
 ]
 
 
@@ -218,23 +266,73 @@ class SignalCsvLogger:
             f"[SIGNAL_LOG] 헤더 마이그레이션 시작 — 누락 컬럼 {len(missing)}개: {missing}"
         )
 
-        # 기존 데이터를 모두 읽어서 DictReader로 파싱 (utf-8-sig로 BOM 제거)
-        with self.file_path.open("r", newline="", encoding="utf-8-sig") as fp:
-            old_rows = list(csv.DictReader(fp))
+        # 2026-08-04 (GPT 코드리뷰 지시): 기존엔 self.file_path를
+        # "w" 모드로 직접 열어 덮어쓰고 있었음 — 53MB급 실서버
+        # signal_log.csv를 재작성하는 도중 프로세스가 죽거나 디스크
+        # 문제가 생기면 원본 데이터가 통째로 유실될 위험이 있었음
+        # (재작성이 절반만 끝난 상태로 파일이 잘리는 경우, 이전
+        # 내용도 새 내용도 온전하지 않게 됨). 다음 두 가지로 방어:
+        # (1) 재작성 전 원본을 .bak으로 복사(실패해도 원본은 그대로
+        #     남아있어 최소한 데이터 유실은 없음).
+        # (2) 임시 파일에 전부 쓴 뒤 os.replace()로 원자적 교체 —
+        #     os.replace는 같은 파일시스템 안에서 단일 시스템 콜로
+        #     완료되므로, 교체 도중에 프로세스가 죽어도 원본 파일이
+        #     "절반만 쓰인 상태"로 남는 일이 없음(교체 전이면 원본
+        #     그대로, 교체 후면 새 파일 그대로 — 중간 상태가 없음).
+        backup_path = self.file_path.with_suffix(self.file_path.suffix + ".bak")
+        try:
+            shutil.copy2(self.file_path, backup_path)
+            logger.info(f"[SIGNAL_LOG] 마이그레이션 전 백업 생성: {backup_path}")
+        except OSError as exc:
+            logger.warning(
+                f"[SIGNAL_LOG] 백업 생성 실패 — 마이그레이션 중단(원본 보호 우선): {exc}"
+            )
+            return
 
-        # 새 헤더 + 기존 행(없는 컬럼은 빈 값)으로 전체 재작성
-        with self.file_path.open("w", newline="", encoding="utf-8") as fp:
-            writer = csv.DictWriter(fp, fieldnames=SIGNAL_FIELDS, extrasaction="ignore")
-            writer.writeheader()
-            for old_row in old_rows:
-                for field in SIGNAL_FIELDS:
-                    old_row.setdefault(field, "")
-                writer.writerow(old_row)
+        tmp_path = self.file_path.with_suffix(self.file_path.suffix + ".tmp")
+        try:
+            # 기존 데이터를 스트리밍으로 한 행씩 읽어 임시 파일에 바로
+            # 씀 — old_rows를 리스트로 통째로 메모리에 올리지 않아
+            # 53MB급 파일도 메모리 부담 없이 처리.
+            row_count = 0
+            with self.file_path.open("r", newline="", encoding="utf-8-sig") as src, \
+                    tmp_path.open("w", newline="", encoding="utf-8") as dst:
+                reader = csv.DictReader(src)
+                writer = csv.DictWriter(dst, fieldnames=SIGNAL_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                for old_row in reader:
+                    for field in SIGNAL_FIELDS:
+                        old_row.setdefault(field, "")
+                    writer.writerow(old_row)
+                    row_count += 1
+                # 2026-08-04 (GPT 코드리뷰 선택 개선): close() 전에
+                # flush + fsync로 OS 캐시가 아니라 실제 디스크에
+                # 기록됨을 보장 — os.replace() 자체는 이미 원자적
+                # 이지만, 그 직전 tmp 파일의 내용이 디스크에 아직
+                # 안 쓰인 상태에서 정전 등 강한 장애가 나면 replace
+                # 후에도 빈 파일이나 일부만 쓰인 파일이 될 위험이
+                # 있음(일반적인 프로세스 종료에는 이미 안전했지만,
+                # 더 강한 내구성을 위해 추가).
+                dst.flush()
+                os.fsync(dst.fileno())
 
-        logger.info(
-            f"[SIGNAL_LOG] 헤더 마이그레이션 완료 — {len(old_rows):,}행 재작성, "
-            f"컬럼 {len(existing_header)}개 → {len(SIGNAL_FIELDS)}개"
-        )
+            os.replace(tmp_path, self.file_path)
+            logger.info(
+                f"[SIGNAL_LOG] 헤더 마이그레이션 완료 — {row_count:,}행 재작성, "
+                f"컬럼 {len(existing_header)}개 → {len(SIGNAL_FIELDS)}개 "
+                f"(백업: {backup_path})"
+            )
+        except Exception as exc:
+            logger.error(
+                f"[SIGNAL_LOG] 마이그레이션 중 예외 발생 — 원본 파일은 아직 "
+                f"교체 전이라 온전함(임시 파일만 불완전할 수 있음): {exc}"
+            )
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+            raise
 
     def append(self, row: dict[str, Any]) -> None:
         """시그널 로그 한 줄을 추가합니다."""
