@@ -228,3 +228,4 @@ experimental:
   reward_risk_guard_mode: "off"     # 4단계: 상승여력·손익비 하드 게이트
   candidate_ranking_mode: "off"     # 5단계: 후보 순위화
   trailing_breakeven_mode: "off"    # 6단계: 순본전 트레일링
+  entry_quality_guard_mode: "off"   # 1E.5단계: MACD/VWAP 진입 품질 shadow 관측 (off/shadow만 지원)

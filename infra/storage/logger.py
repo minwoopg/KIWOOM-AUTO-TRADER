@@ -215,6 +215,21 @@ SIGNAL_FIELDS = [
                                                   # legacy_buy_candidate=True
                                                   # 일 때만 계산. 원래
                                                   # 검증하려던 대상.
+    # ── VWAP shadow 관측 요약 필드 (2026-08-05, 1E.5단계) ────────
+    # 상세 8개 would_block_* 조합은 logs/entry_quality_shadow.csv
+    # (legacy BUY 후보만 기록)에 두고, 여기 signal_log.csv에는
+    # 기존 분석기(analyze_signal_log.py 등)가 HOLD/SKIP 포함 전체
+    # 판단에서 상태를 훑어볼 수 있도록 원시값과 상태값만 추가.
+    "is_pr",                        # minute_analysis.is_pulldown_recovery
+    "is_c",                         # minute_analysis.is_valid_pulldown
+    "is_pullback_condition",        # 조건식 중 "눌림목" 포함 여부
+    "condition_names",              # 전체 조건식(|로 연결)
+    "rolling_vwap",
+    "rolling_vwap_distance_pct",
+    "session_vwap",
+    "session_vwap_distance_pct",
+    "session_metrics_ready",
+    "session_readiness_reason",
 ]
 
 
@@ -384,6 +399,91 @@ class EntryWatchShadowLogger:
             for field in SHADOW_FIELDS:
                 row.setdefault(field, "")
             writer.writerow(row)
+
+
+# ── entry_quality_shadow.csv ─────────────────────────────────────────────────
+# MACD/VWAP 진입 품질 shadow 관측 전용 로그 (2026-08-05, 1E.5단계, GPT
+# 코드리뷰 지시). signal_log.csv(이미 53MB급, 모든 판단을 기록)와 달리
+# legacy_buy_candidate=True(전략이 실제로 BUY를 반환한 경우)일 때만
+# 기록 — 같은 분봉·같은 판단이 반복되면 한 번만 남긴다(중복 방지 키:
+# symbol+latest_bar_timestamp+detected_patterns+score).
+
+ENTRY_QUALITY_SHADOW_FIELDS = [
+    "timestamp",              # 기록 시각(KST)
+    "symbol",
+    "latest_bar_timestamp",   # 이 판단에 쓰인 분봉의 최신 timestamp(중복 방지 키)
+    "detected_patterns",      # V/PR/A/B/C/D 패턴 조합(중복 방지 키)
+    "score",                  # 8점 체계 점수(중복 방지 키)
+    "regime",
+    "condition_name",         # 대표 조건식(호환용)
+    "condition_names",        # 전체 조건식(| 로 연결)
+    # MACD (1E 단계와 동일 계산 재사용)
+    "macd",
+    "macd_signal",
+    "macd_above_signal",
+    "would_block_macd_dead_min_score5",
+    "would_block_macd_above_signal_required",
+    # VWAP 상태
+    "is_pr",
+    "is_c",
+    "is_pullback_condition",
+    "is_pr_or_pullback_condition",
+    "rolling_vwap",
+    "rolling_vwap_distance_pct",
+    "session_vwap",
+    "session_vwap_distance_pct",
+    "session_metrics_ready",
+    "session_readiness_reason",
+    "session_gate_eligible",
+    # VWAP 가상 게이트 — rolling 기준
+    "would_block_pr_only_rolling_vwap",
+    "would_block_c_or_pr_rolling_vwap",
+    "would_block_pullback_condition_rolling_vwap",
+    "would_block_pr_or_pullback_condition_rolling_vwap",
+    # VWAP 가상 게이트 — session 기준
+    "would_block_pr_only_session_vwap",
+    "would_block_c_or_pr_session_vwap",
+    "would_block_pullback_condition_session_vwap",
+    "would_block_pr_or_pullback_condition_session_vwap",
+]
+
+
+class EntryQualityShadowLogger:
+    """MACD/VWAP 진입 품질 shadow 관측을 legacy BUY 후보에만 기록하는 로거입니다.
+
+    2026-08-05 (1E.5단계): 같은 (symbol, latest_bar_timestamp,
+    detected_patterns, score) 조합은 프로세스 수명 동안 한 번만
+    기록 — 같은 분봉에서 반복되는 폴링(10초 간격)이 매번 중복
+    행을 만들지 않도록 함.
+    """
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._seen_keys: set[tuple] = set()
+        if not self.file_path.exists():
+            with self.file_path.open("w", newline="", encoding="utf-8") as fp:
+                writer = csv.DictWriter(fp, fieldnames=ENTRY_QUALITY_SHADOW_FIELDS)
+                writer.writeheader()
+
+    def append_if_new(self, row: dict[str, Any]) -> bool:
+        """중복 키가 아니면 한 줄을 추가하고 True, 이미 기록된 키면 아무것도 안 하고 False를 반환합니다."""
+        key = (
+            row.get("symbol", ""),
+            row.get("latest_bar_timestamp", ""),
+            row.get("detected_patterns", ""),
+            row.get("score", ""),
+        )
+        if key in self._seen_keys:
+            return False
+        self._seen_keys.add(key)
+
+        with self.file_path.open("a", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=ENTRY_QUALITY_SHADOW_FIELDS, extrasaction="ignore")
+            for field in ENTRY_QUALITY_SHADOW_FIELDS:
+                row.setdefault(field, "")
+            writer.writerow(row)
+        return True
 
 
 # ── position_lifecycle.csv ───────────────────────────────────────────────────

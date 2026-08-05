@@ -253,6 +253,10 @@ class StorageConfig:
     entry_watch_shadow_log_file: str = "logs/entry_watch_shadow.csv"
     # 포지션 상태머신(shadow) 전이 로그 (2026-07-22)
     position_lifecycle_log_file: str = "logs/position_lifecycle.csv"
+    # 진입 품질(MACD/VWAP) shadow 관측 전용 로그 (2026-08-05, 1E.5단계)
+    # — legacy BUY 후보에만 기록, signal_log.csv와 별도로 관리해
+    # 53MB급 signal_log.csv를 더 이상 키우지 않음.
+    entry_quality_shadow_log_file: str = "logs/entry_quality_shadow.csv"
 
 
 @dataclass(frozen=True)
@@ -275,6 +279,10 @@ class ExperimentalConfig:
     reward_risk_guard_mode: str = "off"    # 4단계: 상승여력·손익비 하드 게이트
     candidate_ranking_mode: str = "off"    # 5단계: 후보 순위화
     trailing_breakeven_mode: str = "off"   # 6단계: 순본전 트레일링
+    # 2026-08-05 (1E.5단계, GPT 코드리뷰 지시): MACD/VWAP 진입 품질
+    # shadow 관측 — off/shadow만 지원, enforce는 이번 단계에서
+    # 의도적으로 구현하지 않음(아래 __post_init__에서 별도 검증).
+    entry_quality_guard_mode: str = "off"
 
     def __post_init__(self) -> None:
         # 2026-07-27: YAML에서 off/on처럼 quote 없는 특정 단어는 YAML 1.1
@@ -286,6 +294,7 @@ class ExperimentalConfig:
         for field_name in (
             "session_metrics_mode", "decision_engine_mode", "position_lifecycle_mode",
             "reward_risk_guard_mode", "candidate_ranking_mode", "trailing_breakeven_mode",
+            "entry_quality_guard_mode",
         ):
             value = getattr(self, field_name)
             if not isinstance(value, str) or value not in valid:
@@ -295,6 +304,18 @@ class ExperimentalConfig:
                     f'따옴표를 빠뜨리면 "off"가 YAML boolean(False)으로 해석될 수 있습니다. '
                     f'반드시 "off"처럼 따옴표로 감싸세요.'
                 )
+        # 2026-08-05 (GPT 코드리뷰 지시): entry_quality_guard_mode는
+        # 이번 1E.5단계에서 off/shadow만 지원 — enforce 동작(실제
+        # BUY 차단)은 아직 구현하지 않았으므로, 설정 파일에 실수로
+        # "enforce"가 들어가도 조용히 무시되는 대신 명확한 오류로
+        # 막아서 "설정은 enforce인데 실제로는 shadow처럼 동작"하는
+        # 혼동을 방지.
+        if self.entry_quality_guard_mode == "enforce":
+            raise ValueError(
+                'experimental.entry_quality_guard_mode="enforce"는 아직 지원되지 '
+                '않습니다(1E.5단계는 shadow 관측까지만 구현됨). "off" 또는 '
+                '"shadow"를 사용하세요.'
+            )
 
 
 @dataclass(frozen=True)

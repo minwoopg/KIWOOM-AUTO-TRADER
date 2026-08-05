@@ -113,6 +113,7 @@ def build_minimal_settings(tmpdir: str) -> Settings:
             # tmpdir 기준 경로로 명시.
             entry_watch_shadow_log_file=f"{tmpdir}/entry_watch_shadow.csv",
             position_lifecycle_log_file=f"{tmpdir}/position_lifecycle.csv",
+            entry_quality_shadow_log_file=f"{tmpdir}/entry_quality_shadow.csv",
         ),
         websocket=WebSocketConfig(
             enabled=False, url="", condition_seqs=[], max_symbols=10,

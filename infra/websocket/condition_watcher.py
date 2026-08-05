@@ -61,13 +61,42 @@ class ConditionWatcher:
 
     @property
     def symbol_to_condition(self) -> dict[str, str]:
-        """종목 → 조건식 이름 매핑 (복수 조건식 편입 시 마지막 기준)."""
+        """종목 → 조건식 이름 매핑 (복수 조건식 편입 시 마지막 기준).
+
+        2026-08-05 (GPT 코드리뷰 지적): 이 property는 여러 조건식에
+        동시 편입된 종목의 정보를 하나로 뭉개버림 — 아래 dict 순회
+        순서상 "마지막으로 처리된 seq"의 이름만 남는데, 이건
+        _symbols_by_seq(dict)의 순회 순서에 의존하는 우연한 결과라
+        실제로 "대표 조건식"을 의미 있게 고르는 게 아님. 기존
+        호환을 위해 남겨두되, 신규 코드는 symbol_to_conditions
+        (복수형, 전체 조건식 보존)를 사용해야 함.
+        """
         mapping: dict[str, str] = {}
         for seq, symbols in self._symbols_by_seq.items():
             cond_name = self._condition_names.get(seq, f"seq{seq}")
             for sym in symbols:
                 mapping[sym] = cond_name
         return mapping
+
+    @property
+    def symbol_to_conditions(self) -> dict[str, tuple[str, ...]]:
+        """종목 → 편입된 모든 조건식 이름의 튜플 매핑.
+
+        2026-08-05 (GPT 코드리뷰 지적, VWAP shadow 1단계): 한 종목이
+        동시에 여러 조건식(예: "자동매매_돌파형A"와 "자동매매_
+        눌림목_PR")에 편입될 수 있는데, 기존 symbol_to_condition은
+        그중 하나만 남겨서 "이 종목이 실제로 눌림목 조건식에도
+        들어와 있는지"를 정확히 판단할 수 없었음. 이 property는
+        해당 종목이 편입된 *모든* 조건식 이름을 튜플로 보존 —
+        순서는 seq 딕셔너리 순회 순서(결정적이지 않을 수 있음)라
+        판단 로직에서는 순서에 의존하지 말고 in 연산자로만 사용할 것.
+        """
+        mapping: dict[str, list[str]] = {}
+        for seq, symbols in self._symbols_by_seq.items():
+            cond_name = self._condition_names.get(seq, f"seq{seq}")
+            for sym in symbols:
+                mapping.setdefault(sym, []).append(cond_name)
+        return {sym: tuple(names) for sym, names in mapping.items()}
 
     async def start(self) -> None:
         await self._ws_client.start()

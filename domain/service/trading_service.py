@@ -28,10 +28,12 @@ from domain.models import AccountBalance, MarketRegime, OrderRequest, OrderSide,
 from domain.position.lifecycle import PositionLifecycle, PositionStateMachine
 from domain.risk.risk_manager import RiskManager
 from domain.strategy.strategy_router import StrategyRouter
+from domain.strategy.entry_quality_shadow import evaluate_vwap_shadow
 from infra.broker.base import Broker
 from infra.storage.daily_reporter import DailyReporter
 from infra.storage.logger import (
     AppLogger, TradeCsvLogger, SignalCsvLogger, EntryWatchShadowLogger, PositionLifecycleLogger,
+    EntryQualityShadowLogger,
 )
 from infra.storage.minute_bar_saver import MinuteBarSaver
 from infra.storage.skip_reason import classify_skip_reason, SkipReason
@@ -57,6 +59,7 @@ class TradingService:
         state_store: JsonStateStore,
         entry_watch_shadow_logger: "EntryWatchShadowLogger | None" = None,
         position_lifecycle_logger: "PositionLifecycleLogger | None" = None,
+        entry_quality_shadow_logger: "EntryQualityShadowLogger | None" = None,
     ) -> None:
         self.settings = settings
         self.broker = broker
@@ -74,6 +77,13 @@ class TradingService:
         )
         self.position_lifecycle_logger = position_lifecycle_logger or PositionLifecycleLogger(
             settings.storage.position_lifecycle_log_file
+        )
+        # 2026-08-05 (1E.5단계): 동일 패턴 — None이면 storage 설정에서
+        # 자동 생성. entry_quality_guard_mode="off"일 때는 이 로거가
+        # 존재해도 실제로 append_if_new()가 호출되지 않으므로(호출부
+        # 자체가 mode를 먼저 확인) 파일이 새로 만들어지지 않음.
+        self.entry_quality_shadow_logger = entry_quality_shadow_logger or EntryQualityShadowLogger(
+            settings.storage.entry_quality_shadow_log_file
         )
 
         self.state, loaded_highest = self.state_store.load()
@@ -113,6 +123,15 @@ class TradingService:
         # (기본값)면 이 저장소는 채워지지 않고 완전히 비어있는 채로
         # 유지됨(불필요한 메모리 사용 없음).
         self._session_state_by_symbol: dict = {}
+        # 2026-08-05 (GPT 코드리뷰 지적, VWAP shadow 1단계):
+        # _update_session_metrics_shadow()가 매번 build_session_
+        # metrics()를 호출해 계산한 결과를 여기 캐시 — VWAP shadow
+        # 관측(_write_signal_log)에서 같은 계산을 또 하지 않고
+        # 이 최신값을 그대로 재사용. 로그 자체는 60초 스로틀이
+        # 걸려도 이 캐시는 매 폴링마다 최신 상태로 갱신됨(로그
+        # 출력 여부와 무관하게 metrics 계산 자체는 항상 일어나므로).
+        # 일일 초기화(reset_daily_loss_counts) 시 함께 clear.
+        self._latest_session_metrics_by_symbol: dict = {}
 
         # 장세 분류 결과 캐시
         self.cached_regime: dict[str, MarketRegime] = {}
@@ -120,7 +139,16 @@ class TradingService:
         # HOLD 로그 throttle
         self.last_hold_log_at_by_symbol: dict[str, datetime] = {}
         self._last_buy_signal_at: dict[str, datetime] = {}  # 종목별 마지막 BUY신호 시각
-        self._symbol_to_condition: dict[str, str] = {}       # 종목 → 조건검색식 이름
+        self._symbol_to_condition: dict[str, str] = {}       # 종목 → 조건검색식 이름(대표값, 호환용)
+        # 2026-08-05 (GPT 코드리뷰 지적, VWAP shadow 1단계): 종목이
+        # 편입된 *모든* 조건식 이름 — update()가 아니라 매번 현재
+        # 스냅샷으로 통째로 교체됨(update_targets 참고). 기존
+        # _symbol_to_condition은 update()로 누적되어 조건식에서
+        # 편출된 뒤에도 과거 값이 잔존할 수 있었는데(재현: 1회차
+        # 편입 -> 2회차 매핑에서 제거해도 update()는 기존 키를
+        # 지우지 않아 과거 조건명이 계속 남음), 이 저장소는 그
+        # 문제를 피하기 위해 매번 전체 교체.
+        self._symbol_to_conditions: dict[str, tuple[str, ...]] = {}
 
         # [REGIME]/[MIN] 로그 중복 억제 (2026-07-14: app.log 200MB 급증 원인 —
         # 매 폴링(10초)마다 값이 살짝만 바뀌어도 무조건 재로깅되던 것을,
@@ -225,13 +253,34 @@ class TradingService:
         self,
         symbols: list[str],
         sym_to_cond: dict[str, str] | None = None,
+        sym_to_conditions: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
         """조건검색 결과로 종목 목록을 동적으로 갱신합니다.
 
         보유 중인 종목은 조건검색 편출 여부와 무관하게 항상 포함합니다.
+
+        2026-08-05 (GPT 코드리뷰 지적, VWAP shadow 1단계):
+        sym_to_cond(대표값 1개)는 기존처럼 update()로 누적 —
+        이건 "이 종목을 마지막으로 어떤 조건식에서 봤는지"에 대한
+        느슨한 참고값이라 큰 문제는 아님. 하지만 sym_to_conditions
+        (전체 조건식 목록)는 반드시 매번 통째로 교체해야 함 —
+        update()를 쓰면 이번 폴링에 편출된 종목의 과거 조건식
+        이름이 dict에 그대로 남아, "지금 이 종목이 눌림목
+        조건식에 편입돼 있는가"라는 질문에 거짓 True를 답하게 됨
+        (재현 확인: 1회차 눌림목 편입 후 2회차 매핑에서 완전히
+        빠져도, update() 방식이면 과거 "눌림목_PR" 값이 계속
+        _symbol_to_condition에 남아있음).
+
+        sym_to_conditions가 None으로 전달되면(예: 조건검색 자체가
+        비활성이거나 이번 폴링에 결과가 없는 경우) 기존 저장소를
+        비우지 않고 그대로 유지 — "결과가 없다"와 "전부 편출됐다"
+        는 다른 신호이므로, 호출부가 명시적으로 빈 dict({})를
+        넘겨야 실제로 전량 편출로 처리됨.
         """
         if sym_to_cond:
             self._symbol_to_condition.update(sym_to_cond)
+        if sym_to_conditions is not None:
+            self._symbol_to_conditions = dict(sym_to_conditions)
         holding_symbols: list[str] = []
         try:
             balance = self._get_balance_with_cache()
@@ -766,6 +815,12 @@ class TradingService:
         self._session_state_by_symbol[symbol] = new_state
 
         metrics = build_session_metrics(new_state)
+        # 2026-08-05 (GPT 코드리뷰 지적): 로그 스로틀 체크보다 먼저
+        # 캐시를 갱신 — 아래 60초 스로틀은 "로그 출력"만 제한하지,
+        # metrics 계산 자체는 매 폴링마다 일어나므로 이 캐시는 항상
+        # 최신 상태를 유지함(VWAP shadow가 스로틀된 로그 주기와
+        # 무관하게 최신 세션 값을 쓸 수 있도록).
+        self._latest_session_metrics_by_symbol[symbol] = metrics
 
         last_log = self.last_hold_log_at_by_symbol.get(f"__session_shadow_{symbol}")
         now_dt = datetime.now()
@@ -1543,6 +1598,7 @@ class TradingService:
         # 전날 세션 데이터가 새 거래일의 session_vwap/session_high/
         # session_low 계산에 섞여 들어가면 안 되므로.
         self._session_state_by_symbol.clear()
+        self._latest_session_metrics_by_symbol.clear()
         self.app_logger.info("[RESET] 당일 종목별 손실/진입 카운트 초기화 완료")
 
     def _update_indicators(self, symbol: str, current_price: int) -> None:
@@ -2900,4 +2956,106 @@ class TradingService:
             "bb_bandwidth_pct": round(bb.bandwidth_pct, 2) if bb else "",
             "bb_position":     bb.position if bb else "",
         })
+
+        # ── VWAP shadow 관측 (2026-08-05, 1E.5단계, GPT 코드리뷰 지시) ──
+        # entry_quality_guard_mode가 "off"(기본값)면 계산 자체를
+        # 건너뜀 — MACD shadow(1E단계)와 달리 이건 신규 기능이라
+        # 명시적으로 shadow를 켜야 계산됨. "shadow"일 때만 evaluate_
+        # vwap_shadow()를 호출하고, 그 결과를 signal_log.csv(상태값
+        # 요약)와 entry_quality_shadow.csv(legacy BUY 후보 전용,
+        # 상세 8개 would_block_*)에 각각 기록. Signal이나 주문 결과는
+        # 이 블록이 절대 건드리지 않음 — 이미 위에서 row가 전부
+        # 완성된 뒤 관측치만 추가하는 순수 로깅 단계.
+        guard_mode = getattr(self.settings.experimental, "entry_quality_guard_mode", "off")
+        if guard_mode == "shadow":
+            condition_names = self._symbol_to_conditions.get(symbol, ())
+            session_metrics = self._latest_session_metrics_by_symbol.get(symbol)
+            # 2026-08-05: 세션 값이 오늘 거래일 것이 아니면(예: 어제
+            # 계산된 값이 자정을 넘겨 그대로 남아있는 극단적 상황)
+            # 사용하지 않음 — merge_session_bars()가 날짜 변경 시
+            # 자동으로 새 세션을 시작하므로 이 경로는 실제로는 거의
+            # 발생하지 않지만, 방어적으로 재확인.
+            if session_metrics is not None and session_metrics.session_date != now_kst().strftime("%Y%m%d"):
+                session_metrics = None
+
+            assessment = evaluate_vwap_shadow(
+                legacy_buy_candidate=legacy_buy_candidate_val,
+                current_price=price,
+                minute_analysis=minute_analysis,
+                condition_names=condition_names,
+                session_metrics=session_metrics,
+            )
+
+            row.update({
+                "is_pr": assessment.is_pr,
+                "is_c": assessment.is_c,
+                "is_pullback_condition": assessment.is_pullback_condition,
+                "condition_names": "|".join(assessment.condition_names),
+                "rolling_vwap": assessment.rolling_vwap if assessment.rolling_vwap is not None else "",
+                "rolling_vwap_distance_pct": (
+                    round(assessment.rolling_vwap_distance_pct, 2)
+                    if assessment.rolling_vwap_distance_pct is not None else ""
+                ),
+                "session_vwap": assessment.session_vwap if assessment.session_vwap is not None else "",
+                "session_vwap_distance_pct": (
+                    round(assessment.session_vwap_distance_pct, 2)
+                    if assessment.session_vwap_distance_pct is not None else ""
+                ),
+                "session_metrics_ready": assessment.session_metrics_ready,
+                "session_readiness_reason": assessment.session_readiness_reason,
+            })
+
+            # 전용 CSV는 legacy BUY 후보에만 기록(GPT 지시) — 같은
+            # 분봉·같은 패턴·같은 점수의 중복 폴링은 로거 내부에서
+            # 자동으로 걸러짐(append_if_new의 키 기준).
+            if legacy_buy_candidate_val:
+                self.entry_quality_shadow_logger.append_if_new({
+                    "timestamp": now_kst().replace(tzinfo=None).isoformat(),
+                    "symbol": symbol,
+                    "latest_bar_timestamp": latest_bar_timestamp_val,
+                    "detected_patterns": row.get("detected_patterns", "-"),
+                    "score": score,
+                    "regime": regime.value if regime else "",
+                    "condition_name": self._symbol_to_condition.get(symbol, ""),
+                    "condition_names": "|".join(assessment.condition_names),
+                    "macd": macd_val,
+                    "macd_signal": macd_signal_val,
+                    "macd_above_signal": macd_above_signal_val,
+                    "would_block_macd_dead_min_score5": would_block_macd_dead_min_score5_val,
+                    "would_block_macd_above_signal_required": would_block_macd_above_signal_required_val,
+                    "is_pr": assessment.is_pr,
+                    "is_c": assessment.is_c,
+                    "is_pullback_condition": assessment.is_pullback_condition,
+                    "is_pr_or_pullback_condition": assessment.is_pr_or_pullback_condition,
+                    "rolling_vwap": assessment.rolling_vwap if assessment.rolling_vwap is not None else "",
+                    "rolling_vwap_distance_pct": (
+                        round(assessment.rolling_vwap_distance_pct, 4)
+                        if assessment.rolling_vwap_distance_pct is not None else ""
+                    ),
+                    "session_vwap": assessment.session_vwap if assessment.session_vwap is not None else "",
+                    "session_vwap_distance_pct": (
+                        round(assessment.session_vwap_distance_pct, 4)
+                        if assessment.session_vwap_distance_pct is not None else ""
+                    ),
+                    "session_metrics_ready": assessment.session_metrics_ready,
+                    "session_readiness_reason": assessment.session_readiness_reason,
+                    "session_gate_eligible": assessment.session_gate_eligible,
+                    "would_block_pr_only_rolling_vwap": assessment.would_block_pr_only_rolling_vwap,
+                    "would_block_c_or_pr_rolling_vwap": assessment.would_block_c_or_pr_rolling_vwap,
+                    "would_block_pullback_condition_rolling_vwap": (
+                        assessment.would_block_pullback_condition_rolling_vwap
+                    ),
+                    "would_block_pr_or_pullback_condition_rolling_vwap": (
+                        assessment.would_block_pr_or_pullback_condition_rolling_vwap
+                    ),
+                    "would_block_pr_only_session_vwap": assessment.would_block_pr_only_session_vwap,
+                    "would_block_c_or_pr_session_vwap": assessment.would_block_c_or_pr_session_vwap,
+                    "would_block_pullback_condition_session_vwap": (
+                        assessment.would_block_pullback_condition_session_vwap
+                    ),
+                    "would_block_pr_or_pullback_condition_session_vwap": (
+                        assessment.would_block_pr_or_pullback_condition_session_vwap
+                    ),
+                })
+
         self.signal_logger.append(row)

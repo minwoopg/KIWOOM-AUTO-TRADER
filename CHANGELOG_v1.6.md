@@ -2589,3 +2589,145 @@ pulldown`/조건검색식명 세 범위를 각각 따로 관찰.
 
 ---
 
+## 1E.5: VWAP shadow 관측 구현 (2026-08-05)
+
+**배경**: 매매 성과 분석에서 VWAP 대비 +2% 초과 진입 3건이 전부
+손실 방향이었음을 확인했으나, PR(`is_pulldown_recovery`)과 C
+(`is_valid_pulldown`)를 코드로 직접 읽어본 결과 둘 다 VWAP
+거리(%)와 무관하다는 게 확인됨 — PR은 저점 우상향+거래량 팽창,
+C는 "VWAP 위/아래"만 확인(몇 % 위인지는 무관). 즉 "VWAP +2%
+초과 차단"은 기존 PR/C 계산식을 조정하는 게 아니라 완전히 새로운
+진입 품질 게이트. GPT 코드리뷰 지시대로 다음 순서로 구현.
+
+### 1. ConditionWatcher 복수 조건식 보존
+
+기존 `symbol_to_condition`(단수형) property는 한 종목이 여러
+조건식에 동시 편입돼도 마지막 seq 순회 결과 하나만 남겼음 —
+`_symbols_by_seq`(dict) 순회 순서에 우연히 의존하는 결과라 실제로
+"대표 조건식"을 의미 있게 고르는 게 아님. `symbol_to_conditions`
+(복수형, `dict[str, tuple[str, ...]]`) property를 신규 추가해
+편입된 모든 조건식 이름을 튜플로 보존.
+
+재현 검증: 058610이 "자동매매_돌파형A"와 "자동매매_눌림목_PR"에
+동시 편입된 경우, 기존 필드는 하나만 남기지만 신규 필드는 둘 다
+보존함을 확인.
+
+### 2. TradingService 스냅샷 교체 구조 (편출 잔존 방지)
+
+`update_targets()`가 기존 `sym_to_cond`(단수형)는 그대로
+`update()`로 누적하되, 신규 `sym_to_conditions`(복수형) 파라미터는
+반드시 매번 전체 교체(`self._symbol_to_conditions = dict(...)`)
+하도록 구현 — `update()`를 쓰면 이번 폴링에 편출된 종목의 과거
+조건식 이름이 dict에 그대로 남아 "지금 이 종목이 눌림목 조건식에
+편입돼 있는가"라는 질문에 거짓 True를 답하게 됨. `sym_to_
+conditions`가 `None`으로 전달되면(조건검색 비활성 등) 기존
+저장소를 비우지 않고 유지 — "결과가 없다"와 "전부 편출됐다"는
+다른 신호이므로, 호출부가 명시적으로 빈 `dict`를 넘겨야 실제
+전량 편출로 처리됨. `app/main.py`도 `watcher.symbol_to_conditions`
+를 함께 전달하도록 갱신.
+
+재현 검증: 1회차 눌림목 조건식 편입 → 2회차 완전 편출(빈 dict
+전달) 시 과거 조건명이 `_symbol_to_conditions`에서 정확히 제거됨.
+
+### 3. SessionMetrics 최신값 캐시
+
+`_latest_session_metrics_by_symbol` 저장소 신설, `_update_
+session_metrics_shadow()`가 `build_session_metrics()` 계산 직후
+(60초 로그 스로틀 체크 이전)에 캐시하도록 수정 — 스로틀로 로그가
+안 남는 폴링에서도 이 캐시는 항상 최신 상태 유지. `_write_signal_
+log()`에서 세션 상태를 다시 계산하지 않고 이 캐시를 그대로 재사용.
+일일 초기화(`reset_daily_loss_counts`) 시 함께 clear. 세션 값의
+`session_date`가 오늘 거래일과 다르면(극단적 방어) 사용하지 않음.
+
+### 4. 순수 평가 모듈 `domain/strategy/entry_quality_shadow.py`
+
+`VwapShadowAssessment` dataclass와 `evaluate_vwap_shadow()` 순수
+함수 신규 작성 — `Signal`이나 주문 결과를 절대 건드리지 않고
+관측치만 계산해 반환. 핵심 설계:
+- rolling VWAP(`MinuteAnalysis.vwap`, 최근 60분)과 session VWAP
+  (1C단계 `SessionMetrics.session_vwap`, 당일 정규장 전체)을
+  완전히 독립적으로 관측 — 두 기준의 성과를 직접 비교 가능하도록.
+- `session_metrics_ready=False`(예: `PARTIAL_SESSION`)이면
+  `session_vwap_distance_pct`는 관찰용으로 계산해 기록하되,
+  `session_gate_eligible=False`가 되어 session 기반 `would_
+  block_*`는 전부 `None`(빈 값)으로 남음 — 불완전한 세션 값을
+  완전한 당일 VWAP처럼 오인해 판단에 쓰지 않도록.
+- PR-only / C-or-PR / condition-source / PR-or-condition-source
+  네 범위를 rolling·session 각각(총 8개 `would_block_*` 필드)
+  독립적으로 관측 — 데이터가 쌓이기 전까지 어느 범위가 가장
+  안정적인 개선인지 미리 확정하지 않음.
+- 임계값은 정확히 `distance_pct > 2.0`(2.00%는 통과, 2.01%부터
+  차단 후보).
+- 모든 `would_block_*`는 `legacy_buy_candidate=True`(전략이
+  실제로 BUY를 반환한 경우)일 때만 계산 — MACD shadow와 동일한
+  원칙, HOLD였던 판단을 "차단"이라 부르지 않기 위함.
+
+재현 검증: 임계값 경계(2.00%=False, 2.01%=True), `PARTIAL_
+SESSION`일 때 거리는 기록/would_block은 빈 값, HOLD에서 상태값은
+기록되지만 would_block 8개 전부 빈 값, 조건식명 없어도 PR=True면
+정상 평가 — 모두 정확히 확인.
+
+### 5. `experimental.entry_quality_guard_mode` 플래그
+
+`off`/`shadow`만 허용, `"enforce"` 지정 시 `ExperimentalConfig.
+__post_init__()`에서 명시적으로 `ValueError` — 이 단계는 shadow
+관측까지만 구현했으므로, 설정 파일에 실수로 `"enforce"`가 들어가도
+조용히 무시되는 대신("실제로는 shadow처럼 동작") 명확한 오류로
+막음. `settings.yaml`에 `entry_quality_guard_mode: "off"`로 추가
+(기본값, 아직 실서버에서 활성화 안 함).
+
+### 6. 전용 로그 `logs/entry_quality_shadow.csv`
+
+`infra/storage/logger.py`에 `ENTRY_QUALITY_SHADOW_FIELDS`와
+`EntryQualityShadowLogger` 신규 추가 — `legacy_buy_candidate=True`
+(BUY 후보)에만 기록, 중복 방지 키 `(symbol, latest_bar_timestamp,
+detected_patterns, score)`로 같은 분봉·같은 판단의 반복 폴링이
+중복 행을 만들지 않음. `signal_log.csv`(이미 53MB급)에는 원시
+값·상태값(`is_pr`, `is_c`, `rolling_vwap_distance_pct` 등)만
+추가해 기존 분석기가 HOLD/SKIP 포함 전체 판단에서 상태를 훑어볼
+수 있도록 하고, 8개 `would_block_*` 상세는 전용 CSV로 분리.
+
+재현 검증: 같은 (symbol, latest_bar_timestamp, patterns, score)
+로 3회 연속 호출해도 `entry_quality_shadow.csv`는 1행만 기록,
+`signal_log.csv`는 dedup 대상이 아니라 3행 그대로 기록됨(의도된
+차이 — 전용 CSV만 후보 단위로 압축).
+
+### 7. `TradingService` 통합
+
+`_write_signal_log()` 끝부분(row가 이미 완성된 뒤)에서 `entry_
+quality_guard_mode == "shadow"`일 때만 `evaluate_vwap_shadow()`
+호출 — `off`(기본값)에서는 계산 자체가 스킵됨(빈 값). `__init__`
+에 `entry_quality_shadow_logger` 선택적 파라미터 추가(기존
+`entry_watch_shadow_logger` 등과 동일 패턴, `None`이면 storage
+설정에서 자동 생성).
+
+재현 검증(통합 흐름): `strategy.generate_signal()`을 `patch`로
+고정한 뒤 `off`/`shadow` 두 모드로 `_process_symbol()`을 각각
+실행 — `skip_reason`(최종 신호)과 `final_decision`이 완전히
+동일함을 확인. VWAP shadow 계산이 실제 매매 판단에 조금도 개입하지
+않음을 통합 레벨에서 재확인.
+
+### 테스트
+
+`test_vwap_shadow_observation.py`(신규, 34건): 범위 판정(PR-only/
+C-or-PR/condition-source 분리), 복수 조건식 보존과 편출 스냅샷,
+임계값 경계, session ready 여부에 따른 관찰/판단 분리, BUY 후보
+한정, 조건명 누락 시에도 정상 평가, off/shadow 무영향(통합 흐름),
+중복 방지 — GPT가 제시한 필수 테스트 항목 전부 반영. `test_
+experimental_config.py`에도 `entry_quality_guard_mode` 검증
+추가(9건, `enforce` 명시적 거부 케이스 포함).
+
+**전체 회귀**: `run_regression_tests.py` — 11개 파일 전부 통과,
+1개(`test_legacy_fixture_structure.py`) 명시적 스킵, 종료코드 0.
+기존 MACD shadow 테스트(55건) 그대로 유지. 로그/데이터 디렉토리
+오염 없음 확인.
+
+**현재 상태**: 이번 라운드도 실거래 동작을 전혀 바꾸지 않음 —
+`entry_quality_guard_mode`가 `settings.yaml`에서 `"off"`로
+시작하므로, 코드는 준비됐지만 아직 계산 자체가 실행되지 않는
+상태. MACD shadow(1E단계)와 VWAP shadow(1E.5단계)를 동시에
+`"shadow"`로 전환해 같은 기간에 함께 수집해야, 같은 시장·같은
+종목·같은 BUY 후보에서 두 게이트를 직접 비교할 수 있음(GPT 지시).
+
+---
+

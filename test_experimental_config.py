@@ -36,6 +36,7 @@ def check(label: str, condition: bool) -> None:
 FLAG_NAMES = [
     "session_metrics_mode", "decision_engine_mode", "position_lifecycle_mode",
     "reward_risk_guard_mode", "candidate_ranking_mode", "trailing_breakeven_mode",
+    "entry_quality_guard_mode",
 ]
 
 # ── 1) 실제 settings.yaml에서 정확히 파싱되는지 ────────────────────
@@ -51,6 +52,10 @@ check("1) settings.yaml에 experimental 섹션이 정상 파싱됨", settings.ex
 # 매번 회귀로 오인될 것 — 대신 "각 플래그가 해당 단계의 진행
 # 상황에 맞는 값인지"를 검증하도록 갱신. 1C는 shadow까지 진행됨,
 # 나머지 5개 단계(2~6단계)는 아직 착수 전이라 여전히 off여야 함.
+# 2026-08-05 (1E.5단계): entry_quality_guard_mode 신규 추가 —
+# 이 단계는 아직 shadow 관측 코드만 구현됐고 settings.yaml의
+# 실제 값은 "off"로 시작(운영자가 명시적으로 shadow로 전환하기
+# 전까지는 계산 자체가 스킵됨).
 EXPECTED_MODES = {
     "session_metrics_mode": "shadow",      # 1단계: 1C.2 완료, shadow 관찰 중
     "decision_engine_mode": "off",         # 2단계: 착수 전
@@ -58,6 +63,7 @@ EXPECTED_MODES = {
     "reward_risk_guard_mode": "off",       # 4단계: 착수 전
     "candidate_ranking_mode": "off",       # 5단계: 착수 전
     "trailing_breakeven_mode": "off",      # 6단계: 착수 전
+    "entry_quality_guard_mode": "off",     # 1E.5단계: 코드 구현 완료, shadow 전환 대기
 }
 modes_match = all(
     getattr(settings.experimental, f) == expected
@@ -101,6 +107,21 @@ try:
     check("5) 정상적인 off/shadow/enforce 조합은 예외 없이 생성됨", True)
 except ValueError as e:
     check(f"5) 예상치 못한 예외: {e}", False)
+
+# ── 5-1) entry_quality_guard_mode="enforce"는 명시적으로 거부됨 ──────
+# 2026-08-05 (1E.5단계, GPT 코드리뷰 지시): 이 플래그는 아직 shadow
+# 관측까지만 구현됐으므로, 설정 파일에 실수로 "enforce"가 들어가도
+# 조용히 무시되지 않고 명확한 오류로 막혀야 함.
+try:
+    ExperimentalConfig(entry_quality_guard_mode="enforce")
+    check('5-1) entry_quality_guard_mode="enforce" -> ValueError 발생'
+          '(1E.5단계는 shadow까지만 지원, enforce 미구현 명시)', False)
+except ValueError as e:
+    check('5-1) entry_quality_guard_mode="enforce" -> ValueError 발생'
+          '(1E.5단계는 shadow까지만 지원, enforce 미구현 명시)',
+          "지원되지" in str(e))
+check("    entry_quality_guard_mode='shadow'는 정상적으로 생성됨",
+      ExperimentalConfig(entry_quality_guard_mode="shadow").entry_quality_guard_mode == "shadow")
 
 # ── 6) experimental 섹션이 없는 YAML도 기본값(전부 off)으로 안전하게 로드 ──
 with tempfile.TemporaryDirectory() as tmpdir:
