@@ -139,16 +139,21 @@ class TradingService:
         # HOLD 로그 throttle
         self.last_hold_log_at_by_symbol: dict[str, datetime] = {}
         self._last_buy_signal_at: dict[str, datetime] = {}  # 종목별 마지막 BUY신호 시각
-        self._symbol_to_condition: dict[str, str] = {}       # 종목 → 조건검색식 이름(대표값, 호환용)
-        # 2026-08-05 (GPT 코드리뷰 지적, VWAP shadow 1단계): 종목이
-        # 편입된 *모든* 조건식 이름 — update()가 아니라 매번 현재
-        # 스냅샷으로 통째로 교체됨(update_targets 참고). 기존
-        # _symbol_to_condition은 update()로 누적되어 조건식에서
-        # 편출된 뒤에도 과거 값이 잔존할 수 있었는데(재현: 1회차
-        # 편입 -> 2회차 매핑에서 제거해도 update()는 기존 키를
-        # 지우지 않아 과거 조건명이 계속 남음), 이 저장소는 그
-        # 문제를 피하기 위해 매번 전체 교체.
+        # 2026-08-05 (GPT 코드리뷰 지적, 5번): 기존엔 _symbol_to_
+        # condition(단수형)을 update()로 별도 누적해서, _symbol_to_
+        # conditions(복수형)는 스냅샷 교체로 고쳤는데도 단수형 대표
+        # 값에는 편출된 종목의 과거 조건식명이 계속 남아 두 필드가
+        # 서로 모순되는 상황(condition_name=옛값, condition_names=
+        # 빈 문자열)이 생길 수 있었음. 이제 단수형은 별도 저장소로
+        # 관리하지 않고, 필요할 때마다 복수형 스냅샷에서 결정적으로
+        # 파생시킴(_representative_condition_name() 메서드 참고) —
+        # 항상 같은 시점의 데이터에서 나오므로 모순이 생길 수 없음.
         self._symbol_to_conditions: dict[str, tuple[str, ...]] = {}
+        # 2026-08-05 (GPT 코드리뷰 지적, 1번): 종목별로 조건식 출처가
+        # CNSRREQ 초기 조회로 확정된 것인지(True), 실시간 이벤트로만
+        # 알려져 불확실한지(False)를 추적 — ConditionWatcher.symbol_
+        # condition_source_reliable을 그대로 스냅샷 교체.
+        self._symbol_condition_source_reliable: dict[str, bool] = {}
 
         # [REGIME]/[MIN] 로그 중복 억제 (2026-07-14: app.log 200MB 급증 원인 —
         # 매 폴링(10초)마다 값이 살짝만 바뀌어도 무조건 재로깅되던 것을,
@@ -254,33 +259,40 @@ class TradingService:
         symbols: list[str],
         sym_to_cond: dict[str, str] | None = None,
         sym_to_conditions: dict[str, tuple[str, ...]] | None = None,
+        sym_to_reliable: dict[str, bool] | None = None,
     ) -> None:
         """조건검색 결과로 종목 목록을 동적으로 갱신합니다.
 
         보유 중인 종목은 조건검색 편출 여부와 무관하게 항상 포함합니다.
 
         2026-08-05 (GPT 코드리뷰 지적, VWAP shadow 1단계):
-        sym_to_cond(대표값 1개)는 기존처럼 update()로 누적 —
-        이건 "이 종목을 마지막으로 어떤 조건식에서 봤는지"에 대한
-        느슨한 참고값이라 큰 문제는 아님. 하지만 sym_to_conditions
-        (전체 조건식 목록)는 반드시 매번 통째로 교체해야 함 —
-        update()를 쓰면 이번 폴링에 편출된 종목의 과거 조건식
-        이름이 dict에 그대로 남아, "지금 이 종목이 눌림목
-        조건식에 편입돼 있는가"라는 질문에 거짓 True를 답하게 됨
-        (재현 확인: 1회차 눌림목 편입 후 2회차 매핑에서 완전히
-        빠져도, update() 방식이면 과거 "눌림목_PR" 값이 계속
-        _symbol_to_condition에 남아있음).
+        sym_to_conditions(전체 조건식 목록)는 반드시 매번 통째로
+        교체해야 함 — update()를 쓰면 이번 폴링에 편출된 종목의
+        과거 조건식 이름이 dict에 그대로 남아, "지금 이 종목이
+        눌림목 조건식에 편입돼 있는가"라는 질문에 거짓 True를
+        답하게 됨(재현 확인: 1회차 눌림목 편입 후 2회차 매핑에서
+        완전히 빠져도, update() 방식이면 과거 값이 남아있음).
+
+        2026-08-05 (2차 GPT 코드리뷰 지적, 5번): sym_to_cond(단수형
+        대표값) 파라미터는 하위 호환을 위해 시그니처에는 남기되
+        더 이상 별도 저장소에 update()로 누적하지 않음 — 대표
+        `condition_name`이 필요할 때는 _representative_condition_
+        name()이 sym_to_conditions 스냅샷에서 그때그때 결정적으로
+        파생시킴. 이렇게 해야 "condition_name=옛 조건식, condition_
+        names=빈 문자열"처럼 두 필드가 서로 모순되는 상황이 생기지
+        않음(같은 시점의 같은 데이터에서 파생되므로).
 
         sym_to_conditions가 None으로 전달되면(예: 조건검색 자체가
         비활성이거나 이번 폴링에 결과가 없는 경우) 기존 저장소를
         비우지 않고 그대로 유지 — "결과가 없다"와 "전부 편출됐다"
         는 다른 신호이므로, 호출부가 명시적으로 빈 dict({})를
-        넘겨야 실제로 전량 편출로 처리됨.
+        넘겨야 실제로 전량 편출로 처리됨. sym_to_reliable도 동일
+        원칙.
         """
-        if sym_to_cond:
-            self._symbol_to_condition.update(sym_to_cond)
         if sym_to_conditions is not None:
             self._symbol_to_conditions = dict(sym_to_conditions)
+        if sym_to_reliable is not None:
+            self._symbol_condition_source_reliable = dict(sym_to_reliable)
         holding_symbols: list[str] = []
         try:
             balance = self._get_balance_with_cache()
@@ -297,6 +309,23 @@ class TradingService:
                 )
 
         self._dynamic_targets = merged
+
+    def _representative_condition_name(self, symbol: str) -> str:
+        """종목의 대표 조건식 이름을 현재 스냅샷에서 결정적으로 파생시킵니다.
+
+        2026-08-05 (GPT 코드리뷰 지적, 5번): 기존엔 이 값을 별도
+        저장소(_symbol_to_condition)에 update()로 누적해서, 편출된
+        종목의 과거 조건식명이 잔존해 "condition_name=옛 조건식,
+        condition_names=빈 문자열"처럼 두 필드가 서로 모순되는
+        상황이 생길 수 있었음. 이제 항상 _symbol_to_conditions
+        (같은 시점의 스냅샷)에서 파생시키므로 모순 자체가 구조적
+        으로 불가능함 — 대표값을 정렬 순서로 고정해 호출마다
+        같은 종목에 대해 항상 같은 대표값이 나오도록 함(결정적).
+        """
+        names = self._symbol_to_conditions.get(symbol, ())
+        if not names:
+            return ""
+        return sorted(names)[0]
 
     def get_excluded_symbols(self) -> set[str]:
         """자동 제외된 종목 목록을 반환합니다."""
@@ -2551,7 +2580,7 @@ class TradingService:
                 "exit_reason": exit_reason,
                 "hold_minutes": hold_minutes,
                 "avg_buy_price": avg_buy_price,
-                "condition_name": self._symbol_to_condition.get(symbol, ""),
+                "condition_name": self._representative_condition_name(symbol),
             },
         )
 
@@ -2902,7 +2931,7 @@ class TradingService:
             "skip_reason": classify_skip_reason(signal.reason, signal.type.value),
             "final_decision":    final_decision or signal.type.value,
             "order_block_reason": order_block_reason,
-            "condition_name": self._symbol_to_condition.get(symbol, ""),
+            "condition_name": self._representative_condition_name(symbol),
             "macd": macd_val,
             "macd_signal": macd_signal_val,
             "macd_above_signal": macd_above_signal_val,
@@ -2969,6 +2998,11 @@ class TradingService:
         guard_mode = getattr(self.settings.experimental, "entry_quality_guard_mode", "off")
         if guard_mode == "shadow":
             condition_names = self._symbol_to_conditions.get(symbol, ())
+            # 2026-08-05 (2차 GPT 코드리뷰 지적 1번): 딕셔너리에
+            # 아예 없는 경우도 "신뢰 불가"로 취급해야 함(get()의
+            # 기본값을 False로 명시) — "이 종목에 대해 아무 정보도
+            # 없다"와 "신뢰 가능하다고 확인됐다"를 혼동하면 안 됨.
+            condition_source_reliable = self._symbol_condition_source_reliable.get(symbol, False)
             session_metrics = self._latest_session_metrics_by_symbol.get(symbol)
             # 2026-08-05: 세션 값이 오늘 거래일 것이 아니면(예: 어제
             # 계산된 값이 자정을 넘겨 그대로 남아있는 극단적 상황)
@@ -2983,6 +3017,7 @@ class TradingService:
                 current_price=price,
                 minute_analysis=minute_analysis,
                 condition_names=condition_names,
+                condition_source_reliable=condition_source_reliable,
                 session_metrics=session_metrics,
             )
 
@@ -3016,8 +3051,21 @@ class TradingService:
                     "detected_patterns": row.get("detected_patterns", "-"),
                     "score": score,
                     "regime": regime.value if regime else "",
-                    "condition_name": self._symbol_to_condition.get(symbol, ""),
+                    "condition_name": self._representative_condition_name(symbol),
                     "condition_names": "|".join(assessment.condition_names),
+                    "condition_source_reliable": condition_source_reliable,
+                    # 2026-08-05 (2차 GPT 코드리뷰 지적 3번): 실제
+                    # 진입 기준값 — legacy_buy_candidate=True라도
+                    # 실제 주문됐는지, 기존 규칙(DAILY_ENTRY_LIMIT/
+                    # AFTER_1450/RISK_LIMIT 등)으로 이미 차단된
+                    # 후보인지 이 필드들로 구분 가능. current_price
+                    # 가 있어야 5·10·20분 후 수익률도 다른 로그와
+                    # 복잡한 조인 없이 직접 계산 가능.
+                    "current_price": price,
+                    "legacy_reason": signal.reason,
+                    "final_decision": final_decision or signal.type.value,
+                    "order_block_reason": order_block_reason,
+                    "actual_order_submitted": (final_decision or signal.type.value) == "BUY",
                     "macd": macd_val,
                     "macd_signal": macd_signal_val,
                     "macd_above_signal": macd_above_signal_val,

@@ -74,11 +74,20 @@ class VwapShadowAssessment:
         would_block_pr_only_rolling_vwap 등 8개 필드: legacy_buy_
             candidate=True(전략이 실제로 BUY를 반환한 경우)일 때만
             계산 — 그 외에는 None(빈 값).
+
+        condition_source_reliable: 이 종목의 condition_names가
+            CNSRREQ(정확한 seq 포함)로 확정된 것인지(True), REAL
+            (실시간, 출처 불명)로만 알려진 것인지(False). False면
+            is_pullback_condition과 그로부터 파생되는 4개 would_
+            block_*(*_pullback_condition_*, *_pr_or_pullback_
+            condition_*)가 전부 None — PR-only/C-or-PR 4개는
+            이 값과 무관하게 항상 정상 계산됨.
     """
     is_pr: bool
     is_c: bool
     condition_names: tuple[str, ...]
-    is_pullback_condition: bool
+    condition_source_reliable: bool
+    is_pullback_condition: bool | None
     is_pr_or_pullback_condition: bool
 
     rolling_vwap: float | None
@@ -108,6 +117,7 @@ def evaluate_vwap_shadow(
     current_price: float,
     minute_analysis,
     condition_names: tuple[str, ...],
+    condition_source_reliable: bool,
     session_metrics,
     threshold_pct: float = VWAP_DISTANCE_THRESHOLD_PCT,
 ) -> VwapShadowAssessment:
@@ -123,6 +133,15 @@ def evaluate_vwap_shadow(
             (False/None)으로 반환.
         condition_names: 이 종목이 편입된 모든 조건식 이름(튜플,
             빈 튜플 가능).
+        condition_source_reliable: 이 종목의 condition_names가
+            CNSRREQ(조건식별 초기 조회, 정확한 seq 포함)로 확정된
+            것인지(True), 아니면 REAL(실시간 이벤트, 어느 조건식
+            인지 알 수 없음)로만 알려진 것인지(False). False면
+            condition-source 기반 판정(is_pullback_condition 및
+            그로부터 파생되는 4개 would_block_*)은 계산하지 않고
+            None으로 남김 — PR-only/C-or-PR은 이 값과 무관하게
+            항상 정상 계산됨(PR/C는 분봉 자체 분석값이라 조건식
+            출처 문제와 무관).
         session_metrics: SessionMetrics 또는 None(session_metrics_
             mode="off"이거나 해당 종목 세션 데이터가 아직 없는 경우).
         threshold_pct: VWAP 거리 임계값(%) — 기본 2.0, 정확히
@@ -133,8 +152,37 @@ def evaluate_vwap_shadow(
     """
     is_pr = bool(minute_analysis is not None and minute_analysis.is_pulldown_recovery)
     is_c = bool(minute_analysis is not None and minute_analysis.is_valid_pulldown)
-    is_pullback_condition = any("눌림목" in name for name in condition_names)
-    is_pr_or_pullback_condition = is_pr or is_pullback_condition
+    # 2026-08-05 (2차 GPT 코드리뷰 지적 1번, 재현 확인): 키움 REAL
+    # 메시지에는 어느 조건식에서 편입/편출됐는지 정보가 없어서,
+    # 실시간 이벤트로만 알려진 종목의 조건식 소속은 확정할 수 없음
+    # (재현: seq1=돌파형A, seq2=눌림목_PR 상태에서 실시간 편입 이벤트
+    # 가 오면 기존 코드는 항상 seq1 결과로만 기록하고 있었음).
+    # condition_source_reliable=False면 이 종목의 condition_names가
+    # 실제로 정확한지 확신할 수 없으므로, condition-source 기반
+    # 판정(is_pullback_condition 및 그로부터 파생되는 4개 would_
+    # block_*)은 계산하지 않고 None으로 남김 — PR/C(분봉 자체
+    # 분석값이라 조건식 출처 문제와 무관)는 신뢰도와 무관하게 항상
+    # 정상 계산.
+    is_pullback_condition: bool | None
+    if condition_source_reliable:
+        is_pullback_condition = any("눌림목" in name for name in condition_names)
+    else:
+        is_pullback_condition = None
+
+    # 2026-08-05: is_pr_or_pullback_condition은 PR(항상 신뢰 가능)
+    # 과 is_pullback_condition(신뢰 불가일 수 있음)의 OR — PR이
+    # 이미 True면 조건식 출처를 몰라도 최종 결과는 확정적으로
+    # True(OR 연산의 단락 평가와 동일한 원리). PR이 False인데
+    # is_pullback_condition을 모르면(None) 최종 결과도 알 수 없으
+    # 므로 None — bool(None)=False로 암묵 변환하면 "조건식 소속이
+    # 아니다"로 잘못 단정하게 되므로 반드시 3진으로 처리.
+    is_pr_or_pullback_condition: bool | None
+    if is_pr:
+        is_pr_or_pullback_condition = True
+    elif is_pullback_condition is None:
+        is_pr_or_pullback_condition = None
+    else:
+        is_pr_or_pullback_condition = is_pullback_condition
 
     rolling_vwap = None
     rolling_vwap_distance_pct = None
@@ -177,29 +225,45 @@ def evaluate_vwap_shadow(
 
     if legacy_buy_candidate:
         if rolling_over_threshold is not None:
+            # PR-only/C-or-PR은 조건식 출처와 무관(PR/C는 분봉 자체
+            # 분석값) — 신뢰도와 관계없이 항상 정상 계산.
             would_block_pr_only_rolling_vwap = is_pr and rolling_over_threshold
             would_block_c_or_pr_rolling_vwap = (is_pr or is_c) and rolling_over_threshold
-            would_block_pullback_condition_rolling_vwap = (
-                is_pullback_condition and rolling_over_threshold
-            )
-            would_block_pr_or_pullback_condition_rolling_vwap = (
-                is_pr_or_pullback_condition and rolling_over_threshold
-            )
+            # 2026-08-05: 이 두 필드는 각각 자신이 의존하는 상위값
+            # (is_pullback_condition / is_pr_or_pullback_condition)
+            # 이 None인지를 독립적으로 확인 — is_pr_or_pullback_
+            # condition은 is_pr=True이면 is_pullback_condition이
+            # None(신뢰 불가)이어도 확정적으로 True가 되므로, 이
+            # 경우 would_block_pr_or_pullback_condition_*는 정상
+            # 계산 가능해야 함(반면 would_block_pullback_
+            # condition_*는 is_pullback_condition 자체가 None이면
+            # 항상 None).
+            if is_pullback_condition is not None:
+                would_block_pullback_condition_rolling_vwap = (
+                    is_pullback_condition and rolling_over_threshold
+                )
+            if is_pr_or_pullback_condition is not None:
+                would_block_pr_or_pullback_condition_rolling_vwap = (
+                    is_pr_or_pullback_condition and rolling_over_threshold
+                )
 
         if session_gate_eligible and session_over_threshold is not None:
             would_block_pr_only_session_vwap = is_pr and session_over_threshold
             would_block_c_or_pr_session_vwap = (is_pr or is_c) and session_over_threshold
-            would_block_pullback_condition_session_vwap = (
-                is_pullback_condition and session_over_threshold
-            )
-            would_block_pr_or_pullback_condition_session_vwap = (
-                is_pr_or_pullback_condition and session_over_threshold
-            )
+            if is_pullback_condition is not None:
+                would_block_pullback_condition_session_vwap = (
+                    is_pullback_condition and session_over_threshold
+                )
+            if is_pr_or_pullback_condition is not None:
+                would_block_pr_or_pullback_condition_session_vwap = (
+                    is_pr_or_pullback_condition and session_over_threshold
+                )
 
     return VwapShadowAssessment(
         is_pr=is_pr,
         is_c=is_c,
         condition_names=condition_names,
+        condition_source_reliable=condition_source_reliable,
         is_pullback_condition=is_pullback_condition,
         is_pr_or_pullback_condition=is_pr_or_pullback_condition,
         rolling_vwap=rolling_vwap,

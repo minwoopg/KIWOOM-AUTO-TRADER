@@ -2731,3 +2731,154 @@ experimental_config.py`에도 `entry_quality_guard_mode` 검증
 
 ---
 
+## 1E.6: 조건검색식 출처 신뢰도 및 shadow 로그 개선 (2026-08-05)
+
+**배경**: 1E.5 승인 직후, `entry_quality_guard_mode="shadow"`로
+실전환하기 전 GPT 코드리뷰로 6가지 보완사항이 지적됨 — 그중 1번
+(조건검색식 출처 부정확)은 shadow 데이터 자체를 오염시킬 수 있는
+문제라 반드시 먼저 고쳐야 했음.
+
+### 1. 실시간 REAL 이벤트의 조건검색식 출처 오류 (가장 중요, 재현 확인)
+
+`ConditionWatcher._on_realtime()`에 `seq = next(iter(self.
+_symbols_by_seq))`라는 코드가 있었는데, 주석은 "모든 단타 seq에
+동시 귀속"이라고 되어 있었지만 실제로는 **첫 번째 seq 하나에만**
+임의로 귀속시키고 있었음 — 키움 REAL 메시지 자체에 어느 조건식
+에서 온 이벤트인지 정보가 없기 때문. 재현: seq1=돌파형A,
+seq2=눌림목_PR 상태에서 058610이 실시간 편입되면, 실제 출처와
+무관하게 항상 seq1 결과로만 기록됨. 이 오귀속 정보로 조건검색식
+기반 VWAP shadow(`is_pullback_condition` 등)를 계산하면 통계
+자체가 왜곡됨. 편출 처리도 같은 문제 — "임의로 고른 seq 하나
+에서만 제거"해서 실제로 다른 조건식에 남아있는 종목을 잘못
+제거할 위험이 있었음.
+
+**수정**: GPT 권장 3번 방식(가장 보수적) 채택 — 실시간 이벤트는
+"이 종목이 어떤 조건식엔가 소속돼 있다/아니다"라는 targets
+갱신에만 쓰고, 어느 조건식인지는 확정하지 않음. `"__realtime_
+unknown__"` 전용 버킷을 신설해 실시간 편입은 여기에 담아
+`_all_symbols`(targets)에는 정확히 반영하되, `symbol_to_
+condition(s)` 계산에서는 이 버킷을 제외 — 그 결과 이 종목은
+조건검색식 이름 없이 targets에만 잡히고, 다음 `CNSRREQ` 재조회
+때 정확한 seq로 확정됨. 편출은 "임의로 seq 하나 선택"이 아니라
+그 종목이 들어있는 **모든 버킷에서 실제로 제거**하도록 재작성 —
+"다른 조건식에 남아있는 종목을 잘못 제거"하던 위험을 근본적으로
+없앰.
+
+`_condition_source_reliable: dict[str, bool]` 저장소와 `symbol_
+condition_source_reliable` property 신규 추가 — `_on_initial_
+result()`(`CNSRREQ`, 메시지에 정확한 `seq` 포함)로 확정된 종목은
+`True`, `_on_realtime()`(`REAL`, 출처 불명)으로만 알려진 종목은
+`False`.
+
+재현 검증: 실시간 편입 시 `symbol_to_conditions`에는 안 나타나고
+`condition_source_reliable=False`, 하지만 `targets`에는 정확히
+포함됨을 확인. `CNSRREQ` 초기조회 후에는 정확한 조건식명 +
+`reliable=True`로 확정됨을 확인. 편출 시 두 조건식 모두에서 정확히
+제거됨을 확인.
+
+`domain/strategy/entry_quality_shadow.py`의 `evaluate_vwap_
+shadow()`에 `condition_source_reliable` 파라미터 추가 —
+`False`면 `is_pullback_condition`(및 그로부터 파생되는 4개
+`would_block_*`)이 `None`, PR-only/C-or-PR 4개는 신뢰도와 무관
+하게 항상 정상 계산(PR/C는 분봉 자체 분석값이라 조건식 출처
+문제와 무관). `is_pr_or_pullback_condition`은 `is_pr=True`이면
+`is_pullback_condition`이 `None`이어도 확정적으로 `True`가
+되도록 3진 로직으로 정확히 구현(단순히 `bool(None)=False`로
+암묵 변환하면 "조건식 소속이 아니다"로 잘못 단정하게 되는 문제를
+재현으로 확인하고 수정) — `would_block_pr_or_pullback_condition_
+*`도 이 3진 로직을 정확히 따라가도록 게이트 조건을 `is_
+pullback_condition`과 `is_pr_or_pullback_condition` 각각
+독립적으로 확인.
+
+### 2. entry_quality_shadow.csv 중복 방지가 게이트 상태 변화를 삭제 (재현 확인)
+
+기존 중복 방지 키가 `(symbol, latest_bar_timestamp, detected_
+patterns, score)`뿐이라, 같은 1분봉 안에서 현재가가 움직여 게이트
+상태가 바뀌어도(예: rolling 거리 1.99%→2.01%로 임계값을 넘어감)
+두 번째 관측이 조용히 버려지고 있었음(재현: 첫 관측 block=False로
+기록 성공, 두 번째 관측 block=True인데 같은 키라 `append_if_new`
+가 `False`를 반환해 기록 안 됨 — 최종 CSV에는 첫 상태만 남음).
+
+**수정**: 키에 `assessment_signature`(MACD 2개 + VWAP rolling/
+session 8개 + `final_decision` + `order_block_reason`, 총 12개
+필드) 추가 — 같은 분봉이라도 이 서명이 바뀌면 새 행으로 기록.
+`_entry_quality_shadow_key()` 헬퍼로 계산을 통일하고, 모든 값을
+`str()`로 정규화(재현 확인: Python `bool` 타입과 CSV에서 복원한
+문자열 `"True"`가 그대로 섞이면 재시작 후 중복 감지가 실패하는
+문제가 있어서 타입을 통일).
+
+재현 검증: 1.99%→2.01% 상태 변화 시 정확히 2행 기록, 동일 상태
+3회 반복은 1행 유지, `final_decision`이 `BLOCKED`→`BUY`로 바뀌면
+새 행 기록.
+
+### 3. entry_quality_shadow.csv 필드 추가 (실제 진입 기준값)
+
+`current_price`, `legacy_reason`, `final_decision`, `order_
+block_reason`, `actual_order_submitted`(`final_decision=="BUY"`),
+`condition_source_reliable` 신규 추가 — 기존엔 `legacy_buy_
+candidate=True`라도 실제로 주문됐는지, `DAILY_ENTRY_LIMIT`/
+`AFTER_1450`/`RISK_LIMIT` 등 기존 규칙으로 이미 차단된 후보인지
+전용 로그만으로는 구분할 수 없었고, `current_price`가 없어
+5·10·20분 후 수익률 계산도 다른 로그와 복잡하게 조인하거나
+VWAP 거리에서 역산해야 했음.
+
+### 4. 재시작 시 중복 방지 복원
+
+`EntryQualityShadowLogger.__init__()`이 기존 파일이 있으면(장중
+재시작) 그 안의 모든 행에서 키를 읽어 `_seen_keys`를 복원하도록
+수정 — 전용 파일은 legacy BUY 후보만 담아 크기가 작으므로 전체
+재읽기 부담이 크지 않음. 복원 실패(파일 손상 등)는 경고만 남기고
+빈 상태로 계속 진행(fail-open).
+
+재현 검증: 재시작 시뮬레이션(같은 파일 경로로 새 로거 인스턴스
+생성) → 기존 1개 키가 정확히 복원되고, 동일 판단 재시도 시
+중복으로 정확히 거부됨.
+
+### 5. 대표 condition_name 모순 해소
+
+기존엔 `_symbol_to_condition`(단수형)을 `update()`로 별도 누적해서,
+`_symbol_to_conditions`(복수형)는 스냅샷 교체로 고쳤는데도 단수형
+대표값에는 편출된 종목의 과거 조건식명이 남아 `condition_name`
+(옛값)과 `condition_names`(빈 문자열)가 서로 모순되는 로그 행이
+생길 수 있었음. `_symbol_to_condition` 저장소 자체를 폐기하고,
+`_representative_condition_name()` 메서드가 항상 `_symbol_to_
+conditions`(같은 시점의 복수형 스냅샷)에서 정렬 후 첫 번째 값을
+결정적으로 파생시키도록 변경 — 두 필드가 항상 같은 시점의 같은
+데이터에서 나오므로 모순이 구조적으로 불가능해짐. `TradingService`
+내 3개 참조 지점 전부 교체.
+
+재현 검증: 복수 조건식 편입 시 대표값이 실제 스냅샷 안의 값 중
+하나로 정확히 나옴, 편출 후에는 대표값도 정확히 빈 문자열(과거
+값 잔존 없음).
+
+### 6. off 모드 문서 불일치 정정
+
+`EntryQualityShadowLogger` 생성자가 `entry_quality_guard_mode`와
+무관하게 항상 헤더 파일을 즉시 생성하는 것 자체는 기존 다른
+shadow 로거들과 동일한 패턴 — 코드 동작은 문제 없었으나 docstring
+표현을 "`off`에서는 이 파일에 행이 추가되지 않을 뿐, 빈 헤더만
+있는 파일 자체는 생성됨"으로 명확히 정정.
+
+### 테스트
+
+`test_vwap_shadow_observation.py`를 34→58건으로 확장 — 기존
+`evaluate_vwap_shadow()` 호출부 10곳에 `condition_source_
+reliable=True`(기존 테스트 의미 유지) 추가, GPT가 제시한 9가지
+필수 신규 테스트(REAL 이벤트 신뢰도, CNSRREQ 확정, unreliable
+시 조건-소스 `would_block=None`, PR/C는 신뢰도 무관 정상 계산,
+1.99%→2.01% 상태변화 2행, 동일상태 반복 1행, `BLOCKED`→`BUY`
+변화 새행, 실제 진입 기준값 기록, 재시작 후 중복방지, 대표
+`condition_name` 일치) 전부 반영.
+
+**전체 회귀**: `run_regression_tests.py` — 11개 파일 전부 통과,
+1개(`test_legacy_fixture_structure.py`) 명시적 스킵, 종료코드 0.
+MACD shadow(55건) 그대로 유지, VWAP shadow 58건. 로그/데이터
+디렉토리 오염 없음 확인.
+
+**현재 상태**: 이번 라운드도 실거래 동작을 전혀 바꾸지 않음.
+`entry_quality_guard_mode`는 여전히 `settings.yaml`에서 `"off"`.
+이제 조건검색식 출처 문제가 해결됐으므로, `"shadow"`로 실전환해
+MACD/VWAP 데이터를 동시에 수집해도 안전한 상태로 판단.
+
+---
+

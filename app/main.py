@@ -243,7 +243,12 @@ async def async_main() -> None:
             # 이걸 매 폴링마다 통째로 교체하므로, 편출된 종목의
             # 과거 조건식 이름이 잔존하지 않음.
             sym_to_conditions = watcher.symbol_to_conditions
-            trading_service.update_targets(limited, sym_to_cond, sym_to_conditions)
+            # 2026-08-05 (2차 GPT 코드리뷰 지적, 1번): 조건식 출처
+            # 신뢰도도 함께 전달 — 실시간 이벤트로만 알려져 어느
+            # 조건식인지 불확실한 종목은 이 값이 False가 되고,
+            # VWAP shadow의 condition-source 기반 판단에서 제외됨.
+            sym_to_reliable = watcher.symbol_condition_source_reliable
+            trading_service.update_targets(limited, sym_to_cond, sym_to_conditions, sym_to_reliable)
             blocked = excluded & set(day_symbols)
             if blocked:
                 app_logger.info(f"[COND] 제외 종목 재편입 차단: {sorted(blocked)}")

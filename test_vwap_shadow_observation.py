@@ -141,7 +141,7 @@ symbol = "005930"
 ma = make_ma(is_pulldown_recovery=True, is_valid_pulldown=False)
 r = evaluate_vwap_shadow(
     legacy_buy_candidate=True, current_price=102010, minute_analysis=ma,
-    condition_names=(), session_metrics=None,
+    condition_names=(), condition_source_reliable=True, session_metrics=None,
 )
 check("1) PR=True,C=False + rolling거리2.01% -> PR-only=True", r.would_block_pr_only_rolling_vwap is True)
 check("   C-or-PR도 True(PR이 True이므로)", r.would_block_c_or_pr_rolling_vwap is True)
@@ -150,7 +150,7 @@ check("   C-or-PR도 True(PR이 True이므로)", r.would_block_c_or_pr_rolling_v
 ma2 = make_ma(is_pulldown_recovery=False, is_valid_pulldown=True)
 r2 = evaluate_vwap_shadow(
     legacy_buy_candidate=True, current_price=102010, minute_analysis=ma2,
-    condition_names=(), session_metrics=None,
+    condition_names=(), condition_source_reliable=True, session_metrics=None,
 )
 check("2) PR=False,C=True -> PR-only=False", r2.would_block_pr_only_rolling_vwap is False)
 check("   C-or-PR=True(C가 True이므로)", r2.would_block_c_or_pr_rolling_vwap is True)
@@ -159,7 +159,7 @@ check("   C-or-PR=True(C가 True이므로)", r2.would_block_c_or_pr_rolling_vwap
 ma3 = make_ma(is_pulldown_recovery=False, is_valid_pulldown=False)
 r3 = evaluate_vwap_shadow(
     legacy_buy_candidate=True, current_price=102010, minute_analysis=ma3,
-    condition_names=("자동매매_눌림목_PR",), session_metrics=None,
+    condition_names=("자동매매_눌림목_PR",), condition_source_reliable=True, session_metrics=None,
 )
 check("3) PR=False,C=False,조건식눌림목 -> PR-only=False", r3.would_block_pr_only_rolling_vwap is False)
 check("   C-or-PR=False", r3.would_block_c_or_pr_rolling_vwap is False)
@@ -174,7 +174,7 @@ check("   condition scope=True(조건식명에 눌림목 포함)",
 ma4 = make_ma(is_pulldown_recovery=False, is_valid_pulldown=False)
 r4 = evaluate_vwap_shadow(
     legacy_buy_candidate=True, current_price=102010, minute_analysis=ma4,
-    condition_names=("자동매매_돌파형A", "자동매매_눌림목_PR"), session_metrics=None,
+    condition_names=("자동매매_돌파형A", "자동매매_눌림목_PR"), condition_source_reliable=True, session_metrics=None,
 )
 check("4) 복수조건식(돌파형A+눌림목_PR) 동시편입 -> is_pullback_condition=True",
       r4.is_pullback_condition is True)
@@ -213,7 +213,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
 ma_exact = make_ma(is_pulldown_recovery=True)
 r_exact = evaluate_vwap_shadow(
     legacy_buy_candidate=True, current_price=102000, minute_analysis=ma_exact,
-    condition_names=(), session_metrics=None,
+    condition_names=(), condition_source_reliable=True, session_metrics=None,
 )
 check("7) rolling distance 정확히 2.00% -> would_block=False(통과)",
       r_exact.would_block_pr_only_rolling_vwap is False)
@@ -221,7 +221,7 @@ check("7) rolling distance 정확히 2.00% -> would_block=False(통과)",
 # ── 8) rolling distance=2.01% -> block=True ───────────────────────
 r_over = evaluate_vwap_shadow(
     legacy_buy_candidate=True, current_price=102010, minute_analysis=ma_exact,
-    condition_names=(), session_metrics=None,
+    condition_names=(), condition_source_reliable=True, session_metrics=None,
 )
 check("8) rolling distance 2.01% -> would_block=True(차단 후보)",
       r_over.would_block_pr_only_rolling_vwap is True)
@@ -235,7 +235,7 @@ ma_pr = make_ma(is_pulldown_recovery=True)
 sm_ready = make_session_metrics(ready=True, reason="COMPLETE_FROM_OPEN")
 r9 = evaluate_vwap_shadow(
     legacy_buy_candidate=True, current_price=102010, minute_analysis=ma_pr,
-    condition_names=(), session_metrics=sm_ready,
+    condition_names=(), condition_source_reliable=True, session_metrics=sm_ready,
 )
 check("9) session ready=True + distance2.01% -> session_gate_eligible=True",
       r9.session_gate_eligible is True)
@@ -245,7 +245,7 @@ check("   would_block_pr_only_session_vwap=True", r9.would_block_pr_only_session
 sm_partial = make_session_metrics(ready=False, reason="PARTIAL_SESSION")
 r10 = evaluate_vwap_shadow(
     legacy_buy_candidate=True, current_price=103000, minute_analysis=ma_pr,
-    condition_names=(), session_metrics=sm_partial,
+    condition_names=(), condition_source_reliable=True, session_metrics=sm_partial,
 )
 check("10) session ready=False(PARTIAL_SESSION) -> session_vwap_distance_pct는 관찰용으로 기록됨"
       "(정확히 GPT 지시 필수 테스트)", r10.session_vwap_distance_pct is not None)
@@ -260,7 +260,7 @@ check("    would_block_pr_only_session_vwap은 빈 값(None) — 불완전 세�
 # ── 11) HOLD에서는 상태값만 기록, would_block 전부 빈 값 ─────────
 r11 = evaluate_vwap_shadow(
     legacy_buy_candidate=False, current_price=102010, minute_analysis=ma_pr,
-    condition_names=(), session_metrics=sm_ready,
+    condition_names=(), condition_source_reliable=True, session_metrics=sm_ready,
 )
 check("11) legacy_buy_candidate=False(HOLD) -> is_pr 상태값은 기록됨", r11.is_pr is True)
 check("    rolling_vwap_distance_pct도 기록됨", r11.rolling_vwap_distance_pct is not None)
@@ -277,7 +277,7 @@ check("    would_block 8개 전부 빈 값(None)",
 # ── 12) condition_names=() 이어도 PR=True면 정상 평가 ─────────────
 r12 = evaluate_vwap_shadow(
     legacy_buy_candidate=True, current_price=102010, minute_analysis=ma_pr,
-    condition_names=(), session_metrics=None,
+    condition_names=(), condition_source_reliable=True, session_metrics=None,
 )
 check("12) condition_names=() 이어도 PR=True면 PR-only 정상 평가됨"
       "(조건식명 누락이 PR 판정에 영향 없음)", r12.would_block_pr_only_rolling_vwap is True)
@@ -395,6 +395,243 @@ with tempfile.TemporaryDirectory() as tmpdir_off, tempfile.TemporaryDirectory() 
           row_off["skip_reason"] == row_shadow["skip_reason"] == original_signal.reason)
     check("    off/shadow 모드에서 final_decision도 완전히 동일함",
           row_off["final_decision"] == row_shadow["final_decision"])
+
+# ══════════════════════════════════════════════════════════════
+# 7부: 조건검색식 출처 신뢰도 (2026-08-05, 2차 GPT 코드리뷰 지적 1번)
+# ══════════════════════════════════════════════════════════════
+
+# ── 18) REAL 이벤트 후 condition_source_reliable=False ────────────
+config_ws = WebSocketConfig(enabled=False, url="", condition_seqs=["1", "2"], max_symbols=10,
+                             app_key="", secret_key="")
+watcher18 = ConditionWatcher.__new__(ConditionWatcher)
+watcher18.config = config_ws
+watcher18._symbols_by_seq = {"1": set(), "2": set()}
+watcher18._condition_names = {"1": "자동매매_돌파형A", "2": "자동매매_눌림목_PR"}
+watcher18._condition_source_reliable = {}
+watcher18.on_symbols_changed = lambda x: None
+
+msg_real = {"trnm": "REAL", "data": [
+    {"values": {"9001": "A058610", "843": "I"}, "type": "00", "name": "조건검색", "item": "058610"}
+]}
+watcher18._on_realtime(msg_real)
+check("18) REAL 이벤트로 편입된 종목 -> condition_source_reliable=False"
+      "(정확히 GPT 지시 필수 테스트 — 어느 조건식인지 확정 불가)",
+      watcher18.symbol_condition_source_reliable.get("058610") is False)
+check("    symbol_to_conditions에는 이 종목이 안 나타남(조건식 미확정)",
+      "058610" not in watcher18.symbol_to_conditions)
+check("    하지만 targets(_all_symbols)에는 정확히 포함됨(편입 자체는 반영)",
+      "058610" in watcher18._all_symbols)
+
+# ── 19) CNSRREQ 초기조회 후에는 reliable=True ─────────────────────
+msg_cnsrreq = {"trnm": "CNSRREQ", "return_code": 0, "seq": "2", "data": [{"jmcode": "A058610"}]}
+watcher18._on_initial_result(msg_cnsrreq)
+check("19) CNSRREQ 초기조회 후 -> condition_source_reliable=True",
+      watcher18.symbol_condition_source_reliable.get("058610") is True)
+check("    symbol_to_conditions에 정확한 조건식명이 나타남",
+      watcher18.symbol_to_conditions.get("058610") == ("자동매매_눌림목_PR",))
+
+# ── 20) unreliable이면 condition-source 기반 would_block=None ─────
+ma20 = make_ma(is_pulldown_recovery=False, is_valid_pulldown=False)
+r20 = evaluate_vwap_shadow(
+    legacy_buy_candidate=True, current_price=102010, minute_analysis=ma20,
+    condition_names=("자동매매_눌림목_PR",), condition_source_reliable=False,
+    session_metrics=None,
+)
+check("20) condition_source_reliable=False -> is_pullback_condition=None"
+      "(정확히 GPT 지시 필수 테스트)", r20.is_pullback_condition is None)
+check("    would_block_pullback_condition_rolling_vwap도 None",
+      r20.would_block_pullback_condition_rolling_vwap is None)
+
+# ── 21) PR/C 기반 would_block은 reliable 여부와 무관하게 정상 계산 ──
+ma21 = make_ma(is_pulldown_recovery=True, is_valid_pulldown=True)
+r21_unreliable = evaluate_vwap_shadow(
+    legacy_buy_candidate=True, current_price=102010, minute_analysis=ma21,
+    condition_names=(), condition_source_reliable=False, session_metrics=None,
+)
+r21_reliable = evaluate_vwap_shadow(
+    legacy_buy_candidate=True, current_price=102010, minute_analysis=ma21,
+    condition_names=(), condition_source_reliable=True, session_metrics=None,
+)
+check("21) PR/C 기반 would_block_pr_only_rolling_vwap은 reliable 여부와 무관하게 "
+      "동일하게 정상 계산됨(정확히 GPT 지시 필수 테스트)",
+      r21_unreliable.would_block_pr_only_rolling_vwap == r21_reliable.would_block_pr_only_rolling_vwap
+      and r21_unreliable.would_block_pr_only_rolling_vwap is True)
+check("    would_block_c_or_pr_rolling_vwap도 동일하게 정상 계산됨",
+      r21_unreliable.would_block_c_or_pr_rolling_vwap == r21_reliable.would_block_c_or_pr_rolling_vwap
+      and r21_unreliable.would_block_c_or_pr_rolling_vwap is True)
+
+# ══════════════════════════════════════════════════════════════
+# 8부: entry_quality_shadow.csv 중복 방지 — 게이트 상태 변화 보존
+# (2026-08-05, 2차 GPT 코드리뷰 지적 2번)
+# ══════════════════════════════════════════════════════════════
+
+# ── 22) 동일 봉 1.99%->2.01% 상태 변화는 2행 기록 ──────────────────
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir, guard_mode="shadow")
+    service._symbol_to_conditions[symbol] = ()
+
+    for distance_price in (101990, 102010):  # 1.99% -> 2.01%
+        mp = MarketPrice(symbol=symbol, current_price=distance_price, reference_price=98000,
+            previous_close=98000, timestamp=datetime.now(),
+            indicator_macd=1.5, indicator_macd_signal=1.0, indicator_macd_hist_direction=1)
+        ma_dist = make_ma(is_pulldown_recovery=True)
+        signal = Signal(type=SignalType.BUY, reason="최적 타점 6/8 — 테스트")
+        service._write_signal_log(
+            symbol=symbol, price=distance_price, regime=MarketRegime.BULLISH,
+            signal=signal, minute_analysis=ma_dist, final_decision="BUY",
+            order_block_reason="", market_price=mp, latest_bar_timestamp="20260805100000",
+        )
+    shadow_rows = read_shadow_rows(service)
+    check("22) 동일 분봉에서 rolling거리 1.99%->2.01%(게이트 상태 변화) -> "
+          "entry_quality_shadow.csv에 2행 기록됨(정확히 GPT 지시 필수 테스트 — "
+          "상태 변화가 삭제되지 않음)", len(shadow_rows) == 2)
+    if len(shadow_rows) == 2:
+        check("    첫 행은 would_block_pr_only_rolling_vwap=False",
+              shadow_rows[0]["would_block_pr_only_rolling_vwap"] == "False")
+        check("    둘째 행은 would_block_pr_only_rolling_vwap=True",
+              shadow_rows[1]["would_block_pr_only_rolling_vwap"] == "True")
+
+# ── 23) 같은 상태 반복은 1행 유지 ──────────────────────────────────
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir, guard_mode="shadow")
+    mp = MarketPrice(symbol=symbol, current_price=102010, reference_price=98000,
+        previous_close=98000, timestamp=datetime.now(),
+        indicator_macd=1.5, indicator_macd_signal=1.0, indicator_macd_hist_direction=1)
+    ma23 = make_ma(is_pulldown_recovery=True)
+    signal = Signal(type=SignalType.BUY, reason="최적 타점 6/8 — 테스트")
+    for _ in range(3):
+        service._write_signal_log(
+            symbol=symbol, price=102010, regime=MarketRegime.BULLISH,
+            signal=signal, minute_analysis=ma23, final_decision="BUY",
+            order_block_reason="", market_price=mp, latest_bar_timestamp="20260805100000",
+        )
+    shadow_rows = read_shadow_rows(service)
+    check("23) 같은 상태(같은 거리·같은 게이트 결과) 3회 반복은 1행만 유지됨",
+          len(shadow_rows) == 1)
+
+# ── 24) final_decision BLOCKED->BUY 변화는 새 행 기록 ──────────────
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir, guard_mode="shadow")
+    mp = MarketPrice(symbol=symbol, current_price=100000, reference_price=98000,
+        previous_close=98000, timestamp=datetime.now(),
+        indicator_macd=1.5, indicator_macd_signal=1.0, indicator_macd_hist_direction=1)
+    ma24 = make_ma(is_pulldown_recovery=False)
+    signal = Signal(type=SignalType.BUY, reason="최적 타점 6/8 — 테스트")
+    # 1차: DAILY_ENTRY_LIMIT로 차단됨(final_decision=BLOCKED)
+    service._write_signal_log(
+        symbol=symbol, price=100000, regime=MarketRegime.BULLISH,
+        signal=signal, minute_analysis=ma24, final_decision="BLOCKED",
+        order_block_reason="DAILY_ENTRY_LIMIT", market_price=mp,
+        latest_bar_timestamp="20260805100000",
+    )
+    # 2차: 동일 분봉·패턴·점수인데 이번엔 실제로 BUY 체결됨
+    service._write_signal_log(
+        symbol=symbol, price=100000, regime=MarketRegime.BULLISH,
+        signal=signal, minute_analysis=ma24, final_decision="BUY",
+        order_block_reason="", market_price=mp,
+        latest_bar_timestamp="20260805100000",
+    )
+    shadow_rows = read_shadow_rows(service)
+    check("24) final_decision이 BLOCKED->BUY로 바뀌면 새 행 기록됨"
+          "(정확히 GPT 지시 필수 테스트)", len(shadow_rows) == 2)
+    if len(shadow_rows) == 2:
+        check("    첫 행 final_decision=BLOCKED, order_block_reason=DAILY_ENTRY_LIMIT",
+              shadow_rows[0]["final_decision"] == "BLOCKED"
+              and shadow_rows[0]["order_block_reason"] == "DAILY_ENTRY_LIMIT")
+        check("    둘째 행 final_decision=BUY, actual_order_submitted=True",
+              shadow_rows[1]["final_decision"] == "BUY"
+              and shadow_rows[1]["actual_order_submitted"] == "True")
+
+# ── 25) current_price/final_decision/order_block_reason 정확히 기록 ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir, guard_mode="shadow")
+    mp = MarketPrice(symbol=symbol, current_price=105000, reference_price=98000,
+        previous_close=98000, timestamp=datetime.now(),
+        indicator_macd=1.5, indicator_macd_signal=1.0, indicator_macd_hist_direction=1)
+    ma25 = make_ma(is_pulldown_recovery=True)
+    signal = Signal(type=SignalType.BUY, reason="최적 타점 6/8 — 특정사유")
+    service._write_signal_log(
+        symbol=symbol, price=105000, regime=MarketRegime.BULLISH,
+        signal=signal, minute_analysis=ma25, final_decision="BUY",
+        order_block_reason="", market_price=mp, latest_bar_timestamp="20260805110000",
+    )
+    shadow_rows = read_shadow_rows(service)
+    check("25) current_price=105000 정확히 기록됨(정확히 GPT 지시 필수 테스트)",
+          shadow_rows[0]["current_price"] == "105000")
+    check("    legacy_reason 정확히 기록됨", shadow_rows[0]["legacy_reason"] == signal.reason)
+    check("    final_decision=BUY 정확히 기록됨", shadow_rows[0]["final_decision"] == "BUY")
+
+# ══════════════════════════════════════════════════════════════
+# 9부: 재시작 후 중복 방지, 대표 condition_name 일치
+# (2026-08-05, 2차 GPT 코드리뷰 지적 4, 5번)
+# ══════════════════════════════════════════════════════════════
+
+# ── 26) 프로세스 재시작 후 기존 key 중복 방지 ──────────────────────
+with tempfile.TemporaryDirectory() as tmpdir:
+    service1 = build_service(tmpdir, guard_mode="shadow")
+    mp = MarketPrice(symbol=symbol, current_price=102010, reference_price=98000,
+        previous_close=98000, timestamp=datetime.now(),
+        indicator_macd=1.5, indicator_macd_signal=1.0, indicator_macd_hist_direction=1)
+    ma26 = make_ma(is_pulldown_recovery=True)
+    signal = Signal(type=SignalType.BUY, reason="최적 타점 6/8 — 테스트")
+    service1._write_signal_log(
+        symbol=symbol, price=102010, regime=MarketRegime.BULLISH,
+        signal=signal, minute_analysis=ma26, final_decision="BUY",
+        order_block_reason="", market_price=mp, latest_bar_timestamp="20260805100000",
+    )
+    rows_before_restart = read_shadow_rows(service1)
+    check("26-준비) 재시작 전 1행 기록됨", len(rows_before_restart) == 1)
+
+    # "재시작" 시뮬레이션: 같은 storage 설정으로 새 TradingService(및
+    # 새 EntryQualityShadowLogger) 인스턴스를 만들어 기존 파일에서
+    # 복원되는지 확인.
+    service2 = build_service(tmpdir, guard_mode="shadow")
+    # tmpdir을 공유하지 않으므로(build_service가 tmpdir 인자를
+    # 그대로 씀) 정확히 같은 entry_quality_shadow_log_file 경로를
+    # 갖도록 로거를 직접 재생성해 검증.
+    from infra.storage.logger import EntryQualityShadowLogger
+    restored_logger = EntryQualityShadowLogger(service1.settings.storage.entry_quality_shadow_log_file)
+    check("26) 재시작 시뮬레이션 -> 새 로거 인스턴스가 기존 파일에서 키를 복원함"
+          "(정확히 GPT 지시 필수 테스트)", len(restored_logger._seen_keys) == 1)
+
+    # 복원된 로거로 동일 판단을 다시 시도 -> 중복으로 거부돼야 함
+    same_row = {
+        "symbol": symbol, "latest_bar_timestamp": "20260805100000",
+        "detected_patterns": rows_before_restart[0]["detected_patterns"],
+        "score": rows_before_restart[0]["score"],
+        "would_block_macd_dead_min_score5": rows_before_restart[0]["would_block_macd_dead_min_score5"],
+        "would_block_macd_above_signal_required": rows_before_restart[0]["would_block_macd_above_signal_required"],
+        "would_block_pr_only_rolling_vwap": rows_before_restart[0]["would_block_pr_only_rolling_vwap"],
+        "would_block_c_or_pr_rolling_vwap": rows_before_restart[0]["would_block_c_or_pr_rolling_vwap"],
+        "would_block_pullback_condition_rolling_vwap": rows_before_restart[0]["would_block_pullback_condition_rolling_vwap"],
+        "would_block_pr_or_pullback_condition_rolling_vwap": rows_before_restart[0]["would_block_pr_or_pullback_condition_rolling_vwap"],
+        "would_block_pr_only_session_vwap": rows_before_restart[0]["would_block_pr_only_session_vwap"],
+        "would_block_c_or_pr_session_vwap": rows_before_restart[0]["would_block_c_or_pr_session_vwap"],
+        "would_block_pullback_condition_session_vwap": rows_before_restart[0]["would_block_pullback_condition_session_vwap"],
+        "would_block_pr_or_pullback_condition_session_vwap": rows_before_restart[0]["would_block_pr_or_pullback_condition_session_vwap"],
+        "final_decision": rows_before_restart[0]["final_decision"],
+        "order_block_reason": rows_before_restart[0]["order_block_reason"],
+    }
+    result_after_restart = restored_logger.append_if_new(same_row)
+    check("    복원된 로거로 동일 판단 재시도 -> 중복으로 거부됨(False)",
+          result_after_restart is False)
+
+# ── 27) condition_name과 condition_names가 현재 스냅샷에서 일치함 ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    service.update_targets(["058610"], sym_to_conditions={
+        "058610": ("자동매매_돌파형A", "자동매매_눌림목_PR"),
+    })
+    rep_name = service._representative_condition_name("058610")
+    check("27) 대표 condition_name이 현재 복수형 스냅샷에서 파생됨"
+          "(정확히 GPT 지시 필수 테스트 — 두 필드가 서로 모순되지 않음)",
+          rep_name in service._symbol_to_conditions["058610"])
+
+    # 편출 후에는 대표값도 정확히 빈 문자열이 됨(과거 값 잔존 없음)
+    service.update_targets([], sym_to_conditions={})
+    rep_name_after = service._representative_condition_name("058610")
+    check("    편출 후 대표 condition_name도 빈 문자열(과거 값 잔존 없음)",
+          rep_name_after == "")
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

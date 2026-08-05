@@ -405,8 +405,17 @@ class EntryWatchShadowLogger:
 # MACD/VWAP 진입 품질 shadow 관측 전용 로그 (2026-08-05, 1E.5단계, GPT
 # 코드리뷰 지시). signal_log.csv(이미 53MB급, 모든 판단을 기록)와 달리
 # legacy_buy_candidate=True(전략이 실제로 BUY를 반환한 경우)일 때만
-# 기록 — 같은 분봉·같은 판단이 반복되면 한 번만 남긴다(중복 방지 키:
-# symbol+latest_bar_timestamp+detected_patterns+score).
+# 기록 — 같은 분봉·같은 판단이 반복되면 한 번만 남긴다.
+#
+# 2026-08-05 (2차 GPT 코드리뷰 지적 2번, 재현 확인): 중복 방지 키가
+# (symbol, latest_bar_timestamp, detected_patterns, score)만이라
+# 같은 분봉 안에서 현재가가 움직여 게이트 상태(would_block_*)가
+# 바뀌어도(예: 1.99%->2.01%로 임계값을 넘어감) 두 번째 관측이
+# 조용히 버려지고 있었음(재현: 첫 관측 block=False로 append 성공,
+# 두 번째 관측 block=True인데 같은 key라 append_if_new가 False를
+# 반환해 기록 안 됨 -> 최종 CSV에는 첫 상태만 남음). 게이트 상태
+# 자체(assessment_signature)를 키에 포함시켜, 같은 분봉이라도
+# 판단이 바뀌면 새 행으로 남도록 수정.
 
 ENTRY_QUALITY_SHADOW_FIELDS = [
     "timestamp",              # 기록 시각(KST)
@@ -417,6 +426,17 @@ ENTRY_QUALITY_SHADOW_FIELDS = [
     "regime",
     "condition_name",         # 대표 조건식(호환용)
     "condition_names",        # 전체 조건식(| 로 연결)
+    "condition_source_reliable",  # 조건식 출처가 CNSRREQ로 확정됐는지
+    # 2026-08-05 (2차 GPT 코드리뷰 지적 3번): 실제 진입 기준값 —
+    # 이게 없으면 legacy_buy_candidate=True라도 실제로 주문됐는지,
+    # DAILY_ENTRY_LIMIT/AFTER_1450/RISK_LIMIT 등 기존 규칙으로
+    # 이미 차단된 후보인지 구분할 수 없고, 정확한 5·10·20분 후
+    # 수익률 계산도 어려움.
+    "current_price",
+    "legacy_reason",
+    "final_decision",
+    "order_block_reason",
+    "actual_order_submitted",   # final_decision=="BUY"
     # MACD (1E 단계와 동일 계산 재사용)
     "macd",
     "macd_signal",
@@ -447,33 +467,106 @@ ENTRY_QUALITY_SHADOW_FIELDS = [
     "would_block_pr_or_pullback_condition_session_vwap",
 ]
 
+# 2026-08-05: 중복 방지 키에 포함될 "게이트 상태" 필드 — 이 값들
+# 중 하나라도 이전 기록과 다르면 새 행을 남김. MACD 2개 + VWAP
+# 8개(rolling 4 + session 4) + final_decision + order_block_reason
+# = 12개, GPT가 지시한 목록 그대로.
+_ASSESSMENT_SIGNATURE_FIELDS = [
+    "would_block_macd_dead_min_score5",
+    "would_block_macd_above_signal_required",
+    "would_block_pr_only_rolling_vwap",
+    "would_block_c_or_pr_rolling_vwap",
+    "would_block_pullback_condition_rolling_vwap",
+    "would_block_pr_or_pullback_condition_rolling_vwap",
+    "would_block_pr_only_session_vwap",
+    "would_block_c_or_pr_session_vwap",
+    "would_block_pullback_condition_session_vwap",
+    "would_block_pr_or_pullback_condition_session_vwap",
+    "final_decision",
+    "order_block_reason",
+]
+
+
+def _entry_quality_shadow_key(row: dict[str, Any]) -> tuple:
+    """entry_quality_shadow.csv의 중복 방지 키를 계산합니다.
+
+    (symbol, latest_bar_timestamp, detected_patterns, score,
+    assessment_signature) — 같은 분봉·패턴·점수라도 게이트 상태나
+    최종 결정이 바뀌면 다른 키가 되어 새 행으로 기록됨.
+
+    2026-08-05 (재현 확인): append_if_new()에 새로 들어오는 row는
+    Python 값(bool True/False 등)을 담고 있지만, 재시작 시 기존
+    CSV에서 csv.DictReader로 복원하는 row는 전부 문자열("True"/
+    "False")임 — 이 둘을 그대로 튜플 키로 쓰면 같은 논리적 값인데
+    타입이 달라 키가 일치하지 않는 문제가 재현됨(재시작 직후 동일
+    판단을 다시 넣었을 때 중복으로 감지되지 않고 새로 기록됨).
+    모든 값을 str()로 정규화해 타입 불일치를 원천 차단.
+    """
+    signature = tuple(str(row.get(f, "")) for f in _ASSESSMENT_SIGNATURE_FIELDS)
+    return (
+        str(row.get("symbol", "")),
+        str(row.get("latest_bar_timestamp", "")),
+        str(row.get("detected_patterns", "")),
+        str(row.get("score", "")),
+        signature,
+    )
+
 
 class EntryQualityShadowLogger:
     """MACD/VWAP 진입 품질 shadow 관측을 legacy BUY 후보에만 기록하는 로거입니다.
 
     2026-08-05 (1E.5단계): 같은 (symbol, latest_bar_timestamp,
-    detected_patterns, score) 조합은 프로세스 수명 동안 한 번만
-    기록 — 같은 분봉에서 반복되는 폴링(10초 간격)이 매번 중복
-    행을 만들지 않도록 함.
+    detected_patterns, score, assessment_signature) 조합은 한 번만
+    기록 — 같은 분봉에서 반복되는 폴링(10초 간격)이 매번 중복 행을
+    만들지 않도록 함. assessment_signature(게이트 상태·최종 결정)
+    가 바뀌면 같은 분봉이라도 새 행으로 기록됨(2차 GPT 코드리뷰
+    지적 2번).
+
+    2026-08-05 (2차 GPT 코드리뷰 지적 4번): 이 로거는 파일 생성
+    시점에 기존 CSV가 있으면 그 안의 키를 전부 읽어 _seen_keys를
+    복원함 — 장중 프로세스 재시작 시 같은 분봉·같은 판단이 다시
+    기록되는 것을 방지. 전용 파일은 legacy BUY 후보만 담아 크기가
+    작아(signal_log.csv와 달리) 매번 전체를 읽어도 부담이 크지 않음.
+
+    2026-08-05 (2차 GPT 코드리뷰 지적 6번, 문서 정정): 이 생성자는
+    entry_quality_guard_mode 설정과 무관하게 항상 헤더 파일을
+    즉시 생성함(TradingService.__init__에서 다른 shadow 로거들과
+    동일 패턴으로 항상 인스턴스화되므로) — "off"에서는 이 파일에
+    행이 추가되지 않을 뿐, 빈 헤더만 있는 파일 자체는 생성됨.
     """
 
     def __init__(self, file_path: str) -> None:
         self.file_path = Path(file_path)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._seen_keys: set[tuple] = set()
-        if not self.file_path.exists():
+
+        if self.file_path.exists():
+            # 2026-08-05: 기존 파일이 있으면(재시작) 키를 복원 —
+            # 파일이 크지 않으므로(legacy BUY 후보만 기록됨) 전체를
+            # 읽어도 부담 없음. 헤더가 예상과 다르거나(과거 버전
+            # 필드 구조) 파싱 오류가 나는 개별 행은 건너뛰고 계속
+            # 진행 — 복원 실패가 로거 생성 자체를 막으면 안 됨.
+            try:
+                with self.file_path.open("r", newline="", encoding="utf-8") as fp:
+                    reader = csv.DictReader(fp)
+                    for row in reader:
+                        try:
+                            self._seen_keys.add(_entry_quality_shadow_key(row))
+                        except Exception:
+                            continue
+            except Exception as exc:
+                logger.warning(
+                    f"[ENTRY_QUALITY_SHADOW] 기존 파일에서 중복방지 키 복원 실패"
+                    f"(무시하고 빈 상태로 계속 진행): {exc}"
+                )
+        else:
             with self.file_path.open("w", newline="", encoding="utf-8") as fp:
                 writer = csv.DictWriter(fp, fieldnames=ENTRY_QUALITY_SHADOW_FIELDS)
                 writer.writeheader()
 
     def append_if_new(self, row: dict[str, Any]) -> bool:
         """중복 키가 아니면 한 줄을 추가하고 True, 이미 기록된 키면 아무것도 안 하고 False를 반환합니다."""
-        key = (
-            row.get("symbol", ""),
-            row.get("latest_bar_timestamp", ""),
-            row.get("detected_patterns", ""),
-            row.get("score", ""),
-        )
+        key = _entry_quality_shadow_key(row)
         if key in self._seen_keys:
             return False
         self._seen_keys.add(key)
