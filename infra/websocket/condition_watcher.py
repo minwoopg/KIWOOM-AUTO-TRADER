@@ -8,8 +8,16 @@ from __future__ import annotations
     1. 로그인 성공 → CNSRLST로 조건식 목록 조회
     2. condition_seqs에 등록된 모든 seq에 CNSRREQ(실시간) 구독
     3. REAL 메시지 수신
-       843=I → targets에 종목 추가
-       843=D → 해당 조건식에서 편출 (다른 조건식 편입 유지)
+       843=I → targets에 종목 추가(어느 조건식인지는 불확실 —
+               다음 CNSRREQ 재조회로 확정 전까지 조건식 출처
+               기반 shadow 분석에서는 제외됨)
+       843=D → targets에서 종목 완전 제거(2026-08-05 정정: 키움
+               REAL 메시지에는 어느 조건식의 편출인지 정보가
+               없어서, "그 종목이 소속된 모든 조건식에서 편출"
+               되는 보수적 정책 — 실제로는 다른 조건식에 여전히
+               남아있는 종목도 함께 제거될 수 있음. "정확한
+               조건식별 편출"이 아니라 "출처불명 이벤트는 안전을
+               위해 전체 제거"라는 원칙임)
     4. 종료 시 CNSRCLR로 모든 구독 해제
 """
 
@@ -37,29 +45,47 @@ class ConditionWatcher:
         self.token  = token
         self.on_symbols_changed = on_symbols_changed
 
-        # 조건식별 편입 종목 관리 {seq: set(symbols)}
-        self._symbols_by_seq: dict[str, set[str]] = {}
+        # 2026-08-05 (3차 GPT 코드리뷰 지적, P0-2 전면 재설계):
+        # 기존엔 _symbols_by_seq 하나(+ __realtime_unknown__ 특수
+        # 버킷)와 _condition_source_reliable(단순 dict, 누적 수정)
+        # 로만 상태를 관리했는데, 다음 세 가지 문제가 재현으로
+        # 확인됨:
+        #
+        # (A) 이미 CNSRREQ로 확정돼 reliable=True인 종목에 REAL I
+        #     가 와도, "symbol not in self._all_symbols" 조건 때문에
+        #     아무 처리도 안 하고 reliable=True가 그대로 유지됨 —
+        #     그 REAL I가 실제로는 다른(아직 모르는) 조건식에서의
+        #     신규 편입일 수 있는데도 출처를 안 바꿈.
+        # (B) REAL D가 오면 그 종목이 들어있는 모든 seq 버킷에서
+        #     한꺼번에 제거함 — 두 조건식에 동시 편입된 종목이 한
+        #     조건식에서만 편출된 경우에도 전체가 삭제됨(부정확한
+        #     "정확한 편출"이 아니라 "보수적 전체 제거" 정책임을
+        #     인지하고 있어야 함).
+        # (C) _on_initial_result()가 새 결과에 없는 종목의 stale
+        #     reliability나 unknown marker를 정리하지 않음 — 재조회
+        #     결과 특정 조건식에 더 이상 없다고 확인된 종목도 과거
+        #     reliable=True가 그대로 남음.
+        #
+        # 해결: reliability를 "누적 dict"로 들고 다니지 않고, 매번
+        # 아래 두 상태에서 그때그때 재계산.
+        #   _confirmed_symbols_by_seq: CNSRREQ로 확정된 조건식별
+        #     편입 종목(진짜 seq 키만, "__realtime_unknown__" 없음).
+        #   _realtime_unresolved: REAL 이벤트로만 알려져 출처가
+        #     아직 미확정인 종목의 집합 — I로 추가, D로 제거,
+        #     CNSRREQ 재조회로 확정되면(같은 종목이 다시 오든 안
+        #     오든) 제거.
+        # reliable(symbol) = symbol이 confirmed 쪽에 있고
+        #                     symbol이 unresolved에는 없음.
+        # 이렇게 하면 "reliable을 True로 표시했다가 나중에 잘못된
+        # False로 덮어쓸 실수" 자체가 구조적으로 불가능해짐 —
+        # 매번 현재 상태에서 새로 계산하므로.
+        self._confirmed_symbols_by_seq: dict[str, set[str]] = {}
         for seq in config.condition_seqs:
-            self._symbols_by_seq[str(seq)] = set()
+            self._confirmed_symbols_by_seq[str(seq)] = set()
+        self._realtime_unresolved: set[str] = set()
 
         # 조건식 이름 저장 {seq: name}
         self._condition_names: dict[str, str] = {}
-
-        # 2026-08-05 (GPT 코드리뷰 지적, VWAP shadow 조건검색식 출처
-        # 문제 재현 확인): 키움 REAL 메시지에는 어느 조건식에서 편입
-        # 됐는지 정보가 없어서, 기존 코드는 모든 실시간 편입/편출을
-        # "첫 번째 seq"(next(iter(...)))에 임의로 귀속시키고 있었음
-        # — 재현: seq1=돌파형A, seq2=눌림목_PR 상태에서 058610이
-        # 실시간 편입되면, 실제 출처와 무관하게 항상 seq1(돌파형A)
-        # 결과로 기록됨. 이 오귀속 정보로 조건검색식 기반 VWAP shadow
-        # (is_pullback_condition 등)를 계산하면 통계 자체가 왜곡됨.
-        #
-        # 해결: 각 종목이 "확실한 출처"(CNSRREQ 초기 조회 결과)로
-        # 알려진 것인지, "출처 불명"(REAL 실시간 이벤트로만 알려진
-        # 것)인지 추적. reliable=False인 종목은 조건검색식 기반
-        # shadow 판단(is_pullback_condition 등)에 쓰지 않고, 대신
-        # PR/C(분봉 자체 분석값이라 이 문제와 무관)는 정상 계산.
-        self._condition_source_reliable: dict[str, bool] = {}
 
         self._ws_client = KiwoomWebSocket(
             url=config.url,
@@ -69,10 +95,11 @@ class ConditionWatcher:
 
     @property
     def _all_symbols(self) -> set[str]:
-        """모든 조건식의 편입 종목 합집합입니다."""
+        """모든 조건식의 확정 편입 종목 + 출처 미확정 실시간 종목의 합집합입니다."""
         result: set[str] = set()
-        for symbols in self._symbols_by_seq.values():
+        for symbols in self._confirmed_symbols_by_seq.values():
             result |= symbols
+        result |= self._realtime_unresolved
         return result
 
     @property
@@ -82,19 +109,16 @@ class ConditionWatcher:
         2026-08-05 (GPT 코드리뷰 지적): 이 property는 여러 조건식에
         동시 편입된 종목의 정보를 하나로 뭉개버림 — 아래 dict 순회
         순서상 "마지막으로 처리된 seq"의 이름만 남는데, 이건
-        _symbols_by_seq(dict)의 순회 순서에 의존하는 우연한 결과라
-        실제로 "대표 조건식"을 의미 있게 고르는 게 아님. 기존
-        호환을 위해 남겨두되, 신규 코드는 symbol_to_conditions
-        (복수형, 전체 조건식 보존)를 사용해야 함.
+        _confirmed_symbols_by_seq(dict)의 순회 순서에 의존하는
+        우연한 결과라 실제로 "대표 조건식"을 의미 있게 고르는 게
+        아님. 기존 호환을 위해 남겨두되, 신규 코드는 symbol_to_
+        conditions(복수형, 전체 조건식 보존)를 사용해야 함.
 
-        "__realtime_unknown__" 버킷(실시간 이벤트로만 알려져 어느
-        조건식인지 불확실한 종목)은 제외 — 이 매핑은 "확정된 조건식
-        이름"만 담아야 함.
+        출처 미확정(_realtime_unresolved) 종목은 제외 — 이 매핑은
+        "확정된 조건식 이름"만 담아야 함.
         """
         mapping: dict[str, str] = {}
-        for seq, symbols in self._symbols_by_seq.items():
-            if seq == "__realtime_unknown__":
-                continue
+        for seq, symbols in self._confirmed_symbols_by_seq.items():
             cond_name = self._condition_names.get(seq, f"seq{seq}")
             for sym in symbols:
                 mapping[sym] = cond_name
@@ -113,13 +137,12 @@ class ConditionWatcher:
         순서는 seq 딕셔너리 순회 순서(결정적이지 않을 수 있음)라
         판단 로직에서는 순서에 의존하지 말고 in 연산자로만 사용할 것.
 
-        "__realtime_unknown__" 버킷은 제외 — 어느 조건식인지
-        불확실한 종목은 이 매핑에 아예 안 나타남(빈 튜플로 취급).
+        출처 미확정(_realtime_unresolved) 종목은 제외 — 어느
+        조건식인지 불확실한 종목은 이 매핑에 아예 안 나타남(빈
+        튜플로 취급).
         """
         mapping: dict[str, list[str]] = {}
-        for seq, symbols in self._symbols_by_seq.items():
-            if seq == "__realtime_unknown__":
-                continue
+        for seq, symbols in self._confirmed_symbols_by_seq.items():
             cond_name = self._condition_names.get(seq, f"seq{seq}")
             for sym in symbols:
                 mapping.setdefault(sym, []).append(cond_name)
@@ -129,17 +152,32 @@ class ConditionWatcher:
     def symbol_condition_source_reliable(self) -> dict[str, bool]:
         """종목별로 조건식 출처가 신뢰 가능한지(CNSRREQ 초기 조회로 확정됐는지).
 
-        2026-08-05 (GPT 코드리뷰 지적, VWAP shadow 조건검색식 출처
-        문제 대응): True면 이 종목의 symbol_to_conditions 값이
-        CNSRREQ(조건식별 초기 조회, 메시지에 정확한 seq 포함)로
-        확정된 것 — 조건식 출처 기반 shadow 판단(is_pullback_
-        condition 등)에 안전하게 쓸 수 있음. False 또는 이 dict에
-        아예 없으면(딕셔너리에 없는 경우도 "신뢰 불가"로 취급해야
-        함) 실시간 이벤트로만 알려져 정확한 조건식을 확정할 수
-        없는 상태 — 이런 종목은 targets에는 정확히 포함되지만
-        조건식 출처 기반 통계에는 쓰면 안 됨.
+        2026-08-05 (3차 GPT 코드리뷰 지적, P0-2): 이 값은 더 이상
+        누적 dict가 아니라, _confirmed_symbols_by_seq와 _realtime_
+        unresolved 두 상태로부터 호출 시점에 매번 재계산됨 — True면
+        이 종목의 symbol_to_conditions 값이 CNSRREQ(조건식별 초기
+        조회, 메시지에 정확한 seq 포함)로 확정된 것이고 그 이후
+        출처 불명 REAL 이벤트에 노출되지 않은 상태.
+
+        주의: 이 딕셔너리는 confirmed_union(한 번이라도 CNSRREQ로
+        확정된 적 있는 종목)만 키로 가짐 — REAL로만 알려져 한 번도
+        확정된 적 없는 종목은 이 딕셔너리에 아예 없음(값이 False로
+        들어있는 게 아니라 키 자체가 없음). 호출부는 반드시
+        `.get(symbol, False)`처럼 기본값을 False로 명시해서 조회
+        해야 함 — `.get(symbol)`만 쓰면 None이 반환되어 "신뢰
+        불가(False)"와 "값 없음(None)"을 혼동하는 버그가 생김
+        (재현 확인: 테스트에서 기본값 없이 조회했다가 None을
+        받고 `is False` 비교가 실패했던 사례). 실제 호출부인
+        TradingService._write_signal_log()는 `.get(symbol, False)`
+        로 정확히 처리하고 있음.
         """
-        return dict(self._condition_source_reliable)
+        confirmed_union: set[str] = set()
+        for symbols in self._confirmed_symbols_by_seq.values():
+            confirmed_union |= symbols
+        return {
+            sym: (sym not in self._realtime_unresolved)
+            for sym in confirmed_union
+        }
 
     async def start(self) -> None:
         await self._ws_client.start()
@@ -226,13 +264,21 @@ class ConditionWatcher:
             if re.fullmatch(r"\d{6}", code):
                 symbols.append(code)
 
-        if seq in self._symbols_by_seq:
-            self._symbols_by_seq[seq] = set(symbols)
-            # 2026-08-05: CNSRREQ 초기 조회 결과는 메시지 자체에
-            # 정확한 seq가 포함되어 있어 출처가 확실함 — 이 seq에
-            # 편입된 것으로 확인된 종목은 신뢰 가능으로 표시.
-            for s in symbols:
-                self._condition_source_reliable[s] = True
+        if seq in self._confirmed_symbols_by_seq:
+            new_symbol_set = set(symbols)
+            # 2026-08-05 (3차 GPT 코드리뷰 지적 P0-2 문제D, 재현
+            # 확인): 이전엔 이 seq의 확정 결과만 덮어쓰고, 그
+            # 결과로 확정된 종목의 unresolved 상태를 정리하지
+            # 않았음 — 예를 들어 047040이 REAL로 unresolved에
+            # 들어간 뒤, 이번 재조회 결과에 047040이 포함되면
+            # (즉 실제로 이 조건식 소속이었다고 확정되면) unresolved
+            # 에서 반드시 제거해야 reliable=True로 정확히 계산됨.
+            # 재조회 결과에 없는 종목(이 seq에서는 사라졌다고
+            # 확인된 것)은 이 seq 버킷에서만 빠지고, 다른 seq나
+            # unresolved 상태는 그대로 유지 — "이 조건식에는 없다"
+            # 는 것이 "완전히 알 수 없다"는 뜻은 아니므로.
+            self._confirmed_symbols_by_seq[seq] = new_symbol_set
+            self._realtime_unresolved -= new_symbol_set
 
         cond_name = self._condition_names.get(seq, seq)
         logger.info(f"[COND] [{cond_name}] 초기 결과: {len(symbols)}개 종목")
@@ -263,54 +309,60 @@ class ConditionWatcher:
             # 2026-08-05 (GPT 코드리뷰 지적, 재현 확인): 키움 REAL
             # 메시지에는 어느 조건식에서 편입/편출됐는지 정보가 없음
             # (item['item']은 종목코드, item['name']은 '조건검색'으로
-            # 고정 — 2026-06-26 확인). 기존 코드는 이걸 "첫 번째 seq"
-            # (next(iter(...)))에 임의로 귀속시켰는데, 실제로는 어느
-            # seq에서 온 이벤트인지 전혀 알 수 없어 조건검색식별 통계
-            # (is_pullback_condition 등)를 심각하게 왜곡시켰고, 편출
-            # 처리도 "실제로 다른 조건식에 남아있는 종목을 잘못
-            # 첫 seq에서만 제거"할 위험이 있었음(재현: seq1=돌파형A,
-            # seq2=눌림목_PR 상태에서 실시간 편입 이벤트가 오면 항상
-            # seq1 결과로만 기록됨).
-            #
-            # 수정(GPT 권장 3번 방식 — 가장 보수적): 실시간 이벤트는
-            # "이 종목이 어떤 조건식엔가 소속돼 있다/아니다"라는 전체
-            # targets 갱신에만 쓰고, 어느 조건식인지는 확정하지 않음.
-            # 전용 버킷("__realtime_unknown__")에 편입/편출을 반영해
-            # _all_symbols(targets)는 정확히 유지하되, 이 버킷은
-            # symbol_to_condition(s) 계산에서 제외 — 그 결과 이
-            # 종목은 조건검색식 이름 없이 targets에만 잡히고, 다음
-            # CNSRREQ 재조회 때 정확한 seq로 다시 확정됨.
-            unknown_bucket = self._symbols_by_seq.setdefault("__realtime_unknown__", set())
+            # 고정 — 2026-06-26 확인). 실시간 이벤트는 "이 종목이
+            # 어떤 조건식엔가 소속돼 있다/아니다"라는 targets 갱신
+            # 에만 쓰고, 어느 조건식인지는 절대 확정하지 않음.
 
             if action == "I":
-                if symbol not in unknown_bucket and symbol not in self._all_symbols:
-                    unknown_bucket.add(symbol)
-                    # 2026-08-05: 출처를 확정할 수 없으므로 신뢰
-                    # 불가로 명시 — 이미 CNSRREQ로 신뢰 가능하다고
-                    # 표시된 종목이면 그 값을 덮어쓰지 않음(실시간
-                    # 이벤트가 이미 확인된 종목의 신뢰도를 낮출
-                    # 이유는 없음 — 다만 조건식 소속 자체는 이
-                    # 버킷과 무관하게 이미 알고 있던 것을 유지).
-                    self._condition_source_reliable.setdefault(symbol, False)
+                # 2026-08-05 (3차 GPT 코드리뷰 지적 P0-2 문제A, 재현
+                # 확인): 이전엔 "symbol not in self._all_symbols"
+                # 조건 때문에, 이미 CNSRREQ로 확정돼 reliable=True
+                # 인 종목에 REAL I가 와도 아무 처리를 안 해서
+                # reliable=True가 그대로 남았음 — 하지만 이 REAL I는
+                # 실제로 다른(아직 모르는) 조건식에서의 신규 편입
+                # 일 수 있어, 출처를 모르는 채로 True를 유지하는 건
+                # 틀림. 이제 이미 알려진 종목이어도 REAL I가 오면
+                # 무조건 _realtime_unresolved에 추가 — symbol_
+                # condition_source_reliable() 계산식이 "confirmed
+                # 이면서 unresolved에 없어야 True"이므로, 이 종목은
+                # 즉시 reliable=False로 떨어짐(다음 CNSRREQ 재조회
+                # 결과에 다시 나타나야 reliable=True로 복구됨).
+                was_known = symbol in self._all_symbols
+                self._realtime_unresolved.add(symbol)
+                if not was_known:
                     logger.info(f"[COND] [출처불명] 편입: {symbol} (실시간 이벤트, "
                                 f"어느 조건식인지 불확실 — 다음 재조회 시 확정)")
                     self._notify()
+                else:
+                    logger.info(f"[COND] [출처불명] {symbol} 실시간 이벤트 수신 — "
+                                f"이미 알려진 종목이지만 이 이벤트의 정확한 출처는 "
+                                f"불명(다른 조건식일 수 있음) — 신뢰도를 재확정 "
+                                f"전까지 하향")
 
             elif action == "D":
-                # 편출은 종목이 소속된 모든 버킷(seq별 + unknown)에서
-                # 제거 — "실제로 다른 조건식에 남아있는 종목을 잘못
-                # 첫 seq에서만 제거"하던 기존 버그를 근본적으로 없앰:
-                # 이제 특정 seq 하나를 임의로 골라 제거하지 않고,
-                # 이 종목이 들어있는 모든 버킷에서 실제로 제거.
+                # 2026-08-05 (3차 GPT 코드리뷰 지적 P0-2 문제B): 이
+                # 종목이 들어있는 모든 버킷(seq별 confirmed +
+                # unresolved)에서 제거 — 주의: 이건 "정확한 조건식별
+                # 편출"이 아니라 "출처불명 D는 안전을 위해 전체
+                # targets에서 제거하는 보수적 정책"임. 두 조건식에
+                # 동시 편입된 종목이 한쪽에서만 편출된 경우에도
+                # 이 종목 전체가 targets에서 사라짐 — REAL 메시지가
+                # 어느 조건식의 D인지 알 방법이 없는 한, "실수로
+                # 계속 감시하는 것"보다 "실수로 조기 제외하는 것"이
+                # 더 안전하다는 판단(신규 진입 후보를 못 보는 게,
+                # 편출됐어야 할 종목을 계속 신호 판단 대상으로
+                # 남기는 것보다 낫다는 원칙).
                 removed_from_any = False
-                for seq_key, sym_set in self._symbols_by_seq.items():
+                for seq_key, sym_set in self._confirmed_symbols_by_seq.items():
                     if symbol in sym_set:
                         sym_set.discard(symbol)
                         removed_from_any = True
+                if symbol in self._realtime_unresolved:
+                    self._realtime_unresolved.discard(symbol)
+                    removed_from_any = True
                 if removed_from_any:
-                    self._condition_source_reliable.pop(symbol, None)
-                    logger.info(f"[COND] [출처불명] 편출: {symbol} (실시간 이벤트) "
-                                f"— targets에서 제거")
+                    logger.info(f"[COND] [출처불명] 편출: {symbol} (실시간 이벤트, "
+                                f"보수적 전체 제거 정책) — targets에서 제거")
                     self._notify()
 
     def _notify(self) -> None:

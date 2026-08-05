@@ -233,6 +233,113 @@ SIGNAL_FIELDS = [
 ]
 
 
+def _migrate_csv_header_if_needed(file_path: Path, target_fields: list[str], log_prefix: str) -> None:
+    """기존 CSV의 헤더에 target_fields의 새 필드가 없으면 헤더를 갱신합니다.
+
+    2026-08-05 (GPT 코드리뷰 지적, P0-1): 원래 SignalCsvLogger 안의
+    메서드였던 로직을 범용 함수로 추출 — EntryQualityShadowLogger
+    (1E.5→1E.6에서 6개 필드 추가)도 같은 마이그레이션이 필요한데,
+    이전엔 이 로거가 파일 존재 여부만 확인하고 헤더 스키마는 전혀
+    비교하지 않았음. 재현 확인: 1E.5 시절 구형 헤더(32열)에 1E.6
+    로거로 행을 추가하면 실제 데이터는 38열이 되어, csv.DictReader
+    로 다시 읽을 때 초과된 6개 값이 row[None]으로 밀려나고 
+    final_decision 같은 정상 필드가 None으로 파싱됨. 이 로거는
+    entry_quality_guard_mode="off"일 때도 빈 헤더 파일을 생성하므로,
+    1E.5 코드를 한 번이라도 실행했다면 실서버에 이미 구형 헤더
+    파일이 있을 수 있어 — shadow를 켜는 순간 첫날부터 CSV 스키마가
+    깨질 위험이 있었음.
+
+    extrasaction='ignore' 때문에, 헤더에 없는 컬럼은 조용히 버려집니다.
+    따라서 필드를 추가해도 기존 파일은 그대로면 새 데이터가 영영
+    안 들어갑니다. 이 함수가 그 격차를 메웁니다.
+
+    주의: 기존 파일이 utf-8-sig(BOM 포함)로 쓰였을 수 있으므로
+    반드시 utf-8-sig로 읽어야 첫 컬럼의 키가 BOM 때문에 깨지지
+    않는다. (utf-8로 읽으면 '\ufeff타임스탬프'가 되어 값이 유실됨)
+    """
+    try:
+        with file_path.open("r", newline="", encoding="utf-8-sig") as fp:
+            reader = csv.reader(fp)
+            existing_header = next(reader, [])
+    except (StopIteration, OSError) as exc:
+        logger.warning(f"[{log_prefix}] 헤더 확인 실패 — 마이그레이션 건너뜀: {exc}")
+        return
+
+    # 헤더가 이미 최신이면 아무것도 안 함
+    missing = [f for f in target_fields if f not in existing_header]
+    if not missing:
+        logger.info(f"[{log_prefix}] 헤더 최신 상태 확인 ({len(existing_header)}개 컬럼) — 마이그레이션 불필요")
+        return
+
+    logger.info(
+        f"[{log_prefix}] 헤더 마이그레이션 시작 — 누락 컬럼 {len(missing)}개: {missing}"
+    )
+
+    # 2026-08-04 (GPT 코드리뷰 지시): 원본 파일을 "w" 모드로 직접
+    # 덮어쓰면, 대용량 파일을 재작성하는 도중 프로세스가 죽거나
+    # 디스크 문제가 생겼을 때 원본 데이터가 통째로 유실될 위험이
+    # 있음(재작성이 절반만 끝난 상태로 파일이 잘리는 경우, 이전
+    # 내용도 새 내용도 온전하지 않게 됨). 다음 두 가지로 방어:
+    # (1) 재작성 전 원본을 .bak으로 복사(실패해도 원본은 그대로
+    #     남아있어 최소한 데이터 유실은 없음).
+    # (2) 임시 파일에 전부 쓴 뒤 os.replace()로 원자적 교체 —
+    #     os.replace는 같은 파일시스템 안에서 단일 시스템 콜로
+    #     완료되므로, 교체 도중에 프로세스가 죽어도 원본 파일이
+    #     "절반만 쓰인 상태"로 남는 일이 없음(교체 전이면 원본
+    #     그대로, 교체 후면 새 파일 그대로 — 중간 상태가 없음).
+    backup_path = file_path.with_suffix(file_path.suffix + ".bak")
+    try:
+        shutil.copy2(file_path, backup_path)
+        logger.info(f"[{log_prefix}] 마이그레이션 전 백업 생성: {backup_path}")
+    except OSError as exc:
+        logger.warning(
+            f"[{log_prefix}] 백업 생성 실패 — 마이그레이션 중단(원본 보호 우선): {exc}"
+        )
+        return
+
+    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+    try:
+        # 기존 데이터를 스트리밍으로 한 행씩 읽어 임시 파일에 바로
+        # 씀 — 통째로 메모리에 올리지 않아 대용량 파일도 메모리
+        # 부담 없이 처리.
+        row_count = 0
+        with file_path.open("r", newline="", encoding="utf-8-sig") as src, \
+                tmp_path.open("w", newline="", encoding="utf-8") as dst:
+            reader = csv.DictReader(src)
+            writer = csv.DictWriter(dst, fieldnames=target_fields, extrasaction="ignore")
+            writer.writeheader()
+            for old_row in reader:
+                for field in target_fields:
+                    old_row.setdefault(field, "")
+                writer.writerow(old_row)
+                row_count += 1
+            # flush + fsync로 OS 캐시가 아니라 실제 디스크에 기록됨을
+            # 보장 — os.replace() 자체는 이미 원자적이지만, 그 직전
+            # tmp 파일의 내용이 디스크에 아직 안 쓰인 상태에서 정전
+            # 등 강한 장애가 나면 replace 후에도 빈 파일이나 일부만
+            # 쓰인 파일이 될 위험이 있음.
+            dst.flush()
+            os.fsync(dst.fileno())
+
+        os.replace(tmp_path, file_path)
+        logger.info(
+            f"[{log_prefix}] 헤더 마이그레이션 완료 — {row_count:,}행 재작성, "
+            f"컬럼 {len(existing_header)}개 → {len(target_fields)}개 "
+            f"(백업: {backup_path})"
+        )
+    except Exception as exc:
+        logger.error(
+            f"[{log_prefix}] 마이그레이션 중 예외 발생 — 원본 파일은 아직 "
+            f"교체 전이라 온전함(임시 파일만 불완전할 수 있음): {exc}"
+        )
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
 class SignalCsvLogger:
     """모든 시그널 판단 결과를 signal_log.csv에 기록합니다.
 
@@ -249,105 +356,7 @@ class SignalCsvLogger:
                 writer.writeheader()
             logger.info(f"[SIGNAL_LOG] 신규 생성: {self.file_path} ({len(SIGNAL_FIELDS)}개 컬럼)")
         else:
-            self._migrate_header_if_needed()
-
-    def _migrate_header_if_needed(self) -> None:
-        """
-        기존 CSV의 헤더에 새 필드(atr_14 등)가 없으면 헤더를 갱신합니다.
-
-        extrasaction='ignore' 때문에, 헤더에 없는 컬럼은 조용히 버려집니다.
-        따라서 SIGNAL_FIELDS에 컬럼을 추가해도 기존 파일은 그대로면
-        새 데이터가 영영 안 들어갑니다. 이 함수가 그 격차를 메웁니다.
-
-        주의: 기존 파일이 utf-8-sig(BOM 포함)로 쓰였을 수 있으므로
-        반드시 utf-8-sig로 읽어야 첫 컬럼(timestamp)의 키가 BOM 때문에
-        깨지지 않는다. (utf-8로 읽으면 '\ufefftimestamp'가 되어 값이 유실됨)
-        """
-        try:
-            with self.file_path.open("r", newline="", encoding="utf-8-sig") as fp:
-                reader = csv.reader(fp)
-                existing_header = next(reader, [])
-        except (StopIteration, OSError) as exc:
-            logger.warning(f"[SIGNAL_LOG] 헤더 확인 실패 — 마이그레이션 건너뜀: {exc}")
-            return
-
-        # 헤더가 이미 최신이면 아무것도 안 함
-        missing = [f for f in SIGNAL_FIELDS if f not in existing_header]
-        if not missing:
-            logger.info(f"[SIGNAL_LOG] 헤더 최신 상태 확인 ({len(existing_header)}개 컬럼) — 마이그레이션 불필요")
-            return
-
-        logger.info(
-            f"[SIGNAL_LOG] 헤더 마이그레이션 시작 — 누락 컬럼 {len(missing)}개: {missing}"
-        )
-
-        # 2026-08-04 (GPT 코드리뷰 지시): 기존엔 self.file_path를
-        # "w" 모드로 직접 열어 덮어쓰고 있었음 — 53MB급 실서버
-        # signal_log.csv를 재작성하는 도중 프로세스가 죽거나 디스크
-        # 문제가 생기면 원본 데이터가 통째로 유실될 위험이 있었음
-        # (재작성이 절반만 끝난 상태로 파일이 잘리는 경우, 이전
-        # 내용도 새 내용도 온전하지 않게 됨). 다음 두 가지로 방어:
-        # (1) 재작성 전 원본을 .bak으로 복사(실패해도 원본은 그대로
-        #     남아있어 최소한 데이터 유실은 없음).
-        # (2) 임시 파일에 전부 쓴 뒤 os.replace()로 원자적 교체 —
-        #     os.replace는 같은 파일시스템 안에서 단일 시스템 콜로
-        #     완료되므로, 교체 도중에 프로세스가 죽어도 원본 파일이
-        #     "절반만 쓰인 상태"로 남는 일이 없음(교체 전이면 원본
-        #     그대로, 교체 후면 새 파일 그대로 — 중간 상태가 없음).
-        backup_path = self.file_path.with_suffix(self.file_path.suffix + ".bak")
-        try:
-            shutil.copy2(self.file_path, backup_path)
-            logger.info(f"[SIGNAL_LOG] 마이그레이션 전 백업 생성: {backup_path}")
-        except OSError as exc:
-            logger.warning(
-                f"[SIGNAL_LOG] 백업 생성 실패 — 마이그레이션 중단(원본 보호 우선): {exc}"
-            )
-            return
-
-        tmp_path = self.file_path.with_suffix(self.file_path.suffix + ".tmp")
-        try:
-            # 기존 데이터를 스트리밍으로 한 행씩 읽어 임시 파일에 바로
-            # 씀 — old_rows를 리스트로 통째로 메모리에 올리지 않아
-            # 53MB급 파일도 메모리 부담 없이 처리.
-            row_count = 0
-            with self.file_path.open("r", newline="", encoding="utf-8-sig") as src, \
-                    tmp_path.open("w", newline="", encoding="utf-8") as dst:
-                reader = csv.DictReader(src)
-                writer = csv.DictWriter(dst, fieldnames=SIGNAL_FIELDS, extrasaction="ignore")
-                writer.writeheader()
-                for old_row in reader:
-                    for field in SIGNAL_FIELDS:
-                        old_row.setdefault(field, "")
-                    writer.writerow(old_row)
-                    row_count += 1
-                # 2026-08-04 (GPT 코드리뷰 선택 개선): close() 전에
-                # flush + fsync로 OS 캐시가 아니라 실제 디스크에
-                # 기록됨을 보장 — os.replace() 자체는 이미 원자적
-                # 이지만, 그 직전 tmp 파일의 내용이 디스크에 아직
-                # 안 쓰인 상태에서 정전 등 강한 장애가 나면 replace
-                # 후에도 빈 파일이나 일부만 쓰인 파일이 될 위험이
-                # 있음(일반적인 프로세스 종료에는 이미 안전했지만,
-                # 더 강한 내구성을 위해 추가).
-                dst.flush()
-                os.fsync(dst.fileno())
-
-            os.replace(tmp_path, self.file_path)
-            logger.info(
-                f"[SIGNAL_LOG] 헤더 마이그레이션 완료 — {row_count:,}행 재작성, "
-                f"컬럼 {len(existing_header)}개 → {len(SIGNAL_FIELDS)}개 "
-                f"(백업: {backup_path})"
-            )
-        except Exception as exc:
-            logger.error(
-                f"[SIGNAL_LOG] 마이그레이션 중 예외 발생 — 원본 파일은 아직 "
-                f"교체 전이라 온전함(임시 파일만 불완전할 수 있음): {exc}"
-            )
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except OSError:
-                pass
-            raise
+            _migrate_csv_header_if_needed(self.file_path, SIGNAL_FIELDS, "SIGNAL_LOG")
 
     def append(self, row: dict[str, Any]) -> None:
         """시그널 로그 한 줄을 추가합니다."""
@@ -436,7 +445,21 @@ ENTRY_QUALITY_SHADOW_FIELDS = [
     "legacy_reason",
     "final_decision",
     "order_block_reason",
-    "actual_order_submitted",   # final_decision=="BUY"
+    # 2026-08-05 (3차 GPT 코드리뷰 지적 P1, 재현 확인): 기존
+    # actual_order_submitted = final_decision=="BUY" 하나로는
+    # "주문을 시도했다"와 "브로커가 실제로 접수했다"를 구분할 수
+    # 없었음 — _try_buy()가 broker.place_order()를 호출한 뒤
+    # result.accepted=False(브로커 거부)여도 명시적 block 사유를
+    # 반환하지 않아 final_decision은 여전히 "BUY"로 남는 것을 재현
+    # 확인. 다음 4개로 분리 — order_attempted는 "기존 리스크/제한
+    # 규칙을 통과해 실제로 broker.place_order()를 호출했는지",
+    # order_accepted는 "브로커가 그 주문을 실제로 접수했는지"로
+    # 서로 다른 질문. order_attempted=False면 order_accepted/
+    # order_id/order_message는 애초에 호출 자체가 없었으므로 빈 값.
+    "order_attempted",
+    "order_accepted",
+    "order_id",
+    "order_message",
     # MACD (1E 단계와 동일 계산 재사용)
     "macd",
     "macd_signal",
@@ -533,6 +556,18 @@ class EntryQualityShadowLogger:
     즉시 생성함(TradingService.__init__에서 다른 shadow 로거들과
     동일 패턴으로 항상 인스턴스화되므로) — "off"에서는 이 파일에
     행이 추가되지 않을 뿐, 빈 헤더만 있는 파일 자체는 생성됨.
+
+    2026-08-05 (3차 GPT 코드리뷰 지적 P0-1, 재현 확인): 이전엔
+    파일이 존재하면 헤더 스키마를 전혀 확인하지 않고 곧바로 키만
+    복원했음 — 1E.5→1E.6에서 6개 필드(condition_source_reliable,
+    current_price 등)가 추가됐는데, 이 로거는 entry_quality_
+    guard_mode="off"일 때도 빈 헤더 파일을 생성하므로 1E.5 코드를
+    한 번이라도 실행한 실서버에는 구형 32열 헤더 파일이 있을 수
+    있었음. 그 상태에서 신형(38열) 로거로 행을 추가하면 csv.
+    DictReader가 다시 읽을 때 초과 6개 값이 row[None]으로 밀려나고
+    final_decision 등 정상 필드가 None으로 파싱되는 것을 재현
+    확인. 이제 키 복원 전에 반드시 _migrate_csv_header_if_needed()
+    로 헤더를 먼저 최신화.
     """
 
     def __init__(self, file_path: str) -> None:
@@ -541,6 +576,10 @@ class EntryQualityShadowLogger:
         self._seen_keys: set[tuple] = set()
 
         if self.file_path.exists():
+            # 2026-08-05: 헤더 마이그레이션을 먼저 수행 — 구형
+            # 헤더인 상태로 키를 복원하면 이후 append_if_new()가
+            # 쓰는 신형 행과 열 구조가 어긋나는 문제를 방지.
+            _migrate_csv_header_if_needed(self.file_path, ENTRY_QUALITY_SHADOW_FIELDS, "ENTRY_QUALITY_SHADOW")
             # 2026-08-05: 기존 파일이 있으면(재시작) 키를 복원 —
             # 파일이 크지 않으므로(legacy BUY 후보만 기록됨) 전체를
             # 읽어도 부담 없음. 헤더가 예상과 다르거나(과거 버전
@@ -565,17 +604,28 @@ class EntryQualityShadowLogger:
                 writer.writeheader()
 
     def append_if_new(self, row: dict[str, Any]) -> bool:
-        """중복 키가 아니면 한 줄을 추가하고 True, 이미 기록된 키면 아무것도 안 하고 False를 반환합니다."""
+        """중복 키가 아니면 한 줄을 추가하고 True, 이미 기록된 키면 아무것도 안 하고 False를 반환합니다.
+
+        2026-08-05 (3차 GPT 코드리뷰 지적 P2, 재현 확인): 이전엔
+        _seen_keys.add(key)를 파일 쓰기 *전에* 실행했음 — 파일
+        쓰기 도중 예외가 발생하면 그 행은 실제로 저장되지 않았는데
+        키는 이미 소비된 상태가 되어, 같은 판단을 다음에 다시
+        시도해도 "이미 기록됨"으로 오판해 영구히 누락되는 문제가
+        있었음. writer.writerow()가 실제로 성공한 뒤에만 키를
+        추가하도록 순서를 바꿈 — 쓰기 실패 시 다음 재시도가
+        정상적으로 가능해짐.
+        """
         key = _entry_quality_shadow_key(row)
         if key in self._seen_keys:
             return False
-        self._seen_keys.add(key)
 
         with self.file_path.open("a", newline="", encoding="utf-8") as fp:
             writer = csv.DictWriter(fp, fieldnames=ENTRY_QUALITY_SHADOW_FIELDS, extrasaction="ignore")
             for field in ENTRY_QUALITY_SHADOW_FIELDS:
                 row.setdefault(field, "")
             writer.writerow(row)
+
+        self._seen_keys.add(key)
         return True
 
 

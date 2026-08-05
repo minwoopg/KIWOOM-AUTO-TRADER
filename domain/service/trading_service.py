@@ -24,7 +24,7 @@ from config.settings import Settings
 from domain.market_regime.classifier import MarketRegimeClassifier
 from domain.market_regime.minute_analyzer import MinuteAnalyzer, MinuteAnalysis, MinuteDataResult
 from domain.market_regime.session_metrics import merge_session_bars, build_session_metrics, format_session_metrics_log_line
-from domain.models import AccountBalance, MarketRegime, OrderRequest, OrderSide, Signal, SignalType
+from domain.models import AccountBalance, MarketRegime, OrderRequest, OrderResult, OrderSide, Signal, SignalType
 from domain.position.lifecycle import PositionLifecycle, PositionStateMachine
 from domain.risk.risk_manager import RiskManager
 from domain.strategy.strategy_router import StrategyRouter
@@ -139,6 +139,24 @@ class TradingService:
         # HOLD 로그 throttle
         self.last_hold_log_at_by_symbol: dict[str, datetime] = {}
         self._last_buy_signal_at: dict[str, datetime] = {}  # 종목별 마지막 BUY신호 시각
+        # 2026-08-05 (3차 GPT 코드리뷰 지적 P1, 재현 확인): 기존
+        # entry_quality_shadow.csv의 actual_order_submitted가
+        # final_decision=="BUY"로만 계산되고 있었는데, _try_buy()
+        # 내부에서 실제로 broker.place_order()를 호출한 뒤 결과가
+        # result.accepted=False(브로커가 거부)여도 명시적 block
+        # 사유를 반환하지 않아서(암묵적으로 None 반환) final_
+        # decision은 여전히 "BUY"로 남는 것을 확인 — "주문을
+        # 시도했다"와 "브로커가 실제로 접수했다"가 이 필드
+        # 하나로는 구분이 안 됐음.
+        #
+        # _try_buy()의 반환 시그니처(차단 사유 문자열 또는 빈
+        # 문자열)는 test_order_block_reason.py 등 기존 회귀가 직접
+        # 비교하므로 그대로 유지하고, 대신 place_order()를 실제로
+        # 호출했을 때의 OrderResult를 이 저장소에 별도로 기록 —
+        # _write_signal_log() 호출 시점에 여기서 조회해 order_
+        # attempted/order_accepted/order_id/order_message를 정확히
+        # 채움. 종목당 최근 1건만 필요하므로 매 시도마다 덮어씀.
+        self._last_order_attempt_by_symbol: dict[str, OrderResult] = {}
         # 2026-08-05 (GPT 코드리뷰 지적, 5번): 기존엔 _symbol_to_
         # condition(단수형)을 update()로 별도 누적해서, _symbol_to_
         # conditions(복수형)는 스냅샷 교체로 고쳤는데도 단수형 대표
@@ -1567,6 +1585,16 @@ class TradingService:
             order_block_reason = ""
             final_decision = signal.type.value
             if signal.type == SignalType.BUY:
+                # 2026-08-05 (3차 GPT 코드리뷰 지적 P1): _try_buy()
+                # 호출 직전에 이 종목의 이전 폴링 주문시도 기록을
+                # 명시적으로 지움 — 이번 폴링에서 place_order()가
+                # 실제로 호출됐는지(order_attempted)를, "저장소에
+                # 값이 있다"가 아니라 "이번 호출 이후에 값이 새로
+                # 생겼다"로 정확히 판단하기 위함. _try_buy() 내부의
+                # 조기 반환(EXCLUDED_SYMBOL 등)들은 place_order()
+                # 자체를 호출하지 않으므로, 그 경로에서는 이 값이
+                # 계속 비어있는 게 맞음.
+                self._last_order_attempt_by_symbol.pop(symbol, None)
                 block = self._try_buy(
                     symbol, market_price.current_price, balance,
                     signal=signal, regime=regime,
@@ -2432,6 +2460,13 @@ class TradingService:
         self._position_state_machine.on_buy_requested(symbol, order.quantity, "pending")
         result = self.broker.place_order(order)
         self._position_state_machine.on_buy_result(symbol, result.accepted)
+        # 2026-08-05 (3차 GPT 코드리뷰 지적 P1): 브로커 응답을
+        # 즉시 저장 — _write_signal_log()가 이 시점의 실제 접수
+        # 여부(result.accepted)를 order_accepted로 정확히 반영할
+        # 수 있도록. final_decision="BUY"라도 result.accepted가
+        # False일 수 있음(브로커 거부) — 이전엔 이 구분이 전혀
+        # 없었음.
+        self._last_order_attempt_by_symbol[symbol] = result
 
         # ── 매수 컨텍스트 구성 ────────────────────────────────────
         ctx = self._build_trade_context(
@@ -2824,6 +2859,14 @@ class TradingService:
         m = re.search(r'(\d+)/8', signal.reason)
         score = m.group(1) if m else ""
 
+        # 2026-08-05 (3차 GPT 코드리뷰 지적 P1): 이번 폴링에서
+        # _try_buy()가 실제로 broker.place_order()를 호출했다면
+        # (호출 직전에 이전 폴링 기록을 pop()으로 지워뒀으므로,
+        # 여기 값이 있다는 건 정확히 "이번 폴링에서 새로 생긴
+        # 기록"을 의미) 그 OrderResult를 그대로 가져와 order_
+        # attempted/order_accepted/order_id/order_message에 반영.
+        order_attempt = self._last_order_attempt_by_symbol.get(symbol)
+
         # ── MACD 상태 관측 (2026-08-04, 2차 개정) ────────────────
         # 원시값(macd/macd_signal)과 breakout_strategy.py의 실제
         # 계산식(macd > macd_signal)을 그대로 재사용 — 다른 계산식을
@@ -3065,7 +3108,10 @@ class TradingService:
                     "legacy_reason": signal.reason,
                     "final_decision": final_decision or signal.type.value,
                     "order_block_reason": order_block_reason,
-                    "actual_order_submitted": (final_decision or signal.type.value) == "BUY",
+                    "order_attempted": order_attempt is not None,
+                    "order_accepted": order_attempt.accepted if order_attempt is not None else "",
+                    "order_id": order_attempt.order_id if order_attempt is not None else "",
+                    "order_message": order_attempt.message if order_attempt is not None else "",
                     "macd": macd_val,
                     "macd_signal": macd_signal_val,
                     "macd_above_signal": macd_above_signal_val,

@@ -2882,3 +2882,136 @@ MACD/VWAP 데이터를 동시에 수집해도 안전한 상태로 판단.
 
 ---
 
+## 1E.7: shadow 실전환 전 최종 무결성 수정 (2026-08-05)
+
+**배경**: 1E.6 승인 직후, `entry_quality_guard_mode="shadow"` 실전환
+직전 GPT 3차 코드리뷰로 P0 2건 + P1/P2 각 1건이 지적됨. 모두
+재현부터 확인 후 수정.
+
+### P0-1: EntryQualityShadowLogger 헤더 마이그레이션 누락 (재현 확인)
+
+1E.5 시절 헤더는 32열, 1E.6에서 6개 필드(`condition_source_
+reliable` 등)가 추가돼 38열이 됐는데, `EntryQualityShadowLogger`
+가 파일 존재 여부만 확인하고 헤더 스키마는 전혀 비교하지 않았음
+— 이 로거는 `entry_quality_guard_mode="off"`일 때도 빈 헤더 파일을
+생성하므로, 1E.5 코드를 한 번이라도 실행한 실서버에는 구형 헤더
+파일이 있을 수 있었음. 재현: 구형 32열 헤더에 신형 38열 로거로
+행을 추가하면, `csv.DictReader`로 다시 읽을 때 초과 6개 값이
+`row[None]`으로 밀려나고 `final_decision`이 `None`으로 파싱됨.
+
+**수정**: `SignalCsvLogger`의 마이그레이션 로직(백업 → 임시파일
+스트리밍 → flush+fsync → `os.replace`)을 `_migrate_csv_header_
+if_needed()` 범용 함수로 추출해 두 로거가 공유하도록 재작성.
+`EntryQualityShadowLogger.__init__()`이 기존 파일이 있으면 키
+복원 *전에* 반드시 이 함수를 먼저 호출.
+
+재현 시나리오로 재검증: 마이그레이션 후 기존 행 보존, 신규 필드
+정상 파싱, `.bak` 백업 생성 확인.
+
+### P0-2: ConditionWatcher 신뢰도 로직 4가지 문제 (전면 재설계, 재현 확인)
+
+기존 `_symbols_by_seq` + 누적 `_condition_source_reliable` dict
+구조를 폐기하고, `_confirmed_symbols_by_seq`(CNSRREQ로 확정된
+것만) + `_realtime_unresolved`(REAL로만 알려진 미확정 종목) 두
+상태로 완전히 분리 — `reliable` 여부는 항상 이 두 상태에서 호출
+시점에 재계산(`symbol_condition_source_reliable` property).
+
+- **문제A** (재현 확인): 이미 CNSRREQ로 `reliable=True`가 확정된
+  종목에 REAL I가 와도 `"symbol not in self._all_symbols"` 조건
+  때문에 아무 처리를 안 해 `reliable=True`가 그대로 남았음 — 그
+  REAL I가 실제로 다른(아직 모르는) 조건식에서의 신규 편입일 수
+  있는데도. 수정: 이미 알려진 종목이어도 REAL I가 오면 무조건
+  `_realtime_unresolved`에 추가해 즉시 `reliable=False`로 하향.
+- **문제B**: REAL D가 그 종목이 소속된 모든 seq 버킷에서 한꺼번에
+  제거하는 기존 동작 자체는 유지하되, 이게 "정확한 조건식별
+  편출"이 아니라 "출처불명 이벤트는 안전을 위해 전체 제거하는
+  보수적 정책"임을 코드 주석과 모듈 docstring에 명확히 정정
+  (신규 진입 후보를 못 보는 게, 편출됐어야 할 종목을 계속 신호
+  판단 대상으로 남기는 것보다 낫다는 원칙).
+- **문제C**: 주기적 CNSRREQ 재조회 자체는 이번에도 구현하지
+  않음 — REAL-touched 종목은 계속 condition-source 분석에서
+  제외되는 게 맞다는 GPT 판단을 그대로 따름.
+- **문제D** (재현 확인): `_on_initial_result()`가 새 결과에서
+  사라진 종목의 stale reliability나 unresolved 상태를 정리하지
+  않았음. 수정: 재조회 확정 결과로 `_realtime_unresolved`에서
+  해당 종목들을 명시적으로 제거(`self._realtime_unresolved -=
+  new_symbol_set`) — 재조회 결과에 없는 종목은 이 seq 버킷에서만
+  빠지고 다른 seq·unresolved 상태는 그대로 유지("이 조건식에는
+  없다"가 "완전히 알 수 없다"는 뜻은 아니므로).
+
+재현 시나리오로 재검증: (A) 이미 known/reliable=True 종목에 REAL
+I → reliable=False로 하향, targets는 유지. (D) unresolved 종목이
+재조회로 확정되면 → reliable=True + unresolved에서 제거. (D-2)
+재조회 결과에서 완전히 사라진 종목 → confirmed에서 제거되어
+`symbol_condition_source_reliable`에도 안 나타남, targets에서도
+제거.
+
+부수 발견: `symbol_condition_source_reliable`의 docstring이 "계산식
+자체로 없으면 False가 보장된다"고 썼는데 실제로는 confirmed_union
+에 없는 종목은 딕셔너리에 키 자체가 없어 `.get(symbol)`이 `None`을
+반환하는 것을 테스트 작성 중 재현 확인 — docstring을 실제 동작
+("호출부는 반드시 `.get(symbol, False)`로 조회해야 함")에 맞게
+정정. 실제 호출부(`TradingService._write_signal_log()`)는 이미
+정확히 `.get(symbol, False)`로 처리하고 있어 프로덕션 동작에는
+영향 없었음.
+
+### P1: 주문 결과 필드 분리 (재현 확인)
+
+기존 `actual_order_submitted = final_decision=="BUY"` 하나로는
+"기존 리스크/제한 규칙을 통과해 실제로 `place_order()`를 호출
+했는지"와 "브로커가 그 주문을 실제로 접수했는지"를 구분할 수
+없었음 — `_try_buy()`가 `place_order()`를 호출한 뒤 `result.
+accepted=False`(브로커 거부)여도 명시적 차단 사유를 반환하지
+않아(암묵적 `None` 반환) `final_decision`은 여전히 `"BUY"`로
+남는 것을 재현 확인.
+
+**수정**: `_try_buy()`의 기존 반환 시그니처(차단 사유 문자열
+또는 빈 문자열)는 `test_order_block_reason.py` 등 기존 회귀가
+직접 비교하므로 그대로 유지. 대신 `_last_order_attempt_by_symbol`
+저장소를 신설해 `place_order()` 호출 직후의 `OrderResult`를 별도
+기록 — `_try_buy()` 호출 직전에 이전 폴링의 낡은 기록을 `pop()`
+으로 먼저 지워서, "이번 폴링에서 새로 생긴 값이 있다"가 곧 "이번
+폴링에서 실제로 `place_order()`가 호출됐다"를 정확히 의미하도록
+설계. `ENTRY_QUALITY_SHADOW_FIELDS`의 `actual_order_submitted`를
+`order_attempted`/`order_accepted`/`order_id`/`order_message`
+4개로 분리.
+
+재현 시나리오로 재검증: 브로커가 거부하도록 패치한 뒤 `_try_buy()`
+호출 → `block=None`(리스크 게이트는 통과해 `place_order()`까지
+호출됨) + `order_attempt.accepted=False`(브로커 거부) 정확히
+분리 확인. 통합 흐름(`_write_signal_log()`)까지 재확인: `final_
+decision="BUY"`인데 `order_accepted="False"`로 정확히 기록됨.
+
+### P2: append_if_new 기록 순서 (이전 라운드에서 이미 반영 확인)
+
+`_seen_keys.add(key)`를 `writer.writerow()` *이후*로 옮기는 수정
+자체는 1E.6에서 이미 반영돼 있었음 — 이번 라운드에서 재확인만
+수행. 테스트로 `open()`이 예외를 던지도록 강제한 뒤, 쓰기 실패
+시 키가 소비되지 않아 재시도가 정상적으로 가능함을 직접 검증.
+
+### 테스트
+
+`test_vwap_shadow_observation.py`를 58→79건으로 확장 — GPT가
+제시한 필수 테스트(28: 구형 헤더 마이그레이션, 29: known 종목
+REAL I 시 하향, 30: unresolved 재조회 확정, 31: stale reliability
+정리, 32: 브로커 거부 시 필드 분리, 33: 리스크게이트 조기차단
+시 order_attempted, 34: 쓰기 실패 후 재시도 가능) 전부 반영.
+기존 5/18번 테스트가 1E.6 이전 세대 필드명(`_symbols_by_seq`,
+`_condition_source_reliable`)을 그대로 쓰고 있던 것도 이번에
+발견해 신규 구조(`_confirmed_symbols_by_seq`, `_realtime_
+unresolved`)로 갱신, 24번 테스트의 폐기된 필드명(`actual_order_
+submitted`) 참조도 정리.
+
+**전체 회귀**: `run_regression_tests.py` — 11개 파일 전부 통과,
+1개(`test_legacy_fixture_structure.py`) 명시적 스킵, 종료코드 0.
+MACD shadow(55건), experimental config(9건) 그대로 유지. 로그/
+데이터 디렉토리 오염 없음 확인.
+
+**현재 상태**: 이번 라운드도 실거래 동작을 전혀 바꾸지 않음.
+`entry_quality_guard_mode`는 여전히 `settings.yaml`에서 `"off"`.
+P0 2건이 모두 해결됐으므로, 이제 `settings.yaml`만 별도 커밋으로
+`"shadow"` 전환하면 MACD/VWAP shadow를 동시에 실서버에서 안전하게
+수집 시작할 수 있는 상태.
+
+---
+

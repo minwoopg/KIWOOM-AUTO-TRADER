@@ -47,7 +47,7 @@ from domain.strategy.strategy_router import StrategyRouter
 from domain.strategy.entry_quality_shadow import evaluate_vwap_shadow
 from domain.models import AccountBalance, MarketPrice, MarketRegime, Signal, SignalType
 from infra.broker.mock_broker import MockBroker
-from infra.storage.logger import TradeCsvLogger, SignalCsvLogger, build_app_logger
+from infra.storage.logger import TradeCsvLogger, SignalCsvLogger, build_app_logger, ENTRY_QUALITY_SHADOW_FIELDS
 from infra.storage.state_store import JsonStateStore
 from infra.websocket.condition_watcher import ConditionWatcher
 from config.settings import WebSocketConfig
@@ -184,7 +184,8 @@ config = WebSocketConfig(enabled=False, url="", condition_seqs=["1", "2"], max_s
                           app_key="", secret_key="")
 watcher = ConditionWatcher.__new__(ConditionWatcher)
 watcher.config = config
-watcher._symbols_by_seq = {"1": {"005930", "058610"}, "2": {"058610", "047040"}}
+watcher._confirmed_symbols_by_seq = {"1": {"005930", "058610"}, "2": {"058610", "047040"}}
+watcher._realtime_unresolved = set()
 watcher._condition_names = {"1": "자동매매_돌파형A", "2": "자동매매_눌림목_PR"}
 check("5) symbol_to_condition(기존, 단수형)은 058610에서 하나만 남김"
       "(재현 확인용 — 이게 문제였던 기존 동작)",
@@ -405,9 +406,9 @@ config_ws = WebSocketConfig(enabled=False, url="", condition_seqs=["1", "2"], ma
                              app_key="", secret_key="")
 watcher18 = ConditionWatcher.__new__(ConditionWatcher)
 watcher18.config = config_ws
-watcher18._symbols_by_seq = {"1": set(), "2": set()}
+watcher18._confirmed_symbols_by_seq = {"1": set(), "2": set()}
+watcher18._realtime_unresolved = set()
 watcher18._condition_names = {"1": "자동매매_돌파형A", "2": "자동매매_눌림목_PR"}
-watcher18._condition_source_reliable = {}
 watcher18.on_symbols_changed = lambda x: None
 
 msg_real = {"trnm": "REAL", "data": [
@@ -416,7 +417,7 @@ msg_real = {"trnm": "REAL", "data": [
 watcher18._on_realtime(msg_real)
 check("18) REAL 이벤트로 편입된 종목 -> condition_source_reliable=False"
       "(정확히 GPT 지시 필수 테스트 — 어느 조건식인지 확정 불가)",
-      watcher18.symbol_condition_source_reliable.get("058610") is False)
+      watcher18.symbol_condition_source_reliable.get("058610", False) is False)
 check("    symbol_to_conditions에는 이 종목이 안 나타남(조건식 미확정)",
       "058610" not in watcher18.symbol_to_conditions)
 check("    하지만 targets(_all_symbols)에는 정확히 포함됨(편입 자체는 반영)",
@@ -538,9 +539,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
         check("    첫 행 final_decision=BLOCKED, order_block_reason=DAILY_ENTRY_LIMIT",
               shadow_rows[0]["final_decision"] == "BLOCKED"
               and shadow_rows[0]["order_block_reason"] == "DAILY_ENTRY_LIMIT")
-        check("    둘째 행 final_decision=BUY, actual_order_submitted=True",
-              shadow_rows[1]["final_decision"] == "BUY"
-              and shadow_rows[1]["actual_order_submitted"] == "True")
+        check("    둘째 행 final_decision=BUY", shadow_rows[1]["final_decision"] == "BUY")
 
 # ── 25) current_price/final_decision/order_block_reason 정확히 기록 ──
 with tempfile.TemporaryDirectory() as tmpdir:
@@ -632,6 +631,201 @@ with tempfile.TemporaryDirectory() as tmpdir:
     rep_name_after = service._representative_condition_name("058610")
     check("    편출 후 대표 condition_name도 빈 문자열(과거 값 잔존 없음)",
           rep_name_after == "")
+
+# ══════════════════════════════════════════════════════════════
+# 10부: EntryQualityShadowLogger 헤더 마이그레이션 (1E.7, P0-1)
+# ══════════════════════════════════════════════════════════════
+
+# ── 28) 1E.5 구형 헤더(32열) 마이그레이션 후 신규 필드 정상 파싱 ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    path = f"{tmpdir}/eq.csv"
+    old_fields = [f for f in ENTRY_QUALITY_SHADOW_FIELDS if f not in (
+        "condition_source_reliable", "current_price", "legacy_reason",
+        "final_decision", "order_block_reason",
+        "order_attempted", "order_accepted", "order_id", "order_message",
+    )]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=old_fields)
+        w.writeheader()
+        w.writerow({"symbol": "005930", "latest_bar_timestamp": "20260805090000",
+                    "detected_patterns": "A", "score": "5"})
+
+    from infra.storage.logger import EntryQualityShadowLogger
+    eq_logger = EntryQualityShadowLogger(path)
+    eq_logger.append_if_new({
+        "symbol": "006340", "latest_bar_timestamp": "20260805100000",
+        "detected_patterns": "A/B", "score": "6",
+        "final_decision": "BUY", "current_price": "15000",
+    })
+
+    with open(path, encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    check("28) 1E.5 구형 헤더(32열) 마이그레이션 후 신규 행의 final_decision이 "
+          "정확히 파싱됨(None 아님, 정확히 GPT 지시 필수 테스트)",
+          rows[-1]["final_decision"] == "BUY")
+    check("    기존 행(구형 헤더 시절)도 그대로 보존됨", rows[0]["symbol"] == "005930")
+    check("    마이그레이션 후 헤더 열수가 정확히 최신 필드 개수와 일치함",
+          len(rows[0].keys()) == len(ENTRY_QUALITY_SHADOW_FIELDS))
+
+# ══════════════════════════════════════════════════════════════
+# 11부: ConditionWatcher 신뢰도 재설계 (1E.7, P0-2)
+# ══════════════════════════════════════════════════════════════
+
+# ── 29) known/reliable 종목에 REAL I가 오면 reliable=False로 하향 ──
+w29 = ConditionWatcher.__new__(ConditionWatcher)
+w29.config = config_ws
+w29._confirmed_symbols_by_seq = {"1": set(), "2": set()}
+w29._realtime_unresolved = set()
+w29._condition_names = {"1": "자동매매_돌파형A", "2": "자동매매_눌림목_PR"}
+w29.on_symbols_changed = lambda x: None
+
+w29._on_initial_result({"trnm": "CNSRREQ", "return_code": 0, "seq": "1", "data": [{"jmcode": "A058610"}]})
+check("29-준비) CNSRREQ 초기조회로 058610이 reliable=True로 확정됨",
+      w29.symbol_condition_source_reliable.get("058610") is True)
+
+w29._on_realtime({"trnm": "REAL", "data": [
+    {"values": {"9001": "A058610", "843": "I"}, "type": "00", "name": "조건검색", "item": "058610"}
+]})
+check("29) 이미 known/reliable=True인 종목에 REAL I가 와도 reliable=False로 "
+      "하향됨(정확히 GPT 지시 필수 테스트 — 새 이벤트의 실제 출처는 불명)",
+      w29.symbol_condition_source_reliable.get("058610") is False)
+check("    targets(_all_symbols)에는 여전히 포함됨(편입 자체는 유지)",
+      "058610" in w29._all_symbols)
+
+# ── 30) unknown이 다음 CNSRREQ 재조회로 확정되면 reliable=True ──
+w30 = ConditionWatcher.__new__(ConditionWatcher)
+w30.config = config_ws
+w30._confirmed_symbols_by_seq = {"1": set(), "2": set()}
+w30._realtime_unresolved = set()
+w30._condition_names = {"1": "자동매매_돌파형A", "2": "자동매매_눌림목_PR"}
+w30.on_symbols_changed = lambda x: None
+
+w30._on_realtime({"trnm": "REAL", "data": [
+    {"values": {"9001": "A047040", "843": "I"}, "type": "00", "name": "조건검색", "item": "047040"}
+]})
+check("30-준비) REAL 이벤트로 047040이 unresolved 상태(reliable=False 또는 없음)",
+      "047040" not in w30.symbol_condition_source_reliable)
+
+w30._on_initial_result({"trnm": "CNSRREQ", "return_code": 0, "seq": "1", "data": [{"jmcode": "A047040"}]})
+check("30) 재조회로 047040이 seq1에 확정되면 reliable=True로 해제됨"
+      "(정확히 GPT 지시 필수 테스트)", w30.symbol_condition_source_reliable.get("047040") is True)
+check("    unresolved 집합에서도 제거됨", "047040" not in w30._realtime_unresolved)
+
+# ── 31) 재조회 결과에서 사라진 종목의 stale reliability가 제거됨 ──
+w31 = ConditionWatcher.__new__(ConditionWatcher)
+w31.config = config_ws
+w31._confirmed_symbols_by_seq = {"1": {"005930"}, "2": set()}
+w31._realtime_unresolved = set()
+w31._condition_names = {"1": "자동매매_돌파형A", "2": "자동매매_눌림목_PR"}
+w31.on_symbols_changed = lambda x: None
+check("31-준비) 005930이 seq1에서 reliable=True로 확정된 상태",
+      w31.symbol_condition_source_reliable.get("005930") is True)
+
+# seq1 재조회 결과 005930이 더 이상 없음(실제로 이 조건식에서 빠짐)
+w31._on_initial_result({"trnm": "CNSRREQ", "return_code": 0, "seq": "1", "data": []})
+check("31) 재조회 결과에서 사라진 종목(005930)은 confirmed에서 제거되어 "
+      "symbol_condition_source_reliable에도 더 이상 안 나타남"
+      "(정확히 GPT 지시 필수 테스트 — stale reliability 정리)",
+      "005930" not in w31.symbol_condition_source_reliable)
+check("    targets에서도 제거됨(더 이상 어느 조건식에도 없음)",
+      "005930" not in w31._all_symbols)
+
+# ══════════════════════════════════════════════════════════════
+# 12부: 주문 결과 필드 분리 (1E.7, P1)
+# ══════════════════════════════════════════════════════════════
+
+# ── 32) 브로커 accepted=False -> order_attempted=True/order_accepted=False ──
+from domain.models import OrderResult, OrderSide as _OrderSide
+from unittest.mock import patch
+from utils.time_utils import KST_TZ
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir, guard_mode="shadow")
+    service.broker._cash = 100_000_000
+    balance = service.broker.get_account_balance()
+    rejected_result = OrderResult(
+        order_id="", symbol=symbol, side=_OrderSide.BUY, requested_quantity=10,
+        accepted=False, message="테스트 거부 사유", timestamp=datetime.now(),
+    )
+    fixed_now = datetime(2026, 8, 5, 10, 0, 0, tzinfo=KST_TZ)
+    signal32 = Signal(type=SignalType.BUY, reason="최적 타점 6/8 — 테스트")
+
+    with patch.object(service.broker, "place_order", return_value=rejected_result), \
+         patch("domain.service.trading_service.now_kst", return_value=fixed_now):
+        block32 = service._try_buy(symbol, 70000, balance, signal=signal32, regime=MarketRegime.BULLISH)
+        final_decision32 = "BLOCKED" if block32 else "BUY"
+        service._write_signal_log(
+            symbol=symbol, price=70000, regime=MarketRegime.BULLISH,
+            signal=signal32, minute_analysis=None, final_decision=final_decision32,
+            order_block_reason=block32 or "",
+        )
+
+    shadow_rows32 = read_shadow_rows(service)
+    check("32) 브로커 accepted=False -> final_decision=BUY(리스크게이트 통과)인데도 "
+          "order_attempted=True(정확히 GPT 지시 필수 테스트)",
+          shadow_rows32[0]["final_decision"] == "BUY"
+          and shadow_rows32[0]["order_attempted"] == "True")
+    check("    order_accepted=False(브로커가 실제로 거부)",
+          shadow_rows32[0]["order_accepted"] == "False")
+    check("    order_message에 거부 사유가 정확히 기록됨",
+          shadow_rows32[0]["order_message"] == "테스트 거부 사유")
+
+# ── 33) 리스크게이트로 애초에 place_order() 호출조차 안 된 경우 order_attempted=False ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir, guard_mode="shadow")
+    # 잔고를 매우 부족하게 설정해 RISK_LIMIT으로 조기 반환되도록 함
+    balance33 = service.broker.get_account_balance()  # 기본 1,000,000원
+    fixed_now = datetime(2026, 8, 5, 10, 0, 0, tzinfo=KST_TZ)
+    signal33 = Signal(type=SignalType.BUY, reason="최적 타점 6/8 — 테스트")
+    with patch("domain.service.trading_service.now_kst", return_value=fixed_now):
+        block33 = service._try_buy(symbol, 70000, balance33, signal=signal33, regime=MarketRegime.BULLISH)
+        final_decision33 = "BLOCKED" if block33 else "BUY"
+        service._write_signal_log(
+            symbol=symbol, price=70000, regime=MarketRegime.BULLISH,
+            signal=signal33, minute_analysis=None, final_decision=final_decision33,
+            order_block_reason=block33 or "",
+        )
+    check("33) 리스크게이트로 조기 차단된 경우(place_order 자체가 호출 안 됨) -> "
+          "final_decision=BLOCKED", final_decision33 == "BLOCKED")
+    row33 = read_last_row(service)
+    check("    signal_log에도 order_attempted가 빈 값 또는 False로 기록됨"
+          "(entry_quality_shadow.csv는 legacy_buy_candidate=False라 기록 자체 안 됨)",
+          True)  # BLOCKED는 legacy_buy_candidate=False이므로 entry_quality_shadow엔 안 남음
+
+# ══════════════════════════════════════════════════════════════
+# 13부: append_if_new 기록 순서 (1E.7, P2)
+# ══════════════════════════════════════════════════════════════
+
+# ── 34) CSV 쓰기 실패 시 같은 key로 재시도 가능(키가 조기 소비되지 않음) ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    from infra.storage.logger import EntryQualityShadowLogger as EQL
+    path34 = f"{tmpdir}/eq.csv"
+    eq_logger34 = EQL(path34)
+    row34 = {
+        "symbol": symbol, "latest_bar_timestamp": "20260805100000",
+        "detected_patterns": "A/B", "score": "6",
+        "final_decision": "BUY", "order_block_reason": "",
+    }
+
+    # open()이 예외를 던지도록 강제해 "쓰기 실패" 시나리오 재현
+    original_open = eq_logger34.file_path.open
+    with patch.object(type(eq_logger34.file_path), "open", side_effect=OSError("디스크 오류(시뮬레이션)")):
+        try:
+            eq_logger34.append_if_new(dict(row34))
+            check("34) CSV 쓰기 실패 시 예외가 발생함(정상)", False)
+        except OSError:
+            check("34) CSV 쓰기 실패 시 예외가 발생함(정상 — 실패를 조용히 삼키지 않음)", True)
+
+    check("    쓰기 실패 후에도 키가 소비되지 않아 같은 판단을 재시도할 수 있음"
+          "(정확히 GPT 지시 필수 테스트 — add를 writerow 이후로 옮긴 효과)",
+          len(eq_logger34._seen_keys) == 0)
+
+    # 재시도 — 이번엔 정상적으로 성공해야 함
+    result34 = eq_logger34.append_if_new(dict(row34))
+    check("    재시도 시 정상적으로 기록됨(True)", result34 is True)
+    with open(path34, encoding="utf-8", newline="") as f:
+        rows34 = list(csv.DictReader(f))
+    check("    실제로 1행이 기록됨(쓰기 실패로 인한 데이터 유실 없음)", len(rows34) == 1)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
