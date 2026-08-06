@@ -192,14 +192,6 @@ websocket:
   app_key: ${KIWOOM_REAL_APP_KEY}
   secret_key: ${KIWOOM_REAL_SECRET_KEY}
 
-  # ── 스윙 전용 조건검색 (2026-06-16 신규) ─────────────────
-  # 키움 HTS에서 직접 만든 스윙용 검색식(20일선 근처/충분히 눌린 종목)의
-  # 시퀀스 번호를 여기에 추가하면, 그 결과만 별도로 분리해서
-  # data/swing_condition_symbols.json에 저장 → main_swing.py가 읽어감.
-  # 검색식 만들기 전까지는 빈 리스트로 둬도 안전 (스윙은 watchlist만 사용).
-  swing_condition_seqs: []   # 예: [4] — 검색식 만든 후 seq 번호로 교체
-  swing_condition_output: data/swing_condition_symbols.json
-
 storage:
   state_file: data/state.json
   trade_log_file: logs/trades.csv

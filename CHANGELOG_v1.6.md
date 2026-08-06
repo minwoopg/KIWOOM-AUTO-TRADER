@@ -3179,3 +3179,95 @@ seq로 1회 재구독. 무한 루프 방지를 위해 **연결당 seq별 1회**�
 
 ---
 
+## 1F: 스윙 전략 전량 폐기 — 단타 단일 구조로 정리 (2026-08-06)
+
+**배경**: 민우님 결정으로 스윙 전략을 폐기하고 단타 전략만으로
+운영하기로 함. 구조도 그에 맞춰 정리.
+
+### 사전 확인: 스윙 파이프라인은 이미 실행 불가 상태였음
+
+제거 전 의존 관계를 점검하다가, `domain/service/swing_service.py`가
+**`SwingService` 클래스를 전혀 포함하지 않는 파일**임을 확인했습니다.
+내용은 `analyze_trades.py`의 구버전(417줄 vs 현재 381줄, 800줄 차이)
+으로, 어느 시점엔가 잘못된 경로에 저장된 것으로 보입니다.
+
+따라서 `app/main_swing.py`는 188행
+`from domain.service.swing_service import SwingService`에서
+ImportError로 죽는 상태였고, 스윙 프로세스는 이미 기동 자체가
+불가능했습니다. **이번 폐기로 실제로 잃는 동작은 없습니다.**
+(`logs/app_swing.log`의 마지막 기록이 2026-06-26인 것도 이와 일치.)
+
+### 삭제한 것
+
+| 경로 | 내용 |
+|---|---|
+| `app/main_swing.py` | 스윙 프로세스 진입점 |
+| `config/settings_swing.yaml` | 스윙 전용 설정 |
+| `domain/swing/` | `__init__.py`, `pullback_rebound.py`, `swing_analyzer.py`, `swing_strategy.py` |
+| `domain/strategy/swing_strategy.py` | 어디서도 import되지 않던 사문 |
+| `domain/service/swing_service.py` | `SwingService` 없는 `analyze_trades.py` 구버전 |
+| `data/swing_condition_symbols.json` | 스윙 프로세스 연동용 중간 파일 |
+
+`domain/strategy/strategy_router.py`는 스윙을 전혀 참조하지 않아
+수정 불필요 — 단타 전략 라우팅은 영향 없음.
+
+### 코드 변경
+
+**`app/main.py`**
+- 스윙 seq 병합 제거: `dataclasses.replace()`로 `condition_seqs`에
+  스윙 seq를 합쳐 `ws_config_combined`를 만들던 로직을 삭제하고,
+  `ConditionWatcher`에 `settings.websocket`을 그대로 전달.
+- `data/swing_condition_symbols.json` 저장 블록(`[COND_SWING]` 로그)
+  제거.
+- 위 블록 제거로 사용처가 사라진 `import json`,
+  `from datetime import datetime` 정리(`Path`는 다른 곳에서 계속
+  사용하므로 유지). 함수 내 지역 import(`_dt`, `_dt_notify`)는 그대로.
+
+**`app/target_selection.py`**
+- `swing_seqs` 매개변수와 그에 딸린 분기 제거. 스윙 검색식이 동시
+  구독될 수 없게 되어, 출처 미확정 종목의 소속이 애매할 여지가
+  원천적으로 사라짐 → **이제 항상 단타 targets에 포함**.
+- `DayTargetSelection.unresolved_skipped` 필드 및 그 경고 로그 제거
+  (발생 불가능해짐).
+- `day_seqs` 필터링 자체는 **유지** — 설정에 등록되지 않은 seq의
+  결과가 흘러들어와 조용히 감시 대상이 되는 것을 막는 방어선이므로
+  스윙과 무관하게 남겨둘 가치가 있음.
+
+**`domain/service/trading_service.py`**
+- 스윙 전용으로 선언만 되어 있고 읽기·쓰기 참조가 **0건**이던
+  `cached_weekly_bars` / `cached_weekly_bars_loaded_at` 제거
+  (전체 grep으로 선언부 외 사용처 없음 확인).
+
+**설정**
+- `config/settings.py`: `WebSocketConfig`에서 `swing_condition_seqs`,
+  `swing_condition_output` 필드 제거.
+- `config/settings.yaml`: 해당 스윙 블록(주석 포함 7줄) 제거.
+- `tests/fixtures/legacy_20260721/settings.yaml`은 **의도적으로 손대지
+  않음** — 1A단계 캡처 시점을 그대로 보존해야 하는 동결 fixture이고,
+  `yaml.safe_load()`로만 읽히지 `load_settings()`를 타지 않으므로
+  필드 제거의 영향을 받지 않음(실제로 확인).
+
+**테스트**
+- `test_condition_target_selection.py`: 스윙 관련 3번 섹션을
+  "설정에 등록되지 않은 seq의 결과가 targets에 섞이지 않음" 검증으로
+  교체. 호출부에서 `swing_seqs` 인자 제거. 37건 유지, 전부 통과.
+- `test_stale_sell_and_clock_safety.py`, `domain/indicator/indicators.py`:
+  docstring의 스윙 언급 정리(동작 변경 없음).
+
+### 검증
+
+- `load_settings("config/settings.yaml")` 정상 로드,
+  `hasattr(websocket, "swing_condition_seqs") == False` 확인.
+- `app.main` / `app.target_selection` import 스모크 테스트 통과 —
+  삭제된 모듈을 참조하는 잔존 import 없음.
+- `compileall`로 `app`/`domain`/`infra`/`config`/`utils` 전체 컴파일 이상 없음.
+- **전체 회귀**: 12개 파일 전부 통과, 1개 스킵, 종료코드 0.
+
+### 남은 정리 대상(코드 아님, 다음 기회에)
+
+`logs/app_swing.log`, `logs/swing_watch.csv`는 과거 실행 기록이라
+git에 포함되지 않으며(.gitignore), 로컬에서 필요 없으면 수동 삭제
+하시면 됩니다.
+
+---
+

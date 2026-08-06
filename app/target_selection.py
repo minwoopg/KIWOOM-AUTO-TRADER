@@ -16,7 +16,12 @@ from __future__ import annotations
    순수 원시값만 받으므로 테스트에서 직접 호출할 수 있습니다.
 
 2. **1E.9에서 고친 실시간 편입 누락 결함의 재발 방지**
-   아래 `include_unresolved` 관련 주석 참고.
+   아래 `compute_day_targets()` 주석 참고.
+
+2026-08-06 (1F단계): 스윙 전략 전량 폐기에 따라 `swing_seqs`
+매개변수와 그에 딸린 분기를 제거했습니다. 구독하는 조건검색식이
+전부 단타용이므로, 출처 미확정 종목의 소속이 애매할 여지가
+원천적으로 없어졌습니다.
 """
 
 from dataclasses import dataclass, field
@@ -26,18 +31,16 @@ from dataclasses import dataclass, field
 class DayTargetSelection:
     """`compute_day_targets()`의 계산 결과 묶음.
 
-    final_targets     : trading_service.update_targets()에 넘길 최종 목록
-    day_symbols       : 제외/상한 적용 전, 단타 대상으로 인정된 전체 종목
-    blocked           : 자동 제외 종목이라 재편입이 차단된 종목들
-    unresolved_used   : 출처 미확정 상태로 day_symbols에 포함된 종목들
-    unresolved_skipped: 스윙 검색식과 구분 불가라 제외된 출처 미확정 종목들
+    final_targets  : trading_service.update_targets()에 넘길 최종 목록
+    day_symbols    : 제외/상한 적용 전, 단타 대상으로 인정된 전체 종목
+    blocked        : 자동 제외 종목이라 재편입이 차단된 종목들
+    unresolved_used: 출처 미확정 상태로 day_symbols에 포함된 종목들
     """
 
     final_targets: list[str]
     day_symbols: list[str]
     blocked: set[str] = field(default_factory=set)
     unresolved_used: list[str] = field(default_factory=list)
-    unresolved_skipped: list[str] = field(default_factory=list)
 
 
 def compute_day_targets(
@@ -45,7 +48,6 @@ def compute_day_targets(
     confirmed_symbols_by_seq: dict[str, set[str]],
     realtime_unresolved: set[str],
     day_seqs,
-    swing_seqs,
     manual_symbols,
     excluded_symbols: set[str],
     max_symbols: int,
@@ -81,18 +83,15 @@ def compute_day_targets(
     바로잡으려던 신뢰도 의미론은 그대로 두고 targets 산출만
     8/5 이전 동작으로 복구합니다.
 
-    **스윙 검색식과의 구분**: REAL 메시지에는 어느 조건식에서
-    편입됐는지 정보가 없으므로(2026-06-26 확인), 출처 미확정
-    종목이 단타 seq 소속인지 스윙 seq 소속인지 알 수 없습니다.
-    따라서 `swing_seqs`가 비어 있을 때만(= 구독 중인 모든 seq가
-    단타용이라 애매함이 원천적으로 없을 때만) 포함하고, 스윙
-    검색식이 등록돼 있으면 기존처럼 제외하고 그 사실을
-    `unresolved_skipped`로 돌려줘서 호출부가 경고 로그를 남길 수
-    있게 합니다. (1F단계에서 스윙 기능이 전량 폐기되면 이 분기는
-    항상 참이 됩니다.)
+    ── 2026-08-06 (1F, 스윙 폐기) ──
+    1E.9 시점에는 스윙 검색식이 같은 WebSocket으로 동시 구독될 수
+    있어, 출처 미확정 종목이 스윙 소속일 가능성 때문에 별도 분기가
+    있었습니다. 스윙 전략을 전량 폐기하면서 구독 대상이 전부 단타
+    조건식이 되었으므로 그 분기를 제거했습니다. `day_seqs` 필터링
+    자체는 남겨둡니다 — 설정에 등록되지 않은 seq의 결과가 흘러들어와
+    조용히 targets에 섞이는 일을 막는 방어선이기 때문입니다.
     """
     day_seqs_set = {str(s) for s in day_seqs}
-    swing_seqs_set = {str(s) for s in swing_seqs}
 
     day_symbols: list[str] = []
     for seq, syms in confirmed_symbols_by_seq.items():
@@ -102,17 +101,10 @@ def compute_day_targets(
                     day_symbols.append(s)
 
     unresolved_used: list[str] = []
-    unresolved_skipped: list[str] = []
-    if swing_seqs_set:
-        # 스윙 검색식이 함께 구독 중 — 출처 미확정 종목이 스윙
-        # 소속일 수 있어 단타 targets를 오염시킬 위험이 있으므로
-        # 기존 정책(제외)을 유지합니다.
-        unresolved_skipped = sorted(s for s in realtime_unresolved if s not in day_symbols)
-    else:
-        for s in sorted(realtime_unresolved):
-            if s not in day_symbols:
-                day_symbols.append(s)
-                unresolved_used.append(s)
+    for s in sorted(realtime_unresolved):
+        if s not in day_symbols:
+            day_symbols.append(s)
+            unresolved_used.append(s)
 
     blocked = excluded_symbols & set(day_symbols)
     filtered = [s for s in day_symbols if s not in excluded_symbols]
@@ -124,5 +116,4 @@ def compute_day_targets(
         day_symbols=day_symbols,
         blocked=blocked,
         unresolved_used=unresolved_used,
-        unresolved_skipped=unresolved_skipped,
     )

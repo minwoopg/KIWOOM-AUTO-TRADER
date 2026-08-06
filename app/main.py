@@ -31,8 +31,6 @@ from infra.storage.logger import TradeCsvLogger, SignalCsvLogger, build_app_logg
 from infra.storage.state_reconciler import StateReconciler
 from infra.storage.state_store import JsonStateStore
 from utils.time_utils import is_market_open, seconds_until_market_open
-import json
-from datetime import datetime
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -233,7 +231,6 @@ async def async_main() -> None:
                 confirmed_symbols_by_seq=watcher.confirmed_symbols_by_seq,
                 realtime_unresolved=watcher.realtime_unresolved_symbols,
                 day_seqs=settings.websocket.condition_seqs,
-                swing_seqs=settings.websocket.swing_condition_seqs,
                 manual_symbols=manual_symbols,
                 excluded_symbols=excluded,
                 max_symbols=settings.websocket.max_symbols,
@@ -256,16 +253,6 @@ async def async_main() -> None:
             blocked = selection.blocked
             if blocked:
                 app_logger.info(f"[COND] 제외 종목 재편입 차단: {sorted(blocked)}")
-            # 2026-08-06 (1E.9): 스윙 검색식이 함께 구독 중이면 출처
-            # 미확정 종목을 단타 targets에 넣을 수 없어 제외되는데,
-            # 이게 조용히 일어나면 1E.7~1E.8처럼 "장중 편입이 전부
-            # 사라지는" 상황을 또 놓치게 되므로 반드시 경고로 남김.
-            if selection.unresolved_skipped:
-                app_logger.warning(
-                    f"[COND] 출처 미확정 {len(selection.unresolved_skipped)}종목이 "
-                    f"단타 targets에서 제외됨(스윙 검색식 구독 중이라 소속 구분 불가): "
-                    f"{selection.unresolved_skipped}"
-                )
             # ── 조건검색식별 편입 현황 + final_targets 로그 ──
             seq_info = " | ".join(
                 f"seq{seq}={len(syms)}종목"
@@ -278,28 +265,6 @@ async def async_main() -> None:
                 f"final={len(limited)}종목: {limited}"
             )
 
-            # ── 스윙용 검색식 결과만 분리해서 파일로 저장 ───────
-            # main_swing.py(별도 프로세스)가 이 파일을 읽어 watchlist와 합침.
-            swing_seqs_set = {str(s) for s in settings.websocket.swing_condition_seqs}
-            if swing_seqs_set:
-                swing_symbols: set[str] = set()
-                for seq, syms in watcher.confirmed_symbols_by_seq.items():
-                    if seq in swing_seqs_set:
-                        swing_symbols |= syms
-                out_path = Path(settings.websocket.swing_condition_output)
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(
-                    json.dumps({
-                        "updated_at": datetime.now().isoformat(),
-                        "symbols": sorted(swing_symbols),
-                    }, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                app_logger.info(
-                    f"[COND_SWING] 스윙용 검색식 결과 저장 "
-                    f"({len(swing_symbols)}종목) → {out_path}"
-                )
-
         # 조건검색은 실전 계좌 토큰으로 별도 발급
         app_logger.info("[COND] 실전 계좌 토큰 발급 중...")
         real_token = fetch_real_token(
@@ -308,24 +273,11 @@ async def async_main() -> None:
         )
         app_logger.info("[COND] 실전 계좌 토큰 발급 완료")
 
-        # ── 스윙용 조건검색 seq를 단타 구독 목록에 합침 ──────────
-        # (같은 WebSocket 연결로 동시 구독 — 별도 연결 불필요)
-        import dataclasses
-        swing_seqs = settings.websocket.swing_condition_seqs
-        combined_seqs = list(dict.fromkeys(
-            list(settings.websocket.condition_seqs) + list(swing_seqs)
-        ))
-        ws_config_combined = dataclasses.replace(
-            settings.websocket, condition_seqs=combined_seqs,
-        )
-        if swing_seqs:
-            app_logger.info(
-                f"[COND] 스윙용 검색식 seq={swing_seqs} 추가 구독 "
-                f"(결과는 {settings.websocket.swing_condition_output}에 저장)"
-            )
-
+        # 2026-08-06 (1F): 스윙 전략 폐기로 스윙 seq 병합 로직 제거 —
+        # 구독하는 조건검색식은 전부 단타용이므로 settings.websocket을
+        # 그대로 사용합니다(dataclasses.replace 불필요).
         watcher = ConditionWatcher(
-            config=ws_config_combined,
+            config=settings.websocket,
             token=real_token,
             on_symbols_changed=on_symbols_changed,
         )

@@ -14,7 +14,7 @@
   1) 실서버 8/6 09:10:10 로그로 확인된 P0 결함(실시간 편입 종목이
      targets에서 통째로 누락)이 재현되지 않는지
   2) 8/5(구 코드)의 실제 편입 규모를 넣었을 때 targets가 정상 산출되는지
-  3) 스윙 검색식 구독 시의 제외 정책과 경고 정보가 정확한지
+  3) 설정에 등록되지 않은 seq의 결과가 targets에 섞이지 않는지
   4) 자동 제외 종목 차단 / max_symbols 상한 / 수동 targets 우선순위
   5) `ConditionWatcher`의 public 접근자가 내부 상태와 일치하는지
      (1E.8식 필드명 불일치 재발 방지)
@@ -60,7 +60,6 @@ sel = compute_day_targets(
     confirmed_symbols_by_seq={"1": set(), "2": {"069540"}, "3": set()},
     realtime_unresolved={"215790"},
     day_seqs=[1, 2, 3],
-    swing_seqs=[],
     manual_symbols=MANUAL,
     excluded_symbols=set(),
     max_symbols=10,
@@ -75,8 +74,8 @@ check("1-4) 8/6 재현: final이 6종목(수동4 + 069540 + 215790)",
       len(sel.final_targets) == 6)
 check("1-5) 8/6 재현: 215790이 unresolved_used로 정확히 보고됨",
       sel.unresolved_used == ["215790"])
-check("1-6) 8/6 재현: 스윙 미구독이므로 skipped는 없음",
-      sel.unresolved_skipped == [])
+check("1-6) 8/6 재현: 확정 종목은 unresolved_used로 중복 계상되지 않음",
+      "069540" not in sel.unresolved_used)
 
 # 수정 전 동작(확정 버킷만 순회)이 실제로 215790을 잃었다는 점도 명시적으로 고정
 legacy_day_symbols = sorted(
@@ -98,7 +97,6 @@ sel2 = compute_day_targets(
     confirmed_symbols_by_seq={"1": set(), "2": set(), "3": set()},
     realtime_unresolved=intraday,
     day_seqs=[1, 2, 3],
-    swing_seqs=[],
     manual_symbols=MANUAL,
     excluded_symbols=set(),
     max_symbols=10,
@@ -114,25 +112,28 @@ check("2-4) 나머지 6칸이 실시간 편입 종목으로 채워짐",
 
 
 # ══════════════════════════════════════════════════════════════
-# 3) 스윙 검색식 구독 중이면 출처 미확정 종목 제외 + 경고 정보 제공
+# 3) 설정에 등록되지 않은 seq의 결과는 targets에 섞이지 않음
 # ══════════════════════════════════════════════════════════════
+# 2026-08-06 (1F): 스윙 전략 폐기로 "스윙 seq 제외" 시나리오는
+# 사라졌지만, day_seqs 필터링 자체는 방어선으로 남겨둠 — 설정에
+# 없는 seq의 확정 결과가 흘러들어와도 조용히 감시 대상이 되지
+# 않아야 함.
 sel3 = compute_day_targets(
-    confirmed_symbols_by_seq={"1": {"111111"}, "2": set(), "3": set(), "4": {"999999"}},
+    confirmed_symbols_by_seq={"1": {"111111"}, "2": set(), "3": set(), "9": {"999999"}},
     realtime_unresolved={"215790"},
     day_seqs=[1, 2, 3],
-    swing_seqs=[4],
     manual_symbols=[],
     excluded_symbols=set(),
     max_symbols=10,
 )
-check("3-1) 스윙 구독 시 출처 미확정 종목은 단타 targets에서 제외됨",
-      "215790" not in sel3.final_targets)
-check("3-2) 제외 사실이 unresolved_skipped로 보고됨(경고 로그 근거)",
-      sel3.unresolved_skipped == ["215790"])
-check("3-3) 스윙 seq(4)의 확정 종목은 단타 targets에 섞이지 않음",
+check("3-1) 미등록 seq(9)의 확정 종목은 targets에 포함되지 않음",
       "999999" not in sel3.final_targets)
-check("3-4) 단타 seq의 확정 종목은 정상 포함됨",
-      sel3.final_targets == ["111111"])
+check("3-2) 등록된 seq의 확정 종목은 정상 포함됨",
+      "111111" in sel3.final_targets)
+check("3-3) 출처 미확정 종목은 항상 포함됨(스윙 폐기로 제외 분기 없음)",
+      "215790" in sel3.final_targets and sel3.unresolved_used == ["215790"])
+check("3-4) 최종 targets가 정확히 두 종목",
+      sel3.final_targets == ["111111", "215790"])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -142,7 +143,6 @@ sel4 = compute_day_targets(
     confirmed_symbols_by_seq={"1": {"111111", "222222"}, "2": set(), "3": set()},
     realtime_unresolved={"333333"},
     day_seqs=[1, 2, 3],
-    swing_seqs=[],
     manual_symbols=[],
     excluded_symbols={"222222", "333333"},
     max_symbols=10,
@@ -162,7 +162,6 @@ sel5 = compute_day_targets(
     confirmed_symbols_by_seq={"1": {"111111"}, "2": {"111111"}, "3": set()},
     realtime_unresolved={"111111", "222222"},
     day_seqs=[1, 2, 3],
-    swing_seqs=[],
     manual_symbols=["111111"],
     excluded_symbols=set(),
     max_symbols=10,
@@ -175,7 +174,6 @@ sel5b = compute_day_targets(
     confirmed_symbols_by_seq={"3": set(), "2": {"111111"}, "1": set()},
     realtime_unresolved={"222222", "215790"},
     day_seqs=[1, 2, 3],
-    swing_seqs=[],
     manual_symbols=[],
     excluded_symbols=set(),
     max_symbols=10,

@@ -98,9 +98,6 @@ class TradingService:
         self.cached_daily_bars: dict[str, list] = {}
         self.cached_daily_bars_loaded_at: dict[str, datetime] = {}
 
-        # 주봉 히스토리 캐시 (스윙 전략용)
-        self.cached_weekly_bars: dict[str, list] = {}
-        self.cached_weekly_bars_loaded_at: dict[str, datetime] = {}
 
         # 분봉 캐시 (단타 2차 필터용)
         self.cached_minute_bars: dict[str, list] = {}

@@ -1,7 +1,7 @@
 """
 ATR(Average True Range)과 볼린저밴드 계산 모듈.
 
-단타 및 스윙 전략에서 로그 기록용으로 사용합니다.
+단타 전략에서 로그 기록용으로 사용합니다.
 실제 매수 차단은 데이터 축적 후 결정합니다.
 """
 from __future__ import annotations
