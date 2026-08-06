@@ -373,11 +373,23 @@ class ConditionWatcher:
 
     def _on_realtime(self, msg: dict) -> None:
         data_list = msg.get("data") or []
-        # ── 종목별로 처리 (seq는 data[i].item 필드에 있음) ──────────
-        # 2026-06-24 REAL 메시지 구조 확인:
-        #   msg_keys = ['data', 'trnm']  (최상위에 seq 없음)
-        #   data[0]_keys = ['values', 'type', 'name', 'item']
-        #   → seq는 각 item의 'item' 필드에 담겨 있음
+        # ── 종목별로 처리 ────────────────────────────────────────
+        # 2026-06-24 / 2026-06-26 REAL 메시지 구조 확인:
+        #   msg_keys       = ['data', 'trnm']   (최상위에 seq 없음)
+        #   data[0]_keys   = ['values', 'type', 'name', 'item']
+        #   data[i]['item'] = 종목코드          (조건식 seq 아님)
+        #   data[i]['name'] = '조건검색' 고정   (조건식 이름 아님)
+        #
+        # 2026-08-06 (1G.1, GPT 코드리뷰 지적): 기존 주석에 "seq는
+        # 각 item의 'item' 필드에 담겨 있음"이라고 적혀 있었으나,
+        # 이는 바로 아래 실제 로직·주석(REAL에는 조건식 seq가 없어
+        # 출처를 확정할 수 없음)과 정반대로 **틀린 설명**이었음.
+        # 운영 동작에는 영향이 없었지만, 이 주석을 믿고 향후
+        # 유지보수자가 'item'을 seq로 해석해 잘못된 조건식 귀속을
+        # 다시 구현할 위험이 있어 정정함.
+        # → REAL 이벤트로 알 수 있는 것은 "종목코드"와 "편입(I)/
+        #   편출(D) 구분"뿐이며, 어느 조건검색식의 이벤트인지는
+        #   식별할 수 없음.
 
         for item in data_list:
             values   = item.get("values", {})

@@ -33,15 +33,31 @@ class MessageHandlerError(RuntimeError):
     """
 
 
-# 재연결로 회복 가능한 "진짜" 네트워크 오류들.
-# 이 목록에 없는 예외는 재시도해도 같은 결과일 가능성이 높으므로
-# 재연결하지 않고 그대로 전파합니다.
+# 재연결로 회복 가능한 "진짜" 일시적 네트워크 오류들.
+#
+# 2026-08-06 (1G.1, GPT 코드리뷰 지적, 재현 확인): 1G에서는 여기에
+# `websockets.exceptions.WebSocketException`과 `InvalidHandshake`를
+# 넣었는데, 전자는 **모든 WebSocket 예외의 최상위 부모**라 좁히기가
+# 통째로 무의미해졌음. 설치본(websockets 17.0.1) 기준 35개 하위
+# 클래스가 전부 재연결 대상이 됨 — `ConnectionClosed`조차 이 부모를
+# 상속하므로, 사실상 "WebSocket 관련 예외는 전부 재연결"이었음.
+#
+# 재현 결과(수정 전): InvalidURI / ProtocolError / PayloadTooBig 모두
+# 반복 재연결. 즉 "명시된 네트워크 오류만 재연결"이라는 1G의 정책이
+# 실제로는 성립하지 않았음.
+#
+# 아래 셋만 남김 — 재시도하면 결과가 달라질 수 있는 일시적 오류.
+#   ConnectionClosed     : 서버가 연결을 끊음(정상/비정상 모두)
+#   OSError              : ConnectionRefused/Reset, socket.gaierror 등
+#   asyncio.TimeoutError : 응답 지연
+#
+# 나머지(InvalidURI, ProtocolError, PayloadTooBig, InvalidStatus,
+# InvalidHandshake 계열 등)는 URL·인증·헤더·서버 설정·프로토콜
+# 처리 문제라 재시도해도 같은 결과이므로 전파합니다.
 RECOVERABLE_NETWORK_ERRORS = (
     ConnectionClosed,
     OSError,          # ConnectionRefusedError, socket.gaierror 등 포함
     asyncio.TimeoutError,
-    websockets.exceptions.InvalidHandshake,
-    websockets.exceptions.WebSocketException,
 )
 
 
@@ -83,6 +99,16 @@ class KiwoomWebSocket:
             except MessageHandlerError:
                 # 2026-08-06 (1G): 애플리케이션 콜백의 코드 오류 —
                 # 재연결해도 똑같이 실패하므로 루프를 벗어나 전파.
+                raise
+            except websockets.exceptions.InvalidHandshake:
+                # 2026-08-06 (1G.1): 핸드셰이크 실패는 서버 일시 장애일
+                # 수도 있지만 URL·인증 토큰·헤더·서버 설정 오류일 수도
+                # 있음. 후자라면 무제한 재연결이 문제를 감추기만 하므로,
+                # 우선 로그를 남기고 전파해 즉시 드러나게 함. 서버 5xx에
+                # 한해 재시도하려면 상태코드 판별 + 제한 횟수 + 지수
+                # 백오프를 별도로 구현해야 하며, 이번 단계 범위 밖.
+                if self._running:
+                    logger.exception("[WS] 핸드셰이크 실패 — URL·인증·서버 설정 오류 가능성")
                 raise
             except RECOVERABLE_NETWORK_ERRORS as exc:
                 if self._running:

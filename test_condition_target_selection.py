@@ -417,6 +417,12 @@ from infra.websocket.kiwoom_ws import MessageHandlerError
 from websockets.exceptions import ConnectionClosed
 
 
+class _FakeResponse:
+    """InvalidStatus 생성에 필요한 최소 응답 객체."""
+    status_code = 503
+    reason_phrase = "Service Unavailable"
+
+
 class _FakeSocket:
     def __init__(self, msgs, raise_on_recv=None):
         self._msgs = list(msgs)
@@ -509,6 +515,115 @@ attempts_os, _ = _run_client(
 )
 check("10-6) OSError 계열(ConnectionResetError)도 재연결 대상",
       attempts_os >= 2)
+
+
+# ══════════════════════════════════════════════════════════════
+# 11) WebSocket 예외 분류 범위 (1G.1, GPT 코드리뷰 지적)
+# ══════════════════════════════════════════════════════════════
+# 1G에서는 RECOVERABLE_NETWORK_ERRORS에 WebSocketException(모든
+# WebSocket 예외의 최상위 부모)을 넣어, 좁히기가 통째로 무의미했음.
+# 재현 확인(수정 전): InvalidURI / ProtocolError / PayloadTooBig 모두
+# 반복 재연결. 아래 테스트로 분류가 실제로 좁혀졌는지 고정한다.
+from websockets.exceptions import (
+    InvalidURI, ProtocolError, PayloadTooBig, InvalidStatus, ConnectionClosed,
+)
+from infra.websocket.kiwoom_ws import RECOVERABLE_NETWORK_ERRORS
+import websockets as _ws_pkg
+
+
+def _run_connect_failure(exc, budget=0.3):
+    """connect() 자체가 exc를 던질 때의 재연결 동작을 관찰한다."""
+    attempts = {"n": 0}
+    original = kw.websockets.connect
+
+    async def fake_connect(url, *a, **k):
+        attempts["n"] += 1
+        raise exc
+
+    kw.websockets.connect = fake_connect
+    client = kw.KiwoomWebSocket(url="wss://x", token="t",
+                                on_message=_ok_handler, reconnect_delay=0.05)
+    result = {"exc": None}
+
+    async def main():
+        task = asyncio.create_task(client.start())
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+        except asyncio.TimeoutError:
+            client._running = False
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+        except Exception as e:
+            result["exc"] = e
+
+    try:
+        asyncio.run(main())
+    finally:
+        kw.websockets.connect = original
+    return attempts["n"], result["exc"]
+
+
+# 재연결 대상이 정확히 셋으로 좁혀졌는지 (구성 자체를 고정)
+check("11-1) RECOVERABLE_NETWORK_ERRORS가 정확히 3종",
+      len(RECOVERABLE_NETWORK_ERRORS) == 3)
+check("11-2) WebSocketException(최상위 부모)이 재연결 대상에서 제거됨",
+      _ws_pkg.exceptions.WebSocketException not in RECOVERABLE_NETWORK_ERRORS)
+check("11-3) InvalidHandshake도 기본 재연결 대상에서 제거됨",
+      _ws_pkg.exceptions.InvalidHandshake not in RECOVERABLE_NETWORK_ERRORS)
+check("11-4) 재연결 대상은 ConnectionClosed / OSError / TimeoutError",
+      set(RECOVERABLE_NETWORK_ERRORS) == {ConnectionClosed, OSError, asyncio.TimeoutError})
+
+# 결정적 오류: 연결 1회 후 전파
+n, exc = _run_connect_failure(InvalidURI("wss://bad", "잘못된 URL"))
+check("11-5) InvalidURI는 연결 1회 후 예외 전파",
+      n == 1 and isinstance(exc, InvalidURI))
+
+n, exc = _run_connect_failure(ProtocolError("frame error"))
+check("11-6) ProtocolError는 연결 1회 후 예외 전파",
+      n == 1 and isinstance(exc, ProtocolError))
+
+n, exc = _run_connect_failure(PayloadTooBig("too big"))
+check("11-7) PayloadTooBig은 연결 1회 후 예외 전파",
+      n == 1 and isinstance(exc, PayloadTooBig))
+
+# InvalidHandshake 계열(InvalidStatus)도 전파 — 인증·URL·설정 오류 가능성
+n, exc = _run_connect_failure(InvalidStatus(_FakeResponse()))
+check("11-8) InvalidHandshake 계열(InvalidStatus)도 연결 1회 후 예외 전파",
+      n == 1 and isinstance(exc, InvalidStatus))
+
+# 일시적 네트워크 오류: 기존대로 재연결
+n, exc = _run_connect_failure(ConnectionClosed(None, None))
+check("11-9) ConnectionClosed는 기존대로 재연결하며 예외를 전파하지 않음",
+      n >= 2 and exc is None)
+
+n, exc = _run_connect_failure(ConnectionResetError("reset by peer"))
+check("11-10) OSError 계열은 기존대로 재연결",
+      n >= 2 and exc is None)
+
+n, exc = _run_connect_failure(asyncio.TimeoutError())
+check("11-11) asyncio.TimeoutError는 기존대로 재연결",
+      n >= 2 and exc is None)
+
+# MessageHandlerError는 1G 동작 그대로 유지 (10절과 중복 확인이지만
+# 예외 분류를 좁힌 뒤에도 깨지지 않았는지 재확인)
+attempts_mh, exc_mh = _run_client(_bad_handler)
+check("11-12) MessageHandlerError는 좁힌 뒤에도 즉시 전파 유지",
+      attempts_mh == 1 and isinstance(exc_mh, MessageHandlerError))
+
+
+# ══════════════════════════════════════════════════════════════
+# 12) 소스 위생 (1G.1 정리 사항)
+# ══════════════════════════════════════════════════════════════
+cw_src = open("infra/websocket/condition_watcher.py", encoding="utf-8").read()
+check("12-1) symbol_to_conditions의 반환문이 중복되지 않음",
+      cw_src.count("return {sym: tuple(names) for sym, names in mapping.items()}") == 1)
+check("12-2) REAL 메시지에 seq가 있다는 잘못된 주석이 제거됨",
+      "seq는 각 item의 'item' 필드에 담겨 있음" not in cw_src)
+check("12-3) REAL 구조 설명이 실제 로직과 일치함(item은 종목코드)",
+      "종목코드" in cw_src and "조건식 seq 아님" in cw_src)
 
 
 print()

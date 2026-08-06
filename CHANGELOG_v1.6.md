@@ -3391,3 +3391,104 @@ import 스모크, `load_settings()`, `compileall` 전부 정상.
 
 ---
 
+## 1G.1: WebSocket 예외 분류 범위 축소 + 주석 정정 (2026-08-06)
+
+**배경**: 1G에 대한 GPT 코드리뷰에서 핵심 수정 3건은 승인됐으나,
+WebSocket 예외 분류가 의도대로 좁혀지지 않았다는 지적.
+
+### P1: `WebSocketException`이 좁히기를 통째로 무력화 (재현 확인)
+
+1G에서 정의한 재연결 대상:
+```python
+RECOVERABLE_NETWORK_ERRORS = (
+    ConnectionClosed, OSError, asyncio.TimeoutError,
+    websockets.exceptions.InvalidHandshake,
+    websockets.exceptions.WebSocketException,   # ← 문제
+)
+```
+
+`WebSocketException`은 **모든 WebSocket 예외의 최상위 부모**입니다.
+설치본(websockets 17.0.1)에서 직접 확인한 결과 하위 클래스가 35개이며,
+`ConnectionClosed`조차 이 부모를 상속합니다. 즉 이 한 줄 때문에
+사실상 "WebSocket 관련 예외는 전부 재연결"이 되어, 1G 커밋 메시지에
+쓴 "명시된 네트워크 오류만 재연결하고 분류되지 않은 오류는 전파"라는
+정책이 **실제로는 성립하지 않았습니다.**
+
+**재현 결과** (수정 전, `connect()`가 각 예외를 던지도록 하고 관찰):
+```
+InvalidURI          연결시도 7회 → 반복 재연결
+ProtocolError       연결시도 7회 → 반복 재연결
+PayloadTooBig       연결시도 7회 → 반복 재연결
+ConnectionClosed    연결시도 7회 → 반복 재연결
+OSError계열          연결시도 7회 → 반복 재연결
+```
+
+**수정**: 재연결 대상을 "재시도하면 결과가 달라질 수 있는 일시적
+오류" 셋으로 축소.
+```python
+RECOVERABLE_NETWORK_ERRORS = (
+    ConnectionClosed,      # 서버가 연결을 끊음
+    OSError,               # ConnectionRefused/Reset, socket.gaierror 등
+    asyncio.TimeoutError,  # 응답 지연
+)
+```
+
+`InvalidHandshake`는 서버 일시 장애일 수도, URL·인증 토큰·헤더·서버
+설정 오류일 수도 있어 무제한 재연결 대상으로 두면 후자를 감춥니다.
+별도 분기로 빼서 **로그를 남기고 전파**하도록 처리:
+```python
+except websockets.exceptions.InvalidHandshake:
+    logger.exception("[WS] 핸드셰이크 실패 — URL·인증·서버 설정 오류 가능성")
+    raise
+```
+서버 5xx에 한해 재시도하려면 상태코드 판별 + 제한 횟수 + 지수
+백오프가 필요하며, 이번 단계 범위 밖으로 남깁니다.
+
+**수정 후 재현 결과**:
+```
+InvalidURI          연결시도 1회 → 전파(InvalidURI)
+ProtocolError       연결시도 1회 → 전파(ProtocolError)
+PayloadTooBig       연결시도 1회 → 전파(PayloadTooBig)
+ConnectionClosed    연결시도 7회 → 반복 재연결
+OSError계열          연결시도 7회 → 반복 재연결
+```
+
+### P2-2: REAL 메시지 구조 주석 정정
+
+`_on_realtime()` 위 주석에 "seq는 각 item의 'item' 필드에 담겨 있음"
+이라고 적혀 있었으나, 바로 아래 실제 로직·주석(REAL에는 조건식 seq가
+없어 출처를 확정할 수 없음)과 **정반대로 틀린 설명**이었습니다.
+운영 동작에는 영향이 없었지만, 이 주석을 믿고 향후 유지보수자가
+`item`을 seq로 해석해 잘못된 조건식 귀속을 다시 구현할 위험이 있어
+정정했습니다. 실제 구조(2026-06-24 / 06-26 확인)를 명시:
+```
+data[i]['item'] = 종목코드          (조건식 seq 아님)
+data[i]['name'] = '조건검색' 고정   (조건식 이름 아님)
+→ REAL로 알 수 있는 것은 종목코드와 편입(I)/편출(D) 구분뿐
+```
+
+### P2-1: 중복 `return` — 해당 없음
+
+`symbol_to_conditions` 끝의 반환문 중복이 지적됐으나, 실제 트리에서는
+`return {sym: tuple(names) ...}`가 180행에 **1회만** 존재하며 파일
+전체에 연속 중복 `return`도 없음을 확인했습니다(스크립트로 전수 검사).
+검토 측에서 여러 단계 diff를 병합하는 과정의 아티팩트로 보입니다.
+회귀 방지를 위해 이 사실을 테스트로 고정했습니다(12-1).
+
+### 테스트
+
+`test_condition_target_selection.py` 58건 → **73건**:
+- 11절(12건): `RECOVERABLE_NETWORK_ERRORS` 구성 자체를 고정(정확히
+  3종, `WebSocketException`·`InvalidHandshake` 미포함),
+  `InvalidURI`/`ProtocolError`/`PayloadTooBig`/`InvalidStatus`는
+  연결 1회 후 예외 전파, `ConnectionClosed`/`ConnectionResetError`/
+  `asyncio.TimeoutError`는 재연결, `MessageHandlerError`는 좁힌
+  뒤에도 즉시 전파 유지.
+- 12절(3건): 소스 위생 — 중복 `return` 부재, 잘못된 seq 주석 부재,
+  정정된 REAL 구조 설명 존재.
+
+**전체 회귀**: 12개 파일 전부 통과, 1개 스킵, 종료코드 0.
+import 스모크 / `load_settings()` / `compileall` 전부 정상.
+
+---
+
