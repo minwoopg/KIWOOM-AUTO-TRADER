@@ -3015,3 +3015,167 @@ P0 2건이 모두 해결됐으므로, 이제 `settings.yaml`만 별도 커밋으
 
 ---
 
+## 1E.8: app/main.py의 ConditionWatcher 옛 필드명 참조 긴급 수정 (2026-08-06)
+
+**배경**: 민우님이 실서버(08:45 장전)에서 프로그램을 실행하자마자
+`WebSocket 연결 끊김: 'ConditionWatcher' object has no attribute
+'_symbols_by_seq' — 5.0초 후 재연결`이 반복되는 것을 실제 로그로
+보고 — 재연결이 계속 실패하며 루프에 빠지는 심각한 회귀.
+
+**원인**: 1E.7에서 `ConditionWatcher`의 내부 필드명을 `_symbols_
+by_seq` → `_confirmed_symbols_by_seq`로 바꾸면서(P0-2, confirmed/
+unresolved 상태 분리), `condition_watcher.py` 자체와 이번 라운드에
+새로 작성한 테스트는 전부 새 이름으로 정확히 갱신했지만, **`app/
+main.py`의 `on_symbols_changed()` 콜백 안에서 이 필드를 직접
+참조하던 3곳을 놓쳤음** — 단타/스윙 조건식 구분 필터링(day_
+symbols 추림)과 `[COND_STATUS]` 로그 조합, 스윙 종목 파일 저장
+로직. `ConditionWatcher.__new__()`로 인스턴스를 직접 만들어
+테스트했던 `test_vwap_shadow_observation.py`나 단위 테스트로는
+이 문제를 못 잡음 — `app/main.py`의 이 콜백 함수는 어떤 자동
+테스트도 실행하지 않는 부분이었음(실제 웹소켓 콜백 배선 자체가
+회귀 스위트의 사각지대였음).
+
+**수정**: `app/main.py`의 `watcher._symbols_by_seq` 3곳을 전부
+`watcher._confirmed_symbols_by_seq`로 치환 — 세 곳 모두 "특정
+seq에 속한 종목만 추림"이라는 동일한 목적이라 단순 치환으로
+의미가 그대로 보존됨.
+
+재현 검증: 수정된 로직을 직접 재현해 `_confirmed_symbols_by_seq`
++ `_realtime_unresolved`(출처 불명 종목)가 섞인 상태에서 콜백
+로직을 실행 — 예외 없이 정상 동작, `seq_info` 로그도 정확히
+조합됨.
+
+**부수 발견(별도 확인 필요, 이번 라운드에서는 미해결)**: `day_
+symbols` 계산이 `_confirmed_symbols_by_seq`만 순회하므로, 출처
+미확정 종목(`_realtime_unresolved`에만 있는 것)은 이 필터링에서
+빠짐 — `_all_symbols`(targets)에는 포함되지만 `day_symbols`(→
+`combined` → `trading_service.update_targets()`로 전달되는 최종
+목록)에는 안 들어감. 다만 이건 1E.7이 새로 만든 회귀가 아니라
+`__realtime_unknown__`(1E.6 시절 특수 버킷) 때부터 있던 동작으로
+보임 — `day_seqs_set`(숫자 seq 문자열들)에 `__realtime_unknown__`
+이 애초에 매칭될 수 없었으므로. 실제로 의도된 설계인지(출처
+미확정 종목은 정식 판단 대상에서 빼는 게 맞는 정책인지) 아니면
+발견되지 않은 별개의 결함인지는 확인이 더 필요함 — 다음 라운드
+과제로 남김.
+
+**전체 회귀**: `run_regression_tests.py` — 11개 파일 전부 통과,
+1개(`test_legacy_fixture_structure.py`) 명시적 스킵, 종료코드 0.
+이 회귀 스위트 자체는 `app/main.py`의 콜백을 실행하지 않으므로
+이번 버그를 애초에 잡을 수 없었다는 한계를 확인 — 향후 `app/
+main.py`의 `on_symbols_changed` 콜백을 직접 실행하는 통합 테스트
+추가를 고려할 필요가 있음(이번 라운드에서는 긴급 수정만 반영).
+
+---
+
+## 1E.9: 실시간 편입 종목 targets 누락 P0 수정 + CNSRREQ 900003 회복 (2026-08-06)
+
+**배경**: 1E.8 적용 후 실서버 로그를 재점검하는 과정에서, 1E.8에서
+"의도된 설계인지 별개 결함인지 확인 필요"로 남겨뒀던 `day_symbols`
+문제가 **실거래를 사실상 마비시키는 P0 결함**임이 실서버 로그로
+확정됨.
+
+### P0-1: 장중 조건검색 편입 종목이 targets에서 전량 누락 (재현 확인)
+
+**증상 (실서버 8/6 로그)**:
+```
+09:10:10 [COND] [출처불명] 편입: 215790 (실시간 이벤트, ...)
+09:10:10 [COND_STATUS] seq1=0 | seq2=1 | seq3=0 | excluded=0차단 |
+         final=5종목: ['010170','006260','005930','080220','069540']
+```
+방금 편입된 215790이 최종 감시 목록에 없음. `_notify()`는
+`sorted(self._all_symbols)`(= confirmed ∪ unresolved)로 콜백을
+호출했지만, `on_symbols_changed()`가 **인자 `symbols`를 사용하지
+않고** `_confirmed_symbols_by_seq`만 다시 순회해서 재계산하므로
+출처 미확정 종목이 통째로 증발함.
+
+**왜 치명적인가 (로그 실측)**:
+- `CNSRREQ`는 `_on_login()`에서 **연결당 1회만** 발송되며 주기적
+  재조회 코드가 없음 → 확정 버킷은 장전 스냅샷에서 갱신 안 됨.
+- 장전 초기 조회 결과는 실측상 항상 0종목:
+  `08:44:36 [COND] [자동매매_눌림목_PR] 초기 결과: 0개 종목`
+  (seq1/2/3 전부, 8/5·8/6 동일).
+- 즉 **장중 편입은 100% REAL 실시간 이벤트로만 들어옴.**
+- 8/5(구 코드)에는 실시간 편입 3,318건 / 편출 3,203건이 발생하며
+  seq 버킷이 `0/0/0`(08:44) → `52/3/23`(15:30)까지 성장했음.
+- 신규 코드에서는 이 3,318건이 전부 `_realtime_unresolved`로만
+  가므로, 확정 버킷은 하루 종일 비어 있고 **감시 대상이 수동
+  targets 4종목뿐**이 됨. 8/6 로그가 정확히 그 상태(`final=4~5종목`).
+
+**1E.7이 만든 회귀인가**: 실질적으로 그렇다. 1E.8 CHANGELOG는
+`__realtime_unknown__`(1E.6) 시절부터 있던 동작으로 추정했고 그
+추정 자체는 맞지만, 8/5까지 실서버에 떠 있던 코드는 실시간 편입을
+seq 버킷에 직접 넣어 정상 동작했음(`[자동매매_눌림목_PR] 편입:
+419050` 형태의 로그가 그 증거). 조건검색 자동매매가 실제로 죽은
+것은 1E.6~1E.7 계열 변경이 실서버에 올라간 8/6이 처음.
+
+**수정**: 출처 미확정 종목도 단타 감시 대상에 포함.
+`symbol_condition_source_reliable`은 여전히 `False`로 유지되므로,
+1E.6이 바로잡으려던 "조건식 출처 신뢰도" 의미론은 그대로 두고
+**targets 산출만 8/5 이전 동작으로 복구**함 — "매매 대상 포함"과
+"조건식 출처 신뢰"를 분리한 것이 이번 수정의 핵심. VWAP shadow의
+condition-source 기반 판단(조건식명에 "눌림목" 포함 여부)은
+영향받지 않음.
+
+스윙 검색식이 함께 구독 중일 때는 출처 미확정 종목이 스윙 소속일
+수 있어 기존 정책(제외)을 유지하되, 조용히 사라지지 않도록
+`[COND] 출처 미확정 N종목이 단타 targets에서 제외됨` 경고를 남김.
+(현재 `swing_condition_seqs: []`이므로 실서버에서는 항상 포함 경로.)
+
+### P0-2: 재연결 후 CNSRREQ 900003으로 조건식이 영구 사망 (재현 확인)
+
+**증상 (실서버 8/6 09:10:05)**:
+```
+ERROR [COND] 조건검색 조회 실패:
+{'trnm': 'CNSRREQ', 'return_code': 900003,
+ 'return_msg': '이미 등록된 조건검색 일련번호입니다.(seq=3)'}
+```
+1E.8 이전의 재연결 루프(242회)가 서버 측 구독을 남긴 채 끊기면서,
+재기동 시 seq3 등록이 900003으로 실패. `_on_initial_result()`가
+early return이라 `_confirmed_symbols_by_seq["3"]`이 하루 종일 빈
+채로 남았고, CNSRREQ는 연결당 1회뿐이라 자력 회복 경로가 없음
+→ 해당 조건식이 통째로 죽음. P0-1과 겹치면 완전 마비.
+
+**수정**: 900003 수신 시 `CNSRCLR`로 기존 등록을 해제한 뒤 같은
+seq로 1회 재구독. 무한 루프 방지를 위해 **연결당 seq별 1회**로
+제한하고(`_resubscribe_attempted`), 재로그인 시 초기화해 재연결
+때마다 다시 시도할 수 있게 함. 900003 외의 오류는 기존 동작 유지.
+
+응답에 최상위 `seq` 키가 없고 `return_msg` 문구 안에만 들어있는
+실제 형식에 맞춰 `_extract_seq_from_error()`로 파싱(최상위 키 우선,
+없으면 정규식). `_on_initial_result()`는 재전송을 위해 async로 전환.
+
+### 회귀 스위트 사각지대 해소 (1E.8 과제)
+
+`on_symbols_changed()`가 `main()` 안의 클로저라 어떤 테스트도 실행할
+수 없던 구조를 바꿈:
+
+- **`app/target_selection.py` 신규**: `compute_day_targets()` 순수
+  함수 — watcher/settings 객체가 아니라 원시값만 받으므로 테스트에서
+  직접 호출 가능. 반환값 `DayTargetSelection`에 `final_targets` /
+  `day_symbols` / `blocked` / `unresolved_used` / `unresolved_skipped`.
+- **`ConditionWatcher`에 public 접근자 추가**: `confirmed_symbols_by_seq`,
+  `realtime_unresolved_symbols` (둘 다 복사본 반환 — 호출부가 내부
+  상태를 오염시킬 수 없음). `app/main.py`의 private 필드 직접 참조를
+  전부 제거해, 1E.8 같은 필드명 불일치 사고가 구조적으로 재발 불가.
+- **`test_condition_target_selection.py` 신규 (37건)**: 8/6 실서버
+  시나리오 정확 재현, 8/5 실측 규모(78종목) 상한 처리, 스윙 구독 시
+  제외 정책, 제외 종목 차단, dict 순회 순서 무관 결정성, public
+  접근자와 내부 상태 일치 및 복사본 보장, `app/main.py`의 private
+  접근을 정규식으로 감시(`watcher\._\w+`가 0건이어야 통과), 900003
+  회복 경로 전량.
+
+테스트 작성 중 자체 검증식의 오탐을 발견해 수정함 —
+`"_symbols_by_seq" not in main_src` 방식은 `confirmed_symbols_by_seq`가
+`_symbols_by_seq`를 부분문자열로 포함해 항상 실패함. `watcher._\w+`
+정규식으로 교체.
+
+### 부수 수정
+
+`test_vwap_shadow_observation.py`의 `_on_initial_result()` 호출 4곳을
+`asyncio.run()`으로 감쌈(async 전환 대응). 79/79 유지.
+
+**전체 회귀**: 12개 파일 전부 통과, 1개 스킵, 종료코드 0.
+(1E.8 대비 `test_condition_target_selection.py` 1개 파일 추가)
+
+---
+

@@ -31,6 +31,7 @@ pulldown)도 "VWAP 위/아래"만 확인하지 몇 % 위인지는 무관. 즉
 from __future__ import annotations
 
 import csv
+import asyncio
 import sys
 import tempfile
 from datetime import datetime
@@ -425,7 +426,7 @@ check("    하지만 targets(_all_symbols)에는 정확히 포함됨(편입 자�
 
 # ── 19) CNSRREQ 초기조회 후에는 reliable=True ─────────────────────
 msg_cnsrreq = {"trnm": "CNSRREQ", "return_code": 0, "seq": "2", "data": [{"jmcode": "A058610"}]}
-watcher18._on_initial_result(msg_cnsrreq)
+asyncio.run(watcher18._on_initial_result(msg_cnsrreq))
 check("19) CNSRREQ 초기조회 후 -> condition_source_reliable=True",
       watcher18.symbol_condition_source_reliable.get("058610") is True)
 check("    symbol_to_conditions에 정확한 조건식명이 나타남",
@@ -679,7 +680,7 @@ w29._realtime_unresolved = set()
 w29._condition_names = {"1": "자동매매_돌파형A", "2": "자동매매_눌림목_PR"}
 w29.on_symbols_changed = lambda x: None
 
-w29._on_initial_result({"trnm": "CNSRREQ", "return_code": 0, "seq": "1", "data": [{"jmcode": "A058610"}]})
+asyncio.run(w29._on_initial_result({"trnm": "CNSRREQ", "return_code": 0, "seq": "1", "data": [{"jmcode": "A058610"}]}))
 check("29-준비) CNSRREQ 초기조회로 058610이 reliable=True로 확정됨",
       w29.symbol_condition_source_reliable.get("058610") is True)
 
@@ -706,7 +707,7 @@ w30._on_realtime({"trnm": "REAL", "data": [
 check("30-준비) REAL 이벤트로 047040이 unresolved 상태(reliable=False 또는 없음)",
       "047040" not in w30.symbol_condition_source_reliable)
 
-w30._on_initial_result({"trnm": "CNSRREQ", "return_code": 0, "seq": "1", "data": [{"jmcode": "A047040"}]})
+asyncio.run(w30._on_initial_result({"trnm": "CNSRREQ", "return_code": 0, "seq": "1", "data": [{"jmcode": "A047040"}]}))
 check("30) 재조회로 047040이 seq1에 확정되면 reliable=True로 해제됨"
       "(정확히 GPT 지시 필수 테스트)", w30.symbol_condition_source_reliable.get("047040") is True)
 check("    unresolved 집합에서도 제거됨", "047040" not in w30._realtime_unresolved)
@@ -722,7 +723,7 @@ check("31-준비) 005930이 seq1에서 reliable=True로 확정된 상태",
       w31.symbol_condition_source_reliable.get("005930") is True)
 
 # seq1 재조회 결과 005930이 더 이상 없음(실제로 이 조건식에서 빠짐)
-w31._on_initial_result({"trnm": "CNSRREQ", "return_code": 0, "seq": "1", "data": []})
+asyncio.run(w31._on_initial_result({"trnm": "CNSRREQ", "return_code": 0, "seq": "1", "data": []}))
 check("31) 재조회 결과에서 사라진 종목(005930)은 confirmed에서 제거되어 "
       "symbol_condition_source_reliable에도 더 이상 안 나타남"
       "(정확히 GPT 지시 필수 테스트 — stale reliability 정리)",

@@ -19,6 +19,7 @@ import shutil
 import time
 from pathlib import Path
 
+from app.target_selection import compute_day_targets
 from config.settings import Settings, load_settings
 from domain.market_regime.classifier import MarketRegimeClassifier
 from domain.risk.risk_manager import RiskManager
@@ -220,22 +221,25 @@ async def async_main() -> None:
         manual_symbols = settings.targets
 
         def on_symbols_changed(symbols: list[str]) -> None:
-            # ── 단타 seq에 속한 종목만 추림 (스윙 seq 종목은 단타 targets에서 제외) ──
-            # 어제 스윙 seq를 같은 WebSocket으로 합쳐 구독하면서, 콜백의 symbols에
-            # 스윙용 종목까지 섞여 들어와 단타 targets를 오염시키는 문제가 있었음.
-            day_seqs_set = {str(s) for s in settings.websocket.condition_seqs}
-            day_symbols: list[str] = []
-            for seq, syms in watcher._symbols_by_seq.items():
-                if seq in day_seqs_set:
-                    for s in syms:
-                        if s not in day_symbols:
-                            day_symbols.append(s)
-
-            # 자동 제외된 종목은 재편입 차단
+            # ── 단타 감시 종목 계산 ──────────────────────────────
+            # 2026-08-06 (1E.9): 이 계산은 `app/target_selection.py`의
+            # 순수 함수로 분리됨 — (a) 1E.8에서 드러난 "app/main.py의
+            # 콜백은 어떤 테스트도 실행하지 않는다"는 사각지대를 없애고,
+            # (b) 출처 미확정(실시간 편입) 종목이 targets에서 통째로
+            # 누락되던 P0 결함을 고치기 위함. 상세 배경은 해당 모듈의
+            # compute_day_targets() 주석 참고.
             excluded = trading_service.get_excluded_symbols()
-            filtered = [s for s in day_symbols if s not in excluded]
-            combined = list(dict.fromkeys(manual_symbols + filtered))
-            limited  = combined[:settings.websocket.max_symbols]
+            selection = compute_day_targets(
+                confirmed_symbols_by_seq=watcher.confirmed_symbols_by_seq,
+                realtime_unresolved=watcher.realtime_unresolved_symbols,
+                day_seqs=settings.websocket.condition_seqs,
+                swing_seqs=settings.websocket.swing_condition_seqs,
+                manual_symbols=manual_symbols,
+                excluded_symbols=excluded,
+                max_symbols=settings.websocket.max_symbols,
+            )
+            day_symbols = selection.day_symbols
+            limited = selection.final_targets
             sym_to_cond = watcher.symbol_to_condition
             # 2026-08-05 (GPT 코드리뷰 지적, VWAP shadow 1단계):
             # 복수 조건식 편입 정보를 보존하기 위해 symbol_to_
@@ -249,16 +253,27 @@ async def async_main() -> None:
             # VWAP shadow의 condition-source 기반 판단에서 제외됨.
             sym_to_reliable = watcher.symbol_condition_source_reliable
             trading_service.update_targets(limited, sym_to_cond, sym_to_conditions, sym_to_reliable)
-            blocked = excluded & set(day_symbols)
+            blocked = selection.blocked
             if blocked:
                 app_logger.info(f"[COND] 제외 종목 재편입 차단: {sorted(blocked)}")
+            # 2026-08-06 (1E.9): 스윙 검색식이 함께 구독 중이면 출처
+            # 미확정 종목을 단타 targets에 넣을 수 없어 제외되는데,
+            # 이게 조용히 일어나면 1E.7~1E.8처럼 "장중 편입이 전부
+            # 사라지는" 상황을 또 놓치게 되므로 반드시 경고로 남김.
+            if selection.unresolved_skipped:
+                app_logger.warning(
+                    f"[COND] 출처 미확정 {len(selection.unresolved_skipped)}종목이 "
+                    f"단타 targets에서 제외됨(스윙 검색식 구독 중이라 소속 구분 불가): "
+                    f"{selection.unresolved_skipped}"
+                )
             # ── 조건검색식별 편입 현황 + final_targets 로그 ──
             seq_info = " | ".join(
                 f"seq{seq}={len(syms)}종목"
-                for seq, syms in watcher._symbols_by_seq.items()
+                for seq, syms in sorted(watcher.confirmed_symbols_by_seq.items())
             )
             app_logger.info(
                 f"[COND_STATUS] {seq_info} | "
+                f"unresolved={len(selection.unresolved_used)}종목 | "
                 f"excluded={len(blocked)}차단 | "
                 f"final={len(limited)}종목: {limited}"
             )
@@ -268,7 +283,7 @@ async def async_main() -> None:
             swing_seqs_set = {str(s) for s in settings.websocket.swing_condition_seqs}
             if swing_seqs_set:
                 swing_symbols: set[str] = set()
-                for seq, syms in watcher._symbols_by_seq.items():
+                for seq, syms in watcher.confirmed_symbols_by_seq.items():
                     if seq in swing_seqs_set:
                         swing_symbols |= syms
                 out_path = Path(settings.websocket.swing_condition_output)

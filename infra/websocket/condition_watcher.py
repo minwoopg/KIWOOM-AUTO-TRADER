@@ -84,6 +84,11 @@ class ConditionWatcher:
             self._confirmed_symbols_by_seq[str(seq)] = set()
         self._realtime_unresolved: set[str] = set()
 
+        # 2026-08-06 (1E.9): 900003(이미 등록된 seq) 응답에 대해
+        # CNSRCLR+재구독을 시도한 seq 기록 — 연결당 seq별 1회로
+        # 제한해 재시도 무한 루프를 막습니다. 매 로그인마다 초기화.
+        self._resubscribe_attempted: set[str] = set()
+
         # 조건식 이름 저장 {seq: name}
         self._condition_names: dict[str, str] = {}
 
@@ -101,6 +106,32 @@ class ConditionWatcher:
             result |= symbols
         result |= self._realtime_unresolved
         return result
+
+    @property
+    def confirmed_symbols_by_seq(self) -> dict[str, set[str]]:
+        """조건식(seq)별 확정 편입 종목의 복사본입니다.
+
+        2026-08-06 (1E.9): `app/main.py`가 `_confirmed_symbols_by_seq`
+        (private)를 직접 참조하던 것이 1E.7의 필드 개명 때
+        `AttributeError` 재연결 루프를 일으켰고, 회귀 스위트는
+        그 코드를 실행하지 않아 잡지 못했습니다. 외부에서 쓰는
+        경로를 public property로 고정해, 앞으로 내부 필드명이
+        바뀌어도 호출부가 깨지지 않도록 합니다. 호출부가 실수로
+        내부 상태를 변경하지 못하도록 얕은 복사본을 돌려줍니다.
+        """
+        return {seq: set(syms) for seq, syms in self._confirmed_symbols_by_seq.items()}
+
+    @property
+    def realtime_unresolved_symbols(self) -> set[str]:
+        """REAL 이벤트로만 알려져 조건식 출처가 미확정인 종목의 복사본입니다.
+
+        2026-08-06 (1E.9): 이 종목들은 `symbol_condition_source_
+        reliable`에서는 신뢰 불가로 취급되지만, **매매 감시 대상
+        에서는 제외하면 안 됩니다** — 장중 조건검색 편입은 전부
+        이 경로로 들어오기 때문입니다. 자세한 배경은
+        `app/target_selection.compute_day_targets()` 주석 참고.
+        """
+        return set(self._realtime_unresolved)
 
     @property
     def symbol_to_condition(self) -> dict[str, str]:
@@ -197,7 +228,7 @@ class ConditionWatcher:
         elif trnm == "CNSRLST":
             self._on_condition_list(msg)
         elif trnm == "CNSRREQ":
-            self._on_initial_result(msg)
+            await self._on_initial_result(msg)
         elif trnm == "REAL":
             self._on_realtime(msg)
         else:
@@ -209,6 +240,9 @@ class ConditionWatcher:
             return
 
         logger.info("[COND] WebSocket 로그인 성공")
+        # 2026-08-06 (1E.9): 새 연결이므로 재구독 시도 기록 초기화 —
+        # 재연결 때마다 900003 회복을 다시 한 번 시도할 수 있게 함.
+        self._resubscribe_attempted.clear()
         await self._ws_client.send({"trnm": "CNSRLST"})
         await asyncio.sleep(0.5)
 
@@ -249,8 +283,58 @@ class ConditionWatcher:
             if str(seq) in subscribed:
                 self._condition_names[str(seq)] = name
 
-    def _on_initial_result(self, msg: dict) -> None:
-        if msg.get("return_code") != 0:
+    @staticmethod
+    def _extract_seq_from_error(msg: dict) -> str:
+        """오류 응답에서 대상 seq를 뽑아냅니다.
+
+        2026-08-06 (1E.9, 실서버 로그 기준): 900003 응답에는 최상위
+        `seq` 키가 없고 사람이 읽는 문구 안에만 들어있습니다.
+            {'trnm': 'CNSRREQ', 'return_code': 900003,
+             'return_msg': '이미 등록된 조건검색 일련번호입니다.(seq=3)'}
+        최상위 seq를 우선 보고, 없으면 return_msg에서 파싱합니다.
+        """
+        seq = str(msg.get("seq", "") or "")
+        if seq:
+            return seq
+        m = re.search(r"seq\s*=\s*(\d+)", str(msg.get("return_msg", "")))
+        return m.group(1) if m else ""
+
+    async def _on_initial_result(self, msg: dict) -> None:
+        return_code = msg.get("return_code")
+        if return_code != 0:
+            # ── 900003: 이미 등록된 조건검색 일련번호 ──────────────
+            # 2026-08-06 (1E.9, 실서버 8/6 09:10:05 로그로 확인):
+            # 1E.8 이전의 재연결 루프가 서버 쪽에 구독을 남긴 채
+            # 끊기면서, 재기동 후 seq3의 CNSRREQ가 900003으로
+            # 실패했고 그대로 early return —
+            # `_confirmed_symbols_by_seq["3"]`이 하루 종일 빈 채로
+            # 남았습니다. CNSRREQ는 연결당 1회만 발송되므로 스스로
+            # 회복될 경로가 없어, 해당 조건식이 통째로 죽습니다.
+            # 이제 CNSRCLR로 기존 등록을 해제한 뒤 한 번만 재구독을
+            # 시도합니다(연결당 seq별 1회 — 무한 루프 방지).
+            if return_code == 900003:
+                seq = self._extract_seq_from_error(msg)
+                if seq and seq not in self._resubscribe_attempted:
+                    self._resubscribe_attempted.add(seq)
+                    logger.warning(
+                        f"[COND] seq={seq} 이미 등록된 조건검색 일련번호 — "
+                        f"CNSRCLR로 해제 후 재구독 시도(연결당 1회)"
+                    )
+                    await self._ws_client.send({"trnm": "CNSRCLR", "seq": seq})
+                    await asyncio.sleep(0.3)
+                    await self._ws_client.send({
+                        "trnm": "CNSRREQ",
+                        "seq": seq,
+                        "search_type": "1",
+                        "stex_tp": "K",
+                    })
+                    return
+                logger.error(
+                    f"[COND] seq={seq or '?'} 재구독까지 실패 — 이 조건식의 확정 "
+                    f"편입 목록이 비어있게 됩니다(실시간 편입은 출처 미확정으로 "
+                    f"계속 수신됨): {msg}"
+                )
+                return
             logger.error(f"[COND] 조건검색 조회 실패: {msg}")
             return
 
