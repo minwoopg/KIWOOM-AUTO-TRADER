@@ -3492,3 +3492,92 @@ import 스모크 / `load_settings()` / `compileall` 전부 정상.
 
 ---
 
+## 1H: shadow 관측 데이터 분석 리포트 신규 (2026-08-06)
+
+**배경**: shadow를 켜면 데이터는 쌓이지만 **그것을 읽는 코드가 전혀
+없었음**. 확인 결과 기존 리포트 6종(`analyze_signal_log.py`,
+`analyze_trades.py`, `analyze_indicators.py`, `replay_runner.py`,
+`analyze_bb_block_impact`, 분봉 품질) 어디에도 `macd`/`would_block_*`/
+`is_pr`/`rolling_vwap`/`session_vwap`/`chasing_overheated` 참조가
+0건이고, `entry_quality_shadow.csv`를 참조하는 코드는 전부 **쓰기
+쪽**(logger, trading_service, settings)뿐이었음. 매번 즉석 스크립트로
+확인해야 하는 상태였음.
+
+### `analyze_shadow.py` 신규 (읽기 전용)
+
+기존 분석 스크립트와 동일한 패턴 — `python analyze_shadow.py
+[YYYY-MM-DD] [YYYY-MM-DD]`, 콘솔 출력 + `reports/shadow_analysis_
+YYYYMMDD.txt` 저장. 매매 판단·설정을 일절 바꾸지 않고 이미 기록된
+CSV만 읽음.
+
+**이번 단계 범위 — 1~4번만**:
+1. **스키마·품질**: shadow 필드 채움률(`macd`/`rolling_vwap`/
+   `session_metrics`), 정규장 밖 timestamp, `(종목,분봉)` 중복 행
+   (재시작 중복 감지), 필수 필드 결측.
+2. **표본 규모**: 행 수와 유니크 수를 **항상 나란히** 표시하고 평균
+   반복 횟수를 계산. 종목·시간대 집중도로 표본 편향 점검.
+3. **MACD 게이트**: 기존 `chasing_overheated` / MACD 데드+최소5점 /
+   MACD>Signal 하드 게이트 3종을 유니크 기준 집계.
+4. **VWAP 8조합**: PR-only / C-or-PR / condition-source /
+   PR-or-condition × rolling / session.
+
+**의도적으로 제외 — 성과 계산(5·10·20분 수익률, MFE·MAE)**:
+`entry_quality_shadow.csv`에는 판단 시점 `current_price`만 있고 이후
+가격이 없어 분봉 리플레이 CSV와 조인해야 함. 감시 대상에서 빠진
+종목은 분봉이 수집되지 않았을 수 있어 "산출 불가" 처리 설계가
+필요한데, 실제 데이터가 어떻게 쌓이는지 확인한 뒤 붙이는 편이 정확.
+표본 100건도 안 되는 상태에서 성과 수치를 뽑으면 오해를 부름.
+
+### 설계상 강조한 두 가지
+
+**중복집계 함정**: signal_log는 폴링마다 기록되므로 같은 종목·같은
+분봉이 반복됨. 8/5 실측으로 legacy BUY 후보 777행 = **유니크 212건
+(평균 3.7회 반복)**. 과거 "리플레이 5228건을 독립 거래로 오해"했던
+것과 같은 함정이라, 모든 집계를 `(symbol, latest_bar_timestamp)`
+유니크 기준으로 하고 행 수는 참고로만 병기.
+
+**기존 규칙 차단분 분리**: 이미 `order_block_reason`으로 막힌 후보를
+분모에 섞으면 새 게이트가 막았을 건수가 부풀려짐(어차피 못 사던
+후보이므로). 전체와 "기존 규칙 통과분"을 나눠서 표시.
+
+### 8/5 실데이터 검증 결과 (즉시 드러난 사실)
+
+```
+legacy BUY 후보    777행 → 유니크 212건 / 종목 13개 (평균 3.7회 반복)
+  그중 기존 규칙 통과      7건   ← 새 게이트 평가의 실제 분모
+MACD>Signal 하드 게이트  전체 1건(0.5%) / 통과분 1건(14.3%)
+나머지 2개 게이트         0건
+```
+**유니크 212건 중 기존 규칙을 통과한 것이 7건뿐**이라는 점이 핵심.
+새 게이트의 실질 표본은 하루 7건 수준이므로, GPT가 제시한 기준
+(유니크 100건 / 실제 진입 20건 / 종목 10개)을 채우려면 3~5거래일로도
+부족할 수 있음 — 수집 기간을 늘리거나 `[COND_TRUNCATE]` 규모를 보고
+선택 정책을 먼저 개선하는 판단이 필요할 수 있음.
+
+### 장 마감 파이프라인 연결
+
+`TradingService._run_shadow_analysis_today()` 추가 —
+`_run_end_of_day_tasks()`(15:20 트리거)의 기존 6개 분석 뒤에 실행.
+다른 분석과 동일하게 `subprocess` + 예외 삼킴 구조라, 분석이 실패해도
+매매나 다른 리포트 생성에 영향 없음.
+
+### 테스트
+
+`test_shadow_analysis.py` 신규 **19건** — truthy/filled/uniq_key 유틸,
+5행→유니크 2건 축약, 날짜 범위 필터링, 기존 규칙 통과분 분리,
+VWAP 미수집 경고, 빈 CSV·파일 부재에서 예외 없이 동작,
+파이프라인 연결 4건.
+
+**전체 회귀**: 13개 파일 전부 통과, 1개 스킵, 종료코드 0.
+
+### 정정 (이전 세션 안내 오류)
+
+"`entry_quality_shadow.csv`가 헤더만이면 shadow 전환이 안 된 것"이라고
+안내했으나 **틀렸음**. 이 파일은 `legacy_buy_candidate=True`일 때만
+행을 기록하므로, shadow가 정상 동작해도 BUY 후보가 없으면 헤더만
+남음. 정확한 확인 방법은 `signal_log.csv`의 `rolling_vwap` /
+`session_metrics_ready` 채움률이며, `analyze_shadow.py`의 1번 섹션이
+이 값을 그대로 보여줌.
+
+---
+

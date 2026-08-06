@@ -2113,6 +2113,33 @@ class TradingService:
             self._run_indicator_analysis_today(now.date())
             self._run_replay_today(now.date())
             self._run_bb_block_impact_today(now.date())
+            self._run_shadow_analysis_today(now.date())
+
+    def _run_shadow_analysis_today(self, target_date) -> None:
+        """장 마감 후 shadow 관측 데이터 리포트를 자동 생성합니다.
+
+        2026-08-06 (1H단계): 1E(MACD)·1E.5~1E.7(VWAP) shadow가
+        쌓는 데이터를 읽는 코드가 지금까지 전혀 없었음 — 기존
+        리포트 6종은 shadow 필드를 참조하지 않아, 확인할 때마다
+        즉석 스크립트를 써야 했음. 다른 분석과 동일하게
+        subprocess로 실행하고 reports/에 저장하는 패턴을 따름.
+        읽기 전용 후처리라 매매 판단에는 영향이 없음.
+        """
+        try:
+            import subprocess, sys
+            date_str = target_date.strftime("%Y-%m-%d")
+            result = subprocess.run(
+                [sys.executable, "analyze_shadow.py", date_str],
+                capture_output=True, text=True, timeout=120,
+                cwd=str(Path(__file__).resolve().parents[2]),
+                encoding="utf-8", errors="replace",
+            )
+            if result.returncode == 0:
+                self.app_logger.info("[ANALYSIS] shadow 관측 분석 완료 → reports/ 저장")
+            else:
+                self.app_logger.warning(f"[ANALYSIS] shadow 관측 분석 실패:\n{result.stderr}")
+        except Exception as exc:
+            self.app_logger.warning(f"[ANALYSIS] shadow 관측 분석 오류: {exc}")
 
     def _run_signal_analysis_today(self, target_date) -> None:
         """장 마감 후 시그널 분석을 자동 실행합니다."""
