@@ -13,6 +13,7 @@ import csv
 import os
 import sys
 import tempfile
+import time
 from datetime import date
 from pathlib import Path
 
@@ -378,6 +379,147 @@ check("F-1) 파이프라인이 번들 export를 호출함",
 check("F-2) 번들 export가 모든 리포트 생성 뒤에 실행됨",
       ts_src.index("_export_daily_bundle_today(now.date())")
       > ts_src.index("_run_shadow_analysis_today(now.date())"))
+
+# ══════════════════════════════════════════════════════════════
+# 1I.2: 로거 상태 전이 보존 · 로테이션 통합 · 판정 기준 (GPT 리뷰)
+# ══════════════════════════════════════════════════════════════
+from infra.storage.logger import EntryQualityShadowLogger
+from domain.shadow_signature import STATE_TRANSITION_FIELDS
+
+
+def _logger_rows(seq: list[dict]) -> int:
+    """실제 로거를 통과시킨 뒤 CSV 행 수를 셉니다."""
+    path = Path(tempfile.mkdtemp()) / "eq.csv"
+    lg = EntryQualityShadowLogger(str(path))
+    for r in seq:
+        lg.append_if_new(r)
+    with path.open(newline="", encoding="utf-8-sig") as f:
+        return sum(1 for _ in csv.DictReader(f))
+
+
+base = _shadow_row(order_attempted="False", order_accepted="False",
+                   condition_source_reliable="True")
+check("G-1) reject→accept가 CSV에 2행으로 남음(로거까지 실행)",
+      _logger_rows([base, _shadow_row(order_attempted="True", order_accepted="True",
+                                      condition_source_reliable="True")]) == 2)
+check("G-2) order_attempted False→True가 CSV에 2행으로 남음",
+      _logger_rows([base, _shadow_row(order_attempted="True", order_accepted="False",
+                                      condition_source_reliable="True")]) == 2)
+check("G-3) condition_source_reliable True→False가 CSV에 2행으로 남음",
+      _logger_rows([base, _shadow_row(order_attempted="False", order_accepted="False",
+                                      condition_source_reliable="False")]) == 2)
+check("G-4) 완전히 같은 행 반복은 CSV에 1행", _logger_rows([base, base, base]) == 1)
+check("G-5) 로거 키와 분석기 키가 완전히 동일",
+      entry_quality_shadow_key(base) == analysis_dedup_key(base))
+check("G-6) 상태 전이 필드가 키에 포함됨",
+      STATE_TRANSITION_FIELDS == ["order_attempted", "order_accepted",
+                                  "condition_source_reliable"])
+check("G-7) order_id는 키에 포함되지 않음(재시도마다 행이 늘지 않도록)",
+      entry_quality_shadow_key(_shadow_row(order_id="A"))
+      == entry_quality_shadow_key(_shadow_row(order_id="B")))
+
+
+# ── H. 로테이션 로그 통합 ──────────────────────────────────────
+root2 = Path(tempfile.mkdtemp())
+(root2 / "logs").mkdir(parents=True)
+_mkday(root2, "signal_log.csv", ["timestamp", "symbol"], [
+    {"timestamp": "2026-08-06T09:00:30", "symbol": "005930"},
+    {"timestamp": "2026-08-06T15:19:00", "symbol": "005930"},
+])
+# 오전 로그는 로테이션된 app.log.1 에, 오후 로그는 app.log 에
+(root2 / "logs" / "app.log.1").write_text(
+    "2026-08-06 09:00:01,000 | INFO | [COND] watcher.start() 진입 — WebSocket 연결 시작\n"
+    "2026-08-06 09:05:00,000 | INFO | [SESSION_SHADOW] 005930 ready=True reason=COMPLETE_FROM_OPEN\n"
+    "2026-08-06 09:06:00,000 | WARNING | [WS] 연결 끊김: boom — 5초 후 재연결\n"
+    "2026-08-06 09:07:00,000 | WARNING | [COND_TRUNCATE] max_symbols=10 상한으로 조건검색 종목 7개가 잘렸습니다\n",
+    encoding="utf-8")
+(root2 / "logs" / "app.log").write_text(
+    "2026-08-06 15:00:00,000 | INFO | [SESSION_SHADOW] 047040 ready=False reason=PARTIAL_SESSION\n"
+    "2026-08-06 15:10:00,000 | INFO | [WS] start() 진입 — 재연결 루프 시작\n"
+    "2026-08-06 15:19:00,000 | WARNING | [COND_TRUNCATE] max_symbols=10 상한으로 조건검색 종목 21개가 잘렸습니다\n",
+    encoding="utf-8")
+# 포함되면 안 되는 파일
+(root2 / "logs" / "app copy.log").write_text(
+    "2026-08-06 12:00:00,000 | INFO | [COND] SHOULD_NOT_APPEAR_IN_BUNDLE\n", encoding="utf-8")
+
+z2 = _run_export(root2, "2026-08-06")
+t2 = _zip_texts(z2)
+merged = t2["raw/app_analysis_20260806.log"]
+quality = t2["metadata/collection_quality.txt"]
+
+check("H-1) 로테이션된 app.log.1의 09시 로그가 포함됨", "09:05:00" in merged)
+check("H-2) app.log의 15시 로그도 포함됨", "15:00:00" in merged)
+check("H-3) 합쳐진 로그가 시간순으로 정렬됨",
+      merged.index("09:05:00") < merged.index("15:00:00"))
+check("H-4) 'app copy.log' 같은 임의 파일은 포함되지 않음",
+      "SHOULD_NOT_APPEAR_IN_BUNDLE" not in "".join(t2.values()))
+check("H-5) MANIFEST에 사용한 소스 로그가 기록됨",
+      "source logs:" in t2["MANIFEST.txt"] and "app.log.1" in t2["MANIFEST.txt"])
+check("H-6) ready 집계에 두 파일이 모두 반영됨",
+      "session_ready_log_event_count         = 1" in quality
+      and "session_not_ready_log_event_count     = 1" in quality)
+check("H-7) COND_TRUNCATE 집계에 두 파일이 모두 반영됨",
+      "cond_truncate_event_count             = 2" in quality
+      and "max_truncated_condition_count         = 21" in quality)
+check("H-8) rotated_log_paths가 app.log와 app.log.N만 반환",
+      [p.name for p in B.rotated_log_paths(root2 / "logs")] == ["app.log", "app.log.1"])
+
+
+# ── I. 판정 기준 ───────────────────────────────────────────────
+check("I-1) 재연결 집계가 '재연결 루프 시작' 기동 로그를 세지 않음",
+      "websocket_reconnect_count             = 1" in quality)
+check("I-2) 수집 완전성 판정이 signal_log 기준으로 이뤄짐",
+      "signal_collection_first_ts" in quality and "signal_collection_last_ts" in quality)
+check("I-3) shadow 첫·마지막 시각은 별도 coverage 정보로만 기록",
+      "shadow_first_candidate_ts" in quality and "shadow_last_candidate_ts" in quality)
+check("I-4) signal_log가 09:00~15:19이고 재시작 1회면 COMPLETE",
+      "collection_status                     = COMPLETE" in quality)
+check("I-5) session ready 명칭이 로그 이벤트 기준임을 드러냄",
+      "session_ready_log_event_ratio" in quality)
+check("I-6) shadow 후보 기준 ready 비율이 별도로 제공됨",
+      "shadow_candidate_session_ready_ratio" in quality)
+check("I-7) accepted BUY 기준 메타데이터가 분리 기록됨",
+      all(k in quality for k in ("buy_order_attempt_count", "accepted_buy_order_count",
+                                 "unique_accepted_buy_order_count",
+                                 "shadow_order_accepted_count",
+                                 "shadow_unique_accepted_order_count")))
+
+# 거부된 매수 주문이 실제 매수로 집계되지 않아야 함
+_mkday(root2, "trades.csv", ["timestamp", "symbol", "side", "accepted", "order_id"], [
+    {"timestamp": "2026-08-06T09:30:00", "symbol": "005930", "side": "BUY",
+     "accepted": "True", "order_id": "O1"},
+    {"timestamp": "2026-08-06T09:31:00", "symbol": "005930", "side": "BUY",
+     "accepted": "False", "order_id": "O2"},
+])
+z2 = _run_export(root2, "2026-08-06")
+quality2 = _zip_texts(z2)["metadata/collection_quality.txt"]
+check("I-8) 거부된 매수 주문은 accepted 집계에서 제외됨",
+      "buy_order_attempt_count               = 2" in quality2
+      and "accepted_buy_order_count              = 1" in quality2)
+
+
+# ── J. VWAP 분모 유니크 ────────────────────────────────────────
+# 같은 분봉에 상태 변화 행 2개, 둘 다 차단 → 1/1 = 100%여야 함
+dup_bar = [_shadow_row(would_block_pr_only_rolling_vwap="True", order_accepted="False"),
+           _shadow_row(would_block_pr_only_rolling_vwap="True", order_accepted="True")]
+rep = _sess_report(dup_bar)
+check("J-1) 같은 분봉 상태변화 2행이 있어도 분모가 유니크라 100%로 계산",
+      "PR-only            rolling(60분)       1건 100.0%" in rep)
+
+
+# ── K. stale lock ──────────────────────────────────────────────
+check("K-1) stale lock 기준이 30분", B.STALE_LOCK_SECONDS == 30 * 60)
+lock2 = root2 / "exports" / "bundle_20260806.lock"
+lock2.write_text("pid=99999")
+os.utime(lock2, (time.time() - 3600, time.time() - 3600))
+res = _run_export(root2, "2026-08-06")
+check("K-2) 30분 이상 지난 stale lock은 회수되고 export가 진행됨", res is not None)
+lock2.write_text("pid=99999")   # 방금 생성 = 정상 락
+check("K-3) 갓 생성된 락은 회수되지 않고 export가 물러남",
+      _run_export(root2, "2026-08-06") is None)
+lock2.unlink()
+check("K-4) 락 파일에 pid와 생성시각이 기록됨",
+      (lambda: (_run_export(root2, "2026-08-06"), True)[1])())
 
 print()
 print(f"[최종] 총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

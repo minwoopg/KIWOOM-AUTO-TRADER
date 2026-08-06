@@ -3846,3 +3846,141 @@ cond_truncate_event_count    4,332회 / 최대 21종목 잘림
 
 ---
 
+## 1I.2: 로거 상태 전이 보존 · 로테이션 로그 통합 · 판정 기준 수정 (2026-08-06)
+
+1I.1에 대한 GPT 코드리뷰 6건 반영. 매매 로직은 일절 건드리지 않음.
+
+### P0-1: 로거가 주문 결과·신뢰도 변화를 버리고 있었음 (재현 확인)
+
+1I.1에서 signature를 공용화했지만 **분석기만** `ANALYSIS_EXTRA_FIELDS`
+를 썼고, 로거 키에는 `order_attempted`/`order_accepted`/
+`condition_source_reliable`이 없었음. 분석 이전에 **로거가 먼저 행을
+버리므로**, 분석기가 아무리 정확한 signature를 써도 브로커 거부 후
+수락(reject→accept)이나 신뢰도 변화가 원본 CSV에 아예 존재하지 않았음.
+
+**재현 (수정 전)**:
+```
+1) order_accepted=False 기록 → True
+2) order_accepted=True  기록 → False (중복 오판)
+3) reliable=False       기록 → False (중복 오판)
+최종 CSV 행 수: 1행
+```
+**수정 후**: `[True, True, True, False] → CSV 3행`
+(4번째 완전 동일 행만 중복으로 거부)
+
+`STATE_TRANSITION_FIELDS`를 `entry_quality_shadow_key()`에 포함하고,
+`analysis_dedup_key()`는 이를 그대로 위임 — **로거와 분석기가 완전히
+같은 키**를 쓰게 됨(서로 다른 키를 쓰면 로거가 버린 행을 분석기가 볼
+방법이 없음). `order_id`는 일부러 제외 — 같은 판단에서 주문을
+재시도할 때마다 별도 행이 생겨 표본이 부풀려지기 때문.
+
+### P0-2: 번들이 로테이션된 app.log.* 를 읽지 않았음
+
+이번에 잘못된 session 결론이 나온 **직접 원인**이 로테이션 누락이었는데,
+exporter도 `LOGS_DIR / "app.log"` 하나만 읽고 있었음.
+`RotatingFileHandler(20MB × 백업 10개)`이므로 거래량이 많은 날은
+같은 날짜 로그가 여러 파일로 나뉨.
+
+`rotated_log_paths()` 추가 — **정확히 `app.log`와 `app.log.1`~`.10`만**
+대상(`app copy.log` 같은 임의 파일은 제외). 전 파일에서 대상 날짜 줄을
+모아 타임스탬프 접두사로 정렬해 하나의 `raw/app_analysis_YYYYMMDD.log`로
+합침(로테이션 파일은 파일 순서가 시간순이 아니므로 정렬 필수).
+MANIFEST에 `source logs:`와 파일별 줄 수를 기록.
+
+### P1-1: 수집 완전성을 shadow 첫 기록으로 판정하면 안 됨
+
+`entry_quality_shadow.csv`는 legacy BUY 후보가 있을 때만 기록되므로,
+09:00부터 정상 수집됐어도 첫 후보가 10:30이면 PARTIAL로 오판함.
+
+**8/6 실데이터가 정확히 그 경우였음**:
+```
+signal_collection_first_ts = 2026-08-06T09:00:00.203677  ← 09:00부터 정상 수집
+shadow_first_candidate_ts  = 2026-08-06T10:43:45         ← 첫 BUY 후보
+```
+1I.1은 후자로 판정해 "PARTIAL"이라 했으나, 실제로는 **봇이 09:00부터
+정상 작동**했고 그때까지 BUY 후보가 없었을 뿐임.
+
+이제 매 폴링마다 기록되는 `signal_log.csv` 기준으로 판정:
+첫 기록 ≤09:02 **AND** 마지막 기록 ≥15:15 **AND** 재시작 1회일 때만
+`COMPLETE`. shadow 첫·마지막 시각은 `shadow_first/last_candidate_ts`로
+coverage 정보로만 남김.
+
+`analyze_shadow.py` 상단 문구도 정정 — 이 분석기에는 재시작 로그가
+없으므로 "PARTIAL / RESTARTED" 단정을 제거하고,
+`shadow 후보 관측 시작: 10:43` / `전체 수집 상태:
+metadata/collection_quality.txt 참고`로 사실만 표기.
+
+### P1-2: 거부된 매수 주문이 실제 매수로 집계됨
+
+`side=BUY`만 세면 브로커가 거부한 주문까지 포함됨. 이제
+`accepted=True`인 주문만 세고 `order_id`로 유니크 처리. 메타데이터를
+같은 개념끼리 비교 가능하도록 분리:
+`buy_order_attempt_count` / `accepted_buy_order_count` /
+`unique_accepted_buy_order_count` / `shadow_order_attempt_count` /
+`shadow_order_accepted_count` / `shadow_unique_accepted_order_count`.
+coverage는 **shadow accepted ÷ trades accepted BUY**로 계산.
+
+### P1-3: VWAP 게이트 비율 분모가 행 수였음
+
+분자는 유니크 분봉인데 분모가 행 수라, 같은 분봉에 상태 변화 행이 2개
+있으면 비율이 절반으로 낮게 나왔음. 분모도 `{uniq_key(r) for r in pool}`
+로 통일.
+
+### P2: 재연결 집계 · stale lock · 명칭
+
+- **재연결 집계**: `"재연결" in line`은 정상 기동 로그
+  `[WS] start() 진입 — 재연결 루프 시작`까지 셌음. 이제
+  `"연결 끊김:" and "초 후 재연결"`인 줄만 집계. 8/6 실데이터에서
+  2회 → **0회**로 정정됨(그날 실제 재연결은 없었고 재시작만 2회였음).
+- **stale lock**: 프로세스가 강제 종료되면 락이 남아 이후 export가
+  영구 거부됨. 락에 pid·생성시각을 기록하고 `STALE_LOCK_SECONDS`
+  (30분) 초과 시 회수 후 재시도. 정상 export는 수 분 이내라 충분히
+  보수적.
+- **명칭**: `ready=True/False`는 로그 이벤트 행 비율이며 같은 종목이
+  매분 반복되므로 독립 표본이 아님 →
+  `session_ready_log_event_count/ratio`로 개명하고,
+  `shadow_candidate_session_ready_count/ratio`를 별도 제공.
+
+### 8/6 실데이터 검증
+
+```
+번들 크기                            0.5 MB   testzip() = None
+collection_status                    RESTARTED_PARTIAL (재시작 2회)
+signal_collection_first_ts           2026-08-06T09:00:00  ← 1I.1 오판 정정
+shadow_first_candidate_ts            2026-08-06T10:43:45
+websocket_reconnect_count            0  (1I.1의 2회는 기동 로그 오집계)
+session_ready_log_event              0 / 2,083
+shadow_candidate_session_ready       0/358 (0.0%)
+cond_truncate_event_count            4,332회 / 최대 21종목
+전일(8/5) 혼입                        없음
+로그 내 10~13자리 숫자 / Bearer 토큰   0건 / 0건
+```
+
+### 부수 수정
+
+`test_vwap_shadow_observation.py`의 재시작 복원 테스트가 signature
+필드를 하드코딩하고 있어, 상태 전이 필드 3개 추가 시 깨졌음. 공용
+목록(`ASSESSMENT_SIGNATURE_FIELDS` + `STATE_TRANSITION_FIELDS`)에서
+파생하도록 바꿔 앞으로 필드가 늘어도 자동 반영되게 함. 79/79 유지.
+
+### 테스트
+
+`test_shadow_analysis.py` 65건 → **93건**:
+- G(7건) 로거 상태 전이 — `EntryQualityShadowLogger.append_if_new()`를
+  **실제로 실행**해 CSV 행 수를 셈. reject→accept / attempted 변화 /
+  reliable 변화 각 2행, 완전 동일 반복 1행, 로거·분석기 키 동일,
+  `order_id`는 키에 미포함.
+- H(8건) 로테이션 통합 — 09시 로그를 `app.log.1`에, 15시를 `app.log`에
+  두고 둘 다 포함·시간순 정렬 확인, `app copy.log` 미포함,
+  MANIFEST의 source logs, ready·truncate 집계에 두 파일 모두 반영.
+- I(8건) 판정 기준 — 재연결 오집계 해소, signal_log 기준 판정,
+  shadow 시각 분리, COMPLETE 판정, 명칭, accepted BUY 분리 집계,
+  거부 주문 제외.
+- J(1건) VWAP 유니크 분모.
+- K(4건) stale lock — 30분 기준, 오래된 락 회수, 갓 생성된 락은 유지.
+
+**전체 회귀**: 13개 파일 전부 통과, 1개 스킵, 종료코드 0.
+`compileall` 정상.
+
+---
+

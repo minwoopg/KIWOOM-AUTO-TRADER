@@ -133,11 +133,13 @@ def section_data_quality_header(out, sig_rows, sh_rows) -> None:
     attempts = sum(1 for r in sh_rows if truthy(r.get("order_attempted")))
     accepted = sum(1 for r in sh_rows if truthy(r.get("order_accepted")))
     sh_first = next((str(r.get("timestamp") or "") for r in sh_rows), "")
-    open_ok = bool(sh_first) and sh_first[11:16] <= "09:02"
-    status = "COMPLETE" if open_ok else "PARTIAL / RESTARTED"
-
+    # 2026-08-06 (1I.2, GPT 지적 P1-1): 이 분석기에는 재시작 로그가
+    # 없고, entry_quality_shadow는 legacy BUY 후보가 있을 때만
+    # 기록되므로 첫 기록 시각만으로 "PARTIAL/RESTARTED"를 단정할 수
+    # 없음. 관측 시작 시각만 사실대로 적고 판정은 넘기지 않는다.
     out("[ 데이터 품질 ]")
-    out(f"  수집 상태            : {status} (shadow 첫 기록 {sh_first[11:19] or 'N/A'})")
+    out(f"  shadow 후보 관측 시작: {sh_first[11:19] or 'N/A'}")
+    out("  전체 수집 상태       : metadata/collection_quality.txt 참고")
     out(f"  shadow 주문 연결     : 시도 {attempts}건 / 수락 {accepted}건")
     out(f"  session ready        : {complete}/{len(sh_rows)}")
     out(f"  조건식 출처 신뢰     : {reliable}/{len(sh_rows)}")
@@ -149,7 +151,7 @@ def section_data_quality_header(out, sig_rows, sh_rows) -> None:
         interp_hold.append("condition-source 기반 VWAP")
     out(f"  해석 가능            : {', '.join(interp_ok)}")
     out(f"  해석 보류            : {', '.join(interp_hold) if interp_hold else '없음'}")
-    out("  ※ 정확한 수집 완전성·재시작 횟수는 번들의 metadata/collection_quality.txt 참고")
+    out("  ※ 수집 완전성·재시작 횟수는 signal_log 기준으로 collection_quality.txt에 기록됩니다.")
     out("")
 
 
@@ -365,7 +367,11 @@ def section_vwap(out, sh_rows) -> None:
         is_session = basis.startswith("session")
         pool = complete if is_session else sh_rows
         pool_live = [r for r in live if truthy(r.get("session_metrics_ready"))] if is_session else live
-        denom_all, denom_live = len(pool), len(pool_live)
+        # 2026-08-06 (1I.2, GPT 지적 P1-3): 분자는 유니크 분봉인데
+        # 분모가 행 수여서, 같은 분봉에 상태 변화 행이 2개 있으면
+        # 비율이 절반으로 낮게 나왔음. 분모도 유니크로 통일.
+        denom_all = len({uniq_key(r) for r in pool})
+        denom_live = len({uniq_key(r) for r in pool_live})
         hit_u = {uniq_key(r) for r in pool if truthy(r.get(field))}
         live_hit_u = {uniq_key(r) for r in pool_live if truthy(r.get(field))}
         note = "  (ready=True 행만)" if is_session else ""

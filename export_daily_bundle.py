@@ -37,6 +37,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import zipfile
 from datetime import date, datetime
 from pathlib import Path
@@ -44,6 +45,9 @@ from pathlib import Path
 LOGS_DIR = Path("logs")
 REPORTS_DIR = Path("reports")
 EXPORTS_DIR = Path("exports")
+
+# stale lock 판정 기준 — 정상 export는 수 분 이내에 끝납니다.
+STALE_LOCK_SECONDS = 30 * 60
 
 # 날짜별로 잘라낼 CSV — (파일명, 시간 컬럼 후보)
 # 2026-08-06 (1I.1): entry_watch_shadow의 실제 시간 컬럼은
@@ -132,24 +136,55 @@ def slice_csv(src: Path, dst: Path, target: date, ts_cols: tuple[str, ...]) -> t
     return total, kept
 
 
-def slice_log(src: Path, dst: Path, target: date) -> tuple[int, int, list[str]]:
-    """allowlist 태그 줄만 추출하고 마스킹합니다."""
+def rotated_log_paths(logs_dir: Path) -> list[Path]:
+    """app.log 와 app.log.1 ~ app.log.10 만 대상으로 합니다.
+
+    2026-08-06 (1I.2, GPT 코드리뷰 P0-2): 프로그램은
+    RotatingFileHandler(20MB × 백업 10개)를 쓰므로 거래량이 많은
+    날은 같은 날짜 로그가 app.log / app.log.1 / app.log.2 ...로
+    나뉩니다. 1I.1의 exporter는 app.log 하나만 읽어서 오전 로그나
+    이전 재시작 로그를 놓쳤고, **이번에 session 결론을 잘못 냈던
+    직접 원인이 바로 이 로테이션 누락**이었습니다.
+
+    `app copy.log` 같은 임의 파일은 포함하지 않습니다 — 정확히
+    `app.log`와 `app.log.<1~10>`만.
+    """
+    found = [logs_dir / "app.log"] if (logs_dir / "app.log").exists() else []
+    for i in range(1, 11):
+        p = logs_dir / f"app.log.{i}"
+        if p.exists():
+            found.append(p)
+    return found
+
+
+def slice_log(sources: list[Path], dst: Path, target: date) -> tuple[int, int, list[str], list[str]]:
+    """여러 로그 파일에서 allowlist 태그 줄만 모아 시간순으로 씁니다.
+
+    반환: (전체줄, 추출줄, 추출된 줄 목록, 사용한 소스 파일명)
+    """
     day = target.strftime("%Y-%m-%d")
     total = kept = 0
     collected: list[str] = []
-    with src.open(encoding="utf-8", errors="replace") as f, \
-            dst.open("w", encoding="utf-8") as out:
-        for line in f:
-            total += 1
-            if not line.startswith(day):
-                continue
-            if not any(t in line for t in LOG_TAGS):
-                continue
-            masked = mask(line.rstrip("\r\n"))
-            out.write(masked + "\n")
-            collected.append(masked)
-            kept += 1
-    return total, kept, collected
+    used: list[str] = []
+    for src in sources:
+        hit = 0
+        with src.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                total += 1
+                if not line.startswith(day):
+                    continue
+                if not any(t in line for t in LOG_TAGS):
+                    continue
+                collected.append(mask(line.rstrip("\r\n")))
+                hit += 1
+        if hit:
+            used.append(f"{src.name} ({hit:,}줄)")
+        kept += hit
+    # 로테이션 파일은 app.log.N이 오래된 순이라 파일 순서가 시간순이
+    # 아님 — 타임스탬프 접두사로 정렬해 하나의 파일로 합칩니다.
+    collected.sort(key=lambda l: l[:23])
+    dst.write_text("\n".join(collected) + ("\n" if collected else ""), encoding="utf-8")
+    return total, kept, collected, used
 
 
 # ── 수집 품질 메타데이터 ────────────────────────────────────────
@@ -161,7 +196,8 @@ def _first_last_ts(rows: list[dict], col: str) -> tuple[str, str]:
 def build_collection_quality(target: date, log_lines: list[str],
                              counts: dict[str, int],
                              shadow_rows: list[dict],
-                             trades_rows: list[dict]) -> str:
+                             trades_rows: list[dict],
+                             signal_rows: list[dict] | None = None) -> str:
     """분석자가 그날 데이터를 어디까지 믿어도 되는지 판정합니다.
 
     2026-08-06 (1I.1): 8/6처럼 장중 재시작이 여러 번 있었던 날은
@@ -169,12 +205,17 @@ def build_collection_quality(target: date, log_lines: list[str],
     그걸 알 수 없었음. 판정은 **보수적으로** — 조건을 전부
     만족할 때만 COMPLETE.
     """
+    signal_rows = signal_rows or []
     L: list[str] = []
     day = target.strftime("%Y-%m-%d")
 
     starts = sum(1 for l in log_lines if "watcher.start() 진입" in l)
     ws_connect = sum(1 for l in log_lines if "[WS]" in l and "연결 성공" in l)
-    ws_reconnect = sum(1 for l in log_lines if "[WS]" in l and "재연결" in l)
+    # 2026-08-06 (1I.2, GPT 지적 P2): "재연결" 부분일치로 세면
+    # 정상 기동 로그 "[WS] start() 진입 — 재연결 루프 시작"까지
+    # 재연결로 집계됨. 실제 재시도만 세도록 조건을 좁힘.
+    ws_reconnect = sum(1 for l in log_lines
+                       if "[WS]" in l and "연결 끊김:" in l and "초 후 재연결" in l)
     truncate_lines = [l for l in log_lines if "[COND_TRUNCATE]" in l]
     max_trunc = 0
     for l in truncate_lines:
@@ -191,16 +232,43 @@ def build_collection_quality(target: date, log_lines: list[str],
     last_ts = ts_vals[-1] if ts_vals else ""
 
     sh_first, sh_last = _first_last_ts(shadow_rows, "timestamp")
+    sig_first, sig_last = _first_last_ts(signal_rows, "timestamp")
     attempts = sum(1 for r in shadow_rows if str(r.get("order_attempted", "")).lower() == "true")
-    buys = sum(1 for r in trades_rows
-               if any(str(r.get(k, "")).upper() in ("BUY", "매수")
-                      for k in ("side", "type", "구분", "order_type")))
+    sh_accepted_rows = [r for r in shadow_rows
+                        if str(r.get("order_accepted", "")).lower() == "true"]
+    sh_accepted = len(sh_accepted_rows)
+    sh_accept_ids = {str(r.get("order_id", "")) for r in sh_accepted_rows
+                     if str(r.get("order_id", ""))}
+    sh_accepted_uniq = len(sh_accept_ids) if sh_accept_ids else sh_accepted
+    # 2026-08-06 (1I.2, GPT 지적 P1-2): side=BUY만 세면 브로커가
+    # 거부한 주문까지 "실제 매수"로 집계돼 coverage가 왜곡됨.
+    # accepted=True인 주문만 세고, order_id로 유니크 처리.
+    def _is_buy(r: dict) -> bool:
+        return any(str(r.get(k, "")).upper() in ("BUY", "매수")
+                   for k in ("side", "type", "구분", "order_type"))
+
+    def _is_accepted(r: dict) -> bool:
+        for k in ("accepted", "order_accepted", "success", "is_success"):
+            if k in r:
+                return str(r.get(k, "")).lower() in ("true", "1", "y", "yes", "성공")
+        return True  # accepted 컬럼이 없는 스키마면 보수적으로 포함
+
+    buy_attempts = [r for r in trades_rows if _is_buy(r)]
+    buy_accepted = [r for r in buy_attempts if _is_accepted(r)]
+    buy_ids = {str(r.get("order_id", "")) for r in buy_accepted if str(r.get("order_id", ""))}
+    buys = len(buy_ids) if buy_ids else len(buy_accepted)
     reliable = sum(1 for r in shadow_rows
                    if str(r.get("condition_source_reliable", "")).lower() == "true")
 
     # 보수적 판정 — 조건을 전부 만족할 때만 COMPLETE
-    open_ok = bool(sh_first) and sh_first[11:16] <= "09:02"
-    close_ok = bool(last_ts) and last_ts[11:16] >= "15:15"
+    # 2026-08-06 (1I.2, GPT 지적 P1-1): 1I.1은 entry_quality_shadow의
+    # 첫 기록으로 판정했는데, 이 파일은 **legacy BUY 후보가 있을 때만**
+    # 기록되므로 09:00부터 정상 수집됐어도 첫 후보가 10:30이면
+    # PARTIAL로 오판함. 수집 범위 판정은 매 폴링마다 기록되는
+    # signal_log.csv를 기준으로 해야 정확함. shadow 첫·마지막 시각은
+    # 별도 coverage 정보로만 남김.
+    open_ok = bool(sig_first) and sig_first[11:16] <= "09:02"
+    close_ok = bool(sig_last) and sig_last[11:16] >= "15:15"
     if starts > 1:
         status = "RESTARTED_PARTIAL"
     elif open_ok and close_ok:
@@ -229,22 +297,38 @@ def build_collection_quality(target: date, log_lines: list[str],
     L.append("")
     add("signal_log_rows", counts.get("signal_log.csv", 0))
     add("entry_quality_shadow_rows", counts.get("entry_quality_shadow.csv", 0))
-    add("entry_quality_shadow_first_ts", sh_first or "N/A")
-    add("entry_quality_shadow_last_ts", sh_last or "N/A")
+    add("signal_collection_first_ts", sig_first or "N/A")
+    add("signal_collection_last_ts", sig_last or "N/A")
+    add("shadow_first_candidate_ts", sh_first or "N/A")
+    add("shadow_last_candidate_ts", sh_last or "N/A")
     L.append("")
-    add("actual_buy_count", buys if trades_rows else "N/A(trades.csv 없음)")
+    add("buy_order_attempt_count", len(buy_attempts) if trades_rows else "N/A(trades.csv 없음)")
+    add("accepted_buy_order_count", len(buy_accepted) if trades_rows else "N/A")
+    add("unique_accepted_buy_order_count", buys if trades_rows else "N/A")
     add("shadow_order_attempt_count", attempts)
+    add("shadow_order_accepted_count", sh_accepted)
+    add("shadow_unique_accepted_order_count", sh_accepted_uniq)
+    # 같은 개념끼리 비교 — shadow accepted ÷ trades accepted BUY
     if trades_rows and buys:
         add("shadow_to_actual_buy_coverage",
-            f"{attempts}/{buys} ({attempts / buys * 100:.0f}%)")
+            f"{sh_accepted_uniq}/{buys} ({sh_accepted_uniq / buys * 100:.0f}%)")
     else:
         add("shadow_to_actual_buy_coverage", "N/A")
     L.append("")
-    add("session_ready_true_count", ready_true)
-    add("session_ready_false_count", ready_false)
-    add("session_ready_ratio",
+    # 2026-08-06 (1I.2, GPT 지적 P2): ready=True/False는 로그 이벤트
+    # 행 비율이며 같은 종목이 매분 반복되므로 독립 표본 비율이 아님.
+    # 명칭을 명확히 하고, shadow 후보 기준 비율을 따로 제공.
+    add("session_ready_log_event_count", ready_true)
+    add("session_not_ready_log_event_count", ready_false)
+    add("session_ready_log_event_ratio",
         f"{ready_true}/{ready_total} ({ready_true / ready_total * 100:.1f}%)"
         if ready_total else "N/A")
+    sh_ready = sum(1 for r in shadow_rows
+                   if str(r.get("session_metrics_ready", "")).lower() == "true")
+    add("shadow_candidate_session_ready_count", sh_ready)
+    add("shadow_candidate_session_ready_ratio",
+        f"{sh_ready}/{len(shadow_rows)} ({sh_ready / len(shadow_rows) * 100:.1f}%)"
+        if shadow_rows else "N/A")
     add("condition_source_reliable_true_count", reliable)
     add("condition_source_reliable_ratio",
         f"{reliable}/{len(shadow_rows)} ({reliable / len(shadow_rows) * 100:.1f}%)"
@@ -256,8 +340,9 @@ def build_collection_quality(target: date, log_lines: list[str],
     add("session_gate_interpretation", session_interp)
     add("rolling_gate_interpretation", rolling_interp)
     L.append("")
-    L.append("판정 기준(보수적): 첫 데이터가 09:00~09:02 사이이고, 장 마감까지")
-    L.append("데이터가 있고, 장중 프로세스 재시작이 없을 때만 COMPLETE.")
+    L.append("판정 기준(보수적): signal_log 첫 기록이 09:00~09:02이고, 마지막 기록이 15:15 이후이며,")
+    L.append("장중 프로세스 재시작이 없을 때만 COMPLETE. shadow 첫 기록은 legacy BUY")
+    L.append("후보가 있어야 생기므로 수집 완전성 판정에 쓰지 않습니다.")
     L.append("그 외에는 PARTIAL 또는 RESTARTED_PARTIAL. session 게이트는")
     L.append("ready=True 행이 하나도 없으면 성과 해석이 불가능하므로")
     L.append("INVALID_FOR_THIS_DAY로 표시합니다.")
@@ -284,9 +369,18 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
     # 15:20 자동 실행과 수동 실행이 겹치면 서로의 작업물을 지울 수
     # 있으므로, O_EXCL로 락을 잡고 실패하면 기존 실행을 건드리지
     # 않고 조용히 물러남(불완전 ZIP을 만들지 않음).
+    # 2026-08-06 (1I.2, GPT 지적 P2): 프로세스가 강제 종료되면 락이
+    # 남아 이후 export가 영구히 거부됨. 정상 export는 수 분 이상
+    # 걸리지 않으므로 30분을 stale 기준으로 보고 회수한다.
+    if lock_path.exists():
+        age = time.time() - lock_path.stat().st_mtime
+        if age > STALE_LOCK_SECONDS:
+            if not quiet:
+                print(f"⚠ stale lock 감지({age / 60:.0f}분 경과) — 제거 후 재시도합니다.")
+            lock_path.unlink(missing_ok=True)
     try:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(os.getpid()).encode())
+        os.write(fd, f"pid={os.getpid()} created={datetime.now().isoformat()}\n".encode())
         os.close(fd)
     except FileExistsError:
         if not quiet:
@@ -329,13 +423,16 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
 
         manifest.append("")
         manifest.append("[ RAW — 로그 (allowlist 태그 줄만, 마스킹 적용) ]")
-        app_src = LOGS_DIR / "app.log"
+        app_sources = rotated_log_paths(LOGS_DIR)
         log_lines: list[str] = []
-        if app_src.exists():
+        if app_sources:
             dst = work / f"app_analysis_{day_compact}.log"
-            total, kept, log_lines = slice_log(app_src, dst, target)
+            total, kept, log_lines, used = slice_log(app_sources, dst, target)
             raw_files.append(dst.name)
-            manifest.append(f"  {'app.log':30s} | OK | {kept:,}줄 / 전체 {total:,}줄")
+            manifest.append(f"  {'app.log(+로테이션)':30s} | OK | {kept:,}줄 / 전체 {total:,}줄")
+            manifest.append("  source logs:")
+            for u in (used or ["(해당 날짜 줄이 있는 파일 없음)"]):
+                manifest.append(f"    - {u}")
         else:
             manifest.append(f"  {'app.log':30s} | MISSING | 원본 없음 | excluded")
         manifest.append(f"  allowlist: {', '.join(LOG_TAGS)}")
@@ -362,6 +459,7 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
             target, log_lines, counts,
             _read_csv(work / f"entry_quality_shadow_{day_compact}.csv"),
             _read_csv(work / f"trades_{day_compact}.csv"),
+            _read_csv(work / f"signal_log_{day_compact}.csv"),
         )
         (work / "collection_quality.txt").write_text(quality, encoding="utf-8")
 

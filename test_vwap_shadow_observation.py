@@ -595,23 +595,18 @@ with tempfile.TemporaryDirectory() as tmpdir:
           "(정확히 GPT 지시 필수 테스트)", len(restored_logger._seen_keys) == 1)
 
     # 복원된 로거로 동일 판단을 다시 시도 -> 중복으로 거부돼야 함
-    same_row = {
-        "symbol": symbol, "latest_bar_timestamp": "20260805100000",
-        "detected_patterns": rows_before_restart[0]["detected_patterns"],
-        "score": rows_before_restart[0]["score"],
-        "would_block_macd_dead_min_score5": rows_before_restart[0]["would_block_macd_dead_min_score5"],
-        "would_block_macd_above_signal_required": rows_before_restart[0]["would_block_macd_above_signal_required"],
-        "would_block_pr_only_rolling_vwap": rows_before_restart[0]["would_block_pr_only_rolling_vwap"],
-        "would_block_c_or_pr_rolling_vwap": rows_before_restart[0]["would_block_c_or_pr_rolling_vwap"],
-        "would_block_pullback_condition_rolling_vwap": rows_before_restart[0]["would_block_pullback_condition_rolling_vwap"],
-        "would_block_pr_or_pullback_condition_rolling_vwap": rows_before_restart[0]["would_block_pr_or_pullback_condition_rolling_vwap"],
-        "would_block_pr_only_session_vwap": rows_before_restart[0]["would_block_pr_only_session_vwap"],
-        "would_block_c_or_pr_session_vwap": rows_before_restart[0]["would_block_c_or_pr_session_vwap"],
-        "would_block_pullback_condition_session_vwap": rows_before_restart[0]["would_block_pullback_condition_session_vwap"],
-        "would_block_pr_or_pullback_condition_session_vwap": rows_before_restart[0]["would_block_pr_or_pullback_condition_session_vwap"],
-        "final_decision": rows_before_restart[0]["final_decision"],
-        "order_block_reason": rows_before_restart[0]["order_block_reason"],
-    }
+    # 2026-08-06 (1I.2): 예전엔 signature 필드를 여기에 하드코딩했는데,
+    # 1I.2에서 상태 전이 필드 3개(order_attempted / order_accepted /
+    # condition_source_reliable)가 키에 추가되자 이 목록이 따라가지
+    # 못해 테스트가 깨졌음. 공용 필드 목록에서 파생하도록 바꿔
+    # 앞으로 필드가 늘어도 자동으로 반영되게 함.
+    from domain.shadow_signature import (
+        ASSESSMENT_SIGNATURE_FIELDS, STATE_TRANSITION_FIELDS,
+    )
+    _key_fields = (["symbol", "latest_bar_timestamp", "detected_patterns", "score"]
+                   + ASSESSMENT_SIGNATURE_FIELDS + STATE_TRANSITION_FIELDS)
+    same_row = {f: rows_before_restart[0].get(f, "") for f in _key_fields}
+
     result_after_restart = restored_logger.append_if_new(same_row)
     check("    복원된 로거로 동일 판단 재시도 -> 중복으로 거부됨(False)",
           result_after_restart is False)
