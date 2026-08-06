@@ -3984,3 +3984,232 @@ cond_truncate_event_count            4,332회 / 최대 21종목
 
 ---
 
+## 1I.3: JSON 토큰 마스킹 · session 해석 기준 · fail-closed 보완 (2026-08-06)
+
+1I.2에 대한 GPT 코드리뷰 반영. 매매 로직 무변경.
+
+### P0: JSON/dict 형태 토큰이 마스킹되지 않았음 (재현 확인)
+
+1I.2의 마스킹 정규식은 `key=value` / `key: value` / `Bearer <token>`만
+처리해서, 로그가 JSON이나 Python dict 형태이면 **토큰 원문이 그대로
+남았음**.
+
+**재현 (수정 전)**:
+```
+{"access_token":"SECRET123456789"}   → 그대로 노출 ⚠
+{"refresh_token": "REFRESH12345..."} → 그대로 노출 ⚠
+{'api_key': 'KEY123456789'}          → 그대로 노출 ⚠
+{"password":"PW123","symbol":"005930"} → 그대로 노출 ⚠
+{"authorization":"Bearer SECRET..."} → Bearer 정규식 덕에 우연히 마스킹
+```
+allowlist에 `[RECONCILE]`이 있어, 향후 reconcile 코드가 응답 dict를
+로그로 찍으면 토큰이 번들에 실릴 수 있는 실질적 유출 경로였음.
+
+**수정**: 키 양쪽 따옴표를 허용하도록 정규식을 named group으로 재작성.
+구분자(`=`/`:`)와 값의 원래 따옴표는 보존해 로그 가독성 유지.
+```
+{"access_token":"SECRET123456789"}     → {"access_token":"***"}
+{"refresh_token": "REFRESH123456789"}  → {"refresh_token": "***"}
+{'api_key': 'KEY123456789'}            → {'api_key': '***'}
+{"password":"PW123","symbol":"005930"} → {"password":"***","symbol":"005930"}
+access_token=PLAIN123                  → access_token=***
+2026-08-06 09:00:01,000 | [COND] 편입: 005930  → 변형 없음
+```
+
+### P1-1: session 게이트 해석 판정이 잘못된 모집단을 봤음
+
+`session_gate_interpretation`을 `[SESSION_SHADOW]` **로그 이벤트 수**로
+판정했는데, session VWAP 게이트 성과 분석의 실제 모집단은
+`entry_quality_shadow.csv`의 **legacy BUY 후보 중 ready=True**임.
+HOLD 평가에서는 ready=True가 있어도 BUY 후보에서 0건이면 분석 표본이
+없는데 `AVAILABLE`이라 표시됐음.
+
+**수정**: `sh_ready`(shadow 후보 기준) > 0일 때만 `AVAILABLE`.
+로그 이벤트 기준 상태는 `session_state_collection_status`
+(`COLLECTING` / `NO_COMPLETE_SESSION`)로 분리해 진단용으로 유지.
+
+### P1-2: accepted 컬럼이 없으면 모든 BUY를 수락으로 간주했음
+
+`_is_accepted()`가 컬럼을 못 찾으면 `True`를 반환해, 스키마가 바뀌면
+거부 주문까지 체결로 집계됐음. export의 원칙이 fail-closed이므로
+**모르는 주문을 체결로 추정하지 않도록** `_accepted_state()`가
+`None`을 반환하게 바꾸고, 이 경우:
+```
+accepted_buy_order_count        = N/A(SCHEMA_WARNING)
+unique_accepted_buy_order_count = N/A(SCHEMA_WARNING)
+trades_accepted_schema          = SCHEMA_WARNING: accepted 컬럼 없음
+shadow_to_actual_buy_coverage   = N/A
+```
+
+### P1-3: order_id가 일부에만 있으면 수락 수를 과소 집계
+
+`buy_ids` 집합 크기로 세다가 ID 없는 주문이 통째로 사라졌음
+(accepted 10건 중 8건만 ID → 8건). `_identity()`를 모듈 수준 함수로
+두고, ID가 없으면 `(timestamp, symbol, side, quantity, price, index)`
+로 대체. 누락 건수는 별도 경고 필드로 노출:
+`accepted_buy_missing_order_id_count`,
+`shadow_accepted_missing_order_id_count`.
+
+### P2: 락 소유권 확인
+
+30분 초과 프로세스 A의 락을 B가 회수한 뒤, A가 `finally`에서 B의
+락까지 지워 C가 동시 진입할 수 있는 경계 상황이 있었음. 락 파일에
+`pid + created + nonce(time_ns)` 고유 토큰을 기록하고, 해제 시
+**자신이 만든 토큰과 일치할 때만** 삭제.
+
+### 8/6 실데이터 검증
+
+로그 끝에 `[RECONCILE] resp={"access_token":"LEAKTEST_A",
+"refresh_token":"LEAKTEST_B","api_key":"LEAKTEST_C"}`를 주입해 실제
+번들을 생성한 뒤 압축을 풀어 검사:
+```
+LEAKTEST_A / B / C 원문        0건 ✅
+testzip()                      None
+session_state_collection_status NO_COMPLETE_SESSION
+session_gate_interpretation     INVALID_FOR_THIS_DAY  ← 1I.2 판정 정정
+shadow_candidate_session_ready  0
+accepted_buy_order_count        N/A (trades.csv 없음)
+8/5 혼입                        없음
+크기                            0.5 MB
+```
+
+### 부수 수정
+
+`_identity()`가 사용 지점보다 뒤에 정의돼 `UnboundLocalError`가
+발생했고(테스트로 검출), stale lock 회수가 `if not quiet:` 블록
+안으로 들어가 quiet 모드에서 회수되지 않던 문제도 테스트로 검출해
+수정함.
+
+### 테스트
+
+`test_shadow_analysis.py` 93건 → **117건**:
+- L(11건) JSON 마스킹 — 큰따옴표/작은따옴표/공백 변형, 같은 JSON에서
+  종목코드 보존, 기존 `key=value` 유지, ZIP까지 통과시킨 뒤 압축 해제
+  검사로 access_token·refresh_token·api_key 원문 0건 확인.
+- M(4건) session 해석 — 로그 ready=True 10건 + BUY 후보 0건이면
+  `INVALID_FOR_THIS_DAY`, 로그 기준 상태는 별도 유지, BUY 후보에
+  ready=True가 있으면 `AVAILABLE`.
+- N(3건) accepted 스키마 fail-closed.
+- O(3건) order_id 누락 처리 — 3건 전부 집계되고 누락 2건 경고.
+- P(3건) 락 소유권 — stale 회수, 남의 락 미삭제, 정상 해제.
+
+**전체 회귀**: 13개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+
+---
+
+## 1I.4: 실제 키움 자격증명 키 마스킹 · 수집 판정 fail-closed (2026-08-06)
+
+1I.3에 대한 GPT 코드리뷰 반영. 매매 로직 무변경.
+
+### P0: 프로젝트가 실제로 쓰는 자격증명 키가 마스킹 목록에 없었음 (재현 확인)
+
+코드 확인 결과 실제 사용 키:
+```
+infra/broker/kiwoom_broker.py:90-91  {"appkey": …, "secretkey": …}
+infra/broker/kiwoom_broker.py:107    token = api_response.body.get("token")
+infra/notify/kakao_notifier.py       rest_api_key, client_id, refresh_token
+```
+
+**재현 (수정 전)** — 전부 원문 유지:
+```
+{"token":"SECRET1"}        {"appkey":"SECRET2"}      {"secretkey":"SECRET3"}
+{"app_key":"SECRET4"}      {"rest_api_key":"SECRET5"}
+{"password":"hello world"} {"secret":"abc,def"}      {'secretkey': 'abc;def'}
+```
+`[RECONCILE]`·`[WS]`가 allowlist에 있으므로 키움 응답 dict가 로그로
+나가면 토큰이 그대로 번들에 실리는 실질적 유출 경로였음.
+
+**수정 1 — 키 목록 확장**: `token`, `appkey`, `app_key`, `secretkey`,
+`secret_key`, `rest_api_key`, `client_secret`, `client_id` 추가.
+`_KEY_ALT`를 **긴 키부터 정렬**해 생성 — `token`이 `access_token`보다
+먼저 매칭되면 접두사만 남는 부분 매칭이 생기기 때문.
+
+**수정 2 — 값에 공백·쉼표·세미콜론이 있어도 마스킹**: 1I.3의 단일
+정규식은 값 종료 문자에 `\s , ;`가 포함돼 `{"password":"hello world"}`
+같은 값을 놓쳤음. **큰따옴표 / 작은따옴표 / 무따옴표 세 패턴으로
+분리**해, quoted는 닫는 따옴표까지를 값으로 보고 unquoted만 구분자에서
+끊도록 함.
+
+```
+{"token":"SECRET1"}         → {"token":"***"}
+{"appkey":"SECRET2"}        → {"appkey":"***"}
+{"password":"hello world"}  → {"password":"***"}
+{"secret":"abc,def"}        → {"secret":"***"}
+{'secretkey': 'abc;def'}    → {'secretkey': '***'}
+{"access_token":"A","symbol":"005930"} → {"access_token":"***","symbol":"005930"}
+2026-08-06 09:00:01,000 | [COND] 편입: 005930          → 변형 없음
+```
+
+### P1: `process_start_count=0`이어도 COMPLETE로 판정됐음 (재현 확인)
+
+기동 로그가 0건이면 판정 근거 자체가 없는데 `signal_log` 범위만 맞으면
+`COMPLETE`가 됐음. 보고한 기준("정확히 1회 기동")과 불일치.
+`UNKNOWN_START_PARTIAL`을 신설해 구분:
+```
+starts == 0 → UNKNOWN_START_PARTIAL
+starts > 1  → RESTARTED_PARTIAL
+starts == 1 and open_ok and close_ok → COMPLETE
+그 외        → PARTIAL
+```
+
+### P1: accepted 빈 값·부분 인식 처리
+
+- 빈 문자열은 "명시적 거부"가 아니라 **미상**이므로 `False`가 아니라
+  `None`. 알 수 없는 값도 동일. `_TRUE`/`_FALSE` 목록을 명시하고
+  둘 다 아니면 `None`.
+- `any(...)` → `all(...)`: 한 건이라도 판정 불가면 스키마를 신뢰하지
+  않음(fail-closed). `buy_accepted_state_missing_count` 추가.
+
+### P1: order_id 누락 시 unique 수는 N/A
+
+1I.3의 fallback 키에 `idx`가 들어가 **완전히 동일한 중복 행도 별개
+주문**으로 세어졌음 — `unique_accepted_buy_order_count`라는 이름과
+맞지 않음. 분석 메타데이터에서는 보수적 방식을 택해, `order_id`가
+하나라도 없으면 unique 수와 coverage를 `N/A(order_id 누락 있음)`로
+처리하고 행 수(`accepted_buy_order_count`)만 표시.
+
+### P2: 락 PID 생존 확인 + 고유 tmp 경로
+
+- `_lock_owner_alive()` 추가 — 30분이 지나도 **소유 PID가 살아 있으면
+  회수하지 않음**. `os.kill(pid, 0)`으로 확인하며, 판정 불가
+  (`PermissionError`/`OSError`) 시에는 보수적으로 "살아 있다"로 봄.
+  PID 형식을 못 읽으면 구버전 락으로 보고 회수 허용.
+- 임시 ZIP 이름에 `pid + time_ns`를 붙여 동시 실행 시 서로의 임시
+  파일을 덮어쓰지 않게 함.
+
+### 8/6 실데이터 검증
+
+실제 키움 응답 형태를 로그에 주입하고 번들을 만든 뒤 압축 해제 검사:
+```
+주입: {"appkey":"LEAK_APPKEY","secretkey":"LEAK_SECRETKEY"}
+      {"token":"LEAK_TOKEN","access_token":"LEAK_AT","refresh_token":"LEAK_RT"}
+      password="LEAK PW WITH SPACE" api_key=LEAK_APIKEY
+
+결과: 7종 전부 0건 ✅   testzip() = None
+      collection_status           RESTARTED_PARTIAL (기동 2회)
+      session_gate_interpretation INVALID_FOR_THIS_DAY
+      accepted_buy_order_count    N/A (trades.csv 없음)
+      8/5 혼입                     없음        크기 0.5 MB
+```
+
+### 테스트
+
+`test_shadow_analysis.py` 117건 → **157건**:
+- Q(17건) 실제 자격증명 키 — 8개 키가 목록에 포함, JSON/dict 형태
+  마스킹, 공백·쉼표·세미콜론 포함 값, 종목코드·타임스탬프 보존,
+  긴 키 우선 매칭, ZIP 통과 후 appkey/secretkey/token 원문 0건.
+- R(4건) 수집 상태 — 기동 1회 COMPLETE, 0회
+  `UNKNOWN_START_PARTIAL`(+`full_day_collection=False`), 2회
+  `RESTARTED_PARTIAL`.
+- S(4건) accepted 빈 값 → SCHEMA_WARNING + 판정 불가 건수,
+  전부 인식 시 정상 집계.
+- T(3건) order_id 누락 시 unique N/A, 행 수는 보존, coverage N/A.
+- U(5건) 락 — 살아 있는 PID는 회수 금지, 죽은 PID는 회수,
+  고유 tmp 경로, `_lock_owner_alive` 동작.
+
+1I.3에서 추가한 O-1은 정책이 바뀌어 갱신함(3건 집계 → N/A + 행 수).
+
+**전체 회귀**: 13개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+
+---
+

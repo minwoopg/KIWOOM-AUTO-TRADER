@@ -521,6 +521,257 @@ lock2.unlink()
 check("K-4) 락 파일에 pid와 생성시각이 기록됨",
       (lambda: (_run_export(root2, "2026-08-06"), True)[1])())
 
+# ══════════════════════════════════════════════════════════════
+# 1I.3: JSON 토큰 마스킹 · session 해석 기준 · fail-closed (GPT 리뷰)
+# ══════════════════════════════════════════════════════════════
+# P0 재현(수정 전): {"access_token":"SECRET123456789"} 가 그대로 남음
+check("L-1) JSON 큰따옴표 형태 access_token 마스킹",
+      B.mask('{"access_token":"SECRET123456789"}') == '{"access_token":"***"}')
+check("L-2) 공백 있는 JSON refresh_token 마스킹",
+      B.mask('{"refresh_token": "REFRESH123456789"}') == '{"refresh_token": "***"}')
+check("L-3) Python dict 작은따옴표 api_key 마스킹",
+      B.mask("{'api_key': 'KEY123456789'}") == "{'api_key': '***'}")
+check("L-4) 같은 JSON에서 password는 마스킹, 종목코드는 보존",
+      B.mask('{"password":"PW123","symbol":"005930"}')
+      == '{"password":"***","symbol":"005930"}')
+check("L-5) 기존 key=value 형태도 계속 마스킹",
+      B.mask("access_token=PLAIN123") == "access_token=***")
+check("L-6) JSON 안의 Bearer 토큰도 마스킹",
+      "SECRET123456789" not in B.mask('{"authorization":"Bearer SECRET123456789"}'))
+check("L-7) 로그 타임스탬프·종목코드는 변형되지 않음",
+      B.mask("2026-08-06 09:00:01,000 | INFO | [COND] 편입: 005930")
+      == "2026-08-06 09:00:01,000 | INFO | [COND] 편입: 005930")
+
+# ZIP까지 통과시켜 실제 원문이 남지 않는지 검사
+root3 = Path(tempfile.mkdtemp())
+_mkday(root3, "signal_log.csv", ["timestamp", "symbol"],
+       [{"timestamp": "2026-08-06T09:00:30", "symbol": "005930"}])
+(root3 / "logs" / "app.log").write_text(
+    '2026-08-06 09:00:01,000 | INFO | [RECONCILE] resp={"access_token":"SECRET_TOKEN_A",'
+    '"refresh_token":"SECRET_TOKEN_B","api_key":"SECRET_TOKEN_C"}\n'
+    "2026-08-06 09:00:02,000 | INFO | [COND] 편입: 005930\n", encoding="utf-8")
+z3 = _run_export(root3, "2026-08-06")
+blob3 = "".join(_zip_texts(z3).values())
+check("L-8) ZIP 안에 access_token 원문이 없음", "SECRET_TOKEN_A" not in blob3)
+check("L-9) ZIP 안에 refresh_token 원문이 없음", "SECRET_TOKEN_B" not in blob3)
+check("L-10) ZIP 안에 api_key 원문이 없음", "SECRET_TOKEN_C" not in blob3)
+check("L-11) 같은 줄의 정상 로그는 보존됨",
+      "005930" in _zip_texts(z3)["raw/app_analysis_20260806.log"])
+
+
+# ── M. session 해석 기준 (P1-1) ────────────────────────────────
+# SESSION_SHADOW 로그에는 ready=True가 있지만 BUY 후보에는 0건인 상황
+(root3 / "logs" / "app.log").write_text(
+    "".join(f"2026-08-06 09:{i:02d}:00,000 | INFO | [SESSION_SHADOW] 005930 "
+            f"ready=True reason=COMPLETE_FROM_OPEN\n" for i in range(10)), encoding="utf-8")
+_mkday(root3, "entry_quality_shadow.csv",
+       ["timestamp", "symbol", "session_metrics_ready", "order_attempted", "order_accepted"],
+       [{"timestamp": "2026-08-06T10:00:00", "symbol": "005930",
+         "session_metrics_ready": "False", "order_attempted": "True",
+         "order_accepted": "True"}])
+z3 = _run_export(root3, "2026-08-06")
+q3 = _zip_texts(z3)["metadata/collection_quality.txt"]
+check("M-1) 로그 ready=True 10건이어도 BUY 후보 0건이면 해석 불가",
+      "session_gate_interpretation           = INVALID_FOR_THIS_DAY" in q3)
+check("M-2) 로그 이벤트 기준 상태는 진단용으로 별도 유지",
+      "session_state_collection_status       = COLLECTING" in q3)
+check("M-3) shadow 후보 기준 ready 수가 0으로 집계",
+      "shadow_candidate_session_ready_count  = 0" in q3)
+
+# BUY 후보에 ready=True가 있으면 AVAILABLE
+_mkday(root3, "entry_quality_shadow.csv",
+       ["timestamp", "symbol", "session_metrics_ready", "order_attempted", "order_accepted"],
+       [{"timestamp": "2026-08-06T10:00:00", "symbol": "005930",
+         "session_metrics_ready": "True", "order_attempted": "True",
+         "order_accepted": "True"}])
+z3 = _run_export(root3, "2026-08-06")
+q3b = _zip_texts(z3)["metadata/collection_quality.txt"]
+check("M-4) BUY 후보에 ready=True가 있으면 AVAILABLE",
+      "session_gate_interpretation           = AVAILABLE" in q3b)
+
+
+# ── N. accepted 스키마 fail-closed (P1-2) ──────────────────────
+_mkday(root3, "trades.csv", ["timestamp", "symbol", "side"],
+       [{"timestamp": "2026-08-06T09:30:00", "symbol": "005930", "side": "BUY"}])
+z3 = _run_export(root3, "2026-08-06")
+q3c = _zip_texts(z3)["metadata/collection_quality.txt"]
+check("N-1) accepted 컬럼이 없으면 수락 수를 추정하지 않고 N/A",
+      "accepted_buy_order_count              = N/A(SCHEMA_WARNING)" in q3c)
+check("N-2) SCHEMA_WARNING이 명시됨", "SCHEMA_WARNING: accepted 컬럼 없음" in q3c)
+check("N-3) coverage도 N/A 처리",
+      "shadow_to_actual_buy_coverage         = N/A" in q3c)
+
+
+# ── O. order_id 누락 처리 (P1-3) ───────────────────────────────
+_mkday(root3, "trades.csv", ["timestamp", "symbol", "side", "accepted", "order_id", "price"], [
+    {"timestamp": "2026-08-06T09:30:00", "symbol": "005930", "side": "BUY",
+     "accepted": "True", "order_id": "O1", "price": "100"},
+    {"timestamp": "2026-08-06T09:31:00", "symbol": "005930", "side": "BUY",
+     "accepted": "True", "order_id": "", "price": "200"},
+    {"timestamp": "2026-08-06T09:32:00", "symbol": "005930", "side": "BUY",
+     "accepted": "True", "order_id": "", "price": "300"},
+])
+z3 = _run_export(root3, "2026-08-06")
+q3d = _zip_texts(z3)["metadata/collection_quality.txt"]
+# 2026-08-06 (1I.4 정책 변경): 1I.3에서는 fallback 키에 idx를 넣어
+# 3건으로 셌지만, 그러면 완전히 동일한 중복 행도 별개 주문이 되어
+# "unique"라는 이름과 맞지 않음. 이제 order_id가 하나라도 없으면
+# unique는 N/A로 처리하고 행 수만 표시한다.
+check("O-1) order_id 누락 시 unique는 N/A, 행 수는 3건으로 보존",
+      "unique_accepted_buy_order_count       = N/A(order_id 누락 있음)" in q3d
+      and "accepted_buy_order_count              = 3" in q3d)
+check("O-2) order_id 누락 건수가 경고로 기록됨",
+      "accepted_buy_missing_order_id_count   = 2" in q3d)
+check("O-3) shadow 쪽 order_id 누락 건수도 기록됨",
+      "shadow_accepted_missing_order_id_count" in q3d)
+
+
+# ── P. 락 소유권 (P2) ──────────────────────────────────────────
+lock3 = root3 / "exports" / "bundle_20260806.lock"
+lock3.write_text("pid=99999 created=other nonce=1")
+os.utime(lock3, (time.time() - 3600, time.time() - 3600))
+res3 = _run_export(root3, "2026-08-06")
+check("P-1) stale lock은 회수되어 export가 진행됨", res3 is not None)
+# 남의 락은 지우지 않아야 함
+lock3.write_text("pid=99999 created=other nonce=1")
+_run_export(root3, "2026-08-06")   # 락 충돌로 물러남
+check("P-2) 다른 프로세스의 락을 자신의 finally에서 지우지 않음", lock3.exists())
+lock3.unlink()
+check("P-3) 정상 종료 후 자신의 락은 해제됨",
+      _run_export(root3, "2026-08-06") is not None and not lock3.exists())
+
+# ══════════════════════════════════════════════════════════════
+# 1I.4: 실제 키움 자격증명 키 · 판정 기준 · fail-closed (GPT 리뷰)
+# ══════════════════════════════════════════════════════════════
+# P0 재현(수정 전): {"token":"SECRET1"} / {"appkey":…} / {"secretkey":…}
+# 가 전부 원문 유지 — kiwoom_broker.py가 실제로 쓰는 키였음.
+for _k in ("token", "appkey", "secretkey", "app_key", "secret_key",
+           "rest_api_key", "client_secret", "client_id"):
+    check(f"Q-1) 실제 자격증명 키 '{_k}'가 마스킹 목록에 포함됨", _k in B.SENSITIVE_KEYS)
+
+check("Q-2) JSON token 마스킹", B.mask('{"token":"SECRET1"}') == '{"token":"***"}')
+check("Q-3) JSON appkey 마스킹", B.mask('{"appkey":"SECRET2"}') == '{"appkey":"***"}')
+check("Q-4) JSON secretkey 마스킹", B.mask('{"secretkey":"SECRET3"}') == '{"secretkey":"***"}')
+check("Q-5) JSON app_key 마스킹", B.mask('{"app_key":"SECRET4"}') == '{"app_key":"***"}')
+check("Q-6) JSON secret_key 마스킹", B.mask('{"secret_key":"S5"}') == '{"secret_key":"***"}')
+check("Q-7) JSON rest_api_key 마스킹",
+      B.mask('{"rest_api_key":"S6"}') == '{"rest_api_key":"***"}')
+check("Q-8) 값에 공백이 있어도 마스킹",
+      B.mask('{"password":"hello world"}') == '{"password":"***"}')
+check("Q-9) 값에 쉼표가 있어도 마스킹",
+      B.mask('{"secret":"abc,def"}') == '{"secret":"***"}')
+check("Q-10) 작은따옴표 + 세미콜론 값도 마스킹",
+      B.mask("{'secretkey': 'abc;def'}") == "{'secretkey': '***'}")
+check("Q-11) 같은 JSON의 종목코드는 보존",
+      B.mask('{"access_token":"A","symbol":"005930"}')
+      == '{"access_token":"***","symbol":"005930"}')
+check("Q-12) 로그 타임스탬프는 변형되지 않음",
+      B.mask("2026-08-06 09:00:01,000 | INFO | [COND] 편입: 005930")
+      == "2026-08-06 09:00:01,000 | INFO | [COND] 편입: 005930")
+check("Q-13) 긴 키가 짧은 키보다 먼저 매칭됨(access_token이 token으로 쪼개지지 않음)",
+      B.mask('{"access_token":"X"}') == '{"access_token":"***"}')
+
+# ZIP까지 통과시켜 실제 키움 응답 형태의 원문이 남지 않는지
+root4 = Path(tempfile.mkdtemp())
+_mkday(root4, "signal_log.csv", ["timestamp", "symbol"],
+       [{"timestamp": "2026-08-06T09:00:30", "symbol": "005930"},
+        {"timestamp": "2026-08-06T15:19:00", "symbol": "005930"}])
+(root4 / "logs" / "app.log").write_text(
+    '2026-08-06 09:00:01,000 | INFO | [COND] watcher.start() 진입 — WebSocket 연결 시작\n'
+    '2026-08-06 09:00:02,000 | INFO | [RECONCILE] req={"appkey":"KIWOOM_A","secretkey":"KIWOOM_B"}\n'
+    '2026-08-06 09:00:03,000 | INFO | [WS] resp={"token":"KIWOOM_C","expires_dt":"20260807"}\n'
+    '2026-08-06 09:00:04,000 | INFO | [COND] 편입: 005930\n', encoding="utf-8")
+z4 = _run_export(root4, "2026-08-06")
+blob4 = "".join(_zip_texts(z4).values())
+check("Q-14) ZIP에 appkey 원문 없음", "KIWOOM_A" not in blob4)
+check("Q-15) ZIP에 secretkey 원문 없음", "KIWOOM_B" not in blob4)
+check("Q-16) ZIP에 token 원문 없음", "KIWOOM_C" not in blob4)
+check("Q-17) 정상 로그는 보존됨",
+      "005930" in _zip_texts(z4)["raw/app_analysis_20260806.log"])
+
+
+# ── R. 수집 상태 판정 (P1) ─────────────────────────────────────
+q4 = _zip_texts(z4)["metadata/collection_quality.txt"]
+check("R-1) 기동 1회 + signal 09:00~15:19면 COMPLETE",
+      "collection_status                     = COMPLETE" in q4)
+
+# 기동 로그 0건
+(root4 / "logs" / "app.log").write_text(
+    "2026-08-06 09:00:04,000 | INFO | [COND] 편입: 005930\n", encoding="utf-8")
+q4b = _zip_texts(_run_export(root4, "2026-08-06"))["metadata/collection_quality.txt"]
+check("R-2) 기동 로그 0건이면 COMPLETE로 판정하지 않음",
+      "collection_status                     = UNKNOWN_START_PARTIAL" in q4b)
+check("R-3) full_day_collection도 False", "full_day_collection                   = False" in q4b)
+
+# 기동 2회
+(root4 / "logs" / "app.log").write_text(
+    "2026-08-06 09:00:01,000 | INFO | [COND] watcher.start() 진입 — WebSocket 연결 시작\n"
+    "2026-08-06 10:00:01,000 | INFO | [COND] watcher.start() 진입 — WebSocket 연결 시작\n",
+    encoding="utf-8")
+q4c = _zip_texts(_run_export(root4, "2026-08-06"))["metadata/collection_quality.txt"]
+check("R-4) 기동 2회면 RESTARTED_PARTIAL",
+      "collection_status                     = RESTARTED_PARTIAL" in q4c)
+
+
+# ── S. accepted 빈 값 / 부분 인식 (P1) ─────────────────────────
+_mkday(root4, "trades.csv", ["timestamp", "symbol", "side", "accepted", "order_id"], [
+    {"timestamp": "2026-08-06T09:30:00", "symbol": "005930", "side": "BUY",
+     "accepted": "True", "order_id": "O1"},
+    {"timestamp": "2026-08-06T09:31:00", "symbol": "005930", "side": "BUY",
+     "accepted": "", "order_id": "O2"},
+])
+q4d = _zip_texts(_run_export(root4, "2026-08-06"))["metadata/collection_quality.txt"]
+check("S-1) accepted 빈 값은 거부가 아니라 미상으로 처리돼 스키마 경고",
+      "accepted_buy_order_count              = N/A(SCHEMA_WARNING)" in q4d)
+check("S-2) 판정 불가 건수가 별도 기록됨",
+      "buy_accepted_state_missing_count      = 1" in q4d)
+
+# 전부 인식 가능하면 정상 집계
+_mkday(root4, "trades.csv", ["timestamp", "symbol", "side", "accepted", "order_id"], [
+    {"timestamp": "2026-08-06T09:30:00", "symbol": "005930", "side": "BUY",
+     "accepted": "True", "order_id": "O1"},
+    {"timestamp": "2026-08-06T09:31:00", "symbol": "005930", "side": "BUY",
+     "accepted": "False", "order_id": "O2"},
+])
+q4e = _zip_texts(_run_export(root4, "2026-08-06"))["metadata/collection_quality.txt"]
+check("S-3) 전부 판정 가능하면 accepted 1건으로 집계",
+      "accepted_buy_order_count              = 1" in q4e)
+check("S-4) order_id가 모두 있으면 unique 수가 산출됨",
+      "unique_accepted_buy_order_count       = 1" in q4e)
+
+
+# ── T. order_id 누락 시 unique는 N/A (P1) ──────────────────────
+_mkday(root4, "trades.csv", ["timestamp", "symbol", "side", "accepted", "order_id"], [
+    {"timestamp": "2026-08-06T09:30:00", "symbol": "005930", "side": "BUY",
+     "accepted": "True", "order_id": "O1"},
+    {"timestamp": "2026-08-06T09:31:00", "symbol": "005930", "side": "BUY",
+     "accepted": "True", "order_id": ""},
+])
+q4f = _zip_texts(_run_export(root4, "2026-08-06"))["metadata/collection_quality.txt"]
+check("T-1) order_id가 하나라도 없으면 unique 수를 N/A로 처리",
+      "unique_accepted_buy_order_count       = N/A(order_id 누락 있음)" in q4f)
+check("T-2) 행 수(accepted_buy_order_count)는 그대로 표시",
+      "accepted_buy_order_count              = 2" in q4f)
+check("T-3) coverage도 N/A", "shadow_to_actual_buy_coverage         = N/A" in q4f)
+
+
+# ── U. 락 PID 생존 확인 + 고유 tmp (P2) ────────────────────────
+lock4 = root4 / "exports" / "bundle_20260806.lock"
+lock4.write_text(f"pid={os.getpid()} created=x nonce=1")
+os.utime(lock4, (time.time() - 3600, time.time() - 3600))
+check("U-1) 30분 지나도 소유 PID가 살아 있으면 회수하지 않음",
+      _run_export(root4, "2026-08-06") is None)
+check("U-2) 살아 있는 소유자의 락은 삭제되지 않음", lock4.exists())
+lock4.write_text("pid=2147480000 created=x nonce=1")   # 존재하지 않는 PID
+os.utime(lock4, (time.time() - 3600, time.time() - 3600))
+check("U-3) 죽은 PID의 stale lock은 회수됨",
+      _run_export(root4, "2026-08-06") is not None)
+check("U-4) 임시 ZIP 경로가 고유(pid+nonce)해 동시 실행 시 충돌하지 않음",
+      not list((root4 / "exports").glob("*.zip.tmp")))
+check("U-5) _lock_owner_alive가 살아 있는 PID를 True로 판정",
+      (lambda p: (p.write_text(f"pid={os.getpid()}"), B._lock_owner_alive(p))[1])(
+          root4 / "exports" / "probe.lock"))
+
 print()
 print(f"[최종] 총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
 if failed:

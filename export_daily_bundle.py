@@ -74,14 +74,42 @@ LOG_TAGS: tuple[str, ...] = (
 # ── 민감정보 마스킹 ─────────────────────────────────────────────
 # 키 기반 우선 — 날짜·시간·종목코드까지 무차별로 지우지 않기 위해.
 SENSITIVE_KEYS = (
-    "authorization", "bearer", "access_token", "refresh_token",
-    "api_key", "apikey", "secret", "password", "passwd",
+    "authorization", "bearer",
+    # 2026-08-06 (1I.4, GPT 코드리뷰 P0, 재현 확인): 아래 키들이
+    # 목록에 없어서 실제 키움 API 자격증명이 전부 누출됐음.
+    #   infra/broker/kiwoom_broker.py:90-91 {"appkey":…, "secretkey":…}
+    #   infra/broker/kiwoom_broker.py:107   token = body.get("token")
+    #   infra/notify/kakao_notifier.py      rest_api_key, client_id
+    # 재현: {"token":"SECRET1"} / {"appkey":"SECRET2"} /
+    #       {"secretkey":"SECRET3"} 모두 원문 유지.
+    "token", "access_token", "refresh_token",
+    "appkey", "app_key", "secretkey", "secret_key",
+    "api_key", "apikey", "rest_api_key", "client_secret", "client_id",
+    "secret", "password", "passwd",
     "account_number", "account_no", "accountno", "account",
     "계좌번호", "계좌",
 )
-_KEY_ALT = "|".join(re.escape(k) for k in SENSITIVE_KEYS)
-# key=value / key: value / key="value" 형태의 값만 치환
-_KV_RE = re.compile(rf"(?i)({_KEY_ALT})(\s*[=:]\s*)([\"']?)([^\s\"',;)]+)\3")
+# 긴 키부터 정렬 — "token"이 "access_token"보다 먼저 매칭되면
+# 접두사만 남는 부분 매칭이 생기므로.
+_KEY_ALT = "|".join(re.escape(k) for k in sorted(SENSITIVE_KEYS, key=len, reverse=True))
+
+# 2026-08-06 (1I.4, GPT 지적): 단일 정규식으로 quoted/unquoted를
+# 모두 처리하려다 값 종료 문자에 공백·쉼표·세미콜론이 포함돼
+# {"password":"hello world"} / {"secret":"abc,def"} 같은 값이
+# 마스킹되지 않았음. **큰따옴표 / 작은따옴표 / 무따옴표 세 패턴으로
+# 분리**하는 편이 안정적이라 그렇게 구현함.
+#
+# quoted 패턴은 닫는 따옴표까지를 값으로 보므로 공백·쉼표·세미콜론이
+# 들어가도 전부 가려짐. unquoted 패턴만 구분자에서 값을 끊음.
+_DQ_KV_RE = re.compile(
+    rf'(?i)(?P<kq>"?)(?P<key>{_KEY_ALT})(?P=kq)(?P<sep>\s*[:=]\s*)"(?P<val>[^"]*)"'
+)
+_SQ_KV_RE = re.compile(
+    rf"(?i)(?P<kq>'?)(?P<key>{_KEY_ALT})(?P=kq)(?P<sep>\s*[:=]\s*)'(?P<val>[^']*)'"
+)
+_UQ_KV_RE = re.compile(
+    rf'(?i)(?P<key>{_KEY_ALT})(?P<sep>\s*[:=]\s*)(?P<val>[^\s,;}}\)\]"\']+)'
+)
 # "Bearer <token>" 처럼 키 뒤에 공백으로 이어지는 형태
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}")
 # 계좌번호 형태 — 8자리-2자리
@@ -91,10 +119,24 @@ _ACCT_DASH_RE = re.compile(r"\b\d{8}-\d{2}\b")
 _ACCT_LONG_RE = re.compile(r"(?<!\d)\d{10,13}(?!\d)")
 
 
+def _mask_dq(m: "re.Match") -> str:
+    return f'{m.group("kq")}{m.group("key")}{m.group("kq")}{m.group("sep")}"***"'
+
+
+def _mask_sq(m: "re.Match") -> str:
+    return f"{m.group('kq')}{m.group('key')}{m.group('kq')}{m.group('sep')}'***'"
+
+
+def _mask_uq(m: "re.Match") -> str:
+    return f'{m.group("key")}{m.group("sep")}***'
+
+
 def mask(line: str) -> str:
-    """민감정보를 가립니다. 키 기반 → 형태 기반 순서로 적용."""
+    """민감정보를 가립니다. quoted → Bearer → unquoted → 형태 순서."""
+    line = _DQ_KV_RE.sub(_mask_dq, line)
+    line = _SQ_KV_RE.sub(_mask_sq, line)
     line = _BEARER_RE.sub("Bearer ***", line)
-    line = _KV_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}***{m.group(3)}", line)
+    line = _UQ_KV_RE.sub(_mask_uq, line)
     line = _ACCT_DASH_RE.sub("***", line)
     line = _ACCT_LONG_RE.sub("***", line)
     return line
@@ -188,6 +230,48 @@ def slice_log(sources: list[Path], dst: Path, target: date) -> tuple[int, int, l
 
 
 # ── 수집 품질 메타데이터 ────────────────────────────────────────
+def _lock_owner_alive(lock_path: Path) -> bool:
+    """락 소유 프로세스가 아직 살아 있는지 확인합니다.
+
+    2026-08-06 (1I.4, GPT 지적 P2): 30분이 지나면 소유 프로세스가
+    살아 있어도 새 프로세스가 락을 제거하고 진입할 수 있었음.
+    PID가 살아 있으면 stale로 보지 않는다(판정 불가 시에는 보수적
+    으로 "살아 있다"고 보아 회수하지 않음).
+    """
+    try:
+        text = lock_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return False
+    m = re.search(r"pid=(\d+)", text)
+    if not m:
+        return False          # 형식을 모르면 회수 허용(구버전 락)
+    try:
+        os.kill(int(m.group(1)), 0)
+        return True           # 살아 있음 → 회수 금지
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True           # 남의 소유 프로세스가 실재 → 회수 금지
+    except OSError:
+        return True
+
+
+def _identity(r: dict, idx: int) -> tuple:
+    """수락된 주문의 고유 식별자.
+
+    2026-08-06 (1I.3, GPT 지적 P1-3): order_id 집합 크기로 세면
+    ID가 없는 주문이 통째로 사라졌음(accepted 10건 중 8건만 ID →
+    8건으로 집계). ID가 없으면 행 고유값으로 대체하고, 누락 건수는
+    별도 경고 필드로 남긴다.
+    """
+    oid = str(r.get("order_id") or "").strip()
+    if oid:
+        return ("order_id", oid)
+    return ("fallback", str(r.get("timestamp", "")), str(r.get("symbol", "")),
+            str(r.get("side", "")), str(r.get("quantity", "")),
+            str(r.get("price", "")), idx)
+
+
 def _first_last_ts(rows: list[dict], col: str) -> tuple[str, str]:
     vals = [str(r.get(col) or "") for r in rows if str(r.get(col) or "")]
     return (vals[0], vals[-1]) if vals else ("", "")
@@ -237,9 +321,10 @@ def build_collection_quality(target: date, log_lines: list[str],
     sh_accepted_rows = [r for r in shadow_rows
                         if str(r.get("order_accepted", "")).lower() == "true"]
     sh_accepted = len(sh_accepted_rows)
-    sh_accept_ids = {str(r.get("order_id", "")) for r in sh_accepted_rows
-                     if str(r.get("order_id", ""))}
-    sh_accepted_uniq = len(sh_accept_ids) if sh_accept_ids else sh_accepted
+    sh_missing_id = sum(1 for r in sh_accepted_rows if not str(r.get("order_id") or "").strip())
+    sh_id_complete = all(str(r.get("order_id") or "").strip() for r in sh_accepted_rows)
+    sh_accepted_uniq = (len({_identity(r, i) for i, r in enumerate(sh_accepted_rows)})
+                        if sh_id_complete else None)
     # 2026-08-06 (1I.2, GPT 지적 P1-2): side=BUY만 세면 브로커가
     # 거부한 주문까지 "실제 매수"로 집계돼 coverage가 왜곡됨.
     # accepted=True인 주문만 세고, order_id로 유니크 처리.
@@ -247,16 +332,45 @@ def build_collection_quality(target: date, log_lines: list[str],
         return any(str(r.get(k, "")).upper() in ("BUY", "매수")
                    for k in ("side", "type", "구분", "order_type"))
 
-    def _is_accepted(r: dict) -> bool:
+    # 2026-08-06 (1I.3, GPT 지적 P1-2): accepted 컬럼이 없으면 예전엔
+    # 모든 BUY를 수락으로 간주했는데, export의 원칙이 fail-closed이므로
+    # **모르는 주문을 체결로 추정하면 안 됨**. None을 돌려 N/A 처리하고
+    # SCHEMA_WARNING을 남긴다.
+    # 2026-08-06 (1I.4, GPT 지적 P1): 빈 문자열은 "명시적 거부"가
+    # 아니라 "미상"이므로 False가 아니라 None으로 처리해야 함.
+    # 알 수 없는 값도 마찬가지.
+    _TRUE = ("true", "1", "y", "yes", "성공", "ok")
+    _FALSE = ("false", "0", "n", "no", "실패", "거부")
+
+    def _accepted_state(r: dict) -> bool | None:
         for k in ("accepted", "order_accepted", "success", "is_success"):
             if k in r:
-                return str(r.get(k, "")).lower() in ("true", "1", "y", "yes", "성공")
-        return True  # accepted 컬럼이 없는 스키마면 보수적으로 포함
+                raw = str(r.get(k) or "").strip().lower()
+                if raw in _TRUE:
+                    return True
+                if raw in _FALSE:
+                    return False
+                return None
+        return None
 
+    # 2026-08-06 (1I.3, GPT 지적 P1-3): order_id가 일부에만 있으면
+    # ID 집합 크기로 세다가 ID 없는 주문이 통째로 사라졌음
+    # (accepted 10건 중 8건만 ID → 8건으로 집계). ID가 없으면
+    # 행 고유값으로 대체하고, 누락 건수를 별도 경고로 남긴다.
     buy_attempts = [r for r in trades_rows if _is_buy(r)]
-    buy_accepted = [r for r in buy_attempts if _is_accepted(r)]
-    buy_ids = {str(r.get("order_id", "")) for r in buy_accepted if str(r.get("order_id", ""))}
-    buys = len(buy_ids) if buy_ids else len(buy_accepted)
+    accepted_states = [_accepted_state(r) for r in buy_attempts]
+    # fail-closed — 한 건이라도 판정 불가면 스키마를 신뢰하지 않는다.
+    accepted_state_missing = sum(1 for st in accepted_states if st is None)
+    accepted_schema_ok = not buy_attempts or accepted_state_missing == 0
+    buy_accepted = [r for r, st in zip(buy_attempts, accepted_states) if st is True]
+    buy_missing_id = sum(1 for r in buy_accepted if not str(r.get("order_id") or "").strip())
+    # 2026-08-06 (1I.4, GPT 지적 P1): fallback에 idx가 들어가 완전히
+    # 동일한 중복 행도 서로 다른 주문으로 세어졌음 —
+    # "unique_accepted_buy_order_count"라는 이름과 맞지 않음.
+    # 분석 메타데이터에서는 보수적 방식을 택해, order_id가 하나라도
+    # 없으면 unique 수와 coverage를 N/A로 처리하고 행 수만 표시한다.
+    buy_id_complete = all(str(r.get("order_id") or "").strip() for r in buy_accepted)
+    buys = len({_identity(r, i) for i, r in enumerate(buy_accepted)}) if buy_id_complete else None
     reliable = sum(1 for r in shadow_rows
                    if str(r.get("condition_source_reliable", "")).lower() == "true")
 
@@ -269,14 +383,29 @@ def build_collection_quality(target: date, log_lines: list[str],
     # 별도 coverage 정보로만 남김.
     open_ok = bool(sig_first) and sig_first[11:16] <= "09:02"
     close_ok = bool(sig_last) and sig_last[11:16] >= "15:15"
-    if starts > 1:
+    # 2026-08-06 (1I.4, GPT 지적 P1, 재현 확인): 기동 로그가 0건이어도
+    # signal_log 범위만 맞으면 COMPLETE가 됐음. 보고한 판정 기준은
+    # "프로세스 재시작 없음"이 아니라 "정확히 1회 기동"이어야 하고,
+    # 로그가 아예 없는 경우는 판정 근거 자체가 없으므로 따로 구분한다.
+    if starts == 0:
+        status = "UNKNOWN_START_PARTIAL"
+    elif starts > 1:
         status = "RESTARTED_PARTIAL"
     elif open_ok and close_ok:
         status = "COMPLETE"
     else:
         status = "PARTIAL"
 
-    session_interp = "AVAILABLE" if ready_true > 0 else "INVALID_FOR_THIS_DAY"
+    # 2026-08-06 (1I.3, GPT 지적 P1-1): 예전엔 [SESSION_SHADOW] 로그
+    # 이벤트 수(ready_true)로 판정했는데, session VWAP 게이트 성과
+    # 분석의 실제 모집단은 **entry_quality_shadow의 legacy BUY 후보
+    # 중 ready=True**임. HOLD 평가에서는 ready=True가 있어도 BUY
+    # 후보에서 0건이면 분석 표본이 없으므로 AVAILABLE이라 하면 안 됨.
+    # 로그 이벤트 기준 상태는 진단용으로 따로 남김.
+    session_state_status = "COLLECTING" if ready_true > 0 else "NO_COMPLETE_SESSION"
+    sh_ready = sum(1 for r in shadow_rows
+                   if str(r.get("session_metrics_ready", "")).lower() == "true")
+    session_interp = "AVAILABLE" if sh_ready > 0 else "INVALID_FOR_THIS_DAY"
     rolling_interp = ("AVAILABLE" if status == "COMPLETE"
                       else "AVAILABLE_WITH_COVERAGE_LIMIT")
 
@@ -303,13 +432,26 @@ def build_collection_quality(target: date, log_lines: list[str],
     add("shadow_last_candidate_ts", sh_last or "N/A")
     L.append("")
     add("buy_order_attempt_count", len(buy_attempts) if trades_rows else "N/A(trades.csv 없음)")
-    add("accepted_buy_order_count", len(buy_accepted) if trades_rows else "N/A")
-    add("unique_accepted_buy_order_count", buys if trades_rows else "N/A")
+    if not trades_rows:
+        add("accepted_buy_order_count", "N/A")
+        add("unique_accepted_buy_order_count", "N/A")
+    elif not accepted_schema_ok:
+        add("accepted_buy_order_count", "N/A(SCHEMA_WARNING)")
+        add("unique_accepted_buy_order_count", "N/A(SCHEMA_WARNING)")
+        add("trades_accepted_schema", "SCHEMA_WARNING: accepted 컬럼 없음 — 수락 여부 판정 불가")
+    else:
+        add("accepted_buy_order_count", len(buy_accepted))
+        add("unique_accepted_buy_order_count",
+            buys if buys is not None else "N/A(order_id 누락 있음)")
+    add("accepted_buy_missing_order_id_count", buy_missing_id if trades_rows else "N/A")
+    add("buy_accepted_state_missing_count", accepted_state_missing if trades_rows else "N/A")
     add("shadow_order_attempt_count", attempts)
     add("shadow_order_accepted_count", sh_accepted)
-    add("shadow_unique_accepted_order_count", sh_accepted_uniq)
+    add("shadow_unique_accepted_order_count",
+        sh_accepted_uniq if sh_accepted_uniq is not None else "N/A(order_id 누락 있음)")
+    add("shadow_accepted_missing_order_id_count", sh_missing_id)
     # 같은 개념끼리 비교 — shadow accepted ÷ trades accepted BUY
-    if trades_rows and buys:
+    if trades_rows and accepted_schema_ok and buys and sh_accepted_uniq is not None:
         add("shadow_to_actual_buy_coverage",
             f"{sh_accepted_uniq}/{buys} ({sh_accepted_uniq / buys * 100:.0f}%)")
     else:
@@ -323,8 +465,6 @@ def build_collection_quality(target: date, log_lines: list[str],
     add("session_ready_log_event_ratio",
         f"{ready_true}/{ready_total} ({ready_true / ready_total * 100:.1f}%)"
         if ready_total else "N/A")
-    sh_ready = sum(1 for r in shadow_rows
-                   if str(r.get("session_metrics_ready", "")).lower() == "true")
     add("shadow_candidate_session_ready_count", sh_ready)
     add("shadow_candidate_session_ready_ratio",
         f"{sh_ready}/{len(shadow_rows)} ({sh_ready / len(shadow_rows) * 100:.1f}%)"
@@ -337,6 +477,7 @@ def build_collection_quality(target: date, log_lines: list[str],
     add("cond_truncate_event_count", len(truncate_lines))
     add("max_truncated_condition_count", max_trunc)
     L.append("")
+    add("session_state_collection_status", session_state_status)
     add("session_gate_interpretation", session_interp)
     add("rolling_gate_interpretation", rolling_interp)
     L.append("")
@@ -372,15 +513,21 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
     # 2026-08-06 (1I.2, GPT 지적 P2): 프로세스가 강제 종료되면 락이
     # 남아 이후 export가 영구히 거부됨. 정상 export는 수 분 이상
     # 걸리지 않으므로 30분을 stale 기준으로 보고 회수한다.
+    # 2026-08-06 (1I.3, GPT 지적 P2): 락에 고유 토큰을 기록하고
+    # 해제 시 자신이 만든 것일 때만 삭제 — 30분 초과 프로세스 A의
+    # 락을 B가 회수한 뒤, A가 finally에서 B의 락까지 지워 C가 동시
+    # 진입하는 경계 상황을 막기 위함.
+    lock_token = f"pid={os.getpid()} created={datetime.now().isoformat()} nonce={time.time_ns()}"
     if lock_path.exists():
         age = time.time() - lock_path.stat().st_mtime
-        if age > STALE_LOCK_SECONDS:
+        if age > STALE_LOCK_SECONDS and not _lock_owner_alive(lock_path):
             if not quiet:
                 print(f"⚠ stale lock 감지({age / 60:.0f}분 경과) — 제거 후 재시도합니다.")
+            # 회수는 quiet 여부와 무관하게 수행
             lock_path.unlink(missing_ok=True)
     try:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, f"pid={os.getpid()} created={datetime.now().isoformat()}\n".encode())
+        os.write(fd, lock_token.encode())
         os.close(fd)
     except FileExistsError:
         if not quiet:
@@ -388,7 +535,9 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
         return None
 
     work = Path(tempfile.mkdtemp(prefix=f"bundle_{day_compact}_", dir=str(EXPORTS_DIR)))
-    tmp_zip = EXPORTS_DIR / f"bundle_{day_compact}.zip.tmp"
+    # 2026-08-06 (1I.4, GPT 지적 P2): 고정 tmp 이름은 두 실행이
+    # 겹칠 때 서로의 임시 파일을 덮어쓸 수 있으므로 nonce를 붙임.
+    tmp_zip = EXPORTS_DIR / f"bundle_{day_compact}.{os.getpid()}-{time.time_ns()}.zip.tmp"
     try:
         manifest: list[str] = []
         counts: dict[str, int] = {}
@@ -508,7 +657,11 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
         shutil.rmtree(work, ignore_errors=True)
         if tmp_zip.exists():
             tmp_zip.unlink()
-        lock_path.unlink(missing_ok=True)
+        try:
+            if lock_path.read_text(encoding="utf-8").strip() == lock_token.strip():
+                lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _force_utf8_stdout() -> None:
