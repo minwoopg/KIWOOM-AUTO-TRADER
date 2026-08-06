@@ -3581,3 +3581,268 @@ VWAP 미수집 경고, 빈 CSV·파일 부재에서 예외 없이 동작,
 
 ---
 
+## 1I: 분석용 일일 번들 export + session ready 결함 확인 (2026-08-06)
+
+### 🔴 발견: `session_metrics_ready`가 지금까지 단 한 번도 True였던 적이 없음
+
+8/6 shadow 데이터에서 `session_metrics_ready=0건 / PARTIAL_SESSION 358건`
+이 관측돼 원인을 추적한 결과, **구조적 결함**으로 확인됨.
+
+**ready 판정 조건** (`session_metrics.py`): 가장 오래된 세션 봉이
+09:00~09:01이어야 `COMPLETE_FROM_OPEN`, 아니면 `PARTIAL_SESSION`.
+
+**실측 (app.log `[SESSION_SHADOW]`)**:
+```
+024840  earliest=09:49  bar_count=331
+006360  earliest=09:55  bar_count=325
+005935  earliest=10:16  bar_count=304
+047040  earliest=09:49  bar_count=331
+```
+`bar_count`가 **326~331에서 천장**을 침. 키움 분봉 API(ka10080)가
+반환하는 봉 수 상한으로 보임. 09:00~15:20은 380분이므로, 거래가
+활발한 종목은 **오후에는 09:00 봉이 응답에서 밀려나** ready 조건을
+영구히 만족할 수 없음.
+
+**검증**: `[SESSION_SHADOW]` 전체 2,083건 중 `ready=True` **0건**.
+1C에서 `session_metrics_mode="shadow"`를 켠 2026-07-28 이후 지금까지
+계속 False였음.
+
+**영향**: `session_gate_eligible`도 전부 False라, VWAP shadow 8조합 중
+**session 기준 4개가 전부 0건**으로 나옴. 8/6 리포트의
+"session 계열 차단 0건"은 게이트 성능이 아니라 **데이터가 아예 생성되지
+않은 것**. rolling(60분) 계열 4개는 정상 수집됨(PR-only/C-or-PR/
+PR-or-condition 각 4건 차단).
+
+**이번 단계에서는 수정하지 않음** — ready의 의미를 바꾸는 것은
+shadow 해석 기준 자체를 바꾸는 결정이라 별도 단계에서 판단.
+후보: (a) API 상한에 걸린 경우를 `CAPPED_BY_API`(ready=True)로
+분리, (b) 세션 시작 이후 경과 시간 대비 봉 커버리지 비율로 판정,
+(c) 장 시작 시점 봉을 별도로 캐시해 두고 병합. **어떤 안이든
+session 계열 게이트의 과거 관측치는 전부 무효**이므로, 수정 전까지
+rolling 계열만으로 분석해야 함.
+
+### `export_daily_bundle.py` 신규
+
+분석 때마다 `signal_log.csv`(65MB, 233,064행)와 `app.log`(9MB,
+36,217줄) 전체를 올려야 했음. 해당 거래일 몫만 잘라내는 스크립트.
+
+**실측 (8/6)**: 원본 합계 약 74MB → **번들 0.5MB**
+```
+signal_log.csv              9,355행 / 전체 233,064행  (3,874 KB)
+entry_quality_shadow.csv      358행
+entry_watch_shadow.csv        138행
+app.log                    19,368줄 / 전체  36,217줄
+리포트 6종 (daily_report, signal/trade/indicator/shadow_analysis, replay)
+```
+
+`exports/bundle_YYYYMMDD.zip` 하나로 묶고 `MANIFEST.txt`에 행 수·용량·
+누락 파일을 기록. 수동 실행도 가능:
+`python export_daily_bundle.py 2026-08-06`
+
+**보안**: app.log는 분석에 실제로 쓰는 태그 줄만 추출 —
+`[COND_STATUS]`, `[COND_TRUNCATE]`, `[COND]`, `[WS]`,
+`[SESSION_SHADOW]`, `[EXPERIMENTAL]`, `[REPORT]`, `[ANALYSIS]`,
+`[RECONCILE]` + ERROR/CRITICAL/WARNING 레벨. 잔고·주문응답 원문·인증
+관련 줄은 태그 목록에 넣지 않아 자연히 제외되고, 혹시 섞인 계좌번호
+형태(`########-##`)는 정규식으로 마스킹. `.env`/`state.json`/token
+파일은 어떤 경우에도 미포함.
+
+### 장 마감 파이프라인 연결
+
+`TradingService._export_daily_bundle_today()` 추가 —
+`_run_end_of_day_tasks()`(15:20)의 **가장 마지막**에 실행. 그날 생성된
+리포트까지 번들에 담기려면 모든 분석이 끝난 뒤여야 하므로 순서가 중요.
+다른 후처리와 동일하게 subprocess + 예외 삼킴.
+
+### 부수 수정: import 시 stdout 교체 부작용
+
+`analyze_shadow.py` / `export_daily_bundle.py`가 모듈 최상위에서
+`sys.stdout`을 `TextIOWrapper`로 교체하고 있었는데, 이 모듈을
+import하는 쪽(테스트 등)의 stdout까지 닫혀
+`ValueError: I/O operation on closed file`이 발생함(테스트 작성 중
+실제 발생). `_force_utf8_stdout()`로 분리해 **직접 실행할 때만** 적용.
+
+### 테스트
+
+`test_shadow_analysis.py` 19건 → **24건** (계좌번호 마스킹, 일반 줄
+무변형, 인증·잔고 태그 미포함, 파이프라인 연결, 실행 순서가 shadow
+분석보다 뒤인지).
+
+**전체 회귀**: 13개 파일 전부 통과, 1개 스킵, 종료코드 0.
+
+---
+
+## 1I.1: 번들 날짜 정확성·보안·품질 메타데이터 보완 (2026-08-06)
+
+### ⚠️ 1I 결론 정정 — session_metrics_ready
+
+1I에서 다음과 같이 보고했으나 **전부 오류**였음:
+- ~~"7/28 이후 ready=True가 한 번도 없었다"~~
+- ~~"키움 분봉 API가 약 331봉에서 제한된다"~~
+- ~~"session 기반 과거 관측치는 전부 무효다"~~
+
+**원인**: 업로드된 `app.log` **한 개만** 보고 판단함. 로테이션된
+`app.log.1` 등을 포함해 전수 집계하면:
+```
+전체        ready=True 3,631건 / ready=False 5,609건
+2026-07-29  True   960 / False 1,017
+2026-08-03  True   369 / False   401
+2026-08-04  True 1,313 / False   290   ← bar_count=380, earliest=09:00:00
+2026-08-05  True   182 / False 2,435
+```
+`bar_count=380`(09:00~15:19)인 날이 실재하므로 **331은 API 상한이
+아니라** 해당 종목의 SessionState 누적 시작 시각부터 장 마감까지의
+분봉 수임. 8/6이 전부 PARTIAL이었던 것은 그날 장중 재시작이 2회
+있었기 때문이며, 코드 결함이 아님.
+
+**readiness 의미는 그대로 유지**:
+- 09:00 봉부터 누적 → `COMPLETE_FROM_OPEN` (ready=True)
+- 장중 신규 편입·재시작 이후 누적 → `PARTIAL_SESSION` (ready=False)
+
+ready 판정을 **완화하지 않음**. `CAPPED_BY_API` 같은 이유로
+ready=True를 강제로 만들지 않음. 장중 신규 종목의 당일 전체 session
+VWAP이 필요하면 "09:00~현재 분봉 backfill"이라는 별도 기능으로
+풀어야 하며, 이번 단계 범위가 아님.
+
+코드 주석·리포트 문구를 모두 정정했고, 리포트는 이제
+`COMPLETE_FROM_OPEN`/`PARTIAL_SESSION` 건수와 비율을 각각 표시하며,
+**session 게이트 평가에 ready=True 행만 모집단으로 사용**함. 그날
+ready=True가 0건이면 "session 게이트 성과 해석 불가"를 명시하고,
+"다른 날에는 정상 발생하며 코드 결함이 아니다"까지 안내함.
+
+### entry_watch_shadow 날짜 추출 수정 + fail-closed
+
+실제 시간 컬럼은 `trigger_at`(헤더 확인). 후보를
+`("trigger_at", "timestamp", "buy_time")`로 수정.
+
+시간 컬럼을 하나도 못 찾으면 **전체 행을 복사하던 fallback을 제거**.
+일일 번들은 데이터 최소화가 목적이므로 스키마를 모르면 fail-closed가
+맞음 — `SchemaError`를 올려 해당 CSV를 번들에서 제외하고 MANIFEST에
+`| SCHEMA_ERROR | timestamp column not found | excluded`로 기록하며,
+다른 파일 export는 계속 진행.
+
+### app.log 추출 보안 강화
+
+**모든 WARNING/ERROR/CRITICAL 자동 포함을 제거.** allowlist에 없는
+인증·계좌·주문응답 로그가 WARNING이라는 이유만으로 번들에 실릴 수
+있었음. 이제 allowlist 태그 줄만 추출:
+`[COND_STATUS]`, `[COND_TRUNCATE]`, `[COND]`, `[WS]`,
+`[SESSION_SHADOW]`, `[EXPERIMENTAL]`, `[REPORT]`, `[ANALYSIS]`,
+`[RECONCILE]`, `[MIN_STALE]`. 1F에서 스윙을 폐기했으므로
+`[COND_SWING]`은 제거.
+
+**키 기반 마스킹**을 우선 적용 — `authorization`, `bearer`,
+`access_token`, `refresh_token`, `api_key`, `secret`, `password`,
+`account`/`account_no`/`account_number`, `계좌`/`계좌번호`의 **값만**
+치환. 이어서 `Bearer <token>`, `########-##`, 10~13자리 연속 숫자를
+형태 기반으로 마스킹. 종목코드(6자리)·날짜(8자리)·분봉 타임스탬프
+(14자리)는 자릿수 경계와 `(?<!\d)`/`(?!\d)`로 회피.
+
+### shadow 중복 판정 수정
+
+`(symbol, latest_bar_timestamp)`만으로 중복을 판정해서, 같은 분봉에서
+게이트 상태가 바뀐 **정상적인 별도 행**까지 "재시작 중복 가능"
+경고로 잡혔음(8/6 리포트의 "동일 키 중복 1행 ⚠"이 실제로는 정상).
+
+signature 로직을 `domain/shadow_signature.py` **공용 순수 모듈**로
+추출해 로거와 분석기가 같은 함수를 쓰도록 함 — 복제 구현은 향후 필드
+추가 시 다시 어긋날 위험이 있음. `infra/storage/logger.py`는 이제
+이 모듈에서 import하며, 테스트로 `_entry_quality_shadow_key is
+entry_quality_shadow_key`를 검증함.
+
+- `entry_quality_shadow_key()` — 로거의 쓰기 시점 중복 방지 키
+- `analysis_dedup_key()` — 위 키 + `order_attempted`,
+  `order_accepted`, `condition_source_reliable` (사후 분석용)
+
+리포트는 **(종목,분봉) 유니크**(표본 규모 참고용)와 **완전 동일
+signature 중복**(실제 중복)을 분리 표시하고, 같은 분봉에서 상태가
+바뀐 행이 있으면 "정상입니다"라고 안내함.
+
+### 번들 구조 + 수집 품질 메타데이터
+
+ZIP을 `reports/` · `raw/` · `metadata/`로 분리:
+```
+bundle_YYYYMMDD.zip
+├─ MANIFEST.txt
+├─ reports/  daily_report, signal/trade/indicator/shadow_analysis, replay
+├─ raw/      signal_log, entry_quality_shadow, entry_watch_shadow,
+│            trades, position_lifecycle, app_analysis.log
+└─ metadata/ collection_quality.txt
+```
+
+`collection_quality.txt` 신규 — `process_start_count`,
+`websocket_connect/reconnect_count`, `collection_status`,
+`session_ready_true/false_count`와 비율, `condition_source_reliable`
+비율, `shadow_to_actual_buy_coverage`, `cond_truncate_event_count`,
+`max_truncated_condition_count`, `session_gate_interpretation`,
+`rolling_gate_interpretation` 등. 판정은 **보수적** — 첫 데이터가
+09:00~09:02이고, 장 마감까지 데이터가 있고, 장중 재시작이 없을 때만
+`COMPLETE`. 그 외 `PARTIAL` 또는 `RESTARTED_PARTIAL`.
+
+`shadow_analysis` 리포트 상단에도 품질 요약(수집 상태, shadow 주문
+연결, session ready, 조건식 출처 신뢰, 해석 가능/보류 항목)을 표시.
+
+### 원자적 ZIP 생성 + 동시 실행 보호
+
+고정 작업 디렉터리 대신 `tempfile.mkdtemp()` 고유 디렉터리 사용.
+`bundle_YYYYMMDD.zip.tmp`에 먼저 쓰고 → `testzip()` 무결성 확인 →
+`fsync` → `os.replace()`로 교체. 임시 디렉터리는 `finally`에서 삭제.
+동일 날짜 동시 실행은 `os.O_CREAT|os.O_EXCL` 락 파일로 방지하며,
+획득 실패 시 기존 실행을 건드리지 않고 경고만 남기고 `None` 반환
+(불완전 ZIP을 만들지 않음).
+
+### 8/6 실데이터 검증 결과
+
+```
+번들 크기        0.5 MB (원본 약 74MB)
+signal_log        9,355행 / 전체 233,064행
+entry_quality_shadow 358행   entry_watch_shadow  3 KB (trigger_at slicing 적용)
+app_analysis.log 19,267줄 / 전체 36,217줄
+전일(8/5) 데이터 혼입        없음
+Bearer 토큰 / 계좌번호 / access_token / authorization 원문   0건
+app_analysis.log 내 10~13자리 숫자                          0건
+collection_status            RESTARTED_PARTIAL (재시작 2회)
+session_ready                0/2,083 → INVALID_FOR_THIS_DAY
+cond_truncate_event_count    4,332회 / 최대 21종목 잘림
+중복 판정                    완전 동일 0행 (이전 오탐 1행 해소)
+```
+
+`[COND_TRUNCATE]`가 하루 4,332회, 최대 21종목이 잘렸다는 사실이 새로
+드러남 — GPT가 지적한 "종목코드순 앞쪽 6개 표본 편향"이 실제로 상당한
+규모임. 선택 정책 개선을 shadow 5일 수집보다 먼저 검토할 근거.
+
+### 테스트
+
+`test_shadow_analysis.py` 24건 → **65건**:
+- A(7건) 날짜 slicing — trigger_at 기준, 시간 컬럼 없는 CSV 제외 +
+  SCHEMA_ERROR 기록, signal_log/trades/entry_quality_shadow 전일 행
+  미포함, 스키마 오류 후에도 다른 export 계속 진행.
+- B(13건) 로그 보안 — allowlist 밖 WARNING/ERROR의 토큰·계좌번호가
+  번들에 없음, 일반 WARNING 줄 자체 미포함, 허용 태그는 포함,
+  access_token/api_key/secret/password 마스킹, 8-2 및 10자리 계좌번호
+  마스킹, 종목코드는 미마스킹, allowlist에 인증·잔고 태그 없음,
+  `[COND_SWING]` 제거·`[MIN_STALE]` 추가.
+- C(8건) 중복 판정 — would_block·order_accepted·final_decision·
+  condition_source_reliable 변화가 각각 별도 행, 완전 동일은 중복,
+  logger/analyzer 함수 동일성, 확장 관계, bool/문자열 정규화.
+- D(8건) session quality — COMPLETE/PARTIAL 집계, 혼재 시 비율,
+  ready=false만인 날 "해석 불가" 출력, ready=true 있으면 경고 없음,
+  "한 번도 true 없음" 같은 잘못된 단정 미출력, ready 완화 미적용.
+- E(8건) ZIP 안정성 — `testzip()` None, 동시 실행 시 하나만 진행,
+  락 충돌·예외 시 기존 ZIP 유지, tmp·락·임시 디렉터리 정리.
+- F(2건) 파이프라인 연결 및 실행 순서.
+
+**전체 회귀**: 13개 파일 전부 통과, 1개 스킵, 종료코드 0.
+`compileall` 정상.
+
+### 남은 한계
+
+- `trades.csv`/`position_lifecycle.csv`가 컨테이너 검증 환경에
+  없어 `actual_buy_count`·`shadow_to_actual_buy_coverage`는 실서버
+  첫 실행에서 확인 필요.
+- 성과 계산(5·10·20분 수익률, MFE·MAE)은 여전히 미구현.
+- 장중 신규 편입 종목의 session VWAP backfill 미구현 —
+  재시작이 잦은 날은 session 게이트 표본이 계속 0일 수 있음.
+
+---
+

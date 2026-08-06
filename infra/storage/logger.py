@@ -490,49 +490,14 @@ ENTRY_QUALITY_SHADOW_FIELDS = [
     "would_block_pr_or_pullback_condition_session_vwap",
 ]
 
-# 2026-08-05: 중복 방지 키에 포함될 "게이트 상태" 필드 — 이 값들
-# 중 하나라도 이전 기록과 다르면 새 행을 남김. MACD 2개 + VWAP
-# 8개(rolling 4 + session 4) + final_decision + order_block_reason
-# = 12개, GPT가 지시한 목록 그대로.
-_ASSESSMENT_SIGNATURE_FIELDS = [
-    "would_block_macd_dead_min_score5",
-    "would_block_macd_above_signal_required",
-    "would_block_pr_only_rolling_vwap",
-    "would_block_c_or_pr_rolling_vwap",
-    "would_block_pullback_condition_rolling_vwap",
-    "would_block_pr_or_pullback_condition_rolling_vwap",
-    "would_block_pr_only_session_vwap",
-    "would_block_c_or_pr_session_vwap",
-    "would_block_pullback_condition_session_vwap",
-    "would_block_pr_or_pullback_condition_session_vwap",
-    "final_decision",
-    "order_block_reason",
-]
-
-
-def _entry_quality_shadow_key(row: dict[str, Any]) -> tuple:
-    """entry_quality_shadow.csv의 중복 방지 키를 계산합니다.
-
-    (symbol, latest_bar_timestamp, detected_patterns, score,
-    assessment_signature) — 같은 분봉·패턴·점수라도 게이트 상태나
-    최종 결정이 바뀌면 다른 키가 되어 새 행으로 기록됨.
-
-    2026-08-05 (재현 확인): append_if_new()에 새로 들어오는 row는
-    Python 값(bool True/False 등)을 담고 있지만, 재시작 시 기존
-    CSV에서 csv.DictReader로 복원하는 row는 전부 문자열("True"/
-    "False")임 — 이 둘을 그대로 튜플 키로 쓰면 같은 논리적 값인데
-    타입이 달라 키가 일치하지 않는 문제가 재현됨(재시작 직후 동일
-    판단을 다시 넣었을 때 중복으로 감지되지 않고 새로 기록됨).
-    모든 값을 str()로 정규화해 타입 불일치를 원천 차단.
-    """
-    signature = tuple(str(row.get(f, "")) for f in _ASSESSMENT_SIGNATURE_FIELDS)
-    return (
-        str(row.get("symbol", "")),
-        str(row.get("latest_bar_timestamp", "")),
-        str(row.get("detected_patterns", "")),
-        str(row.get("score", "")),
-        signature,
-    )
+# 2026-08-06 (1I.1, GPT 코드리뷰 지적 4번): signature 로직을
+# domain/shadow_signature.py로 추출해 분석기(analyze_shadow.py)와
+# 공유합니다. 복제 구현은 향후 필드 추가 시 다시 어긋날 위험이
+# 있어, 로거와 분석기가 같은 함수를 쓰도록 했습니다.
+from domain.shadow_signature import (  # noqa: E402
+    ASSESSMENT_SIGNATURE_FIELDS as _ASSESSMENT_SIGNATURE_FIELDS,
+    entry_quality_shadow_key as _entry_quality_shadow_key,
+)
 
 
 class EntryQualityShadowLogger:

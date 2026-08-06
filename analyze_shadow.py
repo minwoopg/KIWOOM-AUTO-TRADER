@@ -50,7 +50,9 @@ from collections import Counter, defaultdict
 from datetime import date, datetime
 from pathlib import Path
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from domain.shadow_signature import analysis_dedup_key  # noqa: E402
+
 
 SIGNAL_LOG = Path("logs/signal_log.csv")
 SHADOW_LOG = Path("logs/entry_quality_shadow.csv")
@@ -120,6 +122,37 @@ def uniq_key(row: dict) -> tuple[str, str]:
 
 
 # ── 1) 스키마·품질 점검 ─────────────────────────────────────────
+def section_data_quality_header(out, sig_rows, sh_rows) -> None:
+    """리포트 최상단 데이터 품질 요약 (1I.1)."""
+    if not sh_rows:
+        out("[ 데이터 품질 ] shadow 기록 없음 — 아래 게이트 집계는 해석 불가")
+        out("")
+        return
+    complete = sum(1 for r in sh_rows if truthy(r.get("session_metrics_ready")))
+    reliable = sum(1 for r in sh_rows if truthy(r.get("condition_source_reliable")))
+    attempts = sum(1 for r in sh_rows if truthy(r.get("order_attempted")))
+    accepted = sum(1 for r in sh_rows if truthy(r.get("order_accepted")))
+    sh_first = next((str(r.get("timestamp") or "") for r in sh_rows), "")
+    open_ok = bool(sh_first) and sh_first[11:16] <= "09:02"
+    status = "COMPLETE" if open_ok else "PARTIAL / RESTARTED"
+
+    out("[ 데이터 품질 ]")
+    out(f"  수집 상태            : {status} (shadow 첫 기록 {sh_first[11:19] or 'N/A'})")
+    out(f"  shadow 주문 연결     : 시도 {attempts}건 / 수락 {accepted}건")
+    out(f"  session ready        : {complete}/{len(sh_rows)}")
+    out(f"  조건식 출처 신뢰     : {reliable}/{len(sh_rows)}")
+    interp_ok = ["rolling VWAP", "MACD"]
+    interp_hold = []
+    if complete == 0:
+        interp_hold.append("session VWAP")
+    if reliable < len(sh_rows) * 0.2:
+        interp_hold.append("condition-source 기반 VWAP")
+    out(f"  해석 가능            : {', '.join(interp_ok)}")
+    out(f"  해석 보류            : {', '.join(interp_hold) if interp_hold else '없음'}")
+    out("  ※ 정확한 수집 완전성·재시작 횟수는 번들의 metadata/collection_quality.txt 참고")
+    out("")
+
+
 def section_quality(out, sig_rows, sig_header, sh_rows, sh_header) -> None:
     out("[ 1. 스키마 · 데이터 품질 ]")
 
@@ -161,12 +194,22 @@ def section_quality(out, sig_rows, sig_header, sh_rows, sh_header) -> None:
         out("      shadow 활성 여부는 위 signal_log의 rolling_vwap 채움률로 판단하십시오.")
         return
 
-    # 재시작 중복 — append_if_new의 중복방지키는 프로세스 재시작 시
-    # 복원되지만, 복원 실패나 로그 로테이션 시 같은 키가 다시 들어올 수 있음
-    keys = [uniq_key(r) for r in sh_rows]
-    dup = len(keys) - len(set(keys))
-    out(f"    (종목, 분봉) 유니크       : {len(set(keys)):,}건")
-    out(f"    동일 키 중복 행           : {dup:,}행" + (" ⚠ 재시작 중복 가능" if dup else ""))
+    # 2026-08-06 (1I.1, GPT 코드리뷰 지적 4번): 이전엔 (종목, 분봉)
+    # 만으로 중복을 판정해서, 같은 분봉이라도 게이트 상태가 바뀐
+    # **정상적인 별도 행**(would_block False→True, order_accepted
+    # False→True, final_decision BLOCKED→BUY 등)까지 "재시작 중복
+    # 가능" 경고로 잡았음. 이제 로거와 동일한 assessment signature
+    # (domain/shadow_signature.py 공용 함수)로 판정하고, 표본 규모
+    # 참고용 (종목,분봉) 유니크와 실제 중복을 분리해서 표시.
+    bar_keys = [uniq_key(r) for r in sh_rows]
+    sig_keys = [analysis_dedup_key(r) for r in sh_rows]
+    real_dup = len(sig_keys) - len(set(sig_keys))
+    out(f"    (종목, 분봉) 유니크       : {len(set(bar_keys)):,}건  (표본 규모 참고용)")
+    out(f"    판단 signature 유니크     : {len(set(sig_keys)):,}건")
+    out(f"    완전 동일 중복 행         : {real_dup:,}행"
+        + (" ⚠ 실제 중복 또는 재시작 중복 가능" if real_dup else ""))
+    if len(set(bar_keys)) < len(set(sig_keys)):
+        out(f"    ℹ 같은 분봉에서 게이트 상태가 바뀐 행이 있습니다 — 정상입니다.")
 
     # 결측 — 분석에 반드시 필요한 필드
     critical = ["current_price", "final_decision", "macd_above_signal",
@@ -278,24 +321,56 @@ def section_vwap(out, sh_rows) -> None:
         out("      장중 신규 편입 종목은 하루 종일 출처 미확정으로 남습니다.")
         out("      condition-source 계열 2개 게이트는 표본 부족으로 해석하지 마십시오.")
 
-    # session 준비 상태 — session 계열 게이트의 유효 표본
-    ready_u = {uniq_key(r) for r in sh_rows if truthy(r.get("session_metrics_ready"))}
-    out(f"  session_metrics_ready=True   : {len(ready_u):,}건 ({pct(len(ready_u), len(all_u))})")
+    # ── session 준비 상태 ──────────────────────────────────────
+    # 2026-08-06 (1I.1 정정): 이전 1I 보고에서 "7/28 이후 ready=True가
+    # 한 번도 없었다 / 분봉 API가 331봉에서 제한된다"고 했으나
+    # **오류였음** — 업로드된 app.log 한 개만 보고 판단했고,
+    # 로테이션 파일까지 합치면 ready=True가 매 거래일 발생함
+    # (7/29 960건, 8/3 369건, 8/4 1,313건, bar_count=380인 날도 있음).
+    # 331은 API 상한이 아니라 해당 종목의 SessionState 누적 시작
+    # 시각부터 장 마감까지의 분봉 수임.
+    #
+    # readiness 의미는 그대로 유지한다:
+    #   09:00 봉부터 누적된 종목        → COMPLETE_FROM_OPEN (ready=True)
+    #   장중 신규 편입/재시작 이후 누적  → PARTIAL_SESSION   (ready=False)
+    # ready 기준을 완화하지 않는다. 장중 신규 종목의 당일 전체
+    # session VWAP이 필요하면 "09:00~현재 분봉 backfill"이라는
+    # 별도 기능으로 풀어야 하며, 이번 단계 범위가 아니다.
+    complete = [r for r in sh_rows if truthy(r.get("session_metrics_ready"))]
+    partial = [r for r in sh_rows if not truthy(r.get("session_metrics_ready"))]
+    total_sess = len(sh_rows)
+    out(f"  COMPLETE_FROM_OPEN (ready=True) : {len(complete):,}건 "
+        f"({pct(len(complete), total_sess)})")
+    out(f"  PARTIAL_SESSION    (ready=False): {len(partial):,}건 "
+        f"({pct(len(partial), total_sess)})")
     reasons = Counter(r.get("session_readiness_reason") for r in sh_rows
                       if filled(r.get("session_readiness_reason")))
     if reasons:
-        out("    준비 상태 사유: "
-            + ", ".join(f"{k}({v})" for k, v in reasons.most_common(5)))
+        out("    사유 분포: " + ", ".join(f"{k}({v})" for k, v in reasons.most_common(5)))
+    if not complete:
+        out("    ⚠ 이 거래일은 ready=True 행이 0건 — **session 게이트 성과 해석 불가**.")
+        out("      장중 재시작이나 신규 편입으로 09:00부터 누적된 종목이 없었다는 뜻이며,")
+        out("      다른 날에는 ready=True가 정상적으로 발생합니다(코드 결함 아님).")
+        out("      아래 session 계열 4개 행은 참고용일 뿐 해석하지 마십시오.")
 
     out("")
     out(f"  {'범위':18s} {'기준':14s} {'차단(전체)':>14s} {'차단(기존규칙 통과분)':>22s}")
     for field, scope, basis in VWAP_GATES:
         if field not in (sh_rows[0].keys() if sh_rows else []):
             continue
-        hit_u = {uniq_key(r) for r in sh_rows if truthy(r.get(field))}
-        live_hit_u = {uniq_key(r) for r in live if truthy(r.get(field))}
-        out(f"  {scope:18s} {basis:14s} {len(hit_u):5,}건 {pct(len(hit_u), len(all_u))} "
-            f"{len(live_hit_u):10,}건 {pct(len(live_hit_u), len(live_u))}")
+        # 2026-08-06 (1I.1): session 기준 게이트는 ready=True 행만
+        # 모집단으로 삼는다 — PARTIAL_SESSION 행의 session VWAP은
+        # 당일 전체가 아니라 누적 시작 이후 구간만 반영하므로
+        # 섞어서 세면 게이트 성능을 잘못 읽게 됨.
+        is_session = basis.startswith("session")
+        pool = complete if is_session else sh_rows
+        pool_live = [r for r in live if truthy(r.get("session_metrics_ready"))] if is_session else live
+        denom_all, denom_live = len(pool), len(pool_live)
+        hit_u = {uniq_key(r) for r in pool if truthy(r.get(field))}
+        live_hit_u = {uniq_key(r) for r in pool_live if truthy(r.get(field))}
+        note = "  (ready=True 행만)" if is_session else ""
+        out(f"  {scope:18s} {basis:14s} {len(hit_u):5,}건 {pct(len(hit_u), denom_all)} "
+            f"{len(live_hit_u):10,}건 {pct(len(live_hit_u), denom_live)}{note}")
 
     out("")
     out("  ※ 성과(5·10·20분 수익률, MFE·MAE) 비교는 이번 단계에 포함되지 않았습니다.")
@@ -323,6 +398,9 @@ def build_report(start: date, end: date) -> str:
     out("  범위: 품질·표본·게이트 집계 (성과 계산은 미포함)")
     out("")
 
+    # 2026-08-06 (1I.1): 분석자가 그날 데이터를 어디까지 믿어도
+    # 되는지 맨 위에서 바로 알 수 있도록 품질 요약을 먼저 표시.
+    section_data_quality_header(out, sig_rows, sh_rows)
     section_quality(out, sig_rows, sig_header, sh_rows, sh_header)
     section_sample(out, sig_rows, sh_rows)
     section_macd(out, sig_rows)
@@ -333,7 +411,20 @@ def build_report(start: date, end: date) -> str:
     return "\n".join(buf)
 
 
+def _force_utf8_stdout() -> None:
+    """Windows 콘솔 한글 깨짐 방지.
+
+    2026-08-06 (1I): 모듈 최상위에서 sys.stdout을 교체하면,
+    이 모듈을 import하는 쪽(테스트 등)의 stdout까지 닫혀서
+    ValueError: I/O operation on closed file이 발생함.
+    직접 실행할 때만 적용하도록 함수로 분리.
+    """
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+
 def main() -> int:
+    _force_utf8_stdout()
     args = sys.argv[1:]
     try:
         if len(args) == 0:
