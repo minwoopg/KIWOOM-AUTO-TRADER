@@ -35,12 +35,29 @@ class DayTargetSelection:
     day_symbols    : 제외/상한 적용 전, 단타 대상으로 인정된 전체 종목
     blocked        : 자동 제외 종목이라 재편입이 차단된 종목들
     unresolved_used: 출처 미확정 상태로 day_symbols에 포함된 종목들
+
+    ── 2026-08-06 (1G, GPT 코드리뷰 지적 3번) 선택 통계 ──
+    `max_symbols`(현재 10)에서 수동 targets(현재 4)를 뺀 자리만
+    조건검색 종목이 차지할 수 있으므로 **실제로는 최대 6종목**입니다.
+    게다가 현재 선택 순서는 종목코드 오름차순이라, 상한을 넘기면
+    "코드가 작은 종목"이 남고 나중에 편입된 더 좋은 종목이 잘립니다.
+    이 편향은 감시 대상뿐 아니라 `entry_quality_shadow.csv` 표본에도
+    그대로 반영되므로, shadow 분석 시 반드시 감안해야 합니다.
+    아래 세 값은 그 편향의 크기를 로그로 남겨 정량 확인하기 위한
+    관측치입니다(선택 로직 자체는 이번 단계에서 변경하지 않음).
+
+    eligible_condition_count : 상한 적용 전, 감시 가능한 조건검색 종목 수
+    selected_condition_count : 그중 실제로 최종 목록에 들어간 수
+    truncated_condition_count: 상한 때문에 잘려나간 수
     """
 
     final_targets: list[str]
     day_symbols: list[str]
     blocked: set[str] = field(default_factory=set)
     unresolved_used: list[str] = field(default_factory=list)
+    eligible_condition_count: int = 0
+    selected_condition_count: int = 0
+    truncated_condition_count: int = 0
 
 
 def compute_day_targets(
@@ -111,9 +128,20 @@ def compute_day_targets(
     combined = list(dict.fromkeys(list(manual_symbols) + filtered))
     limited = combined[:max_symbols]
 
+    # 2026-08-06 (1G): 조건검색 유래 종목만 따로 집계 — 수동 targets와
+    # 겹치는 종목은 어차피 상한과 무관하게 항상 들어가므로 제외해야
+    # "상한 때문에 몇 개가 잘렸는지"가 정확해집니다.
+    manual_set = set(manual_symbols)
+    eligible_condition = [s for s in filtered if s not in manual_set]
+    eligible_set = set(eligible_condition)
+    selected_condition = [s for s in limited if s in eligible_set]
+
     return DayTargetSelection(
         final_targets=limited,
         day_symbols=day_symbols,
         blocked=blocked,
         unresolved_used=unresolved_used,
+        eligible_condition_count=len(eligible_condition),
+        selected_condition_count=len(selected_condition),
+        truncated_condition_count=len(eligible_condition) - len(selected_condition),
     )

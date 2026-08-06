@@ -262,8 +262,26 @@ async def async_main() -> None:
                 f"[COND_STATUS] {seq_info} | "
                 f"unresolved={len(selection.unresolved_used)}종목 | "
                 f"excluded={len(blocked)}차단 | "
+                f"eligible_condition_count={selection.eligible_condition_count} "
+                f"selected_condition_count={selection.selected_condition_count} "
+                f"truncated_condition_count={selection.truncated_condition_count} | "
                 f"final={len(limited)}종목: {limited}"
             )
+            # 2026-08-06 (1G, GPT 코드리뷰 지적 3번): max_symbols(10)에서
+            # 수동 targets(4)를 뺀 자리만 조건검색 종목이 차지하므로
+            # 실제 감시 가능한 조건검색 종목은 최대 6개뿐. 상한을 넘기면
+            # 종목코드 오름차순으로 앞쪽만 남아, 나중에 편입된 종목이
+            # 코드가 크다는 이유로 잘림 — 이 편향이 entry_quality_shadow
+            # 표본에도 그대로 반영되므로 발생 즉시 로그로 남겨 크기를
+            # 정량 확인할 수 있게 함(선택 로직 변경은 별도 단계).
+            if selection.truncated_condition_count:
+                app_logger.warning(
+                    f"[COND_TRUNCATE] max_symbols={settings.websocket.max_symbols} 상한으로 "
+                    f"조건검색 종목 {selection.truncated_condition_count}개가 잘렸습니다"
+                    f"(감시 가능 {selection.eligible_condition_count}개 중 "
+                    f"{selection.selected_condition_count}개 선택) — "
+                    f"현재 선택 기준은 종목코드 오름차순이라 shadow 표본이 편향될 수 있음"
+                )
 
         # 조건검색은 실전 계좌 토큰으로 별도 발급
         app_logger.info("[COND] 실전 계좌 토큰 발급 중...")

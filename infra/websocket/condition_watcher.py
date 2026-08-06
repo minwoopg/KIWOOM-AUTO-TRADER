@@ -411,17 +411,33 @@ class ConditionWatcher:
                 # 이면서 unresolved에 없어야 True"이므로, 이 종목은
                 # 즉시 reliable=False로 떨어짐(다음 CNSRREQ 재조회
                 # 결과에 다시 나타나야 reliable=True로 복구됨).
+                #
+                # 2026-08-06 (1G, GPT 코드리뷰 지적 1번, 재현 확인):
+                # 위 처리는 watcher 내부 상태만 바꿀 뿐 _notify()를
+                # 호출하지 않아서, 이미 알려진 종목의 reliability가
+                # True → False로 떨어져도 TradingService에는 전달되지
+                # 않았음. update_targets()는 콜백으로만 갱신되므로
+                # shadow 로그에 과거의 condition_source_reliable=True가
+                # 계속 남게 됨(재현: 변경 후 watcher 내부는 False인데
+                # on_symbols_changed 호출 0회).
+                # → 종목 수가 변하지 않아도 **reliability 메타데이터가
+                #   바뀌면 콜백을 호출**해야 함. unresolved에 처음
+                #   추가되는 경우에만 notify하고, 동일 REAL I가 반복되면
+                #   상태 변화가 없으므로 생략해서 불필요한 폴링 갱신을
+                #   막음.
+                was_unresolved = symbol in self._realtime_unresolved
                 was_known = symbol in self._all_symbols
                 self._realtime_unresolved.add(symbol)
                 if not was_known:
                     logger.info(f"[COND] [출처불명] 편입: {symbol} (실시간 이벤트, "
                                 f"어느 조건식인지 불확실 — 다음 재조회 시 확정)")
-                    self._notify()
-                else:
+                elif not was_unresolved:
                     logger.info(f"[COND] [출처불명] {symbol} 실시간 이벤트 수신 — "
                                 f"이미 알려진 종목이지만 이 이벤트의 정확한 출처는 "
                                 f"불명(다른 조건식일 수 있음) — 신뢰도를 재확정 "
                                 f"전까지 하향")
+                if not was_unresolved:
+                    self._notify()
 
             elif action == "D":
                 # 2026-08-05 (3차 GPT 코드리뷰 지적 P0-2 문제B): 이

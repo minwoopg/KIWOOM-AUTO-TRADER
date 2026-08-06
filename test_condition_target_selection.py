@@ -307,6 +307,210 @@ check("7-10) 900003이 아닌 오류에는 재구독을 시도하지 않음",
       w4._ws_client.sent == [])
 
 
+# ══════════════════════════════════════════════════════════════
+# 8) 선택 통계 (1G, GPT 코드리뷰 지적 3번)
+# ══════════════════════════════════════════════════════════════
+# 실운영 설정 그대로: max_symbols=10, 수동 targets 4개
+# → 조건검색 종목은 최대 6개만 들어감.
+sel8 = compute_day_targets(
+    confirmed_symbols_by_seq={"1": set(), "2": set(), "3": set()},
+    realtime_unresolved={f"{i:06d}" for i in range(100000, 100078)},
+    day_seqs=[1, 2, 3],
+    manual_symbols=MANUAL,
+    excluded_symbols=set(),
+    max_symbols=10,
+)
+check("8-1) 감시 가능한 조건검색 종목 수를 정확히 집계함",
+      sel8.eligible_condition_count == 78)
+check("8-2) 실제 선택된 조건검색 종목은 6개뿐(수동 4 + 조건 6 = 10)",
+      sel8.selected_condition_count == 6)
+check("8-3) 상한으로 잘린 수가 정확히 계산됨",
+      sel8.truncated_condition_count == 72)
+check("8-4) 잘린 수 + 선택된 수 = 감시 가능 수",
+      sel8.selected_condition_count + sel8.truncated_condition_count
+      == sel8.eligible_condition_count)
+
+# 수동 targets와 겹치는 종목은 조건검색 집계에서 제외되어야 함 —
+# 상한과 무관하게 항상 들어가므로 "잘렸다"고 세면 왜곡됨.
+sel8b = compute_day_targets(
+    confirmed_symbols_by_seq={"1": {"005930", "111111"}},
+    realtime_unresolved=set(),
+    day_seqs=[1],
+    manual_symbols=["005930"],
+    excluded_symbols=set(),
+    max_symbols=10,
+)
+check("8-5) 수동 targets와 겹치는 종목은 조건검색 집계에서 제외됨",
+      sel8b.eligible_condition_count == 1 and sel8b.selected_condition_count == 1)
+check("8-6) 상한에 여유가 있으면 truncated는 0",
+      sel8b.truncated_condition_count == 0)
+
+# 제외 종목은 애초에 감시 가능 수에 포함되지 않아야 함
+sel8c = compute_day_targets(
+    confirmed_symbols_by_seq={"1": {"111111", "222222", "333333"}},
+    realtime_unresolved=set(),
+    day_seqs=[1],
+    manual_symbols=[],
+    excluded_symbols={"222222"},
+    max_symbols=10,
+)
+check("8-7) 자동 제외 종목은 감시 가능 수에 포함되지 않음",
+      sel8c.eligible_condition_count == 2)
+
+
+# ══════════════════════════════════════════════════════════════
+# 9) 이미 알려진 종목의 REAL I도 콜백을 발생시킴 (1G, 지적 1번)
+# ══════════════════════════════════════════════════════════════
+# 재현 확인: 수정 전에는 watcher 내부 reliability만 True→False로
+# 바뀌고 _notify()가 호출되지 않아, TradingService가 과거의
+# condition_source_reliable=True를 계속 사용했음.
+delivered: list[dict] = []
+w5 = ConditionWatcher.__new__(ConditionWatcher)
+w5._confirmed_symbols_by_seq = {"1": {"005930"}}
+w5._realtime_unresolved = set()
+w5._condition_names = {"1": "자동매매_눌림목_PR"}
+w5.on_symbols_changed = lambda syms: delivered.append(
+    dict(w5.symbol_condition_source_reliable))
+
+check("9-1) REAL I 이전에는 reliable=True",
+      w5.symbol_condition_source_reliable == {"005930": True})
+
+w5._on_realtime({"data": [{"values": {"9001": "A005930", "843": "I"}}]})
+
+check("9-2) 이미 알려진 종목의 REAL I에도 콜백이 정확히 1회 호출됨",
+      len(delivered) == 1)
+check("9-3) 콜백 시점에 reliability=False가 전달됨",
+      delivered and delivered[0] == {"005930": False})
+check("9-4) watcher 내부 상태도 reliable=False",
+      w5.symbol_condition_source_reliable == {"005930": False})
+check("9-5) 종목 자체는 감시 대상에서 빠지지 않음",
+      "005930" in w5._all_symbols)
+
+# 동일 REAL I가 반복되면 상태 변화가 없으므로 콜백 생략
+w5._on_realtime({"data": [{"values": {"9001": "A005930", "843": "I"}}]})
+check("9-6) 같은 REAL I 반복 시에는 콜백을 중복 호출하지 않음",
+      len(delivered) == 1)
+
+# 신규 종목 REAL I는 기존대로 콜백 발생
+w5._on_realtime({"data": [{"values": {"9001": "A215790", "843": "I"}}]})
+check("9-7) 신규 종목 REAL I는 기존대로 콜백 발생",
+      len(delivered) == 2 and "215790" in w5._all_symbols)
+
+# targets 계산까지 이어지는지 — reliability=False여도 감시 대상 포함
+sel9 = compute_day_targets(
+    confirmed_symbols_by_seq=w5.confirmed_symbols_by_seq,
+    realtime_unresolved=w5.realtime_unresolved_symbols,
+    day_seqs=[1],
+    manual_symbols=[],
+    excluded_symbols=set(),
+    max_symbols=10,
+)
+check("9-8) reliability=False로 떨어진 종목도 매매 대상에는 그대로 포함",
+      sel9.final_targets == ["005930", "215790"])
+
+
+# ══════════════════════════════════════════════════════════════
+# 10) 코드 오류는 재연결하지 않고 프로세스를 실패시킴 (1G, 지적 2번)
+# ══════════════════════════════════════════════════════════════
+import infra.websocket.kiwoom_ws as kw
+from infra.websocket.kiwoom_ws import MessageHandlerError
+from websockets.exceptions import ConnectionClosed
+
+
+class _FakeSocket:
+    def __init__(self, msgs, raise_on_recv=None):
+        self._msgs = list(msgs)
+        self._raise = raise_on_recv
+        self.sent = []
+
+    async def send(self, raw):
+        self.sent.append(raw)
+
+    async def recv(self):
+        if self._msgs:
+            return self._msgs.pop(0)
+        if self._raise is not None:
+            raise self._raise
+        await asyncio.sleep(3600)
+
+    async def close(self):
+        pass
+
+
+def _run_client(handler, raise_on_recv=None, msgs=('{"trnm":"CNSRREQ"}',), budget=0.4):
+    attempts = {"n": 0}
+    original = kw.websockets.connect
+
+    async def fake_connect(url, *a, **k):
+        attempts["n"] += 1
+        return _FakeSocket(msgs, raise_on_recv)
+
+    kw.websockets.connect = fake_connect
+    client = kw.KiwoomWebSocket(url="wss://x", token="t",
+                                on_message=handler, reconnect_delay=0.05)
+    result = {"exc": None}
+
+    async def main():
+        task = asyncio.create_task(client.start())
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+        except asyncio.TimeoutError:
+            client._running = False
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        except Exception as exc:
+            result["exc"] = exc
+
+    try:
+        asyncio.run(main())
+    finally:
+        kw.websockets.connect = original
+    return attempts["n"], result["exc"]
+
+
+async def _bad_handler(msg):
+    raise AttributeError("'ConditionWatcher' object has no attribute '_symbols_by_seq'")
+
+
+attempts, exc = _run_client(_bad_handler)
+check("10-1) on_message 코드 오류 시 재연결하지 않음(연결 시도 1회)",
+      attempts == 1)
+check("10-2) MessageHandlerError로 감싸여 전파됨",
+      isinstance(exc, MessageHandlerError))
+check("10-3) 원래 예외가 __cause__로 보존됨",
+      exc is not None and isinstance(exc.__cause__, AttributeError))
+
+
+async def _ok_handler(msg):
+    return None
+
+
+# 네트워크 오류(ConnectionClosed)는 기존대로 재연결
+attempts_net, exc_net = _run_client(
+    _ok_handler,
+    raise_on_recv=ConnectionClosed(None, None),
+    msgs=(),
+    budget=0.3,
+)
+check("10-4) ConnectionClosed는 기존대로 재연결함(연결 시도 2회 이상)",
+      attempts_net >= 2)
+check("10-5) 네트워크 오류는 예외를 전파하지 않음",
+      exc_net is None)
+
+# OSError 계열도 재연결 대상
+attempts_os, _ = _run_client(
+    _ok_handler,
+    raise_on_recv=ConnectionResetError("reset by peer"),
+    msgs=(),
+    budget=0.3,
+)
+check("10-6) OSError 계열(ConnectionResetError)도 재연결 대상",
+      attempts_os >= 2)
+
+
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
 if failed:

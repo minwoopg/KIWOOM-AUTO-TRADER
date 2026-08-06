@@ -3271,3 +3271,123 @@ git에 포함되지 않으며(.gitignore), 로컬에서 필요 없으면 수동 
 
 ---
 
+## 1G: shadow 전환 전 보완 — reliability 전달, 코드 오류 재연결 차단, 선택 통계 (2026-08-06)
+
+**배경**: 1E.9 + 1F 누적 적용에 대한 GPT 코드리뷰에서 3건이 지적됨.
+P0 타깃 누락 수정과 스윙 제거는 승인, 다만 `entry_quality_guard_mode`
+를 shadow로 전환하기 전에 아래 2건을 보완할 것.
+
+### 1. 이미 알려진 종목의 REAL I가 TradingService에 전달되지 않음 (재현 확인)
+
+**재현 결과** (패치 전, 직접 실행):
+```
+변경 전 reliable: {'005930': True}
+REAL I 수신
+변경 후 reliable: {'005930': False}
+on_symbols_changed 호출 횟수: 0
+```
+
+`_on_realtime()`의 `action == "I"` 분기는 이미 알려진 종목일 때
+`_realtime_unresolved`에 추가만 하고 `_notify()`를 호출하지 않았음.
+`symbol_condition_source_reliable`은 호출 시점에 재계산되므로 watcher
+내부 값은 즉시 False가 되지만, `TradingService`는 `update_targets()`
+콜백으로만 갱신되므로 **과거의 `condition_source_reliable=True`를
+계속 사용**함 → shadow 로그에 잘못된 신뢰도가 기록될 수 있었음.
+
+**수정**: `was_unresolved`를 먼저 저장하고, unresolved에 **처음
+추가되는 경우에는 신규 종목 여부와 무관하게** `_notify()`를 호출.
+동일 REAL I가 반복되면 상태 변화가 없으므로 생략(불필요한 폴링
+갱신 방지). 핵심은 "종목 수가 변하지 않아도 reliability 메타데이터가
+바뀌면 콜백을 호출한다"는 것.
+
+로그도 정리 — 신규 편입은 기존 문구, 이미 알려진 종목은 신뢰도 하향
+문구를 **최초 1회만** 출력(반복 수신 시 로그 폭주 방지).
+
+### 2. 코드 오류도 무한 재연결 (재현 확인)
+
+**재현 결과** (패치 전, 직접 실행):
+```
+on_message에서 AttributeError 발생시킴
+→ 0.6초 동안 연결 시도 횟수: 12회
+```
+실서버 8/6 08:40~09:06의 242회 재연결 루프와 정확히 같은 구조.
+
+`KiwoomWebSocket.start()`가 모든 `Exception`을 "연결 끊김"으로 취급해
+5초 후 재연결했기 때문. 1E.8의 `AttributeError`처럼 **재시도해도
+결과가 절대 달라지지 않는 결정적 코드 오류**까지 무한 반복됨.
+
+**수정**:
+- `MessageHandlerError(RuntimeError)` 신규 — `on_message` 콜백 내부
+  예외를 이 타입으로 감싸 재전파(`__cause__`에 원래 예외 보존).
+  `CancelledError`는 정상 종료 신호이므로 그대로 통과.
+- `RECOVERABLE_NETWORK_ERRORS` 상수로 재연결 대상을 명시:
+  `ConnectionClosed`, `OSError`(ConnectionRefused/Reset·gaierror 포함),
+  `asyncio.TimeoutError`, `InvalidHandshake`, `WebSocketException`.
+- `start()`의 예외 처리를 셋으로 분리 — `MessageHandlerError`는 즉시
+  전파, 위 네트워크 오류만 재연결, **분류되지 않은 예외도 전파**
+  (조용히 무한 반복되면 1E.8 같은 장애가 또 감춰지므로).
+  새 네트워크 예외 유형이 발견되면 상수에 명시적으로 추가하는 방향.
+
+`app/main.py`의 `watcher_start_guarded()`는 이미 예외를 재전파하고
+있어 수정 불필요 — 전파된 예외가 `asyncio.wait`의 done 처리로
+이어져 프로세스가 0이 아닌 종료 코드로 끝남.
+
+### 3. target 선택 통계 로그 추가 (선택 로직은 미변경)
+
+**정정**: 1F 완료 보고에서 "감시 종목이 4개 → 수십 개로 돌아온다"고
+했는데 **부정확한 서술이었음**. `max_symbols: 10`이고 수동 targets가
+4개이므로, 조건검색 종목이 차지할 수 있는 자리는 **최대 6개**이고
+최종 감시 대상은 항상 10종목 이하임.
+
+더 중요한 것은 선택 기준 — `sorted(realtime_unresolved)`로 정렬하므로
+**종목코드 오름차순 앞쪽 6개**가 선택됨. 편입 시각·거래대금·점수·
+상승여력 등은 전혀 반영되지 않아, 장중에 더 좋은 종목이 편입돼도
+코드가 크면 잘림. 이 편향은 `entry_quality_shadow.csv` 표본에도 그대로
+반영되므로 shadow 분석 시 반드시 감안해야 함.
+
+**이번 단계에서는 선택 로직을 바꾸지 않고 편향의 크기만 관측**:
+- `DayTargetSelection`에 `eligible_condition_count` /
+  `selected_condition_count` / `truncated_condition_count` 추가.
+  수동 targets와 겹치는 종목은 상한과 무관하게 항상 들어가므로
+  조건검색 집계에서 제외(그래야 "상한 때문에 잘린 수"가 정확함).
+- `[COND_STATUS]` 로그에 세 값과 `selected_symbols`(기존 `final=`)를 기록.
+- 잘림이 실제로 발생하면 `[COND_TRUNCATE]` 경고를 별도로 남김.
+
+선택 정책 개선(최근 편입 우선 / 순환 / 거래대금·점수 순위화 /
+`max_symbols` 상향)은 이 로그로 실제 규모를 확인한 뒤 별도 단계에서
+결정. `max_symbols`만 올리는 것은 API 호출량 측정이 선행돼야 함.
+
+### 조건식 출처 기반 VWAP shadow의 예상 한계 (기록)
+
+장전 초기 조회가 0종목이고 주기적 CNSRREQ 재조회가 없으므로, 장중
+신규 편입 종목은 하루 종일 `condition_source_reliable=False`일 가능성이
+높음. 따라서 shadow 전환 후에도 아래 4개 필드는 대부분 빈 값이 될 것:
+`would_block_pullback_condition_rolling_vwap`,
+`would_block_pr_or_pullback_condition_rolling_vwap`,
+`would_block_pullback_condition_session_vwap`,
+`would_block_pr_or_pullback_condition_session_vwap`.
+
+MACD hard/min5, PR-only rolling/session, C-or-PR rolling/session은 정상
+수집됨. 데이터 오류가 아니라 신뢰할 수 없는 값을 남기지 않는 보수적
+동작이므로, **우선 MACD·PR·C 중심으로 분석**하고 조건식 출처 기반
+비교는 `reliable=True` 행만 따로 모아 별도 판단.
+
+### 테스트
+
+`test_condition_target_selection.py` 37건 → **58건**:
+- 8절(7건): 선택 통계 — 실운영 설정(max_symbols=10, 수동 4)에서
+  eligible=78 / selected=6 / truncated=72 정확 집계, 수동 겹침 제외,
+  자동 제외 종목 미포함, 합계 항등식.
+- 9절(8건): known 종목 REAL I → 콜백 1회, 콜백 시점에 reliability=False
+  전달, 반복 수신 시 콜백 생략, 신규 종목은 기존대로 콜백,
+  reliability=False여도 매매 대상에는 포함.
+- 10절(6건): `on_message` AttributeError → 연결 시도 1회로 종료 +
+  `MessageHandlerError` 전파 + `__cause__` 보존,
+  `ConnectionClosed`·`ConnectionResetError`는 기존대로 재연결.
+
+**전체 회귀**: 12개 파일 전부 통과, 1개 스킵, 종료코드 0.
+`app.main` / `app.target_selection` / `infra.websocket.kiwoom_ws`
+import 스모크, `load_settings()`, `compileall` 전부 정상.
+
+---
+
