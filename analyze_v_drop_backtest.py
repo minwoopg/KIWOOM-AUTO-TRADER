@@ -32,6 +32,8 @@ from replay_runner import load_bars
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from domain.cost_model import load_cost_model  # noqa: E402
+from domain.replay_context import ReplayDayContext  # noqa: E402
+from replay_runner import MINUTE_BAR_COUNT as REPLAY_MINUTE_BAR_COUNT  # noqa: E402
 COST_MODEL = load_cost_model()
 TOTAL_COST_PCT = COST_MODEL.base_roundtrip_pct   # 하위호환(Base alias)
 # replay_runner import 시점에 sys.stdout이 이미 UTF-8로 재래핑됨 (중복 래핑 금지)
@@ -123,21 +125,14 @@ def simulate_event(event: dict) -> dict | None:
     if not bars:
         return None
 
-    entry_idx = None
-    for i, b in enumerate(bars):
-        tm = b.cntr_tm.strip()
-        try:
-            if len(tm) >= 14:
-                bar_time = datetime.strptime(tm[8:14], "%H%M%S").time()
-            elif len(tm) == 6:
-                bar_time = datetime.strptime(tm, "%H%M%S").time()
-            else:
-                continue
-        except ValueError:
-            continue
-        if bar_time >= entry_ts.time():
-            entry_idx = i
-            break
+    # 2026-08-07 (1J.3): 이전엔 날짜를 버리고 시각만 비교해서,
+    # 6/23 09:23 이벤트인데 파일 첫 봉이 6/22 14:22면
+    # "14:22 >= 09:23"이라 **전날 봉이 진입봉으로 선택**될 수 있었음.
+    # 또 로그 timestamp가 09:23:00.608이고 분봉이 09:23:00이면
+    # 09:24 봉으로 밀렸음. full datetime + 분 단위 내림으로 교정.
+    ctx = ReplayDayContext(bars, entry_ts.date(),
+                           minute_bar_count=REPLAY_MINUTE_BAR_COUNT)
+    entry_idx = ctx.index_at_or_after(entry_ts)
     if entry_idx is None:
         return None
 
@@ -146,11 +141,12 @@ def simulate_event(event: dict) -> dict | None:
         return None
 
     after_pcts: dict[int, float | None] = {}
+    # 2026-08-07 (1J.3): 봉 개수가 아니라 clock-time 기준
+    _entry_dt = ctx.bar_dt(entry_idx)
     for m in AFTER_MINUTES:
-        idx = entry_idx + m
-        if idx < len(bars):
-            ap = bars[idx].close_price
-            after_pcts[m] = (ap - entry_price) / entry_price * 100
+        hp = ctx.price_at_horizon(_entry_dt, m) if _entry_dt else None
+        if hp is not None and hp.available:
+            after_pcts[m] = (hp.price - entry_price) / entry_price * 100
         else:
             after_pcts[m] = None
 

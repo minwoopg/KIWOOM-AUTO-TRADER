@@ -31,6 +31,17 @@ AFTER_MINUTES   = [5, 10, 20]
 # daily_report는 0.90%를 쓰고 있어 두 기준이 갈라져 있었습니다.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from domain.cost_model import load_cost_model  # noqa: E402
+from domain.replay_context import ReplayDayContext  # noqa: E402
+from config.settings import load_settings  # noqa: E402
+
+# live와 동일한 분석 윈도우 크기를 설정에서 읽습니다.
+try:
+    MINUTE_BAR_COUNT = load_settings().market_regime.minute_bar_count
+except Exception:
+    MINUTE_BAR_COUNT = 60
+
+# prev_close를 복원하지 못해 건너뛴 종목 (리포트에 명시)
+PREV_CLOSE_UNAVAILABLE: list[str] = []
 COST_MODEL = load_cost_model()
 TOTAL_COST_PCT = COST_MODEL.base_roundtrip_pct   # 하위호환(Base 시나리오)
 ROUND_TRIP_COST_PCT = TOTAL_COST_PCT
@@ -120,15 +131,40 @@ def get_time_bucket(cntr_tm: str) -> str:
         return "기타"
 
 
-def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer) -> list[dict]:
+def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
+               target_date: date | None = None) -> list[dict]:
+    # 2026-08-07 (1J.3): target_date를 명시적으로 받습니다 —
+    # 파일에 전일 꼬리 봉이 섞여 있어 봉만 보고는 어느 날의
+    # candidate를 평가해야 하는지 알 수 없기 때문입니다.
+    if target_date is None:
+        from domain.replay_context import parse_bar_dt as _pbd
+        _dts = [d for d in (_pbd(getattr(b, 'cntr_tm', '')) for b in bars) if d]
+        target_date = max(d.date() for d in _dts) if _dts else None
+        if target_date is None:
+            return []
     if len(bars) < 5:
         return []
     results = []
-    prev_close = bars[0].close_price
+    # 2026-08-07 (1J.3): 시간축을 live와 맞추기 위해 공용 컨텍스트 사용.
+    #   - 전일 꼬리 봉은 history로만 쓰고 candidate에서는 제외
+    #   - analyzer window는 현재봉 포함 최근 minute_bar_count(=60)개
+    #   - prev_close는 target_date 이전 마지막 봉의 close
+    ctx = ReplayDayContext(bars, target_date, minute_bar_count=MINUTE_BAR_COUNT)
+    prev_close = ctx.previous_close
+    if prev_close is None:
+        # 임의 추정하지 않고 skip — 등락률 A조건에 직접 들어가는 값이라
+        # 잘못 넣으면 결과가 조용히 왜곡됨.
+        PREV_CLOSE_UNAVAILABLE.append(symbol)
+        return []
 
-    for i in range(5, len(bars)):
-        window  = bars[:i]
+    for i in ctx.target_indices:
+        if i < 5:
+            continue
+        window  = ctx.analysis_window(i)
         current = bars[i]
+        entry_dt = ctx.bar_dt(i)
+        if entry_dt is None:
+            continue
         is_v = is_pr = False
         patterns = "-"
 
@@ -166,21 +202,21 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer) -> list[dict]:
         entry_price = current.close_price
         entry_time  = current.cntr_tm
 
+        # 2026-08-07 (1J.3): "5분 후"를 봉 개수(i+m)가 아니라 clock-time
+        # 으로 계산. 실측상 46.1% 파일에 1분 초과 gap, 15.3%에 5분 이상
+        # gap이 있어 i+5가 8분·15분·35분 후가 될 수 있었음.
         after_pcts: dict[int, float | None] = {}
+        elapsed: dict[int, float | None] = {}
         for m in AFTER_MINUTES:
-            idx = i + m
-            if idx < len(bars):
-                ap = bars[idx].close_price
-                after_pcts[m] = (ap - entry_price) / entry_price * 100
+            hp = ctx.price_at_horizon(entry_dt, m)
+            if hp.available:
+                after_pcts[m] = (hp.price - entry_price) / entry_price * 100
+                elapsed[m] = round(hp.actual_elapsed_minutes, 1)
             else:
                 after_pcts[m] = None
+                elapsed[m] = None
 
-        future = bars[i + 1: i + 21]
-        if future:
-            mfe = (max(b.high_price  for b in future) - entry_price) / entry_price * 100
-            mae = (min(b.low_price   for b in future) - entry_price) / entry_price * 100
-        else:
-            mfe = mae = 0.0
+        mfe, mae = ctx.mfe_mae(entry_dt, entry_price, minutes=20)
 
         results.append({
             "entry_time":  entry_time,
@@ -206,6 +242,11 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer) -> list[dict]:
             "base_20m": COST_MODEL.net(after_pcts.get(20), "base"),
             "stress_20m": COST_MODEL.net(after_pcts.get(20), "stress"),
             "net_20m": COST_MODEL.net(after_pcts.get(20), "base"),
+            # 2026-08-07 (1J.3): idx+m을 "m분 후"라고 부르지 않기 위해
+            # 실제 경과 시간을 함께 기록합니다.
+            "elapsed_5m":  elapsed.get(5),
+            "elapsed_10m": elapsed.get(10),
+            "elapsed_20m": elapsed.get(20),
             "mfe":         round(mfe, 2),
             "mae":         round(mae, 2),
         })
@@ -479,7 +520,7 @@ def main():
         bars    = load_bars(symbol, target_date)
         if not bars:
             continue
-        results = run_replay(symbol, bars, analyzer)
+        results = run_replay(symbol, bars, analyzer, target_date)
         all_results[symbol] = results
         report  = format_report(symbol, results, target_date)
         print(report)

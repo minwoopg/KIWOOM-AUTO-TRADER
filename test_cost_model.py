@@ -278,10 +278,13 @@ except Exception as e:
 finally:
     vd.load_bars = _orig_load
 
-check("12A-3) simulate_event 실행 시 NameError가 발생하지 않음",
-      _sim_err is None or "NameError" not in _sim_err)
+# 2026-08-07 (1J.3): 이전 조건 `_sim_err is None or "NameError" not in _sim_err`
+# 는 KeyError/TypeError/IndexError가 나도 PASS했고, `_sim`이 dict가
+# 아닐 때도 "예외가 있으면 PASS"하는 구조였음. 어떤 예외든 실패로.
+check("12A-3) simulate_event 실행 시 어떤 예외도 발생하지 않음", _sim_err is None)
 if _sim_err:
     print(f"       └ {_sim_err}")
+check("12A-3b) simulate_event가 dict를 반환", isinstance(_sim, dict))
 if isinstance(_sim, dict):
     check("12A-4) gross/base/stress 필드가 산출됨",
           all(k in _sim for k in ("gross_5m", "base_5m", "stress_5m")))
@@ -290,8 +293,7 @@ if isinstance(_sim, dict):
     if _sim.get("gross_5m") is not None:
         check("12A-6) Gross > Base > Stress 수치 관계",
               _sim["gross_5m"] > _sim["base_5m"] > _sim["stress_5m"])
-else:
-    check("12A-4) simulate_event가 dict를 반환", _sim is not None or _sim_err is not None)
+
 
 
 # --- B. helper가 실제로 3시나리오를 출력 --------------------------
@@ -338,6 +340,46 @@ cr_src = Path("analyze_crash_rebound_days.py").read_text(encoding="utf-8")
 check("12D-3) crash entries에 3시나리오 필드 존재",
       all(k in cr_src for k in ('"gross_return"', '"base_return"', '"stress_return"')))
 check("12D-4) crash의 net_return이 Base alias", "net_return = base_return" in cr_src)
+
+
+# ══════════════════════════════════════════════════════════════
+# 1J.1 invariant 복구 (1J.3) — 삭제가 아니라 누적
+# ══════════════════════════════════════════════════════════════
+# 1J.2에서 5~8절을 12절로 교체해버렸음. 기존 invariant는 그대로
+# 유지하면서 신규 regression을 더해야 회귀를 놓치지 않는다.
+
+# --- 5. Base < Gross, Stress < Base 관계 ---
+live = load_cost_model("config/settings.yaml", use_cache=False)
+check("5-1) 실제 설정이 로드됨", live.base_roundtrip_pct > 0)
+check("5-2) 비용 크기: Gross < Base < Stress",
+      live.gross_roundtrip_pct < live.base_roundtrip_pct < live.stress_roundtrip_pct)
+n5 = live.net_all(1.00)
+check("5-3) 순수익 크기: Gross > Base > Stress", n5["gross"] > n5["base"] > n5["stress"])
+check("5-4) 시나리오 순서 상수가 고정", SCENARIO_ORDER == ("gross", "base", "stress"))
+
+# --- 6. 기존 report/replay 계산 결과 재현 ---
+check("6-1) Base가 기존 replay의 0.35%와 일치",
+      abs(live.base_roundtrip_pct - 0.35) < 1e-9)
+check("6-2) Stress가 기존 daily_report의 0.90%와 일치",
+      abs(live.stress_roundtrip_pct - DEFAULT_STRESS_ROUNDTRIP_PCT) < 1e-9
+      and abs(live.stress_roundtrip_pct - 0.90) < 1e-9)
+check("6-3) 기존 replay 수치 재현 (+0.71% → Base +0.36%)",
+      abs(live.net(0.71, "base") - 0.36) < 1e-9)
+
+# --- 7. 리포트에 기준 차이가 명시됨 ---
+check("7-1) daily_report가 Stress 기준임을 표기", "Stress" in rep)
+check("7-2) daily_report가 replay와 기준이 다름을 명시",
+      "replay" in rep and "다릅니다" in rep)
+rr_src = Path("replay_runner.py").read_text(encoding="utf-8")
+check("7-3) replay가 세 시나리오를 함께 출력",
+      'for _s in ("gross", "base", "stress")' in rr_src)
+check("7-4) replay가 daily_report와의 기준 차이를 명시",
+      "daily_report는 Stress" in rr_src)
+
+# --- 8. trades.csv raw PnL 보존 ---
+tw = Path("infra/storage/logger.py").read_text(encoding="utf-8")
+check("8-1) 거래 기록기가 비용을 차감하지 않음(raw PnL 보존)",
+      "COST_RATE" not in tw and "TOTAL_COST_PCT" not in tw)
 
 
 # ── 13. Gross 정의 강제 (1J.2) ──────────────────────────────────

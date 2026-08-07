@@ -55,6 +55,8 @@ AFTER_MINUTES   = [5, 10, 20]
 # daily_report는 0.90%를 쓰고 있어 두 기준이 갈라져 있었습니다.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from domain.cost_model import load_cost_model  # noqa: E402
+from domain.replay_context import ReplayDayContext  # noqa: E402
+from replay_runner import MINUTE_BAR_COUNT as REPLAY_MINUTE_BAR_COUNT  # noqa: E402
 COST_MODEL = load_cost_model()
 TOTAL_COST_PCT = COST_MODEL.base_roundtrip_pct   # 하위호환(Base 시나리오)
 ROUND_TRIP_COST_PCT = TOTAL_COST_PCT
@@ -170,11 +172,17 @@ def get_time_bucket(cntr_tm: str) -> str:
         return "기타"
 
 
-def compute_returns(bars, i, entry_price):
+def compute_returns(ctx, entry_dt, entry_price):
+    """clock-time 기준 5/10/20분 후 수익률.
+
+    2026-08-07 (1J.3): 이전엔 `idx = i + m`(봉 개수)였음. 실측상
+    46.1% 파일에 1분 초과 gap이 있어 "5분 후"가 8·15·35분 후가 될
+    수 있었으므로 timestamp 기준으로 교체.
+    """
     after = {}
     for m in AFTER_MINUTES:
-        idx = i + m
-        after[m] = (bars[idx].close_price - entry_price) / entry_price * 100 if idx < len(bars) else None
+        hp = ctx.price_at_horizon(entry_dt, m)
+        after[m] = ((hp.price - entry_price) / entry_price * 100) if hp.available else None
     return after
 
 
@@ -191,11 +199,20 @@ def run_symbol_day(symbol: str, target_date: date, analyzer) -> dict:
     out = {"B_c_gate_open": [], "C_both_open": [], "D_c_minus15": [], "E_c_minus20": []}
     if len(bars) < 5:
         return out
-    prev_close = bars[0].close_price
+    # 2026-08-07 (1J.3): replay_runner와 동일한 공용 시간축 컨텍스트.
+    ctx = ReplayDayContext(bars, target_date, minute_bar_count=REPLAY_MINUTE_BAR_COUNT)
+    prev_close = ctx.previous_close
+    if prev_close is None:
+        return out          # 임의 추정 금지 — 등락률 조건이 왜곡됨
 
-    for i in range(5, len(bars)):
-        window = bars[:i]
+    for i in ctx.target_indices:
+        if i < 5:
+            continue
+        window = ctx.analysis_window(i)      # 현재봉 포함 최근 60봉
         current = bars[i]
+        entry_dt = ctx.bar_dt(i)
+        if entry_dt is None:
+            continue
         try:
             a = analyzer.analyze(window, prev_close)
         except Exception:
@@ -208,7 +225,7 @@ def run_symbol_day(symbol: str, target_date: date, analyzer) -> dict:
         c_ok,   c_label    = decide(a, -100.0,    -100.0, 100.0)      # A캡+C게이트 전부개방
 
         entry_price = current.close_price
-        after = compute_returns(bars, i, entry_price)
+        after = compute_returns(ctx, entry_dt, entry_price)
         future = bars[i + 1: i + 21]
         mae = (min(b.low_price for b in future) - entry_price) / entry_price * 100 if future else 0.0
         mfe = (max(b.high_price for b in future) - entry_price) / entry_price * 100 if future else 0.0

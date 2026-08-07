@@ -4563,3 +4563,131 @@ docstring과 테스트(14절)를 이 정책에 맞춤.
 
 ---
 
+## 1J.3: Replay Time-Axis Integrity (2026-08-07)
+
+1J.2에 대한 GPT 코드리뷰에서 **비용 모델보다 중요한 replay 시간축
+결함**이 발견됨. 51거래일 결과를 왜곡하는 P0.
+
+### 실측 재현 (분봉 CSV 전수)
+
+```
+분봉 CSV                1,781개
+대상일 외 날짜 봉 포함     920개 (51.7%)
+1분 초과 gap 존재         821개 (46.1%)
+5분 이상 gap 존재         272개 (15.3%)
+예: data/minute_bars/20260623/005930.csv 첫 봉 = 20260622142200
+```
+전일 꼬리 봉이 섞이는 것 자체는 정상(실시간 봇이 최근 60봉을 받으며
+전일 봉을 포함). 문제는 replay가 이를 다루는 방식이었음.
+
+### `domain/replay_context.py` 신규 — 공용 시간축
+
+네 분석기가 각자 구현하지 않고 `ReplayDayContext` 하나를 공유:
+`is_target_bar` / `target_indices` / `target_bars` / `previous_close` /
+`analysis_window` / `price_at_horizon` / `bars_between` / `mfe_mae` /
+`index_at_or_after`. 봉 클래스가 파일마다 달라(`close_price` vs
+`close`) 필드명 흡수 헬퍼도 포함.
+
+### P0-1: 전일 봉이 entry candidate로 평가됨
+
+`for i in range(5, len(bars))`가 전일 봉까지 순회 → 6/23 replay가
+6/22 봉에서 BUY 신호를 만들 수 있었음. **candidate는 `cntr_tm`
+날짜가 target_date인 봉으로 한정**. 전일 봉은 history로만 사용.
+실데이터 검증: 409봉 → target 349봉(전일 60봉 제외).
+
+### P0-2: live 60봉 vs replay 누적 전체
+
+live는 `broker.get_minute_bars(count=cfg.minute_bar_count)`(=60)를
+`MinuteAnalyzer`에 넘기는데 replay는 `bars[:i]`라 오후에 200~400봉이
+들어감. `MinuteAnalyzer`가 전달된 bars 전체로 VWAP·day_high·day_low를
+계산하므로 **다른 전략**이었음. `analysis_window()`가
+`bars[:i+1][-60:]`을 돌려주도록 통일.
+
+### P0-3: 현재봉 누락 (1봉 시차)
+
+`window=bars[:i]`, `current=bars[i]`라 analyzer는 i-1까지만 보고 i
+가격으로 진입. live는 최신 현재봉을 포함한 60봉을 분석. 이제
+현재봉이 항상 `window[-1]`.
+
+### P0-4: prev_close가 파일 첫 봉
+
+`bars[0].close_price`는 전일 *첫 저장봉*이지 전일 종가가 아님.
+등락률 A조건에 직접 들어가는 값. **target_date 이전 마지막 봉의
+close**로 교정. 실데이터: 353,500(정확) vs 353,750(기존).
+이전 날짜 봉이 없으면 **임의 추정하지 않고 None** — replay는 해당
+종목을 skip하고 `PREV_CLOSE_UNAVAILABLE`에 기록.
+
+### P0-5: "5분 후"가 실제로는 "5개 봉 후"
+
+`idx = i + m`. gap이 46.1% 파일에 있어 8분·15분·35분 후가 될 수
+있었음. **timestamp 기준으로 교체** — `entry_dt + m분` 시각 이하의
+가장 최신 봉을 mark-to-market으로 쓰되, `MAX_STALENESS_MINUTES`(3분)
+이상 오래된 봉이면 N/A. `actual_elapsed_minutes`를 함께 기록해
+`idx+m`을 "m분 후"라고 부르지 않음. 날짜 경계를 넘지 않음.
+
+MFE/MAE도 `bars[i+1:i+21]`이 아니라
+`entry_dt < bar_dt <= entry_dt + 20분` 범위.
+
+### P0-6: v-drop 날짜 비교
+
+`if bar_time >= entry_ts.time():`로 **날짜를 버리고 시각만 비교** —
+6/23 09:23 이벤트인데 파일 첫 봉이 6/22 14:22면 "14:22 >= 09:23"이라
+**전날 봉이 진입봉으로 선택**될 수 있었음. 또 로그 timestamp
+`09:23:00.608` vs 분봉 `09:23:00` 때문에 09:24로 밀렸음.
+`index_at_or_after()`가 full datetime + 분 단위 내림으로 매칭.
+
+### P0-7: crash / pullback 동일 적용
+
+- **crash**: `day_open`/`day_low`를 target_date 봉만으로 계산.
+  저점+3/5/10분도 clock-time 기준.
+- **pullback**: candidate 한정 + 60봉 window + 현재봉 포함 +
+  prev_close + timestamp horizon 전부 공용 컨텍스트로.
+
+### 실측 영향 — 지적보다 컸음
+
+```
+crash 3분 지연 Gross 평균
+  1J.2 (기존 시간축)   +5.30%
+  1J.3 (교정 후)       +3.84%      ← 1.46%p 차이
+급락일 판정            50일 → 49일
+표본                   1061건 → 1049건
+```
+GPT 추정 0.79%p보다 큽니다(날짜 경계 + clock-time 둘 다 반영했기
+때문). **지금까지의 51일 replay/backtest 수치는 enforce 판단에
+사용하지 않고 전부 재산출합니다.** Gross/Base/Stress 비용 민감성
+구조 자체는 유효.
+
+### P1: 1J.1 invariant 복구 (누적)
+
+1J.2에서 5~8절을 12절로 **교체**해버렸음 — 88 > 68이지만 누적이
+아니었음. 다음을 복구:
+`Gross < Base < Stress`, 순수익 역순, `SCENARIO_ORDER` 고정,
+Base=0.35 / Stress=0.90 재현, `+0.71 → +0.36` 재현, daily/replay
+기준 문구, trades logger의 raw PnL 보존.
+
+### P1: simulate_event false-pass 제거
+
+`_sim_err is None or "NameError" not in _sim_err`는 KeyError·
+TypeError·IndexError가 나도 PASS했고, `_sim`이 dict가 아닐 때
+"예외가 있으면 PASS"하는 구조였음.
+→ `check(예외 없음, _sim_err is None)` +
+`check(dict 반환, isinstance(_sim, dict))`로 분리.
+
+### 테스트
+
+- **`test_replay_time_axis.py` 신규 67건** — A(전일 봉 candidate
+  배제 7건) / B(60봉 window·현재봉 포함 17건) / C(prev_close 5건) /
+  D(timestamp horizon 7건) / E(clock-time MFE·MAE 4건) /
+  F(v-drop 날짜·초 매칭 5건) / G(분석기 4종이 공용 컨텍스트 사용
+  14건) / H(실데이터 회귀 5건).
+  G절은 주석·docstring 오탐을 피하려고 **AST로 코드만 추출**해 검사
+  (작성 중 실제 오탐 발생).
+- **`test_cost_model.py` 88건 → 101건** — 삭제된 invariant 복구 +
+  false-pass 제거.
+
+**전체 회귀**: 15개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+**실행 스모크**: replay / crash / v-drop / pullback 4종 정상.
+**BUY/HOLD/SELL 실매매 로직 무변경.**
+
+---
+

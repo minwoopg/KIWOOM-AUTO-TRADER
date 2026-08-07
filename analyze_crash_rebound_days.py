@@ -33,6 +33,7 @@ REPORTS_DIR = Path("reports")
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from domain.cost_model import load_cost_model  # noqa: E402
+from domain.replay_context import ReplayDayContext, parse_bar_dt  # noqa: E402
 COST_MODEL = load_cost_model()
 TOTAL_COST_PCT = COST_MODEL.base_roundtrip_pct   # 하위호환(Base 시나리오)
 ROUND_TRIP_COST_PCT = TOTAL_COST_PCT
@@ -83,7 +84,16 @@ def list_symbols_for_date(target_date: date) -> list[str]:
 
 def analyze_symbol_day(symbol: str, target_date: date, crash_threshold: float) -> dict | None:
     """종목 하루치 분봉에서 당일 낙폭/저점/반등 정보를 계산합니다."""
-    bars = load_bars(symbol, target_date)
+    all_bars = load_bars(symbol, target_date)
+    if len(all_bars) < 10:
+        return None
+
+    # 2026-08-07 (1J.3): 분봉 CSV의 51.7%에 전일 꼬리 봉이 섞여 있어
+    # day_open/day_low가 전일 봉으로 오염됐음. 급락 계산은 target_date
+    # 봉만 사용한다. (실측: 날짜 경계만 고쳐도 3분 지연 Gross 평균이
+    # 약 0.79%p 움직임)
+    ctx = ReplayDayContext(all_bars, target_date)
+    bars = ctx.target_bars
     if len(bars) < 10:
         return None
 
@@ -102,12 +112,17 @@ def analyze_symbol_day(symbol: str, target_date: date, crash_threshold: float) -
     eod_from_low_pct = (day_close - low_bar.low) / low_bar.low * 100
 
     entries = {}
+    # 2026-08-07 (1J.3): 저점+N"분"을 봉 개수가 아니라 clock-time으로.
+    # gap이 46.1% 파일에 있어 low_idx+3이 3분 후가 아닐 수 있었음.
+    _low_dt = parse_bar_dt(getattr(low_bar, "cntr_tm", ""))
     for delay in ENTRY_DELAYS:
-        entry_idx = low_idx + delay
-        if entry_idx >= len(bars):
+        entry_price = None
+        _hp = ctx.price_at_horizon(_low_dt, delay) if _low_dt is not None else None
+        if _hp is not None and _hp.available:
+            entry_price = _hp.price
+        if entry_price is None:
             entries[delay] = None
             continue
-        entry_price = bars[entry_idx].close
         raw_return = (day_close - entry_price) / entry_price * 100
         # 2026-08-07 (1J.2): 3시나리오 병행 산출. net_return은 Base alias.
         gross_return = COST_MODEL.net(raw_return, "gross")
@@ -116,7 +131,9 @@ def analyze_symbol_day(symbol: str, target_date: date, crash_threshold: float) -
         net_return = base_return
         entries[delay] = {
             "entry_price": entry_price,
-            "entry_time": bars[entry_idx].cntr_tm[8:14] if len(bars[entry_idx].cntr_tm) >= 14 else "?",
+            "entry_time": _hp.bar_dt.strftime("%H%M%S") if _hp and _hp.bar_dt else "?",
+            # 2026-08-07 (1J.3): 봉 개수가 아니라 실제 경과 시간
+            "actual_elapsed_minutes": _hp.actual_elapsed_minutes if _hp else None,
             "raw_return": raw_return,
             "gross_return": gross_return,
             "base_return": base_return,
