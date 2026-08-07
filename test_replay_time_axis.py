@@ -230,7 +230,8 @@ rr = Path("replay_runner.py").read_text(encoding="utf-8")
 check("G-2) replay_runner가 target_indices로 candidate를 한정",
       "ctx.target_indices" in rr)
 check("G-3) replay_runner가 analysis_window를 사용", "ctx.analysis_window(" in rr)
-check("G-4) replay_runner가 ctx.previous_close를 사용", "ctx.previous_close" in rr)
+check("G-4) replay_runner가 prev_close를 복원 계층으로 얻음",
+      "resolve_prev_close(" in rr)
 check("G-5) replay_runner 코드에 prev_close = bars[0].close_price가 없음",
       "prev_close = bars[0].close_price" not in _code_only(rr))
 check("G-6) replay_runner 코드에 idx = i + m 방식이 없음",
@@ -276,6 +277,154 @@ if real:
           all(str(r["entry_time"]).startswith("20260623") for r in res))
 else:
     print("[SKIP] H절 — 실데이터 없음")
+
+# ══════════════════════════════════════════════════════════════
+# I. pullback MFE/MAE도 clock-time (1J.3.1)
+# ══════════════════════════════════════════════════════════════
+pb2 = Path("simulate_pullback_removal.py").read_text(encoding="utf-8")
+check("I-1) pullback 코드에 bars[i+1:i+21] 방식이 없음",
+      "bars[i + 1: i + 21]" not in _code_only(pb2)
+      and "bars[i+1:i+21]" not in _code_only(pb2))
+check("I-2) pullback이 ctx.mfe_mae를 사용", "ctx.mfe_mae(" in pb2)
+
+# 20분 밖 봉이 실제로 제외되는지 (공용 함수 동작 재확인)
+mm2 = [mk("20260807", 10, 0, 10000),
+       mk("20260807", 10, 19, 10000, high=10400, low=9700),
+       mk("20260807", 10, 21, 10000, high=99999, low=1)]     # 21분 → 제외
+ctx_i = ReplayDayContext(mm2, TARGET)
+mfe2, mae2 = ctx_i.mfe_mae(datetime(2026, 8, 7, 10, 0), 10000, minutes=20)
+check("I-3) clock-time 20분 밖 봉이 MFE에 포함되지 않음", abs(mfe2 - 4.0) < 1e-9)
+check("I-4) clock-time 20분 밖 봉이 MAE에 포함되지 않음", abs(mae2 - (-3.0)) < 1e-9)
+
+
+# ══════════════════════════════════════════════════════════════
+# J. replay fail-closed (1J.3.1)
+# ══════════════════════════════════════════════════════════════
+import replay_runner as RR
+
+check("J-1) ReplayConfigError가 정의됨", hasattr(RR, "ReplayConfigError"))
+check("J-2) 기본은 fallback 비활성", RR.ALLOW_CONFIG_FALLBACK is False)
+check("J-3) 정상 설정에서 minute_bar_count를 읽음",
+      RR.resolve_minute_bar_count() == 60)
+
+# 설정 로딩 실패 → 예외
+_orig_ls = RR.load_settings
+RR.load_settings = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+try:
+    RR.resolve_minute_bar_count()
+    _r1 = False
+except RR.ReplayConfigError:
+    _r1 = True
+except Exception:
+    _r1 = False
+check("J-4) 설정 로딩 실패 → ReplayConfigError", _r1)
+check("J-5) --allow-config-fallback일 때만 60으로 대체",
+      RR.resolve_minute_bar_count(allow_fallback=True) == 60)
+RR.load_settings = _orig_ls
+
+# minute_bar_count가 유효하지 않으면 예외
+class _S:
+    class market_regime:
+        minute_bar_count = 0
+RR.load_settings = lambda *a, **k: _S()
+try:
+    RR.resolve_minute_bar_count()
+    _r2 = False
+except RR.ReplayConfigError:
+    _r2 = True
+check("J-6) minute_bar_count가 0이면 ReplayConfigError", _r2)
+RR.load_settings = _orig_ls
+
+# analyzer 생성 실패 → 기본 예외, 옵션 시에만 None
+_orig_mbc = RR.MINUTE_BAR_COUNT
+import builtins as _b
+_real_import = _b.__import__
+
+
+def _blocked(name, *a, **k):
+    if "minute_analyzer" in name:
+        raise ImportError("blocked for test")
+    return _real_import(name, *a, **k)
+
+
+_b.__import__ = _blocked
+try:
+    RR.try_import_analyzer()
+    _r3 = False
+except RR.ReplayConfigError:
+    _r3 = True
+except Exception:
+    _r3 = False
+check("J-7) MinuteAnalyzer 생성 실패 → 기본은 ReplayConfigError", _r3)
+try:
+    _fb = RR.try_import_analyzer(allow_simple_fallback=True)
+    _r4 = _fb is None
+except Exception:
+    _r4 = False
+check("J-8) --allow-simple-fallback일 때만 None 반환(간이 전략)", _r4)
+_b.__import__ = _real_import
+
+_rr2 = Path("replay_runner.py").read_text(encoding="utf-8")
+check("J-9) analyzer_mode를 리포트에 출력", "analyzer_mode" in _rr2)
+check("J-10) SIMPLE_FALLBACK 사용 금지 경고가 있음",
+      "enforce 판단에 사용하지 마십시오" in _rr2)
+# FALLBACK_MINUTE_BAR_COUNT = 60 상수 정의는 허용(명시적 옵션 전용).
+# 금지 대상은 except 블록에서 조용히 대입하던 형태.
+_rr_code2 = _code_only(_rr2)
+check("J-11) except 블록의 silent 60 대입이 없음",
+      "except Exception:\n    MINUTE_BAR_COUNT = 60" not in _rr_code2
+      and "MINUTE_BAR_COUNT = 60\n" not in _rr_code2.replace("FALLBACK_MINUTE_BAR_COUNT = 60\n", ""))
+
+
+# ══════════════════════════════════════════════════════════════
+# K. prev_close 복원 계층 + coverage 계측 (1J.3.1)
+# ══════════════════════════════════════════════════════════════
+from domain.replay_context import (
+    resolve_prev_close, PREV_CLOSE_SAME_FILE, PREV_CLOSE_PREV_DAY,
+    PREV_CLOSE_UNAVAILABLE,
+)
+
+# 1순위: 같은 파일
+ctx_k1 = ReplayDayContext([mk("20260806", 15, 19, 10000),
+                           mk("20260807", 9, 0, 10100)], TARGET)
+r1 = resolve_prev_close(ctx_k1, "005930")
+check("K-1) 1순위 — 같은 CSV의 target 이전 마지막 close",
+      r1.value == 10000 and r1.source == PREV_CLOSE_SAME_FILE)
+check("K-2) 1순위 confidence가 high", r1.confidence == "high")
+
+# 2순위: 직전 거래일 파일
+ctx_k2 = ReplayDayContext([mk("20260807", 9, 0, 10100)], TARGET)
+r2 = resolve_prev_close(ctx_k2, "005930")
+check("K-3) 직전 거래일 조회 수단이 없으면 UNAVAILABLE",
+      r2.source == PREV_CLOSE_UNAVAILABLE and r2.value is None)
+check("K-4) UNAVAILABLE의 confidence가 none", r2.confidence == "none")
+
+# 실데이터로 2순위 동작 확인
+_real2 = RR.load_bars("005930", date(2026, 6, 23))
+if _real2:
+    _c = ReplayDayContext(_real2, date(2026, 6, 23), 60)
+    _r = resolve_prev_close(_c, "005930", RR.load_bars, RR.MINUTE_BARS_DIR,
+                            date(2026, 6, 23))
+    check("K-5) 실데이터에서 prev_close 복원 성공", _r.available)
+    check("K-6) source가 기록됨", _r.source in
+          (PREV_CLOSE_SAME_FILE, PREV_CLOSE_PREV_DAY))
+
+check("K-7) replay가 coverage 통계를 수집", hasattr(RR, "PREV_CLOSE_STATS"))
+check("K-8) replay가 horizon 통계를 수집", hasattr(RR, "HORIZON_STATS"))
+# horizon 통계를 실제 리플레이로 채운 뒤 검사
+# (통계가 비어 있으면 horizon 섹션 자체가 출력되지 않음)
+_rb = RR.load_bars("005930", date(2026, 6, 23))
+if _rb:
+    RR.run_replay("005930", _rb, RR.try_import_analyzer(), date(2026, 6, 23))
+_q = "\n".join(RR.build_quality_report())
+for key in ("total_symbol_days", "prev_close_available", "prev_close_missing",
+            "prev_close_coverage_pct", "analyzer_mode"):
+    check(f"K-9) 품질 리포트에 {key} 출력", key in _q)
+check("K-10) '전체 데이터'가 아님을 명시", "'전체 데이터'가 아닙니다" in _q)
+check("K-11) horizon 품질에 exact / stale / N/A 구분",
+      "exact" in _q and "stale" in _q and "N/A" in _q)
+check("K-12) horizon 품질에 median과 p10/p90",
+      "median" in _q and "p10" in _q and "p90" in _q)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

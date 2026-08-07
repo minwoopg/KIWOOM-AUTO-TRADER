@@ -31,17 +31,51 @@ AFTER_MINUTES   = [5, 10, 20]
 # daily_report는 0.90%를 쓰고 있어 두 기준이 갈라져 있었습니다.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from domain.cost_model import load_cost_model  # noqa: E402
-from domain.replay_context import ReplayDayContext  # noqa: E402
+from domain.replay_context import ReplayDayContext, resolve_prev_close  # noqa: E402
 from config.settings import load_settings  # noqa: E402
 
-# live와 동일한 분석 윈도우 크기를 설정에서 읽습니다.
-try:
-    MINUTE_BAR_COUNT = load_settings().market_regime.minute_bar_count
-except Exception:
-    MINUTE_BAR_COUNT = 60
+class ReplayConfigError(RuntimeError):
+    """리플레이 설정을 신뢰할 수 없을 때 발생합니다."""
 
-# prev_close를 복원하지 못해 건너뛴 종목 (리포트에 명시)
-PREV_CLOSE_UNAVAILABLE: list[str] = []
+
+# 2026-08-07 (1J.3.1): 예전엔 설정 로딩 실패 시 조용히 60으로
+# 돌아갔음 — 1J.1에서 비용 모델에 대해 제거했던 것과 **같은 문제**를
+# replay에 남겨둔 것. 실제 설정이 minute_bar_count=90으로 바뀌었는데
+# 로딩이 실패하면 51일 백테스트가 아무 경고 없이 60봉으로 돌아감.
+# 백테스트는 fail-closed가 맞습니다.
+ALLOW_CONFIG_FALLBACK = False      # --allow-config-fallback 으로만 활성
+FALLBACK_MINUTE_BAR_COUNT = 60
+
+
+def resolve_minute_bar_count(*, allow_fallback: bool = False) -> int:
+    try:
+        value = load_settings().market_regime.minute_bar_count
+    except Exception as exc:
+        if allow_fallback:
+            print(f"[WARN] 설정 로딩 실패 — fallback {FALLBACK_MINUTE_BAR_COUNT}봉 사용: {exc}")
+            return FALLBACK_MINUTE_BAR_COUNT
+        raise ReplayConfigError(
+            f"설정을 읽을 수 없어 리플레이를 중단합니다: {exc}\n"
+            f"(백테스트가 다른 윈도우 크기로 조용히 도는 것을 막기 위함 — "
+            f"디버깅 목적이면 --allow-config-fallback)") from exc
+    if not isinstance(value, int) or value <= 0:
+        if allow_fallback:
+            print(f"[WARN] minute_bar_count가 유효하지 않음({value!r}) — "
+                  f"fallback {FALLBACK_MINUTE_BAR_COUNT}봉 사용")
+            return FALLBACK_MINUTE_BAR_COUNT
+        raise ReplayConfigError(
+            f"minute_bar_count가 유효하지 않습니다: {value!r} (양의 정수여야 함)")
+    return value
+
+
+MINUTE_BAR_COUNT = resolve_minute_bar_count()
+
+# 2026-08-07 (1J.3.1): prev_close 복원 결과와 horizon 품질을 집계해
+# 리포트에 노출합니다. "전체 데이터를 분석했다"고 말하지 않기 위함 —
+# 실측상 같은 CSV만으로는 51.7%만 복원됩니다.
+PREV_CLOSE_STATS: dict[str, int] = {}
+HORIZON_STATS: dict[int, list[float | None]] = {5: [], 10: [], 20: []}
+ANALYZER_MODE = "LIVE_MINUTE_ANALYZER"
 COST_MODEL = load_cost_model()
 TOTAL_COST_PCT = COST_MODEL.base_roundtrip_pct   # 하위호환(Base 시나리오)
 ROUND_TRIP_COST_PCT = TOTAL_COST_PCT
@@ -88,7 +122,8 @@ def load_bars(symbol: str, target_date: date) -> list[MinuteBarRow]:
     return bars
 
 
-def try_import_analyzer():
+def try_import_analyzer(*, allow_simple_fallback: bool = False):
+    """live와 동일한 MinuteAnalyzer를 만듭니다 (기본 fail-closed)."""
     try:
         import os
         sys.path.insert(0, os.getcwd())
@@ -115,8 +150,17 @@ def try_import_analyzer():
             v_ma5_slope_bars        = cfg.v_ma5_slope_bars,
         )
     except Exception as e:
-        print(f"[WARN] MinuteAnalyzer 임포트 실패: {e}")
-        return None
+        # 2026-08-07 (1J.3.1): 예전엔 None을 돌려주고 replay가
+        # A(simple) 간이 전략(등락률 2~18%)으로 51일을 끝까지 돌 수
+        # 있었음 — 백테스트가 실패하지 않고 **다른 전략** 결과를
+        # 내놓는 셈이라 가장 위험한 형태. 기본은 즉시 실패.
+        if allow_simple_fallback:
+            print(f"[WARN] MinuteAnalyzer 생성 실패 — SIMPLE_FALLBACK으로 진행: {e}")
+            return None
+        raise ReplayConfigError(
+            f"MinuteAnalyzer를 만들 수 없어 리플레이를 중단합니다: {e}\n"
+            f"(간이 전략으로 대체하면 실제 전략과 다른 결과가 나옵니다 — "
+            f"디버깅 목적이면 --allow-simple-fallback)") from e
 
 
 def get_time_bucket(cntr_tm: str) -> str:
@@ -150,12 +194,13 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
     #   - analyzer window는 현재봉 포함 최근 minute_bar_count(=60)개
     #   - prev_close는 target_date 이전 마지막 봉의 close
     ctx = ReplayDayContext(bars, target_date, minute_bar_count=MINUTE_BAR_COUNT)
-    prev_close = ctx.previous_close
-    if prev_close is None:
+    pc = resolve_prev_close(ctx, symbol, load_bars, MINUTE_BARS_DIR, target_date)
+    PREV_CLOSE_STATS[pc.source] = PREV_CLOSE_STATS.get(pc.source, 0) + 1
+    if not pc.available:
         # 임의 추정하지 않고 skip — 등락률 A조건에 직접 들어가는 값이라
         # 잘못 넣으면 결과가 조용히 왜곡됨.
-        PREV_CLOSE_UNAVAILABLE.append(symbol)
         return []
+    prev_close = pc.value
 
     for i in ctx.target_indices:
         if i < 5:
@@ -215,6 +260,7 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
             else:
                 after_pcts[m] = None
                 elapsed[m] = None
+            HORIZON_STATS[m].append(elapsed[m])
 
         mfe, mae = ctx.mfe_mae(entry_dt, entry_price, minutes=20)
 
@@ -251,6 +297,65 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
             "mae":         round(mae, 2),
         })
     return results
+
+
+
+def build_quality_report() -> list[str]:
+    """리플레이 데이터 품질 요약 (1J.3.1).
+
+    "전체 데이터를 분석했다"고 말할 수 없는 이유를 수치로 드러냅니다.
+    """
+    L: list[str] = []
+    L.append("")
+    L.append("── 리플레이 데이터 품질 ──")
+    L.append(f"  analyzer_mode = {ANALYZER_MODE}")
+    if ANALYZER_MODE == "SIMPLE_FALLBACK":
+        L.append("  ⚠ 간이 전략(A simple)입니다 — 실제 전략과 다르므로")
+        L.append("    1K enforce 판단에 사용하지 마십시오.")
+    L.append(f"  minute_bar_count = {MINUTE_BAR_COUNT} (live와 동일)")
+
+    total = sum(PREV_CLOSE_STATS.values())
+    if total:
+        avail = total - PREV_CLOSE_STATS.get("UNAVAILABLE", 0)
+        L.append("")
+        L.append(f"  total_symbol_days        {total}")
+        L.append(f"  prev_close_available     {avail}")
+        L.append(f"  prev_close_missing       {PREV_CLOSE_STATS.get('UNAVAILABLE', 0)}")
+        L.append(f"  prev_close_coverage_pct  {avail / total * 100:.1f}%")
+        for src in ("SAME_FILE_PRETARGET", "PREVIOUS_TRADING_DAY_FILE",
+                    "SIGNAL_LOG_INFERRED", "UNAVAILABLE"):
+            n = PREV_CLOSE_STATS.get(src, 0)
+            if n:
+                L.append(f"    {src:26s} {n:5d} ({n / total * 100:.1f}%)")
+        L.append("  ※ prev_close를 복원하지 못한 종목-일은 제외됩니다.")
+        L.append("    따라서 이 결과는 '전체 데이터'가 아닙니다.")
+
+    # horizon 품질 — "5분 결과"가 실제 몇 분 가격으로 구성됐는지
+    any_h = any(HORIZON_STATS[m] for m in HORIZON_STATS)
+    if any_h:
+        L.append("")
+        L.append("  horizon 품질 (target 대비 실제 경과 시간)")
+        for m in (5, 10, 20):
+            vals = HORIZON_STATS.get(m, [])
+            if not vals:
+                continue
+            ok = [v for v in vals if v is not None]
+            na = len(vals) - len(ok)
+            if not ok:
+                L.append(f"    {m:2d}분: 표본 {len(vals)} / 전부 N/A")
+                continue
+            exact = sum(1 for v in ok if abs(v - m) < 1e-9)
+            le1 = sum(1 for v in ok if 0 <= (m - v) <= 1)
+            s13 = sum(1 for v in ok if 1 < (m - v) <= 3)
+            sv = sorted(ok)
+            med = sv[len(sv) // 2]
+            p10 = sv[int(len(sv) * 0.10)]
+            p90 = sv[int(len(sv) * 0.90)]
+            L.append(f"    {m:2d}분: 표본 {len(vals):5d}  exact {exact:5d}"
+                     f"  ≤1m stale {le1:5d}  1~3m stale {s13:5d}  N/A {na:5d}")
+            L.append(f"          실제경과 median {med:.1f}분  p10 {p10:.1f}  p90 {p90:.1f}")
+        L.append("  ※ 최대 3분 stale 봉까지 mark-to-market으로 인정합니다.")
+    return L
 
 
 def is_high_risk(results: list[dict]) -> tuple[bool, list[str]]:
@@ -494,6 +599,15 @@ def _force_utf8_stdout() -> None:
 
 def main():
     _force_utf8_stdout()
+    # 2026-08-07 (1J.3.1): fallback은 명시적으로 요청할 때만 허용.
+    global MINUTE_BAR_COUNT, ANALYZER_MODE
+    allow_simple = "--allow-simple-fallback" in sys.argv
+    allow_config = "--allow-config-fallback" in sys.argv
+    for _flag in ("--allow-simple-fallback", "--allow-config-fallback"):
+        while _flag in sys.argv:
+            sys.argv.remove(_flag)
+    MINUTE_BAR_COUNT = resolve_minute_bar_count(allow_fallback=allow_config)
+
     args        = sys.argv[1:]
     today       = date.today()
     target_date = date.fromisoformat(args[0]) if args else today
@@ -511,7 +625,8 @@ def main():
         print("[ERROR] 해당 종목의 분봉 데이터 없음")
         sys.exit(1)
 
-    analyzer = try_import_analyzer()
+    analyzer = try_import_analyzer(allow_simple_fallback=allow_simple)
+    ANALYZER_MODE = "LIVE_MINUTE_ANALYZER" if analyzer is not None else "SIMPLE_FALLBACK"
     all_reports = []
     all_results: dict[str, list[dict]] = {}
 
@@ -535,6 +650,10 @@ def main():
 
     REPORTS_DIR.mkdir(exist_ok=True)
     fname = REPORTS_DIR / f"replay_{target_date.strftime('%Y%m%d')}.txt"
+    # 2026-08-07 (1J.3.1): 데이터 품질을 결과와 함께 남깁니다.
+    quality = "\n".join(build_quality_report())
+    print(quality)
+    all_reports.append(quality)
     fname.write_text("\n\n".join(all_reports), encoding="utf-8")
     print(f"\n  → 저장: {fname}")
 

@@ -226,9 +226,10 @@ def run_symbol_day(symbol: str, target_date: date, analyzer) -> dict:
 
         entry_price = current.close_price
         after = compute_returns(ctx, entry_dt, entry_price)
-        future = bars[i + 1: i + 21]
-        mae = (min(b.low_price for b in future) - entry_price) / entry_price * 100 if future else 0.0
-        mfe = (max(b.high_price for b in future) - entry_price) / entry_price * 100 if future else 0.0
+        # 2026-08-07 (1J.3.1): MFE/MAE만 아직 "다음 20개 봉" 기준이었음.
+        # 5/10/20분 수익률은 1J.3에서 clock-time으로 고쳤는데 여기만
+        # 남아, gap이 있으면 20분을 훌쩍 넘는 구간이 포함됐음.
+        mfe, mae = ctx.mfe_mae(entry_dt, entry_price, minutes=20)
         row_base = dict(
             symbol=symbol, date=target_date.isoformat(), entry_time=current.cntr_tm,
             time_bucket=get_time_bucket(current.cntr_tm), entry_price=entry_price,

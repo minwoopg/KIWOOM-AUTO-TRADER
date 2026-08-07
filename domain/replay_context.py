@@ -244,3 +244,70 @@ class ReplayDayContext:
             if dt is not None and dt >= floored:
                 return i
         return None
+
+
+# ── prev_close 복원 (1J.3.1) ─────────────────────────────────────
+# 실측: 누적 분봉 1,781 symbol-day 중 같은 CSV에서 prev_close를
+# 얻을 수 있는 건 920개(51.7%)뿐. 나머지를 전부 제외하면 51일
+# 분석이 표본의 절반을 잃습니다. 직전 거래일 폴더까지 보면
+# 69.7%까지 올라갑니다(실측).
+#
+# 중요: 추정값을 **조용히** 쓰지 않습니다. 어디서 왔는지
+# (source)와 신뢰도(confidence)를 항상 함께 반환해 리포트에
+# 노출합니다.
+PREV_CLOSE_SAME_FILE = "SAME_FILE_PRETARGET"
+PREV_CLOSE_PREV_DAY = "PREVIOUS_TRADING_DAY_FILE"
+PREV_CLOSE_SIGNAL_INFERRED = "SIGNAL_LOG_INFERRED"
+PREV_CLOSE_UNAVAILABLE = "UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class PrevCloseResult:
+    value: int | None
+    source: str
+    confidence: str = "high"
+
+    @property
+    def available(self) -> bool:
+        return self.value is not None
+
+
+def resolve_prev_close(ctx: "ReplayDayContext", symbol: str,
+                       load_bars_fn=None, minute_bars_dir=None,
+                       target_date: date | None = None) -> PrevCloseResult:
+    """우선순위에 따라 prev_close를 복원합니다.
+
+    1순위 동일 CSV의 target_date 이전 마지막 close
+    2순위 직전 거래일 폴더 동일 종목의 마지막 당일 close
+    3순위 (미구현) signal_log price/change_rate_pct 역산 —
+          여러 행에서 값이 일관될 때만. 이상치가 있어 무조건
+          쓰면 안 되므로 별도 조사 후 도입.
+    4순위 불가능하면 UNAVAILABLE
+    """
+    # 1순위
+    v = ctx.previous_close
+    if v is not None:
+        return PrevCloseResult(v, PREV_CLOSE_SAME_FILE, "high")
+
+    # 2순위
+    if load_bars_fn is not None and minute_bars_dir is not None and target_date is not None:
+        from pathlib import Path as _P
+        root = _P(minute_bars_dir)
+        days = sorted(d.name for d in root.iterdir()
+                      if d.is_dir() and d.name.isdigit() and len(d.name) == 8)
+        key = target_date.strftime("%Y%m%d")
+        prior = [d for d in days if d < key]
+        for d in reversed(prior):
+            if not (root / d / f"{symbol}.csv").exists():
+                continue
+            prev_date = datetime.strptime(d, "%Y%m%d").date()
+            pbars = load_bars_fn(symbol, prev_date)
+            if not pbars:
+                continue
+            pctx = ReplayDayContext(pbars, prev_date, ctx.minute_bar_count)
+            tb = pctx.target_bars
+            if tb:
+                return PrevCloseResult(bar_close(tb[-1]), PREV_CLOSE_PREV_DAY, "medium")
+            break
+
+    return PrevCloseResult(None, PREV_CLOSE_UNAVAILABLE, "none")

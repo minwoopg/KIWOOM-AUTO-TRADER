@@ -4691,3 +4691,136 @@ TypeError·IndexError가 나도 PASS했고, `_sim`이 dict가 아닐 때
 
 ---
 
+## 1J.3.1: Replay 데이터 품질 계측 + fail-closed 마무리 (2026-08-07)
+
+1J.3에 대한 GPT 코드리뷰 반영. 매매 로직 무변경.
+
+### 1. pullback MFE/MAE만 아직 "20개 봉"이었음 (재현 확인)
+
+5/10/20분 수익률은 1J.3에서 clock-time으로 고쳤는데
+`simulate_pullback_removal.py`의 `future = bars[i + 1: i + 21]`만
+남아 있었음. gap이 46.1% 파일에 있으므로 20분을 훌쩍 넘는 구간이
+MFE/MAE에 포함됐음. `ctx.mfe_mae(entry_dt, entry_price, minutes=20)`
+으로 통일. **"4개 분석기 모두 전환 완료"라는 1J.3 보고는 이 부분에서
+부정확했습니다.**
+
+### 2·3. replay의 silent fallback — 1J.1에서 제거한 문제의 재발
+
+```python
+try:
+    MINUTE_BAR_COUNT = load_settings().market_regime.minute_bar_count
+except Exception:
+    MINUTE_BAR_COUNT = 60          # ← 비용 모델에서 제거했던 바로 그 패턴
+```
+설정이 `minute_bar_count=90`으로 바뀌어도 로딩이 실패하면 51일
+백테스트가 아무 경고 없이 60봉으로 돌아감.
+
+더 위험한 것은 analyzer:
+```python
+except Exception:
+    return None          # → replay가 A(simple) 간이 전략으로 51일 완주
+```
+백테스트가 **실패하지 않고 다른 전략 결과를 내놓는** 형태.
+
+**수정**:
+- `ReplayConfigError` 신규. 설정 로딩 실패 / `minute_bar_count`
+  누락·비정수·0 이하 → 즉시 예외.
+- `MinuteAnalyzer` 생성 실패 → 즉시 예외.
+- fallback은 `--allow-config-fallback` / `--allow-simple-fallback`
+  을 명시할 때만.
+- 리포트에 `analyzer_mode = LIVE_MINUTE_ANALYZER | SIMPLE_FALLBACK`
+  출력. SIMPLE_FALLBACK이면 "1K enforce 판단에 사용하지 마십시오"
+  경고를 함께 표시.
+
+### 4. prev_close coverage 계측 + 복원 계층
+
+**재현 (복원 전)**:
+```
+total_symbol_days        1781
+SAME_FILE_PRETARGET       920 (51.7%)
+UNAVAILABLE               861 (48.3%)   ← 절반 가까이 통째로 제외
+```
+
+`resolve_prev_close()` 추가 — 우선순위:
+1. 동일 CSV의 target_date 이전 마지막 close (`confidence=high`)
+2. 직전 거래일 폴더 동일 종목의 마지막 당일 close (`medium`)
+3. (미구현) signal_log `price`/`change_rate_pct` 역산 — 이상치가
+   있어 무조건 쓰면 안 되므로 별도 조사 후 도입
+4. 불가능하면 `UNAVAILABLE`
+
+**복원 후 실측**:
+```
+prev_close_coverage_pct  85.4%
+  SAME_FILE_PRETARGET          920 (51.7%)
+  PREVIOUS_TRADING_DAY_FILE    601 (33.7%)
+  UNAVAILABLE                  260 (14.6%)
+```
+GPT 추정(약 70%)보다 높습니다 — 직전 거래일에 파일이 없으면 그
+이전 거래일까지 거슬러 찾기 때문. **추정값을 조용히 쓰지 않고
+source·confidence를 항상 기록**합니다.
+
+### 리포트에 데이터 품질 노출
+
+`build_quality_report()` — replay 결과에 항상 첨부:
+```
+── 리플레이 데이터 품질 ──
+  analyzer_mode = LIVE_MINUTE_ANALYZER
+  minute_bar_count = 60 (live와 동일)
+
+  total_symbol_days        13
+  prev_close_available     7
+  prev_close_missing       6
+  prev_close_coverage_pct  53.8%
+    SAME_FILE_PRETARGET            4 (30.8%)
+    PREVIOUS_TRADING_DAY_FILE      3 (23.1%)
+    UNAVAILABLE                    6 (46.2%)
+  ※ prev_close를 복원하지 못한 종목-일은 제외됩니다.
+    따라서 이 결과는 '전체 데이터'가 아닙니다.
+
+  horizon 품질 (target 대비 실제 경과 시간)
+     5분: 표본   252  exact   251  ≤1m stale   251  1~3m stale     0  N/A     1
+          실제경과 median 5.0분  p10 5.0  p90 5.0
+    20분: 표본   252  exact   234  ≤1m stale   236  1~3m stale     4  N/A    12
+          실제경과 median 20.0분  p10 20.0  p90 20.0
+```
+"5분 결과"가 실제 몇 분 가격으로 구성됐는지 드러납니다.
+
+### 5~7. 한계 명시 (1J.5 범위 조정)
+
+지적대로 현재 `replay_runner`는 **pattern replay이지 full live BUY
+replay가 아닙니다**. `min_trading_value=0`, `v_min_bar_amount=0`이고
+조건검색 universe·daily entry limit·consecutive loss·cooldown·
+보유 상태·score decision·condition source reliability를 재현하지
+않습니다. 따라서 1J.5는 두 단계로 분리합니다:
+
+- **A. Aligned Value Fidelity** — 8/7 `signal_log`/
+  `entry_quality_shadow`의 `(symbol, latest_bar_timestamp)`를 기준
+  으로 같은 60봉을 넣어 계산값(patterns/VWAP/change_rate/pullback/
+  rebound/V·PR/MACD/rolling VWAP gate)이 일치하는지. **높은 일치율
+  요구 가능.**
+- **B. Candidate Discovery Fidelity** — 하루 전체 스캔 비교.
+  `prev_close coverage` / `minute data coverage` /
+  `condition universe coverage`를 반드시 함께 표기. **"Full Live
+  BUY fidelity"라고 부르지 않습니다.**
+
+**거래대금 한계**: 현재 minute CSV에는 `acc_trde_qty`가 없고
+`volume`만 있습니다. live `MinuteAnalyzer`는 `bars[-1].acc_volume`을
+쓰지만 replay는 파일의 volume을 누적해 구성하므로, 장중부터 저장된
+파일은 오전 거래량이 빠져 live와 다릅니다. 현재는
+`min_trading_value=0`이라 영향이 숨겨져 있음. 1J.5에서 거래대금
+full fidelity를 주장하지 않고, live `signal_log`의 `bar_amount`와
+비교 가능한 경우만 별도 검증합니다.
+
+### 테스트
+
+`test_replay_time_axis.py` 67건 → **98건**:
+- I절(4건) pullback MFE/MAE clock-time — 21분 봉이 실제로 제외되는지.
+- J절(11건) fail-closed — 설정 로딩 실패·`minute_bar_count=0`·
+  analyzer import 차단 시 각각 `ReplayConfigError`, 옵션 지정 시에만
+  fallback, `analyzer_mode` 출력, silent 60 대입 부재.
+- K절(16건) prev_close 복원 계층 + coverage·horizon 품질 지표 출력.
+
+**전체 회귀**: 15개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+
+---
+
