@@ -4213,3 +4213,139 @@ starts == 1 and open_ok and close_ok → COMPLETE
 
 ---
 
+## 1I.5: Windows fsync 호환 핫픽스 (2026-08-06)
+
+**증상 (실서버 PowerShell)**:
+```
+File "export_daily_bundle.py", line 646, in build
+    os.fsync(f.fileno())
+OSError: [Errno 9] Bad file descriptor
+```
+번들 생성이 마지막 단계에서 실패해 `bundle_YYYYMMDD.zip`이 만들어지지
+않음.
+
+**원인**: 1I.1에서 원자적 ZIP 생성을 넣으면서 `open(tmp_zip, "rb")`로
+연 **읽기 전용 핸들**에 `os.fsync()`를 호출했음. Linux는 이를 허용하지만
+Windows는 `FlushFileBuffers`가 쓰기 권한을 요구해 EBADF로 실패함.
+컨테이너(Linux)에서만 검증해 놓친 플랫폼 차이.
+
+**수정**:
+- `open(tmp_zip, "r+b")` — 쓰기 가능한 모드로 열고 `flush()` 후 `fsync()`.
+- 플러시 실패를 `OSError`로 잡아 **경고만 남기고 계속 진행**. 무결성은
+  바로 위 `testzip()`에서 이미 확인하므로, 플러시는 보강일 뿐 번들
+  생성의 성공 조건이 아님. 여기서 죽으면 리포트 파이프라인 전체가
+  헛돌게 됨.
+
+**테스트** `test_shadow_analysis.py` 157건 → **162건**:
+V(5건) — `r+b` 사용 및 `rb` 부재를 소스 수준에서 고정,
+`os.fsync`가 `OSError(9)`를 던지도록 패치한 상태(Windows 상황 모사)에서
+최종 ZIP이 정상 생성되고 `testzip()` 통과, tmp 파일 미잔존.
+
+**전체 회귀**: 13개 파일 전부 통과, 1개 스킵.
+
+**교훈**: 이 프로젝트는 실행 환경이 Windows/PowerShell인데 검증은
+Linux 컨테이너에서 이뤄짐. 파일 핸들·경로·인코딩처럼 플랫폼 의존성이
+있는 코드는 앞으로 실패 경로를 명시적으로 테스트할 것.
+
+---
+
+## 1J: 거래 비용 모델 단일 출처화 (2026-08-07)
+
+### 배경 — 비용이 두 갈래로 갈라져 있었음
+
+```
+infra/storage/daily_reporter.py   COST_RATE = 0.009  (0.90%)
+replay_runner.py                  0.25 + 0.10 = 0.35%
+analyze_crash_rebound_days.py     0.35%
+analyze_v_drop_backtest.py        0.35%  (replay에서 import)
+simulate_pullback_removal.py      0.35%
+```
+2026-07에 `COST_RATE`를 0.53% → 0.90%로 정정했을 때 백테스트
+스크립트 4개가 따라가지 못한 결과. 0.55%p 차이는 작지 않음 —
+8/7 승리 거래 평균이 +0.28%였으므로 0.35% 기준의 "승리"가 0.90%
+기준에서는 전부 적자가 됨. **지금까지의 백테스트 결론이 비용을
+과소평가한 상태에서 나왔을 가능성**이 있음.
+
+### 설계 — 하나로 고정하지 않고 세 시나리오를 함께 계산
+
+실제 체결 비용이 얼마인지 아직 검증되지 않았으므로, 하나를 고르면
+그 선택이 모든 결론에 숨은 가정으로 박힘. 대신 항상 셋을 함께 냄:
+
+```
+Gross  0.00%   비용 전 원수익 — 신호 자체의 품질
+Base   0.35%   왕복 수수료+세금+슬리피지 추정치
+Stress 0.90%   보수적 상한 (daily_report가 쓰던 값)
+```
+Base와 Stress가 같은 방향이면 견고한 결론, 부호가 갈리면 비용
+가정에 의존하는 취약한 결론이라는 뜻.
+
+**실제 `trades.csv` 손익은 비용 전 raw PnL로 보존**. 비용은 분석
+단계에서만 더함 — 원본에 섞으면 나중에 Base를 교정할 때 되돌릴 수
+없음(테스트 8-1로 고정).
+
+### `domain/cost_model.py` 신규
+
+`CostModel` 데이터클래스 + `load_cost_model()`. 제공 API:
+`cost_pct(scenario)` / `net(gross, scenario)` / `net_all(gross)` /
+`positive_rates(returns)` → `gross_positive_rate`,
+`base_net_positive_rate`, `stress_net_positive_rate` /
+`describe()` / `format_scenarios()`.
+
+설정은 `config/settings.yaml`의 `cost_model` 블록 단일 출처.
+설정 파일이 없으면 모듈 상단 기본값 사용 — 분석 스크립트가
+프로젝트 루트 밖에서 실행돼도 통째로 죽지 않도록.
+
+### 적용
+
+- `replay_runner.py`, `analyze_crash_rebound_days.py`,
+  `simulate_pullback_removal.py` — 하드코딩 제거, `load_cost_model()`
+  참조. `TOTAL_COST_PCT`는 Base를 가리키는 하위호환 별칭으로 유지
+  (`analyze_v_drop_backtest.py`가 replay에서 import하므로 간접 반영).
+- `infra/storage/daily_reporter.py` — `COST_RATE`를
+  `stress_roundtrip_pct / 100`으로 대체.
+- **기준 차이를 리포트에 명시**: daily_report에
+  `※ 비용 기준: Gross 0.00% / Base 0.35% / Stress 0.90% — 이 리포트는
+  보수적 상한인 Stress를 적용합니다` +
+  `※ replay/백테스트 리포트는 Base 기준이므로 수치가 다릅니다`.
+  replay 쪽에도 대응 문구 추가.
+- replay 출력에 시나리오 3줄 추가:
+```
+   5분 후  승률 5/6 (83%)  평균 +0.71%  →  비용 후 +0.36%
+           Gross  +0.71%   플러스비율 83%
+           Base   +0.36%   플러스비율 83%
+           Stress -0.19%   플러스비율 33%
+```
+7/31 실데이터에서 **Base 83% → Stress 33%로 플러스비율이 뒤집히는
+것**이 바로 드러남 — 비용 가정이 결론을 얼마나 좌우하는지 보여주는
+사례.
+
+### 테스트
+
+`test_cost_model.py` 신규 **35건** (GPT 지정 6항목 전부):
+1. 동일 gross return에 Gross/Base/Stress 정확 계산 + 승률 3종 +
+   None 처리 + 잘못된 시나리오명 ValueError.
+2. 분석기 5종이 모두 같은 cost model 참조(직접/간접).
+3. 정규식 전수 검사로 허용 위치(`domain/cost_model.py`,
+   `settings.yaml`, 테스트, CHANGELOG) 밖에 `0.25`/`0.10`/`0.009`
+   하드코딩 0건.
+4. 설정 변경 시 모든 결과가 함께 변경 + 설정 부재 시 기본값.
+5. `Gross < Base < Stress` 및 순수익 역순 관계.
+6. 기존 계산 재현 — Base가 replay의 0.35%, Stress가 daily_report의
+   0.90%와 일치, `+0.71% → +0.36%` 재현.
+7. 리포트에 기준 차이 명시 여부.
+8. `trades.csv` raw PnL 보존(기록기가 비용을 차감하지 않음).
+
+**전체 회귀**: 14개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+**BUY/HOLD/SELL 로직 무변경** — 비용 설정 정리만.
+
+### 남은 것 (별도 단계)
+
+실제 체결 기준 P&L 정확도 — 8/7 raw에서 `005930`의 BUY 주문가
+238,500원과 broker `avg_buy_price` 239,000원이 달랐음. 현재
+daily_report의 "체결가 기준" 표현이 부정확할 수 있으므로,
+`filled_quantity` / `fill_price` / `average_fill_price` /
+`commission` / `tax`를 실제 체결 이벤트에서 저장하는 작업이 필요.
+그 전까지는 "주문가 기준 예상손익"으로 표기하는 것이 정확함.
+
+---
+

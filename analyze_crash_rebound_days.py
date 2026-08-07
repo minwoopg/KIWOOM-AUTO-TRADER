@@ -27,9 +27,16 @@ MINUTE_BARS_DIR = Path("data/minute_bars")
 REPORTS_DIR = Path("reports")
 
 # 비용 가정 (기존 replay_runner와 동일 기준)
-ROUND_TRIP_COST_PCT = 0.25
-SLIPPAGE_PCT = 0.10
-TOTAL_COST_PCT = ROUND_TRIP_COST_PCT + SLIPPAGE_PCT
+# 2026-08-07 (1J): 비용은 domain/cost_model.py 단일 출처에서 읽습니다.
+# 예전엔 여기에 0.25 + 0.10 = 0.35%를 직접 박아뒀는데,
+# daily_report는 0.90%를 쓰고 있어 두 기준이 갈라져 있었습니다.
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from domain.cost_model import load_cost_model  # noqa: E402
+COST_MODEL = load_cost_model()
+TOTAL_COST_PCT = COST_MODEL.base_roundtrip_pct   # 하위호환(Base 시나리오)
+ROUND_TRIP_COST_PCT = TOTAL_COST_PCT
+SLIPPAGE_PCT = 0.0
 
 # 매수 확인까지의 지연 시나리오 (분 단위) — 저점을 그 순간 알 수 없으므로
 ENTRY_DELAYS = [3, 5, 10]

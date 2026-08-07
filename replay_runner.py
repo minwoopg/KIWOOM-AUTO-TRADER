@@ -28,9 +28,15 @@ REPORTS_DIR     = Path("reports")
 AFTER_MINUTES   = [5, 10, 20]
 
 # ── 비용 설정 ─────────────────────────────────────────────────────
-ROUND_TRIP_COST_PCT = 0.25   # 왕복 수수료 + 세금 (%)
-SLIPPAGE_PCT        = 0.10   # 슬리피지 (%)
-TOTAL_COST_PCT      = ROUND_TRIP_COST_PCT + SLIPPAGE_PCT  # 총 비용
+# 2026-08-07 (1J): 비용은 domain/cost_model.py 단일 출처에서 읽습니다.
+# 예전엔 여기에 0.25 + 0.10 = 0.35%를 직접 박아뒀는데,
+# daily_report는 0.90%를 쓰고 있어 두 기준이 갈라져 있었습니다.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from domain.cost_model import load_cost_model  # noqa: E402
+COST_MODEL = load_cost_model()
+TOTAL_COST_PCT = COST_MODEL.base_roundtrip_pct   # 하위호환(Base 시나리오)
+ROUND_TRIP_COST_PCT = TOTAL_COST_PCT
+SLIPPAGE_PCT = 0.0
 
 # ── 고위험 종목 경고 기준 ─────────────────────────────────────────
 RISK_MAE_THRESHOLD     = -3.0   # MAE 평균이 이 값 이하면 경고
@@ -228,7 +234,8 @@ def format_report(symbol: str, results: list[dict], target_date: date) -> str:
         sep()
         return "\n".join(lines)
 
-    lines.append(f"  BUY 신호: {len(results)}건  │  비용 가정: 왕복 {ROUND_TRIP_COST_PCT}% + 슬리피지 {SLIPPAGE_PCT}%")
+    lines.append(f"  BUY 신호: {len(results)}건  │  비용 시나리오: {COST_MODEL.describe()}")
+    lines.append("  ※ 아래 '비용 후'는 Base 기준. daily_report는 Stress(0.90%)를 쓰므로 수치가 다릅니다(같은 cost_model의 다른 시나리오).")
     lines.append("  ※ 패턴 리플레이: 패턴 감지 봉 기준 수익률 (실제 전략 BUY와 다를 수 있음 — 점수제/쿨다운 미적용)")
     lines.append("")
 
@@ -249,6 +256,17 @@ def format_report(symbol: str, results: list[dict], target_date: date) -> str:
             f"  평균 {raw_avg:+.2f}%  →  비용 후 {net_avg:+.2f}%  "
             f"(순수익 승률 {net_win}/{len(net_vals)} {net_win/len(net_vals)*100:.0f}%)"
         )
+        # 2026-08-07 (1J): 결론이 비용 가정에 얼마나 민감한지
+        # 드러내기 위해 세 시나리오를 항상 함께 출력합니다.
+        # Base와 Stress가 같은 방향이면 견고한 결론, 부호가 갈리면
+        # 비용 가정에 의존하는 취약한 결론이라는 뜻입니다.
+        rates = COST_MODEL.positive_rates(raw_vals)
+        for _s in ("gross", "base", "stress"):
+            _key = "gross_positive_rate" if _s == "gross" else f"{_s}_net_positive_rate"
+            lines.append(
+                f"           {_s.capitalize():7s}{raw_avg - COST_MODEL.cost_pct(_s):+.2f}%"
+                f"   플러스비율 {rates[_key]*100:.0f}%"
+            )
 
     avg_mfe = sum(r["mfe"] for r in results) / len(results)
     avg_mae = sum(r["mae"] for r in results) / len(results)

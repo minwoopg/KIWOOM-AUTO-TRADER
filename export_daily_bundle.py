@@ -642,8 +642,21 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
         with zipfile.ZipFile(tmp_zip) as z:
             if z.testzip() is not None:
                 raise RuntimeError("생성된 ZIP 무결성 검사 실패")
-        with open(tmp_zip, "rb") as f:
-            os.fsync(f.fileno())
+        # 2026-08-06 (1I.5): 디스크 플러시.
+        # Windows에서 읽기 전용("rb") 핸들에 fsync를 걸면
+        # OSError: [Errno 9] Bad file descriptor가 발생함
+        # (FlushFileBuffers가 쓰기 권한을 요구하기 때문) —
+        # 실서버(PowerShell)에서 실제로 재현됨. 쓰기 가능한
+        # 모드로 열어야 하며, 플러시는 "있으면 좋은" 보강이지
+        # 번들 생성의 성공 조건이 아니므로 실패해도 진행한다
+        # (무결성은 바로 위 testzip()으로 이미 확인함).
+        try:
+            with open(tmp_zip, "r+b") as f:
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError as exc:
+            if not quiet:
+                print(f"⚠ fsync 생략({exc}) — ZIP 무결성 검사는 통과했으므로 계속 진행합니다.")
         os.replace(tmp_zip, final_path)
 
         if not quiet:

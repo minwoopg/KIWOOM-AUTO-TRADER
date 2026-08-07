@@ -177,7 +177,13 @@ class DailyReporter:
         # 실제보다 크게 낮았음 — 실제 수수료+세금 427,911원 / 매도총액
         # 47,438,100원 = 0.902%. 스크린샷 1건 기반 보정이라 잠정치이며,
         # 데이터가 더 쌓이면 재보정 필요.
-        COST_RATE = 0.009
+        # 2026-08-07 (1J): 비용을 domain/cost_model.py 단일 출처에서
+        # 읽습니다. daily_report는 보수적 상한(Stress)을 쓰고,
+        # replay 계열은 Base를 씁니다 — 서로 다른 기준이라는 점을
+        # 리포트에 명시해 혼동을 막습니다.
+        from domain.cost_model import load_cost_model
+        _cm = load_cost_model()
+        COST_RATE = _cm.stress_roundtrip_pct / 100.0
 
         completed_buys = [t for t in buys if t["symbol"] in today_sells]
         holding_buys   = [t for t in buys if t["symbol"] not in today_sells]
@@ -251,7 +257,9 @@ class DailyReporter:
         lines.append(f"    매도 총액 : {total_sell_amount:>11,}원  ({completed_sell_cnt}건)")
         lines.append(f"    승률      : {win_rate}")
         cost_sign = "-" if estimated_cost > 0 else ""
-        lines.append(f"  추정 비용 (수수료+세금+슬리피지 {COST_RATE*100:.2f}%) : {cost_sign}{estimated_cost:>11,}원")
+        lines.append(f"  추정 비용 (Stress {COST_RATE*100:.2f}% 기준) : {cost_sign}{estimated_cost:>11,}원")
+        lines.append(f"    ※ 비용 기준: {_cm.describe()} — 이 리포트는 보수적 상한인 Stress를 적용합니다.")
+        lines.append("    ※ replay/백테스트 리포트는 Base 기준이므로 수치가 다릅니다(같은 cost_model의 다른 시나리오).")
         net_sign = "+" if net_realized_pnl >= 0 else ""
         lines.append(f"  당일 신규 순손익        : {net_sign}{net_realized_pnl:>11,}원")
         if carryover_sells:

@@ -51,9 +51,15 @@ MINUTE_BARS_DIR = Path("data/minute_bars")
 REPORTS_DIR     = Path("reports")
 AFTER_MINUTES   = [5, 10, 20]
 
-ROUND_TRIP_COST_PCT = 0.25
-SLIPPAGE_PCT        = 0.10
-TOTAL_COST_PCT      = ROUND_TRIP_COST_PCT + SLIPPAGE_PCT
+# 2026-08-07 (1J): 비용은 domain/cost_model.py 단일 출처에서 읽습니다.
+# 예전엔 여기에 0.25 + 0.10 = 0.35%를 직접 박아뒀는데,
+# daily_report는 0.90%를 쓰고 있어 두 기준이 갈라져 있었습니다.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from domain.cost_model import load_cost_model  # noqa: E402
+COST_MODEL = load_cost_model()
+TOTAL_COST_PCT = COST_MODEL.base_roundtrip_pct   # 하위호환(Base 시나리오)
+ROUND_TRIP_COST_PCT = TOTAL_COST_PCT
+SLIPPAGE_PCT = 0.0
 
 # 현재 운영값 (config/settings.yaml과 동일)
 BASE_A_CAP          = -2.0    # A조건: 고가 대비 이 값 미만이면 컷 (하드코딩)

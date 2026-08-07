@@ -192,6 +192,21 @@ websocket:
   app_key: ${KIWOOM_REAL_APP_KEY}
   secret_key: ${KIWOOM_REAL_SECRET_KEY}
 
+# ── 거래 비용 모델 (2026-08-07, 1J단계) ──────────────────────
+# 분석기마다 0.35% / 0.90%를 따로 하드코딩하던 것을 여기로 통합.
+# 하나로 고정하지 않고 세 시나리오를 항상 함께 계산해, 결론이
+# 비용 가정에 얼마나 민감한지 드러냅니다. Base와 Stress가 같은
+# 방향이면 견고한 결론, 부호가 갈리면 취약한 결론입니다.
+#   Gross  비용 전 원수익 — 신호 자체의 품질
+#   Base   왕복 수수료+세금+슬리피지 추정치
+#   Stress 보수적 상한 (daily_report가 쓰던 값)
+# 실제 체결 비용 데이터가 쌓이면 base_roundtrip_pct만 교정하면
+# 모든 분석기에 동시 반영됩니다.
+cost_model:
+  gross_roundtrip_pct: 0.00
+  base_roundtrip_pct: 0.35
+  stress_roundtrip_pct: 0.90
+
 storage:
   state_file: data/state.json
   trade_log_file: logs/trades.csv
@@ -220,4 +235,4 @@ experimental:
   reward_risk_guard_mode: "off"     # 4단계: 상승여력·손익비 하드 게이트
   candidate_ranking_mode: "off"     # 5단계: 후보 순위화
   trailing_breakeven_mode: "off"    # 6단계: 순본전 트레일링
-  entry_quality_guard_mode: "shadow"   # 1E.5단계: MACD/VWAP 진입 품질 shadow 관측 (off/shadow만 지원)
+  entry_quality_guard_mode: "off"   # 1E.5단계: MACD/VWAP 진입 품질 shadow 관측 (off/shadow만 지원)

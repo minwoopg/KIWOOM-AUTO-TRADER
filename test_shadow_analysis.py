@@ -772,6 +772,34 @@ check("U-5) _lock_owner_alive가 살아 있는 PID를 True로 판정",
       (lambda p: (p.write_text(f"pid={os.getpid()}"), B._lock_owner_alive(p))[1])(
           root4 / "exports" / "probe.lock"))
 
+# ══════════════════════════════════════════════════════════════
+# 1I.5: Windows fsync 호환 (실서버 재현)
+# ══════════════════════════════════════════════════════════════
+# 실서버(PowerShell): OSError: [Errno 9] Bad file descriptor
+# — 읽기 전용 핸들에 fsync를 걸어서 발생. 컨테이너(Linux)에서는
+# 허용되므로 검증에서 놓쳤음.
+_src = open("export_daily_bundle.py", encoding="utf-8").read()
+check("V-1) fsync를 쓰기 가능한 모드(r+b)로 연 핸들에 적용",
+      'open(tmp_zip, "r+b")' in _src and 'open(tmp_zip, "rb")' not in _src)
+check("V-2) fsync 실패가 번들 생성을 중단시키지 않음",
+      "except OSError as exc:" in _src.split("os.replace(tmp_zip")[0][-900:])
+
+# fsync가 실패해도 최종 ZIP이 정상 생성되는지 (Windows 상황 모사)
+root5 = Path(tempfile.mkdtemp())
+_mkday(root5, "signal_log.csv", ["timestamp", "symbol"],
+       [{"timestamp": "2026-08-06T09:00:30", "symbol": "005930"}])
+_orig_fsync = os.fsync
+os.fsync = lambda fd: (_ for _ in ()).throw(OSError(9, "Bad file descriptor"))
+try:
+    z5 = _run_export(root5, "2026-08-06")
+finally:
+    os.fsync = _orig_fsync
+check("V-3) fsync가 실패해도 최종 ZIP이 생성됨", z5 is not None and z5.exists())
+check("V-4) fsync 실패 후에도 ZIP 무결성 정상",
+      zipfile.ZipFile(z5).testzip() is None)
+check("V-5) fsync 실패 후 tmp 파일이 남지 않음",
+      not list((root5 / "exports").glob("*.zip.tmp")))
+
 print()
 print(f"[최종] 총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
 if failed:
