@@ -24,7 +24,16 @@ import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from replay_runner import load_bars, TOTAL_COST_PCT
+from replay_runner import load_bars
+# 2026-08-07 (1J.2, 재현 확인): 이전엔 replay_runner에서
+# TOTAL_COST_PCT만 가져왔는데 simulate_event()가 COST_MODEL을
+# 참조해 실행 시 NameError가 났음. 다른 분석기와 동일하게
+# cost_model을 직접 로드합니다.
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from domain.cost_model import load_cost_model  # noqa: E402
+COST_MODEL = load_cost_model()
+TOTAL_COST_PCT = COST_MODEL.base_roundtrip_pct   # 하위호환(Base alias)
 # replay_runner import 시점에 sys.stdout이 이미 UTF-8로 재래핑됨 (중복 래핑 금지)
 
 SIGNAL_LOG = Path("logs/signal_log.csv")
@@ -179,6 +188,7 @@ def analyze(start: date, end: date) -> str:
     title(f"📊 V자 낙폭 기준 완화 백테스트  {start} ~ {end}")
     lines.append("")
     lines.append(f"  현재 기준: {CURRENT_THRESHOLD}%  →  완화 후보: {CANDIDATE_THRESHOLD}%")
+    lines.append(f"  비용 시나리오: {COST_MODEL.describe()}")
     lines.append(f"  (낙폭부족만 유일한 실패 사유였던 병목 구간만 검증 — 다른 조건은 이미 충족)")
 
     rows = load_bottleneck_rows(start, end)
@@ -216,6 +226,9 @@ def analyze(start: date, end: date) -> str:
         avg = sum(vals) / len(vals)
         label = horizon.replace("net_", "").replace("m", "분 후")
         row(f"  {label}", f"{len(vals)}건  승률 {win}/{len(vals)} ({win/len(vals)*100:.0f}%)  평균 {avg:+.2f}%")
+        # 2026-08-07 (1J.2): Base 요약 바로 아래에 3시나리오를 실제 출력
+        _gross_key = horizon.replace("net_", "gross_")
+        append_cost_scenarios(lines, [s.get(_gross_key) for s in sims], label)
 
     vals5 = [s["net_5m"] for s in sims if s["net_5m"] is not None]
     if vals5:

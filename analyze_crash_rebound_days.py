@@ -109,11 +109,18 @@ def analyze_symbol_day(symbol: str, target_date: date, crash_threshold: float) -
             continue
         entry_price = bars[entry_idx].close
         raw_return = (day_close - entry_price) / entry_price * 100
-        net_return = raw_return - TOTAL_COST_PCT
+        # 2026-08-07 (1J.2): 3시나리오 병행 산출. net_return은 Base alias.
+        gross_return = COST_MODEL.net(raw_return, "gross")
+        base_return = COST_MODEL.net(raw_return, "base")
+        stress_return = COST_MODEL.net(raw_return, "stress")
+        net_return = base_return
         entries[delay] = {
             "entry_price": entry_price,
             "entry_time": bars[entry_idx].cntr_tm[8:14] if len(bars[entry_idx].cntr_tm) >= 14 else "?",
             "raw_return": raw_return,
+            "gross_return": gross_return,
+            "base_return": base_return,
+            "stress_return": stress_return,
             "net_return": net_return,
         }
 
@@ -143,6 +150,7 @@ def analyze(start: date, end: date, crash_threshold: float, min_crash_symbols: i
     lines.append(f"  급락 기준: 당일 시가 대비 {crash_threshold}% 이하 하락")
     lines.append(f"  급락일 판정: 위 기준 종목이 {min_crash_symbols}개 이상인 날")
     lines.append(f"  매수 지연 시나리오: 저점 후 {ENTRY_DELAYS}분 (실시간 탐지 지연 반영)")
+    lines.append(f"  비용 시나리오: {COST_MODEL.describe()}")
 
     if not MINUTE_BARS_DIR.exists():
         lines.append("")
@@ -185,12 +193,18 @@ def analyze(start: date, end: date, crash_threshold: float, min_crash_symbols: i
                 if r["entries"].get(delay) is not None]
         if not vals:
             continue
+        # 2026-08-07 (1J.2): Base 하나만이 아니라 3시나리오를 실제로 출력
+        raws = [r["entries"][delay]["raw_return"] for r in all_symbol_days
+                if r["entries"].get(delay) is not None]
         win = sum(1 for v in vals if v > 0)
         avg = sum(vals) / len(vals)
         row(f"  저점+{delay}분 진입 → 종가", f"{len(vals)}건  승률 {win}/{len(vals)} ({win/len(vals)*100:.0f}%)  평균 {avg:+.2f}%")
+        append_cost_scenarios(lines, raws, f"저점 후 {delay}분 진입")
 
     # 참고: 저점 직후 즉시 진입 (비현실적 상한선)
-    eod_vals = [r["eod_from_low_pct"] - TOTAL_COST_PCT for r in all_symbol_days]
+    eod_raws = [r["eod_from_low_pct"] for r in all_symbol_days]
+    eod_vals = [COST_MODEL.net(v, "base") for v in eod_raws]
+    append_cost_scenarios(lines, eod_raws, "저점 즉시진입 → 종가")
     if eod_vals:
         win = sum(1 for v in eod_vals if v > 0)
         avg = sum(eod_vals) / len(eod_vals)

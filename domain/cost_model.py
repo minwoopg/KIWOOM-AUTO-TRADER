@@ -106,6 +106,13 @@ class CostModel:
             if v < 0:
                 raise CostModelConfigError(
                     f"비용은 음수일 수 없습니다: {name}_roundtrip_pct={v}")
+        # 2026-08-07 (1J.2): Gross는 정의상 "비용 전 원수익"이므로
+        # 비용이 반드시 0이어야 합니다. gross=0.10도 순서 검사만으로는
+        # 통과해 "Gross 0.10%"라는 모순된 출력이 가능했음(재현 확인).
+        if abs(vals["gross"]) > 1e-9:
+            raise CostModelConfigError(
+                f"Gross는 비용 전 원수익이므로 0이어야 합니다: "
+                f"gross_roundtrip_pct={vals['gross']}")
         if not (vals["gross"] < vals["base"] < vals["stress"]):
             raise CostModelConfigError(
                 "비용 시나리오는 Gross < Base < Stress 여야 합니다: "
@@ -197,6 +204,15 @@ def load_cost_model(path: str | Path | None = None, *,
     숫자 변환 실패·시나리오 순서 위반·음수 비용에 모두 예외를
     던집니다. 백테스트가 잘못된 비용으로 조용히 도는 것을 막기
     위함입니다.
+
+    **allow_default=True의 범위 (1J.2에서 명확화)**:
+    "설정 파일 자체를 사용할 수 없을 때만" 기본값으로 돌아갑니다.
+      허용(기본값 사용): 파일 누락 / YAML 파싱 실패 / cost_model 블록 부재
+      불허(항상 예외)  : 블록은 있는데 키 누락·숫자 변환 실패·
+                        검증 위반(순서/음수/Gross≠0)
+    이유 — 앞의 셋은 "설정을 못 읽었다"이지만, 뒤의 셋은 "설정이
+    있는데 틀렸다"입니다. 후자를 기본값으로 덮으면 사용자가 의도한
+    값이 조용히 무시되므로 어떤 경우에도 예외로 알립니다.
     """
     if path is None:
         resolved = DEFAULT_SETTINGS_PATH

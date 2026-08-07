@@ -269,8 +269,6 @@ class DailyReporter:
         lines.append(f"    ※ 비용 기준: {_cm.describe()} — 이 리포트는 보수적 상한인 Stress를 적용합니다.")
         lines.append("    ※ replay/백테스트 리포트는 Base 기준이므로 수치가 다릅니다(같은 cost_model의 다른 시나리오).")
         lines.append("    ※ 이월 포지션 비용은 전일 평균단가 기준 추정치입니다.")
-        lines.append(f"    ※ 비용 기준: {_cm.describe()} — 이 리포트는 보수적 상한인 Stress를 적용합니다.")
-        lines.append("    ※ replay/백테스트 리포트는 Base 기준이므로 수치가 다릅니다(같은 cost_model의 다른 시나리오).")
         net_sign = "+" if net_realized_pnl >= 0 else ""
         lines.append(f"  당일 신규 순손익        : {net_sign}{net_realized_pnl:>11,}원")
         if carryover_sells:

@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import sys
 import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-
 
 import csv
 import sys
@@ -442,7 +440,19 @@ def load_actual_buys(target_date: date) -> set:
     return buys
 
 
+def _force_utf8_stdout() -> None:
+    """Windows 콘솔 한글 깨짐 방지 — 직접 실행할 때만 적용.
+
+    2026-08-07 (1J.2): 모듈 최상위에서 sys.stdout을 교체하면
+    이 모듈을 import하는 쪽(테스트 등)의 stdout까지 닫혀
+    ValueError: I/O operation on closed file이 발생합니다.
+    """
+    import io as _io, sys as _sys
+    _sys.stdout = _io.TextIOWrapper(_sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+
 def main():
+    _force_utf8_stdout()
     args        = sys.argv[1:]
     today       = date.today()
     target_date = date.fromisoformat(args[0]) if args else today

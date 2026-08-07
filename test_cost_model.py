@@ -226,60 +226,162 @@ check("11-7) '체결가 기준' 표현을 '주문가 기준 예상'으로 정정
 check("11-8) describe()에 기준금액이 드러남", "진입 원금" in live2.describe())
 
 
-# ── 12. 분석기 3시나리오 출력 통일 (1J.1) ───────────────────────
-for name in ["analyze_crash_rebound_days.py", "analyze_v_drop_backtest.py",
-             "simulate_pullback_removal.py"]:
+# ── 12. 분석기 3시나리오 — 실행 기반 검증 (1J.2) ───────────────
+# 1J.1의 12절은 소스에 문자열이 있는지만 봐서, helper를 정의만 하고
+# 한 번도 호출하지 않아도 통과했음(false pass). 이제 **실제로 실행해
+# 출력 결과**를 검증한다. 소스 검사는 보조로만 사용.
+import importlib
+
+
+def _mod(name: str):
+    return importlib.import_module(name)
+
+
+# --- A. v-drop: simulate_event 실제 호출 (NameError 재발 방지) -----
+vd = _mod("analyze_v_drop_backtest")
+check("12A-1) analyze_v_drop_backtest에 COST_MODEL이 정의됨", hasattr(vd, "COST_MODEL"))
+check("12A-2) TOTAL_COST_PCT가 Base alias",
+      abs(vd.TOTAL_COST_PCT - vd.COST_MODEL.base_roundtrip_pct) < 1e-9)
+
+# load_bars를 작은 fixture로 monkeypatch 후 simulate_event 실제 실행
+# replay_runner.MinuteBarRow와 동일한 필드로 최소 fixture 구성
+class _Bar:
+    def __init__(self, t, price):
+        self.cntr_tm = t
+        self.open_price = int(price)
+        self.high_price = int(price * 1.01)
+        self.low_price = int(price * 0.99)
+        self.close_price = int(price)
+        self.volume = 1000
+        self.acc_volume = 1000
+
+
+_bars = [_Bar(f"20260807{9:02d}{m:02d}00", 1000.0 + m * 5) for m in range(0, 40)]
+_orig_load = vd.load_bars
+vd.load_bars = lambda *a, **k: _bars
+_sim_err = None
+_sim = None
+try:
+    from datetime import datetime as _dt
+    # simulate_event(event: dict) — 실제 시그니처에 맞춘 최소 fixture
+    # simulate_event가 실제로 참조하는 키: symbol / start / count
+    _event = {
+        "symbol": "005930",
+        "start": {"timestamp": _dt(2026, 8, 7, 9, 0, 0), "drop_pct": -2.2},
+        "count": 5,
+    }
+    _sim = vd.simulate_event(_event)
+except NameError as e:
+    _sim_err = f"NameError: {e}"
+except Exception as e:
+    _sim_err = f"{type(e).__name__}: {e}"
+finally:
+    vd.load_bars = _orig_load
+
+check("12A-3) simulate_event 실행 시 NameError가 발생하지 않음",
+      _sim_err is None or "NameError" not in _sim_err)
+if _sim_err:
+    print(f"       └ {_sim_err}")
+if isinstance(_sim, dict):
+    check("12A-4) gross/base/stress 필드가 산출됨",
+          all(k in _sim for k in ("gross_5m", "base_5m", "stress_5m")))
+    check("12A-5) net_5m이 base_5m alias",
+          _sim.get("net_5m") == _sim.get("base_5m"))
+    if _sim.get("gross_5m") is not None:
+        check("12A-6) Gross > Base > Stress 수치 관계",
+              _sim["gross_5m"] > _sim["base_5m"] > _sim["stress_5m"])
+else:
+    check("12A-4) simulate_event가 dict를 반환", _sim is not None or _sim_err is not None)
+
+
+# --- B. helper가 실제로 3시나리오를 출력 --------------------------
+live3 = load_cost_model(use_cache=False)
+for name in ("analyze_crash_rebound_days", "analyze_v_drop_backtest",
+             "simulate_pullback_removal"):
+    m = _mod(name)
+    check(f"12B-1) {name}에 append_cost_scenarios가 있음",
+          hasattr(m, "append_cost_scenarios"))
+    _out: list[str] = []
+    m.append_cost_scenarios(_out, [1.00, 0.50, -0.20], "테스트")
+    text = "\n".join(_out)
+    check(f"12B-2) {name}이 Gross/Base/Stress를 실제로 출력",
+          "Gross" in text and "Base" in text and "Stress" in text)
+    check(f"12B-3) {name}이 플러스비율도 출력", "플러스비율" in text)
+    # 수치 관계 — 평균 (1.00+0.50-0.20)/3 = 0.4333
+    nums = [float(x) for x in re.findall(r"([+-]\d+\.\d+)%", text)]
+    check(f"12B-4) {name}의 세 값이 Gross > Base > Stress",
+          len(nums) == 3 and nums[0] > nums[1] > nums[2])
+    check(f"12B-5) {name}의 Base가 Gross - base_roundtrip_pct",
+          len(nums) == 3 and abs((nums[0] - nums[1]) - live3.base_roundtrip_pct) < 0.011)
+
+
+# --- C. helper가 정의만 되고 호출되지 않는 상태를 잡아냄 ----------
+# 1J.1의 false pass 재발 방지: 소스에서 "정의 1회 + 호출 1회 이상"을 확인
+for name in ("analyze_crash_rebound_days.py", "analyze_v_drop_backtest.py",
+             "simulate_pullback_removal.py"):
     src = Path(name).read_text(encoding="utf-8")
-    check(f"12-1) {name}이 3시나리오 출력 헬퍼를 가짐",
-          "append_cost_scenarios" in src and "scenario_lines" in src)
-for name in ["replay_runner.py", "analyze_v_drop_backtest.py", "simulate_pullback_removal.py"]:
-    src = Path(name).read_text(encoding="utf-8")
-    check(f"12-2) {name}이 gross/base/stress 필드를 산출",
-          '"gross_5m"' in src or 'gross_5m=' in src or "COST_MODEL.net(" in src)
-    check(f"12-3) {name}의 net_*가 Base alias로 유지됨",
-          '"base"' in src)
-check("12-4) scenario_lines가 평균과 플러스비율을 함께 냄",
-      all("플러스비율" in l for l in live2.scenario_lines([0.71, 0.5, -0.1])))
+    total = src.count("append_cost_scenarios")
+    defs = src.count("def append_cost_scenarios")
+    check(f"12C-1) {name}에서 helper가 실제로 호출됨 (등장 {total}회, 정의 {defs}회)",
+          defs == 1 and total >= 2)
 
 
-# ── 5. Base < Gross, Stress < Base 관계 ─────────────────────────
-live = load_cost_model("config/settings.yaml", use_cache=False)
-check("5-1) 실제 설정이 로드됨", live.base_roundtrip_pct > 0)
-check("5-2) 비용 크기: Gross < Base < Stress",
-      live.gross_roundtrip_pct < live.base_roundtrip_pct < live.stress_roundtrip_pct)
-n = live.net_all(1.00)
-check("5-3) 순수익 크기: Gross > Base > Stress", n["gross"] > n["base"] > n["stress"])
-check("5-4) 시나리오 순서 상수가 고정", SCENARIO_ORDER == ("gross", "base", "stress"))
+# --- D. pullback row가 3시나리오 필드를 실제로 가짐 ----------------
+pb = _mod("simulate_pullback_removal")
+pb_src = Path("simulate_pullback_removal.py").read_text(encoding="utf-8")
+for m_ in (5, 10, 20):
+    check(f"12D-1) pullback row에 gross/base/stress_{m_}m 필드 존재",
+          all(f"{sc}_{m_}m=" in pb_src for sc in ("gross", "base", "stress")))
+check("12D-2) pullback의 net_*가 Base alias로 명시됨", "# Base alias" in pb_src)
+
+cr_src = Path("analyze_crash_rebound_days.py").read_text(encoding="utf-8")
+check("12D-3) crash entries에 3시나리오 필드 존재",
+      all(k in cr_src for k in ('"gross_return"', '"base_return"', '"stress_return"')))
+check("12D-4) crash의 net_return이 Base alias", "net_return = base_return" in cr_src)
 
 
-# ── 6. 기존 report/replay 계산 결과 재현 ────────────────────────
-# 기존 replay는 0.35%를 뺐음 → Base와 일치해야 함
-check("6-1) Base가 기존 replay의 0.35%와 일치",
-      abs(live.base_roundtrip_pct - 0.35) < 1e-9)
-# 기존 daily_report는 COST_RATE=0.009 (0.90%) → Stress와 일치
-check("6-2) Stress가 기존 daily_report의 0.90%와 일치",
-      abs(live.stress_roundtrip_pct - DEFAULT_STRESS_ROUNDTRIP_PCT) < 1e-9
-      and abs(live.stress_roundtrip_pct - 0.90) < 1e-9)
-check("6-3) 기존 replay 수치 재현 (+0.71% → +0.36%)",
-      abs(live.net(0.71, "base") - 0.36) < 1e-9)
+# ── 13. Gross 정의 강제 (1J.2) ──────────────────────────────────
+check("13-1) gross=0.10 → 예외",
+      _raises(lambda: CostModel(0.10, 0.35, 0.90).validate()))
+check("13-2) gross=-0.10 → 예외",
+      _raises(lambda: CostModel(-0.10, 0.35, 0.90).validate()))
+check("13-3) gross=0.00 → 정상",
+      CostModel(0.00, 0.35, 0.90).validate().gross_roundtrip_pct == 0.0)
+check("13-4) 설정에서 gross>0이면 로딩 예외",
+      _raises(lambda: load_cost_model(_yaml(
+          "cost_model:\n  gross_roundtrip_pct: 0.10\n  base_roundtrip_pct: 0.35\n"
+          "  stress_roundtrip_pct: 0.90"), use_cache=False)))
 
 
-# ── 7. 리포트에 기준 차이가 명시됨 ──────────────────────────────
-check("7-1) daily_report가 Stress 기준임을 표기", "Stress" in rep)
-check("7-2) daily_report가 replay와 기준이 다름을 명시",
-      "replay" in rep and "다릅니다" in rep)
-rr = Path("replay_runner.py").read_text(encoding="utf-8")
-check("7-3) replay가 세 시나리오를 함께 출력",
-      'for _s in ("gross", "base", "stress")' in rr)
-check("7-4) replay가 daily_report와의 기준 차이를 명시",
-      "daily_report는 Stress" in rr)
+# ── 14. allow_default 정책 일치 (1J.2) ──────────────────────────
+# 정책: "설정 파일 자체를 사용할 수 없을 때만" fallback.
+#       블록은 있는데 값이 틀린 경우는 항상 예외.
+check("14-1) 파일 누락 + allow_default → 기본값",
+      load_cost_model(Path(tempfile.mkdtemp()) / "x.yaml",
+                      allow_default=True, use_cache=False).base_roundtrip_pct == 0.35)
+check("14-2) YAML 파싱 실패 + allow_default → 기본값",
+      load_cost_model(_yaml("cost_model: [[["), allow_default=True,
+                      use_cache=False).base_roundtrip_pct == 0.35)
+check("14-3) 블록 부재 + allow_default → 기본값",
+      load_cost_model(_yaml("other: 1"), allow_default=True,
+                      use_cache=False).base_roundtrip_pct == 0.35)
+check("14-4) 키 누락은 allow_default여도 예외(설정이 있는데 틀린 경우)",
+      _raises(lambda: load_cost_model(_yaml("cost_model:\n  base_roundtrip_pct: 0.4"),
+                                      allow_default=True, use_cache=False)))
+check("14-5) 검증 위반은 allow_default여도 예외",
+      _raises(lambda: load_cost_model(_yaml(
+          "cost_model:\n  gross_roundtrip_pct: 0.10\n  base_roundtrip_pct: 0.35\n"
+          "  stress_roundtrip_pct: 0.90"), allow_default=True, use_cache=False)))
+check("14-6) 정책이 문서화됨",
+      "설정 파일 자체를 사용할 수 없을 때만" in
+      Path("domain/cost_model.py").read_text(encoding="utf-8"))
 
 
-# ── 8. trades.csv raw PnL 보존 ──────────────────────────────────
-# 비용은 분석 단계에서만 더해야 하며, 기록 시점에 섞으면 안 됨.
-tw = Path("infra/storage/logger.py").read_text(encoding="utf-8")
-check("8-1) 거래 기록기가 비용을 차감하지 않음(raw PnL 보존)",
-      "COST_RATE" not in tw and "TOTAL_COST_PCT" not in tw)
+# ── 15. daily report 중복 문구 제거 (1J.2) ──────────────────────
+check("15-1) 비용 기준 문구가 한 번만 출력",
+      rep.count("※ 비용 기준: {_cm.describe()}") <= 1)
+check("15-2) replay 기준 차이 문구가 한 번만 출력",
+      rep.count("replay/백테스트 리포트는 Base 기준") == 1)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

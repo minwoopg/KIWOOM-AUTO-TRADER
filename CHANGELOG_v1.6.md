@@ -4444,3 +4444,122 @@ daily :  estimated_cost = buy_notional × cost_pct / 100
 
 ---
 
+## 1J.2: 실행 경로 결함 수정 + 실행 기반 테스트 전환 (2026-08-07)
+
+1J.1에 대한 GPT 코드리뷰 반영. **68/68이 통과했는데도 실제 실행에서
+깨지는 결함이 있었고, 원인은 테스트가 소스 문자열만 검사한 것**입니다.
+
+### 근본 원인 — source-text test의 false pass
+
+```python
+"append_cost_scenarios" in src          # 정의만 있어도 통과
+'"gross_5m"' in src or "COST_MODEL.net(" in src   # Base 하나만 있어도 통과
+```
+"함수가 존재한다"를 검사했지 "실제 출력이 맞다"를 검사하지 않았음.
+12절 전체를 실행 기반으로 교체했습니다.
+
+### P0-1: `analyze_v_drop_backtest.py` NameError (재현 확인)
+
+```
+has COST_MODEL: False
+simulate_event가 COST_MODEL 사용: True
+→ NameError: name 'COST_MODEL' is not defined
+```
+`from replay_runner import load_bars, TOTAL_COST_PCT`만 가져왔는데
+`simulate_event()`는 `COST_MODEL.net(...)`을 씀. 다른 분석기와
+동일하게 `load_cost_model()`을 직접 호출하도록 변경하고
+`TOTAL_COST_PCT`는 Base alias로 유지.
+
+### P0-2: helper가 정의만 되고 호출 0회 (재현 확인)
+
+```
+analyze_crash_rebound_days.py  append_cost_scenarios 1회 (= 정의)
+analyze_v_drop_backtest.py     1회 (= 정의)
+simulate_pullback_removal.py   1회 (= 정의)
+```
+"Gross/Base/Stress를 함께 출력한다"는 1J.1 보고와 코드가 달랐음.
+실제 리포트 생성 경로에 연결:
+- **crash**: 지연별(`저점+3/5/10분`) + `저점 즉시진입 → 종가`
+- **v-drop**: horizon별(`5/10/20분 후`) Base 요약 바로 아래
+- **pullback**: `summarize()`에서 horizon별
+
+수정 후 등장 횟수 — crash 3회 / v-drop 2회 / pullback 2회
+(정의 1 + 호출 N).
+
+**실행 확인** (51거래일 실데이터):
+```
+저점+3분 진입 → 종가   1061건  승률 872/1061 (82%)  평균 +4.95%
+  [ 저점 후 3분 진입 ] 비용 시나리오별 (n=1061)
+           Gross  +5.30%   플러스비율 86%
+           Base   +4.95%   플러스비율 82%
+           Stress +4.40%   플러스비율 76%
+```
+
+### P1: 3시나리오 필드 통일
+
+- **crash**: `entries`에 `gross_return`/`base_return`/`stress_return`
+  추가, `net_return = base_return` alias.
+- **pullback**: `row_base`에 `gross_{5,10,20}m`/`base_*`/`stress_*`
+  추가, `net_* = base_*` alias(주석 명시).
+- **v-drop**: 이미 있던 필드를 리포트에서 실제 사용.
+
+### P1: Gross 정의 강제 (재현 확인)
+
+`CostModel(0.10, 0.35, 0.90).validate()`가 통과해 "Gross 0.10%"라는
+모순된 출력이 가능했음. Gross는 정의상 비용 전 원수익이므로
+`abs(gross) > 1e-9`면 `CostModelConfigError`.
+
+### P1: daily_report 중복 문구 제거
+
+`※ 비용 기준...` / `※ replay/백테스트...` 두 줄이 2회 출력되던 것을
+1회로. pullback의 `비용 가정: 왕복 0.35%` 잔여 줄도 제거(시나리오
+줄로 대체).
+
+### P1: allow_default 정책 명확화
+
+의도를 **"설정 파일 자체를 사용할 수 없을 때만 fallback"**으로 확정:
+```
+허용(기본값): 파일 누락 / YAML 파싱 실패 / cost_model 블록 부재
+불허(항상 예외): 키 누락 / 숫자 변환 실패 / 검증 위반(순서·음수·Gross≠0)
+```
+앞의 셋은 "설정을 못 읽었다"이고 뒤의 셋은 "설정이 있는데 틀렸다"라,
+후자를 기본값으로 덮으면 사용자 의도가 조용히 무시되기 때문.
+docstring과 테스트(14절)를 이 정책에 맞춤.
+
+### 부수 수정 2건
+
+**import 시 stdout 교체** — `replay_runner`, `simulate_pullback_removal`,
+`analyze_signal_log`, `analyze_trades`, `analyze_indicators`가 모듈
+최상위에서 `sys.stdout`을 교체해, import하는 테스트의 stdout까지 닫혀
+`ValueError: I/O operation on closed file`이 발생했음(1I.5와 동일
+패턴). `_force_utf8_stdout()`로 분리해 `main()`에서만 호출.
+
+**`data/minute_bars/rejected/`** — `simulate_pullback_removal.py`가
+날짜가 아닌 디렉터리에서 `int()` 변환 실패로 죽었음(기존 결함).
+8자리 숫자 디렉터리만 대상으로 필터. **1K에서 51일 리플레이를 돌릴
+때 바로 막혔을 문제.**
+
+### 테스트
+
+`test_cost_model.py` 68건 → **88건**:
+- **12A(6건)** v-drop 실행 — `load_bars`를 `MinuteBarRow` 호환
+  fixture로 monkeypatch하고 `simulate_event()`를 **실제 호출**.
+  NameError 부재, `gross/base/stress` 필드 산출,
+  `net_5m == base_5m`, `Gross > Base > Stress` 수치 관계.
+- **12B(15건)** helper 실행 — 세 분석기의 `append_cost_scenarios()`를
+  직접 호출해 출력 문자열에 Gross/Base/Stress·플러스비율이 있는지,
+  세 값의 대소 관계와 `Gross - Base == base_roundtrip_pct`를 검증.
+- **12C(3건)** helper 호출 존재 — "정의 1회 + 호출 1회 이상"을 확인해
+  1J.1의 false pass 재발 차단.
+- **12D(5건)** 3시나리오 필드 및 Base alias 명시.
+- **13절(4건)** Gross==0 강제 — `0.10`/`-0.10` 예외, `0.00` 정상,
+  설정 경유 로딩도 예외.
+- **14절(6건)** allow_default 정책 일치.
+- **15절(2건)** daily_report 중복 문구 제거.
+
+**전체 회귀**: 14개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+**실행 스모크**: replay / crash / v-drop / pullback 4종 모두 정상 실행.
+**BUY/HOLD/SELL 로직 무변경.**
+
+---
+

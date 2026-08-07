@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import sys
 import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 import csv
 import os
@@ -220,9 +219,18 @@ def run_symbol_day(symbol: str, target_date: date, analyzer) -> dict:
             after_5m=after.get(5), after_10m=after.get(10), after_20m=after.get(20),
             # 2026-08-07 (1J.1): net_*는 Base alias로 유지하고
             # gross/base/stress를 함께 산출합니다.
-            net_5m=COST_MODEL.net(after.get(5), "base"),
-            net_10m=COST_MODEL.net(after.get(10), "base"),
-            net_20m=COST_MODEL.net(after.get(20), "base"),
+            gross_5m=COST_MODEL.net(after.get(5), "gross"),
+            base_5m=COST_MODEL.net(after.get(5), "base"),
+            stress_5m=COST_MODEL.net(after.get(5), "stress"),
+            net_5m=COST_MODEL.net(after.get(5), "base"),   # Base alias
+            gross_10m=COST_MODEL.net(after.get(10), "gross"),
+            base_10m=COST_MODEL.net(after.get(10), "base"),
+            stress_10m=COST_MODEL.net(after.get(10), "stress"),
+            net_10m=COST_MODEL.net(after.get(10), "base"),   # Base alias
+            gross_20m=COST_MODEL.net(after.get(20), "gross"),
+            base_20m=COST_MODEL.net(after.get(20), "base"),
+            stress_20m=COST_MODEL.net(after.get(20), "stress"),
+            net_20m=COST_MODEL.net(after.get(20), "base"),   # Base alias
             mfe=round(mfe, 2), mae=round(mae, 2),
         )
 
@@ -295,6 +303,10 @@ def summarize(rows: list[dict], label: str) -> str:
         avg = sum(vals) / len(vals)
         lines.append(f"    {lo:>6.1f}%~{hi:<6.1f}%  {len(vals):>4}건  승률 {win/len(vals)*100:4.0f}%  순수익 {avg:+.2f}%")
 
+    # 2026-08-07 (1J.2): horizon별 3시나리오 실제 출력
+    for _m in (5, 10, 20):
+        _raws = [r.get(f"gross_{_m}m") for r in rows]
+        append_cost_scenarios(lines, _raws, f"{_m}분 후")
     top_gain = sorted([r for r in rows if r['net_5m'] is not None], key=lambda r: -r['net_5m'])[:3]
     top_loss = sorted([r for r in rows if r['net_5m'] is not None], key=lambda r: r['net_5m'])[:3]
     lines.append("")
@@ -324,9 +336,25 @@ def append_cost_scenarios(lines: list, gross_returns, label: str = "") -> None:
         lines.append(f"  비용 시나리오별 (n={len(vals)})")
     lines.extend(COST_MODEL.scenario_lines(vals))
 
+def _force_utf8_stdout() -> None:
+    """Windows 콘솔 한글 깨짐 방지 — 직접 실행할 때만 적용.
+
+    2026-08-07 (1J.2): 모듈 최상위에서 sys.stdout을 교체하면
+    이 모듈을 import하는 쪽(테스트 등)의 stdout까지 닫혀
+    ValueError: I/O operation on closed file이 발생합니다.
+    """
+    import io as _io, sys as _sys
+    _sys.stdout = _io.TextIOWrapper(_sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+
 def main():
+    _force_utf8_stdout()
     args = sys.argv[1:]
+    # 2026-08-07 (1J.2, 기존 결함): data/minute_bars 아래에는 날짜
+    # 디렉터리 외에 rejected/ 같은 보조 폴더가 있어 int() 변환에서
+    # ValueError로 죽었음. 8자리 숫자 디렉터리만 대상으로 제한.
     all_dates = sorted(p.name for p in MINUTE_BARS_DIR.iterdir() if p.is_dir())
+    all_dates = [d for d in all_dates if len(str(d)) == 8 and str(d).isdigit()]
     if len(args) >= 2:
         s, e = args[0].replace("-", ""), args[1].replace("-", "")
         all_dates = [d for d in all_dates if s <= d <= e]
@@ -352,7 +380,7 @@ def main():
     report.append(f"  📊 고가/저가 대비 유효범위 제거 시뮬레이션 v2  ({all_dates[0]}~{all_dates[-1]})")
     report.append("═" * 64)
     report.append(f"  대상: {len(all_dates)}거래일 × 종목-일 {n_symbol_days}건")
-    report.append(f"  비용 가정: 왕복 {ROUND_TRIP_COST_PCT}% + 슬리피지 {SLIPPAGE_PCT}%")
+    # 2026-08-07 (1J.2): 아래 비용 시나리오 줄로 대체됨(중복 제거)
     report.append(f"  비용 시나리오: {COST_MODEL.describe()}")
     report.append(f"  baseline: A조건 고가대비 {BASE_A_CAP}% 캡 / C조건 고가대비 {BASE_C_MIN}%~{BASE_C_MAX}%")
     report.append("  ※ C조건 최초 패턴감지(is_valid_pulldown)에 쓰이는 하드코딩된")
