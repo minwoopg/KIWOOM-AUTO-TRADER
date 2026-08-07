@@ -151,9 +151,19 @@ def simulate_event(event: dict) -> dict | None:
         "entry_price": entry_price,
         "drop_pct": event["start"]["drop_pct"],
         "event_count": event["count"],
-        "net_5m":  (after_pcts.get(5)  - TOTAL_COST_PCT) if after_pcts.get(5)  is not None else None,
-        "net_10m": (after_pcts.get(10) - TOTAL_COST_PCT) if after_pcts.get(10) is not None else None,
-        "net_20m": (after_pcts.get(20) - TOTAL_COST_PCT) if after_pcts.get(20) is not None else None,
+            # 2026-08-07 (1J.1): net_*는 Base alias, 3시나리오 병행 산출
+            "gross_5m": COST_MODEL.net(after_pcts.get(5), "gross"),
+            "base_5m": COST_MODEL.net(after_pcts.get(5), "base"),
+            "stress_5m": COST_MODEL.net(after_pcts.get(5), "stress"),
+            "net_5m": COST_MODEL.net(after_pcts.get(5), "base"),
+            "gross_10m": COST_MODEL.net(after_pcts.get(10), "gross"),
+            "base_10m": COST_MODEL.net(after_pcts.get(10), "base"),
+            "stress_10m": COST_MODEL.net(after_pcts.get(10), "stress"),
+            "net_10m": COST_MODEL.net(after_pcts.get(10), "base"),
+            "gross_20m": COST_MODEL.net(after_pcts.get(20), "gross"),
+            "base_20m": COST_MODEL.net(after_pcts.get(20), "base"),
+            "stress_20m": COST_MODEL.net(after_pcts.get(20), "stress"),
+            "net_20m": COST_MODEL.net(after_pcts.get(20), "base"),
     }
 
 
@@ -235,6 +245,22 @@ def analyze(start: date, end: date) -> str:
     sep()
     return "\n".join(lines)
 
+
+
+# ── 2026-08-07 (1J.1): 비용 3시나리오 요약 ────────────────────
+# 1J에서 비용 숫자는 단일 출처화했지만 세 시나리오를 실제로 함께
+# 출력하는 건 replay_runner뿐이었음. "비용 가정에 따른 결론 뒤집힘을
+# 항상 노출한다"는 1J 원칙에 맞춰 나머지 분석기도 통일합니다.
+def append_cost_scenarios(lines: list, gross_returns, label: str = "") -> None:
+    """원수익률 목록에 대해 Gross/Base/Stress 평균과 플러스비율을 덧붙입니다."""
+    vals = [v for v in gross_returns if v is not None]
+    if not vals:
+        return
+    if label:
+        lines.append(f"  [ {label} ] 비용 시나리오별 (n={len(vals)})")
+    else:
+        lines.append(f"  비용 시나리오별 (n={len(vals)})")
+    lines.extend(COST_MODEL.scenario_lines(vals))
 
 def main():
     import sys

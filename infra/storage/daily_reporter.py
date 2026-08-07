@@ -204,7 +204,12 @@ class DailyReporter:
 
             for m in matches:
                 gross = (m["sell_price"] - m["buy_price"]) * m["qty"]
-                cost  = int(m["sell_price"] * m["qty"] * COST_RATE)
+                # 2026-08-07 (1J.1): 비용 기준금액을 **진입 원금**으로
+                # 통일. 이전엔 매도금액 기준이라 replay의
+                # "gross_return_pct - cost_pct"와 의미가 달랐음
+                # (매수 100 → 매도 110이면 매도금액 기준 비용은
+                # 진입원금 대비 0.99%가 되어 0.90%와 어긋남).
+                cost  = int(m["buy_price"] * m["qty"] * COST_RATE)
                 realized_pnl   += gross
                 estimated_cost += cost
                 total_buy_amount  += m["buy_price"] * m["qty"]
@@ -235,7 +240,10 @@ class DailyReporter:
                 if sell_price <= 0 or sell_qty <= 0 or avg_buy_p <= 0:
                     continue
                 gross = (sell_price - avg_buy_p) * sell_qty
-                cost  = int(sell_price * sell_qty * COST_RATE)
+                # 이월 포지션은 당일 진입 원금을 확정할 수 없으므로
+                # 전일 평균단가 × 수량을 진입 원금 추정치로 사용합니다
+                # (리포트에 추정치임을 명시).
+                cost  = int(avg_buy_p * sell_qty * COST_RATE)
                 net   = gross - cost
                 carryover_pnl += net
                 rate  = (sell_price - avg_buy_p) / avg_buy_p * 100
@@ -251,13 +259,16 @@ class DailyReporter:
         lines.append("")
         lines.append("[ 💰 손익 요약 ]")
         pnl_sign = "+" if realized_pnl >= 0 else ""
-        lines.append(f"  실현 손익 (당일 신규, 체결가 기준) : {pnl_sign}{realized_pnl:>11,}원")
+        lines.append(f"  실현 손익 (당일 신규, 주문가 기준 예상) : {pnl_sign}{realized_pnl:>11,}원")
         completed_sell_cnt = len([t for t in sells if t['symbol'] in today_sells])
-        lines.append(f"    매수 총액 : {total_buy_amount:>11,}원  (당일 체결가 기준)")
+        lines.append(f"    매수 총액 : {total_buy_amount:>11,}원  (당일 주문가 기준)")
         lines.append(f"    매도 총액 : {total_sell_amount:>11,}원  ({completed_sell_cnt}건)")
         lines.append(f"    승률      : {win_rate}")
         cost_sign = "-" if estimated_cost > 0 else ""
-        lines.append(f"  추정 비용 (Stress {COST_RATE*100:.2f}% 기준) : {cost_sign}{estimated_cost:>11,}원")
+        lines.append(f"  추정 비용 (Stress {COST_RATE*100:.2f}%, 진입 원금 기준) : {cost_sign}{estimated_cost:>11,}원")
+        lines.append(f"    ※ 비용 기준: {_cm.describe()} — 이 리포트는 보수적 상한인 Stress를 적용합니다.")
+        lines.append("    ※ replay/백테스트 리포트는 Base 기준이므로 수치가 다릅니다(같은 cost_model의 다른 시나리오).")
+        lines.append("    ※ 이월 포지션 비용은 전일 평균단가 기준 추정치입니다.")
         lines.append(f"    ※ 비용 기준: {_cm.describe()} — 이 리포트는 보수적 상한인 Stress를 적용합니다.")
         lines.append("    ※ replay/백테스트 리포트는 Base 기준이므로 수치가 다릅니다(같은 cost_model의 다른 시나리오).")
         net_sign = "+" if net_realized_pnl >= 0 else ""

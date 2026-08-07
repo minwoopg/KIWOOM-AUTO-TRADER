@@ -4349,3 +4349,98 @@ daily_report의 "체결가 기준" 표현이 부정확할 수 있으므로,
 
 ---
 
+## 1J.1: 비용 모델 신뢰성 마무리 — fail-closed 로딩 (2026-08-07)
+
+1J에 대한 GPT 코드리뷰 5건 반영. 매매 로직 무변경.
+
+### 1. 설정 로딩을 fail-closed로 (재현 확인)
+
+**재현 (수정 전)**:
+```
+cwd를 프로젝트 밖으로 변경 → 예외 없이 Base 0.35 반환 ⚠
+YAML이 깨져 있음          → 예외 없이 Base 0.35 반환 ⚠
+```
+기본 경로가 `Path("config/settings.yaml")`이라 **cwd에 의존**했음.
+나중에 `base_roundtrip_pct: 0.42`로 교정했는데 Windows 작업
+디렉터리가 달라 설정을 못 찾으면, 51일 분석이 아무 경고 없이 다시
+0.35%로 돌아감 — **1J를 한 의미가 사라짐.**
+
+**수정**:
+- `PROJECT_ROOT = Path(__file__).resolve().parents[1]` 기준 절대경로
+  (`DEFAULT_SETTINGS_PATH`). 상대경로가 주어졌고 cwd에 없으면
+  프로젝트 루트 기준으로 한 번 더 시도.
+- `CostModelConfigError` 신규. 설정 누락 / YAML 파싱 실패 /
+  `cost_model` 블록 누락 / 필수 키 누락 / 숫자 변환 실패 /
+  `Gross < Base < Stress` 위반 / 음수 비용 — **전부 예외**.
+- 기본값은 `allow_default=True`를 명시할 때만. 분석기는 기본 strict.
+
+### 2. 경로별 cache (재현 확인)
+
+**재현 (수정 전)**: 전역 `_CACHED` 하나라 A→B 순서로 읽으면
+`A = 0.11/0.22`, `B = 0.11/0.22`(잘못됨). 1K에서 여러 설정으로
+실험할 수 있으므로 `_CACHE: dict[Path, CostModel]`로 분리.
+**수정 후**: `A → 0.11/0.22`, `B → 0.77/0.88`.
+
+### 3. 분석기 3시나리오 출력 통일
+
+1J에서 세 시나리오를 실제로 출력하는 건 `replay_runner`뿐이었음.
+"비용 가정에 따른 결론 뒤집힘을 항상 노출한다"는 1J 원칙에 맞춰
+나머지도 통일:
+- `CostModel.scenario_lines()` 공용 헬퍼 — 평균 + 플러스비율 3줄.
+- `analyze_crash_rebound_days.py` / `analyze_v_drop_backtest.py` /
+  `simulate_pullback_removal.py`에 `append_cost_scenarios()` 추가.
+- 결과 dict에 `gross_5m` / `base_5m` / `stress_5m` 병행 산출.
+  `net_5m`은 **Base alias**로 유지(하위호환 — 기존 집계 코드가
+  `net_5m`을 참조).
+
+### 4. roundtrip_pct 기준금액 통일
+
+replay는 `gross_return_pct - cost_pct`인데 daily_report는
+`매도금액 × cost_pct`였음. 매수 100 → 매도 110이면 매도금액 기준
+비용은 진입원금 대비 **0.99%**가 되어 "0.90%"와 어긋남.
+
+정의를 고정: **`roundtrip_pct` = 진입 원금(buy notional) 대비 왕복
+총비용 추정률**.
+```
+replay:  net_return_pct = gross_return_pct - cost_pct
+daily :  estimated_cost = buy_notional × cost_pct / 100
+```
+- `daily_reporter`의 `sell_price × qty` → `buy_price × qty`.
+- 이월 포지션은 진입 원금을 확정할 수 없으므로 `avg_buy_price × qty`
+  를 추정치로 쓰고 **리포트에 추정치임을 명시**.
+- `CostModel.cost_amount(buy_notional, scenario)` 추가.
+- 리포트 표기: `추정 비용 (Stress 0.90%, 진입 원금 기준)`.
+
+**부수 정정**: GPT가 지적한 P&L 표기 문제도 함께 처리 — 8/7
+`005930`의 BUY 주문가 238,500원과 broker `avg_buy_price` 239,000원이
+달랐으므로 "체결가 기준"은 부정확. **"주문가 기준 예상"**으로 변경.
+실제 체결 이벤트(`filled_quantity`/`fill_price`/`commission`/`tax`)
+저장은 별도 단계.
+
+### 5. 하드코딩 검사 강화
+
+1J의 검사는 과거 변수명만 봐서 `BACKTEST_COST = 0.35` 같은 새
+하드코딩을 못 잡았음. 이제 **비용 literal 자체**
+(`0.35`/`0.90`/`0.9`/`0.0035`/`0.009`)를 `.py`·`.yaml` 전체에서
+찾고, 허용 위치(`domain/cost_model.py`, `settings.yaml`,
+`test_cost_model.py`, CHANGELOG)만 제외. 주석 줄은 설명일 수 있어
+오탐 방지로 제외하며, **검사기가 새 변수명을 실제로 잡는지**도
+자기검증(3-2, 3-3).
+
+### 테스트
+
+`test_cost_model.py` 35건 → **68건**:
+- 9절(9건) fail-closed — cwd 밖에서도 정상 로드, 절대경로 확인,
+  설정 누락/YAML malformed/블록 누락/키 누락/숫자 변환 실패/
+  순서 위반/음수 비용 각각 예외.
+- 10절(3건) 경로별 cache — A/B 순차 로딩이 서로 오염되지 않음.
+- 11절(8건) 기준금액 — `cost_amount`가 진입 원금 기준,
+  replay 정의와 일치(`10% → 9.10%`), daily_report가 매수금액에
+  비용률을 곱하는지, 이월 추정치 명시, "주문가 기준 예상" 표기.
+- 12절(9건) 분석기 3시나리오 출력 통일.
+- 3절 강화 및 4-4(정책 변경: `allow_default` 명시 시에만 기본값).
+
+**전체 회귀**: 14개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+
+---
+

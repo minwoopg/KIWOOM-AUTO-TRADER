@@ -219,6 +219,22 @@ def analyze(start: date, end: date, crash_threshold: float, min_crash_symbols: i
     return "\n".join(lines)
 
 
+
+# ── 2026-08-07 (1J.1): 비용 3시나리오 요약 ────────────────────
+# 1J에서 비용 숫자는 단일 출처화했지만 세 시나리오를 실제로 함께
+# 출력하는 건 replay_runner뿐이었음. "비용 가정에 따른 결론 뒤집힘을
+# 항상 노출한다"는 1J 원칙에 맞춰 나머지 분석기도 통일합니다.
+def append_cost_scenarios(lines: list, gross_returns, label: str = "") -> None:
+    """원수익률 목록에 대해 Gross/Base/Stress 평균과 플러스비율을 덧붙입니다."""
+    vals = [v for v in gross_returns if v is not None]
+    if not vals:
+        return
+    if label:
+        lines.append(f"  [ {label} ] 비용 시나리오별 (n={len(vals)})")
+    else:
+        lines.append(f"  비용 시나리오별 (n={len(vals)})")
+    lines.extend(COST_MODEL.scenario_lines(vals))
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("start")

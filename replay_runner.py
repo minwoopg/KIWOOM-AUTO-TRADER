@@ -195,9 +195,19 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer) -> list[dict]:
             "after_10m":   after_pcts.get(10),
             "after_20m":   after_pcts.get(20),
             # 비용 반영 순수익
-            "net_5m":   (after_pcts.get(5)  - TOTAL_COST_PCT) if after_pcts.get(5)  is not None else None,
-            "net_10m":  (after_pcts.get(10) - TOTAL_COST_PCT) if after_pcts.get(10) is not None else None,
-            "net_20m":  (after_pcts.get(20) - TOTAL_COST_PCT) if after_pcts.get(20) is not None else None,
+            # 2026-08-07 (1J.1): net_*는 Base alias, 3시나리오 병행 산출
+            "gross_5m": COST_MODEL.net(after_pcts.get(5), "gross"),
+            "base_5m": COST_MODEL.net(after_pcts.get(5), "base"),
+            "stress_5m": COST_MODEL.net(after_pcts.get(5), "stress"),
+            "net_5m": COST_MODEL.net(after_pcts.get(5), "base"),
+            "gross_10m": COST_MODEL.net(after_pcts.get(10), "gross"),
+            "base_10m": COST_MODEL.net(after_pcts.get(10), "base"),
+            "stress_10m": COST_MODEL.net(after_pcts.get(10), "stress"),
+            "net_10m": COST_MODEL.net(after_pcts.get(10), "base"),
+            "gross_20m": COST_MODEL.net(after_pcts.get(20), "gross"),
+            "base_20m": COST_MODEL.net(after_pcts.get(20), "base"),
+            "stress_20m": COST_MODEL.net(after_pcts.get(20), "stress"),
+            "net_20m": COST_MODEL.net(after_pcts.get(20), "base"),
             "mfe":         round(mfe, 2),
             "mae":         round(mae, 2),
         })

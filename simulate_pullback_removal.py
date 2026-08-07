@@ -218,9 +218,11 @@ def run_symbol_day(symbol: str, target_date: date, analyzer) -> dict:
             time_bucket=get_time_bucket(current.cntr_tm), entry_price=entry_price,
             pullback_pct=round(a.pullback_pct, 2),
             after_5m=after.get(5), after_10m=after.get(10), after_20m=after.get(20),
-            net_5m=(after[5]-TOTAL_COST_PCT) if after.get(5) is not None else None,
-            net_10m=(after[10]-TOTAL_COST_PCT) if after.get(10) is not None else None,
-            net_20m=(after[20]-TOTAL_COST_PCT) if after.get(20) is not None else None,
+            # 2026-08-07 (1J.1): net_*는 Base alias로 유지하고
+            # gross/base/stress를 함께 산출합니다.
+            net_5m=COST_MODEL.net(after.get(5), "base"),
+            net_10m=COST_MODEL.net(after.get(10), "base"),
+            net_20m=COST_MODEL.net(after.get(20), "base"),
             mfe=round(mfe, 2), mae=round(mae, 2),
         )
 
@@ -306,6 +308,22 @@ def summarize(rows: list[dict], label: str) -> str:
     return "\n".join(lines)
 
 
+
+# ── 2026-08-07 (1J.1): 비용 3시나리오 요약 ────────────────────
+# 1J에서 비용 숫자는 단일 출처화했지만 세 시나리오를 실제로 함께
+# 출력하는 건 replay_runner뿐이었음. "비용 가정에 따른 결론 뒤집힘을
+# 항상 노출한다"는 1J 원칙에 맞춰 나머지 분석기도 통일합니다.
+def append_cost_scenarios(lines: list, gross_returns, label: str = "") -> None:
+    """원수익률 목록에 대해 Gross/Base/Stress 평균과 플러스비율을 덧붙입니다."""
+    vals = [v for v in gross_returns if v is not None]
+    if not vals:
+        return
+    if label:
+        lines.append(f"  [ {label} ] 비용 시나리오별 (n={len(vals)})")
+    else:
+        lines.append(f"  비용 시나리오별 (n={len(vals)})")
+    lines.extend(COST_MODEL.scenario_lines(vals))
+
 def main():
     args = sys.argv[1:]
     all_dates = sorted(p.name for p in MINUTE_BARS_DIR.iterdir() if p.is_dir())
@@ -335,6 +353,7 @@ def main():
     report.append("═" * 64)
     report.append(f"  대상: {len(all_dates)}거래일 × 종목-일 {n_symbol_days}건")
     report.append(f"  비용 가정: 왕복 {ROUND_TRIP_COST_PCT}% + 슬리피지 {SLIPPAGE_PCT}%")
+    report.append(f"  비용 시나리오: {COST_MODEL.describe()}")
     report.append(f"  baseline: A조건 고가대비 {BASE_A_CAP}% 캡 / C조건 고가대비 {BASE_C_MIN}%~{BASE_C_MAX}%")
     report.append("  ※ C조건 최초 패턴감지(is_valid_pulldown)에 쓰이는 하드코딩된")
     report.append("     당일등락률 -8%~-1% 필터는 그대로 유지 (이 시뮬레이션 범위 밖)")
