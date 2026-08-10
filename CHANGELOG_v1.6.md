@@ -5068,3 +5068,138 @@ history prepend로 인덱스 기준이 `ctx.all_bars`로 바뀌면서
 
 ---
 
+## 1J.3.4: prev_close 신뢰성 확정 (2026-08-07)
+
+1J.3.3에 대한 GPT 코드리뷰 반영. **replay 인프라 작업은 이 단계로
+종료하고 1J.5로 넘어갑니다.** 매매 로직 무변경.
+
+### P0: "직전 날짜 파일의 마지막 봉"은 전일 종가가 아님 (재현 확인)
+
+`MinuteBarSaver`는 그 종목을 감시할 때 받은 60봉만 병합 저장하므로,
+전날 오전에 잠깐 감시했다면 파일도 오전에 끝납니다.
+
+**실측 (PREVIOUS_DATA_DAY 후보 321건의 이전 파일 마지막 봉)**:
+```
+12:00 이전    154건
+12:01~14:00    47건
+14:01~14:59    31건
+15:00~15:14    19건
+15:15 이후     70건
+→ 251건(78%)이 15:15 이전
+예: 5/29 파일 마지막 09:03 → 6/1 전일 종가로 사용되고 있었음
+```
+반면 **same-file pretarget**(당일 API가 받아 저장한 전일 봉)의 마지막
+시각은 `15:35` 868건 / `15:30` 46건으로 장 마감부까지 이어집니다.
+→ `EOD_CUTOFF_HHMM = "1530"`으로 상수화.
+
+**수정**:
+- `PREVIOUS_DATA_DAY_FILE` → **`PREVIOUS_DATA_DAY_EOD`**(15:30 이후
+  종료, fallback 허용) / **`PREVIOUS_DATA_DAY_PARTIAL`**(그 이전 종료,
+  **prev_close 사용 금지**)로 분리.
+- `PARTIAL`은 coverage의 `available`에서 제외.
+
+### P0: history prepend에도 동일 검증
+
+`PREVIOUS_DAY_RECONSTRUCTED`가 이전 파일이 장중까지만 있어도 tail을
+붙이고 있었습니다. 7/30 파일이 10:08에 끝났는데 그 tail을 7/31
+09:01의 live history로 붙이면, live가 실제로 본 7/30 장 마감 직전
+60봉과 전혀 다른 데이터가 됩니다.
+
+reconstruction 조건을 **전부 충족**할 때만 허용:
+첫 target 봉이 장초 / 직전 데이터 날짜 파일 존재 / **EOD까지 존재** /
+tail이 충분. 하나라도 실패하면 `INCOMPLETE_PREVIOUS_DAY`(신규) 또는
+`INCOMPLETE_INTRADAY`.
+
+### P0: SIGNAL_LOG_INFERRED 도입 — 실측으로 검증
+
+`prev_close ≈ price / (1 + change_rate_pct / 100)`. live는 minute CSV가
+아니라 시세 API의 `market_price.previous_close`를 쓰므로, 잘 검증된
+역산값이 장중에 끝난 전일 파일보다 실제에 가깝습니다.
+
+**엄격한 일관성 조건**: 유효 행 5개 이상 AND
+`(max-min)/median <= 0.2%`. 미달이면 `UNAVAILABLE`.
+`n_rows`·`spread_pct`를 함께 기록합니다.
+
+**정확도 검증** (same-file 실제값이 있는 표본과 비교):
+```
+비교 가능 138건
+절대오차 <=0.2%   138건 (100%)
+절대오차 <=0.5%   138건
+중앙 절대오차     0.0000%
+```
+
+**우선순위**: `SAME_FILE_PRETARGET`(high) → `SIGNAL_LOG_INFERRED`(high)
+→ `PREVIOUS_DATA_DAY_EOD`(medium) → `UNAVAILABLE`.
+
+### P1: prev_close provenance 보존
+
+prepend한 봉이 `ctx.all_bars`에 들어가면 `resolve_prev_close(ctx)`를
+다시 불렀을 때 `PREVIOUS_DATA_DAY_EOD / medium`이
+**`SAME_FILE_PRETARGET / high`로 둔갑**했습니다. 수익률 숫자는 그대로
+지만 1J.5에서 source별 fidelity를 볼 때 잘못된 결론이 납니다.
+
+`ReplayContextBuildResult(ctx, history_status, prev_close)`를 반환해
+**build 시점에 확정한 provenance를 다시 추론하지 않습니다.**
+`__iter__`로 기존 `(ctx, status)` 언패킹 하위호환 유지. 결과 행에도
+`prev_close_source` / `prev_close_confidence` 기록.
+테스트 R-10이 "재추론하면 둔갑한다"를 대조군으로 고정합니다.
+
+### P1: `SAME_FILE_COMPLETE` → `SAME_FILE_HISTORY_PRESENT`
+
+pretarget이 1봉만 있어도 COMPLETE라 명칭이 과했습니다. 실제 full
+여부는 `is_full_window()`가 판정하며, fidelity eligibility는 계속
+`full_window=True` 기준입니다.
+
+### 51거래일 재산출
+
+```
+                              1J.3.3      1J.3.4
+SAME_FILE_PRETARGET            920         920 (51.7%)
+SIGNAL_LOG_INFERRED              0         116 ( 6.5%)
+PREVIOUS_DATA_DAY_EOD          321           5 ( 0.3%)
+PREVIOUS_DATA_DAY_PARTIAL        -         260 (14.6%)  ← 사용 금지
+UNAVAILABLE                    540         480 (27.0%)
+신뢰 가능 coverage            69.7%       58.5%
+
+history 완전성
+SAME_FILE_HISTORY_PRESENT      920 (51.7%)
+PREVIOUS_DAY_RECONSTRUCTED       4 ( 0.2%)
+INCOMPLETE_PREVIOUS_DAY          7 ( 0.4%)
+INCOMPLETE_INTRADAY            850 (47.7%)
+```
+**69.7% → 58.5%로 또 낮아졌지만 이번에도 낮아진 쪽이 정확합니다.**
+이전 321건 중 316건이 실제로는 장중에 끝난 파일이었습니다.
+"coverage 숫자를 높이는 것보다 previous close가 실제 previous close
+인지가 우선"이라는 판단에 따릅니다.
+
+### 1J.5 Primary Fidelity Set 정의
+
+A(Aligned Value Fidelity)의 주 평가 표본:
+```
+full_window == True
+AND prev_close_source in (SAME_FILE_PRETARGET, SIGNAL_LOG_INFERRED,
+                          PREVIOUS_DATA_DAY_EOD)
+AND analyzer_mode == LIVE_MINUTE_ANALYZER
+AND analyzer_error_count == 0
+```
+그 외는 Secondary/limitation으로 별도 출력합니다.
+
+### 테스트
+
+`test_replay_time_axis.py` 161건 → **185건**:
+- R절(22건) GPT 지정 fixture A~H 전부 — 이전 파일 10:30 종료 시
+  fallback 금지, 15:35 종료 시 허용, 09:00 시작 + 이전 10:30 종료 시
+  prepend 금지, EOD tail 충분 시 prepend 후 window 60,
+  RECONSTRUCTED 후에도 source 유지(+재추론 시 둔갑하는 대조군),
+  역산 10행 spread 0.05% 허용 / 1% 거부 / 3행 거부, 우선순위
+  (역산 > PARTIAL), 명칭 정리, 리포트 필드.
+- 기존 L·P절 fixture를 EOD 정책에 맞춰 갱신 — **갱신 전 8건이
+  실패했는데, 이는 새 정책이 의도대로 작동한다는 증거**입니다.
+
+`test_cost_model.py` **101건 유지**.
+
+**전체 회귀**: 15개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+**실행 스모크**: replay / crash / v-drop / pullback 4종 정상.
+
+---
+

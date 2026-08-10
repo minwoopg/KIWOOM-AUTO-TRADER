@@ -257,7 +257,8 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
                target_date: date | None = None,
                *, minute_bar_count: int | None = None,
                quality_stats: "ReplayQualityStats | None" = None,
-               skip_analyzer_errors: bool = False) -> list[dict]:
+               skip_analyzer_errors: bool = False,
+               signal_rows=None) -> list[dict]:
     # 2026-08-07 (1J.3): target_date를 명시적으로 받습니다 —
     # 파일에 전일 꼬리 봉이 섞여 있어 봉만 보고는 어느 날의
     # candidate를 평가해야 하는지 알 수 없기 때문입니다.
@@ -281,11 +282,14 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
     # 2026-08-07 (1J.3.3): prev_close만이 아니라 **history**도 함께
     # 복원합니다. 장초 파일은 직전 데이터 날짜 tail을 prepend하고,
     # 장중부터 시작한 파일은 억지로 채우지 않습니다.
-    ctx, history_status = build_day_context(
-        symbol, bars, target_date, mbc, load_bars, MINUTE_BARS_DIR)
+    # 2026-08-07 (1J.3.4): prev_close provenance를 build 시점에 확정하고
+    # 다시 추론하지 않습니다 — prepend한 봉이 ctx에 들어가면
+    # resolve_prev_close가 SAME_FILE_PRETARGET/high로 둔갑하기 때문.
+    built = build_day_context(symbol, bars, target_date, mbc,
+                              load_bars, MINUTE_BARS_DIR, signal_rows)
+    ctx, history_status, pc = built.ctx, built.history_status, built.prev_close
     stats.history_status[history_status] = \
         stats.history_status.get(history_status, 0) + 1
-    pc = resolve_prev_close(ctx, symbol, load_bars, MINUTE_BARS_DIR, target_date)
     stats.symbol_days += 1
     stats.prev_close_sources[pc.source] = stats.prev_close_sources.get(pc.source, 0) + 1
     if pc.calendar_gap_days is not None:
@@ -387,6 +391,8 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
             "entry_time":  entry_time,
             "full_window": full_window,
             "history_status": history_status,
+            "prev_close_source": pc.source,
+            "prev_close_confidence": pc.confidence,
             "entry_price": entry_price,
             "patterns":    patterns,
             "is_v":        is_v,
@@ -450,11 +456,14 @@ def build_quality_report(stats: "ReplayQualityStats | None" = None) -> list[str]
     total = st.symbol_days
     if total:
         src = st.prev_close_sources
-        avail = total - src.get("UNAVAILABLE", 0)
+        # PARTIAL은 사용 금지이므로 available에 포함하지 않습니다.
+        avail = total - src.get("UNAVAILABLE", 0) - src.get("PREVIOUS_DATA_DAY_PARTIAL", 0)
         L.append("")
         L.append(f"  total_symbol_days          {total}")
         L.append(f"  same_file_count            {src.get('SAME_FILE_PRETARGET', 0)}")
-        L.append(f"  previous_data_day_count    {src.get('PREVIOUS_DATA_DAY_FILE', 0)}")
+        L.append(f"  previous_day_eod_count     {src.get('PREVIOUS_DATA_DAY_EOD', 0)}")
+        L.append(f"  previous_day_partial_count {src.get('PREVIOUS_DATA_DAY_PARTIAL', 0)}")
+        L.append(f"  signal_inferred_count      {src.get('SIGNAL_LOG_INFERRED', 0)}")
         L.append(f"  unavailable_count          {src.get('UNAVAILABLE', 0)}")
         L.append(f"  prev_close_coverage_pct    {avail / total * 100:.1f}%")
         L.append("  ※ prev_close는 **바로 직전 데이터 날짜 1곳**만 봅니다.")
@@ -470,8 +479,8 @@ def build_quality_report(stats: "ReplayQualityStats | None" = None) -> list[str]
     if st.history_status or st.total_candidate_points:
         L.append("")
         L.append("  history 완전성")
-        for k in ("SAME_FILE_COMPLETE", "PREVIOUS_DAY_RECONSTRUCTED",
-                  "INCOMPLETE_INTRADAY"):
+        for k in ("SAME_FILE_HISTORY_PRESENT", "PREVIOUS_DAY_RECONSTRUCTED",
+                  "INCOMPLETE_PREVIOUS_DAY", "INCOMPLETE_INTRADAY"):
             n = st.history_status.get(k, 0)
             if n:
                 L.append(f"    {k:28s} {n:5d}")

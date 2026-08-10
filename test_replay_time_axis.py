@@ -230,8 +230,8 @@ rr = Path("replay_runner.py").read_text(encoding="utf-8")
 check("G-2) replay_runner가 target_indices로 candidate를 한정",
       "ctx.target_indices" in rr)
 check("G-3) replay_runner가 analysis_window를 사용", "ctx.analysis_window(" in rr)
-check("G-4) replay_runner가 prev_close를 복원 계층으로 얻음",
-      "resolve_prev_close(" in rr)
+check("G-4) replay_runner가 build_day_context로 prev_close provenance를 확정",
+      "built.prev_close" in rr)
 check("G-5) replay_runner 코드에 prev_close = bars[0].close_price가 없음",
       "prev_close = bars[0].close_price" not in _code_only(rr))
 check("G-6) replay_runner 코드에 idx = i + m 방식이 없음",
@@ -423,7 +423,8 @@ if _rb:
                   minute_bar_count=60, quality_stats=_stats_k)
 _q = "\n".join(RR.build_quality_report(_stats_k))
 # 1J.3.2에서 요구된 필드명으로 변경
-for key in ("total_symbol_days", "same_file_count", "previous_data_day_count",
+for key in ("total_symbol_days", "same_file_count", "previous_day_eod_count",
+            "previous_day_partial_count", "signal_inferred_count",
             "unavailable_count", "prev_close_coverage_pct", "analyzer_mode"):
     check(f"K-9) 품질 리포트에 {key} 출력", key in _q)
 check("K-10) '전체 데이터'가 아님을 명시", "'전체 데이터'가 아닙니다" in _q)
@@ -442,6 +443,19 @@ import csv as _csv
 from domain.replay_context import PREV_CLOSE_PREV_DAY
 
 _root = Path(_tf.mkdtemp())
+
+
+def _write_day_eod(day: str, symbol: str, closes: list[int]) -> None:
+    """마지막 봉을 15:35로 두어 EOD 조건을 만족시키는 fixture."""
+    d = _root / day
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / f"{symbol}.csv").open("w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["cntr_tm", "open", "high", "low", "close", "volume", "acc_volume"])
+        for i, c in enumerate(closes[:-1]):
+            w.writerow([f"{day}09{i:02d}00", c, c, c, c, 100, 100])
+        c = closes[-1]
+        w.writerow([f"{day}153500", c, c, c, c, 100, 100])
 
 
 def _write_day(day: str, symbol: str, closes: list[int]) -> None:
@@ -475,7 +489,8 @@ check("L-1) 직전 데이터 날짜(8/6)에 종목이 없으면 UNAVAILABLE",
 check("L-2) 2홉 전(8/5) 종가 8100을 절대 쓰지 않음", _r_l.value != 8100)
 
 # 8/6에 심볼이 있으면 그 날의 마지막 당일 close 사용
-_write_day("20260806", "AAA", [9500, 9700])
+# 1J.3.4: EOD(15:30 이후)까지 있어야 fallback 허용되므로 확장
+_write_day_eod("20260806", "AAA", [9500, 9700])
 _r_l2 = resolve_prev_close(_ctx_l, "AAA", _load, _root, date(2026, 8, 7))
 check("L-3) 직전 데이터 날짜에 종목이 있으면 그 마지막 close 사용",
       _r_l2.value == 9700 and _r_l2.source == PREV_CLOSE_PREV_DAY)
@@ -485,8 +500,8 @@ check("L-5) calendar_gap_days가 기록됨", _r_l2.calendar_gap_days == 1)
 check("L-6) confidence가 medium", _r_l2.confidence == "medium")
 
 # 이름 정정 — trading day라고 단정하지 않음
-check("L-7) source 이름이 PREVIOUS_DATA_DAY_FILE",
-      PREV_CLOSE_PREV_DAY == "PREVIOUS_DATA_DAY_FILE")
+check("L-7) source 이름이 PREVIOUS_DATA_DAY_EOD (1J.3.4 정정)",
+      PREV_CLOSE_PREV_DAY == "PREVIOUS_DATA_DAY_EOD")
 _rc_src = Path("domain/replay_context.py").read_text(encoding="utf-8")
 check("L-8) 무제한 과거 탐색 코드가 제거됨",
       "for d in reversed(prior)" not in _code_only(_rc_src))
@@ -621,10 +636,13 @@ def _load2(symbol, d):
 
 
 # fixture 1: 전일 60봉 별도 파일 + 당일 09:00 시작
-_wd("20260806", "AAA", [(14, m, 9000 + m) for m in range(0, 60)])
+# 1J.3.4: EOD 조건 충족을 위해 15:35까지 확장
+_wd("20260806", "AAA", [(14, m, 9000 + m) for m in range(0, 60)]
+    + [(15, 35, 9059)])
 _wd("20260807", "AAA", [(9, m, 10000 + m) for m in range(0, 30)])
-_ctx1, _hs1 = build_day_context("AAA", _load2("AAA", date(2026, 8, 7)),
-                                date(2026, 8, 7), 60, _load2, _root2)
+_b1 = build_day_context("AAA", _load2("AAA", date(2026, 8, 7)),
+                        date(2026, 8, 7), 60, _load2, _root2)
+_ctx1, _hs1 = _b1.ctx, _b1.history_status
 check("P-1) 장초 파일은 직전 날짜 tail로 history 복원",
       _hs1 == HISTORY_PREVIOUS_DAY_RECONSTRUCTED)
 _i1 = _ctx1.target_indices[5]                      # 09:05
@@ -638,14 +656,15 @@ check("P-5) candidate는 여전히 당일 봉만",
       all(_ctx1.all_bars[i].cntr_tm.startswith("20260807")
           for i in _ctx1.target_indices))
 check("P-6) prev_close가 전일 마지막 close",
-      resolve_prev_close(_ctx1, "AAA", _load2, _root2, date(2026, 8, 7)).value == 9059)
+      _b1.prev_close.value == 9059)
 check("P-7) history가 minute_bar_count를 넘지 않음", len(_w1) <= 60)
 
 # fixture 2: 당일 파일 첫 봉 10:43, same-day 과거 없음
 _wd("20260807", "BBB", [(10, 43 + m, 20000 + m) for m in range(0, 10)])
 _wd("20260806", "BBB", [(14, m, 19000 + m) for m in range(0, 60)])
-_ctx2, _hs2 = build_day_context("BBB", _load2("BBB", date(2026, 8, 7)),
-                                date(2026, 8, 7), 60, _load2, _root2)
+_b2r = build_day_context("BBB", _load2("BBB", date(2026, 8, 7)),
+                         date(2026, 8, 7), 60, _load2, _root2)
+_ctx2, _hs2 = _b2r.ctx, _b2r.history_status
 check("P-8) 장중 시작 파일은 INCOMPLETE_INTRADAY",
       _hs2 == HISTORY_INCOMPLETE_INTRADAY)
 check("P-9) 전일 tail로 가짜 복원하지 않음",
@@ -660,7 +679,8 @@ _bars3 = _load2("CCC", date(2026, 8, 7))
 # 앞 60봉을 전일로 만들기 위해 날짜를 바꿔 재구성
 _bars3 = ([Bar(f"20260806{b.cntr_tm[8:]}", b.close_price) for b in _bars3[:60]]
           + _bars3[60:])
-_ctx3, _hs3 = build_day_context("CCC", _bars3, date(2026, 8, 7), 60, _load2, _root2)
+_b3r = build_day_context("CCC", _bars3, date(2026, 8, 7), 60, _load2, _root2)
+_ctx3, _hs3 = _b3r.ctx, _b3r.history_status
 check("P-11) same-file에 pretarget이 있으면 SAME_FILE_COMPLETE",
       _hs3 == HISTORY_SAME_FILE_COMPLETE)
 check("P-12) 중복 prepend가 없음(봉 수가 그대로)",
@@ -718,6 +738,130 @@ check("Q-5) pullback이 ReplayEvaluationError를 사용",
       "ReplayEvaluationError(" in _pb3)
 check("Q-6) pullback에 skip 옵션과 오류 집계가 있음",
       "SKIP_ANALYZER_ERRORS" in _pb3 and "ANALYZER_ERRORS" in _pb3)
+
+# ══════════════════════════════════════════════════════════════
+# R. 이전 파일 EOD 검증 + 역산 + provenance (1J.3.4)
+# ══════════════════════════════════════════════════════════════
+# 재현: 직전 데이터 날짜 파일의 마지막 봉이 전일 종가라는 보장이
+# 없음. 실측 321건 중 251건(78%)이 15:15 이전에 끝났고, 5/29 파일은
+# 09:03에 끝났는데 그 가격을 6/1 전일 종가로 쓰고 있었음.
+from domain.replay_context import (
+    EOD_CUTOFF_HHMM, PREV_CLOSE_PREV_DAY_PARTIAL, PREV_CLOSE_SIGNAL_INFERRED,
+    HISTORY_INCOMPLETE_PREVIOUS_DAY, SIGNAL_INFER_MIN_ROWS,
+    SIGNAL_INFER_MAX_SPREAD_PCT, infer_prev_close_from_signal_log,
+    ReplayContextBuildResult,
+)
+
+_root3 = Path(_tf.mkdtemp())
+
+
+def _wd3(day, symbol, spec):
+    d = _root3 / day
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / f"{symbol}.csv").open("w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["cntr_tm", "open", "high", "low", "close", "volume", "acc_volume"])
+        for hh, mm, c in spec:
+            w.writerow([f"{day}{hh:02d}{mm:02d}00", c, c, c, c, 100, 100])
+
+
+def _load3(symbol, d):
+    path = _root3 / d.strftime("%Y%m%d") / f"{symbol}.csv"
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        return [Bar(r["cntr_tm"], int(r["close"])) for r in _csv.DictReader(f)]
+
+
+check("R-1) EOD cutoff가 15:30으로 상수화", EOD_CUTOFF_HHMM == "1530")
+
+# A. 이전 파일 마지막 봉 10:30 → prev_close fallback 금지
+_wd3("20260806", "AAA", [(10, m, 5000 + m) for m in range(0, 31)])   # 10:30 종료
+_wd3("20260807", "AAA", [(9, m, 6000 + m) for m in range(0, 30)])
+_ctxA = ReplayDayContext(_load3("AAA", date(2026, 8, 7)), date(2026, 8, 7), 60)
+_rA = resolve_prev_close(_ctxA, "AAA", _load3, _root3, date(2026, 8, 7))
+check("R-2) 이전 파일이 10:30에 끝나면 prev_close로 사용 금지",
+      _rA.value is None and _rA.source == PREV_CLOSE_PREV_DAY_PARTIAL)
+
+# B. 이전 파일 마지막 봉 15:35 → EOD fallback 허용
+_wd3("20260806", "BBB",
+     [(9, m, 5000 + m) for m in range(0, 60)] + [(15, 35, 7777)])
+_wd3("20260807", "BBB", [(9, m, 6000 + m) for m in range(0, 30)])
+_ctxB = ReplayDayContext(_load3("BBB", date(2026, 8, 7)), date(2026, 8, 7), 60)
+_rB = resolve_prev_close(_ctxB, "BBB", _load3, _root3, date(2026, 8, 7))
+check("R-3) 이전 파일이 15:35까지 있으면 EOD fallback 허용",
+      _rB.value == 7777 and _rB.source == PREV_CLOSE_PREV_DAY)
+
+# C. 09:00 시작 + 이전 파일 10:30 종료 → history prepend 금지
+_bA = build_day_context("AAA", _load3("AAA", date(2026, 8, 7)), date(2026, 8, 7),
+                        60, _load3, _root3)
+check("R-4) 이전 파일이 장중에 끝나면 history prepend 금지",
+      _bA.history_status == HISTORY_INCOMPLETE_PREVIOUS_DAY)
+check("R-5) 이전 날짜 봉이 ctx에 섞이지 않음",
+      not any(b.cntr_tm.startswith("20260806") for b in _bA.ctx.all_bars))
+
+# D. 09:00 시작 + 이전 파일 EOD tail 충분 → prepend 허용
+_bB = build_day_context("BBB", _load3("BBB", date(2026, 8, 7)), date(2026, 8, 7),
+                        60, _load3, _root3)
+check("R-6) 이전 파일이 EOD이고 tail이 충분하면 prepend",
+      _bB.history_status == HISTORY_PREVIOUS_DAY_RECONSTRUCTED)
+_iB = _bB.ctx.target_indices[5]
+check("R-7) prepend 후 첫 current window가 60봉",
+      len(_bB.ctx.analysis_window(_iB)) == 60)
+
+# E. prepend 후에도 prev_close_source가 둔갑하지 않음
+check("R-8) RECONSTRUCTED 후에도 source가 PREVIOUS_DATA_DAY_EOD 유지",
+      _bB.prev_close.source == PREV_CLOSE_PREV_DAY)
+check("R-9) confidence도 medium 유지(high로 둔갑 안 함)",
+      _bB.prev_close.confidence == "medium")
+# 둔갑 재현: prepend된 ctx로 다시 resolve하면 SAME_FILE로 바뀜
+_re = resolve_prev_close(_bB.ctx, "BBB", _load3, _root3, date(2026, 8, 7))
+check("R-10) (대조) 재추론하면 SAME_FILE로 둔갑함 — 그래서 보존이 필요",
+      _re.source == PREV_CLOSE_SAME_FILE)
+check("R-11) build 결과가 provenance를 함께 반환",
+      isinstance(_bB, ReplayContextBuildResult))
+
+# F/G/H. signal_log 역산
+def _sig(n, base=10000.0, spread_pct=0.0):
+    rows = []
+    for i in range(n):
+        prev = base * (1 + (spread_pct / 100) * (i / max(n - 1, 1)))
+        chg = 2.0
+        rows.append({"price": prev * (1 + chg / 100), "change_rate_pct": chg})
+    return rows
+
+
+_f = infer_prev_close_from_signal_log("X", date(2026, 8, 7), _sig(10, spread_pct=0.05))
+check("R-12) 10행 spread 0.05% → 허용",
+      _f.available and _f.source == PREV_CLOSE_SIGNAL_INFERRED)
+check("R-13) n_rows와 spread_pct가 기록됨",
+      _f.n_rows == 10 and _f.spread_pct is not None)
+_g = infer_prev_close_from_signal_log("X", date(2026, 8, 7), _sig(10, spread_pct=1.0))
+check("R-14) 10행 spread 1% → UNAVAILABLE",
+      not _g.available and _g.source == PREV_CLOSE_UNAVAILABLE)
+_h = infer_prev_close_from_signal_log("X", date(2026, 8, 7), _sig(3))
+check("R-15) 3행 → UNAVAILABLE(최소 5행 미달)", not _h.available)
+check("R-16) 역산 임계값이 상수화",
+      SIGNAL_INFER_MIN_ROWS == 5 and SIGNAL_INFER_MAX_SPREAD_PCT == 0.2)
+check("R-17) 역산 정확도 — 등락률 2%면 prev_close가 base와 일치",
+      abs(_f.value - 10000) <= 10)
+
+# 우선순위: signal 역산이 PARTIAL보다 우선
+_rP = resolve_prev_close(_ctxA, "AAA", _load3, _root3, date(2026, 8, 7),
+                         signal_rows=_sig(10, base=8888.0, spread_pct=0.05))
+check("R-18) signal 역산이 장중에 끝난 이전 파일보다 우선",
+      _rP.source == PREV_CLOSE_SIGNAL_INFERRED and abs(_rP.value - 8888) <= 10)
+
+# 명칭 정리
+check("R-19) SAME_FILE_COMPLETE가 SAME_FILE_HISTORY_PRESENT로 변경",
+      HISTORY_SAME_FILE_COMPLETE == "SAME_FILE_HISTORY_PRESENT")
+_rr4 = Path("replay_runner.py").read_text(encoding="utf-8")
+check("R-20) 리포트에 previous_day_eod/partial이 분리 출력",
+      "previous_day_eod_count" in _rr4 and "previous_day_partial_count" in _rr4)
+check("R-21) PARTIAL은 coverage available에서 제외",
+      'src.get("PREVIOUS_DATA_DAY_PARTIAL", 0)' in _rr4)
+check("R-22) 결과 행에 prev_close_source가 기록됨",
+      '"prev_close_source"' in _rr4)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
