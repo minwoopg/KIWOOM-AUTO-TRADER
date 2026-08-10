@@ -5203,3 +5203,382 @@ AND analyzer_error_count == 0
 
 ---
 
+## 1J.5 / 1J.5.1: Live ↔ Replay Fidelity 측정 (2026-08-07)
+
+**이 단계는 replay를 고치는 단계가 아니라 "live가 실제로 계산한 값을
+현재 replay가 얼마나 정확히 재현하는가"를 측정하는 단계입니다.**
+매매 로직 무변경.
+
+### 핵심 결과 — eligible recall 100%
+
+```
+Live unique candidates      67
+Replay reproduced           52
+Data-ineligible             15
+Unexplained mismatch         0
+
+overall recall           52/67 (77.6%)
+eligible recall          52/52 (100.0%)   ← 핵심 지표
+precision (replay→live)  52/991 (5.2%)
+```
+`77.6%`만 보면 불안하지만, **미재현 15건은 전부
+`PREV_CLOSE_UNAVAILABLE`**이고 종목별로 `119850` 12건 / `233740` 3건에
+몰려 있습니다. 즉 **신뢰 가능한 prev_close를 확보할 수 있었던 live
+후보는 replay가 전부 다시 찾아냈고, 설명되지 않는 replay 결함은
+0건**입니다.
+
+미재현 reason_code 분포:
+```
+PREV_CLOSE_UNAVAILABLE   15
+BAR_NOT_FOUND             0
+PARTIAL_HISTORY           0
+VALUE_MISMATCH            0
+UNKNOWN                   0
+```
+
+### A. Aligned Value Fidelity
+
+```
+live 평가 5,281건 → replay 정렬 5,256건 (99.5%)
+Primary Set 1,185건 (full_window + Tier A + LIVE analyzer + error 0)
+```
+
+**패턴 플래그** — 합격 기준(≥95%) 충족:
+```
+V         1185/1185  100.0%
+PR        1171/1185   98.8%
+패턴 조합  1148/1185   96.9%
+```
+
+**수치 항목** — 오차 분포:
+| 항목 | 중앙오차 | p90 | ≤0.1 | ≤0.25 | ≤0.5 |
+|---|---|---|---|---|---|
+| 가격 | 0.055% | 0.196% | 65.2% | 95.6% | 99.0% |
+| 등락률 | 0.060%p | 0.208 | 65.2% | 94.6% | 98.3% |
+| VWAP 거리 | 0.058%p | 0.198 | 67.7% | 94.9% | 99.0% |
+| 상승여력 | 0.060%p | 0.200 | 66.0% | 95.6% | 99.3% |
+
+처음엔 "가격 일치율 35%"로 나왔는데, 원인은 **live가 결정 시점의
+실시간 체결가로 판단하고 replay는 분봉 종가를 쓰기 때문**이었습니다.
+형성 중인 봉에서는 구조적으로 다르며 replay 버그가 아닙니다
+(`LIVE_TICK_VS_BAR_CLOSE`). 네 항목이 거의 동일한 분포를 보이는 것도
+전부 현재가에서 파생되기 때문입니다.
+
+**full-window 비율** (가드레일 2 — evaluation-point coverage 61.6%와
+다른 개념):
+```
+aligned_live_rows        5128/5256 (97.6%)
+legacy_buy_candidate      250/250 (100.0%)
+accepted_buy                3/3   (100.0%)
+```
+
+### 🔴 1J.5.1 수정: `actual_buy 250/250`은 오집계였음
+
+`signal == "BUY"`는 **전략이 BUY를 반환한 legacy candidate**이지 실제
+체결이 아닙니다. 8/7 실측으로 세 소스가 일치함을 확인:
+```
+signal=BUY            250행
+legacy_buy_candidate  250행
+final_decision=BUY      3행
+shadow order_accepted   3건  (005930 09:04 / 233740 10:56 / 119850 13:01)
+trades.csv BUY          3건
+```
+`final_decision == "BUY"` 기준으로 정정하고 명칭도
+`accepted_buy_full_window_pct`로 변경.
+
+**실제 accepted BUY 재현**:
+```
+Accepted BUY                 3
+Full-window                  3/3
+Replay candidate reproduced  1/3   (005930)
+Data-ineligible(prev_close)  2/3   (233740, 119850)
+Unexplained mismatch         0/3
+```
+`3/3`으로 만들려고 prev_close 조건을 느슨하게 하지 않았습니다.
+**1/3 재현 + 2/3 평가불가가 정직한 결과**입니다.
+
+### A-2. Daily Indicator (MACD) Fidelity — 1K에서 제외 필요
+
+live의 MACD는 `MinuteAnalyzer`가 아니라 `TradingService`가
+`cached_daily_bars`(일봉 API 응답)로 계산합니다:
+```
+trading_service.py:1050  closes = [bar.close_price for bar in bars]
+trading_service.py:1056  regime_classifier._calc_macd(closes, ...)
+```
+그런데 **이 일봉은 메모리 캐시일 뿐 파일로 저장되지 않습니다**
+(`data/`에는 `minute_bars`만 존재). 따라서 과거 시점의 MACD를 재현할
+원본 자료가 없습니다 → `MACD_DAILY_BARS_NOT_PERSISTED`.
+
+**1K에서 MACD hard gate / MACD dead+score5 평가는 제외해야 합니다.**
+검증되지 않은 새 계산 경로를 51일에 바로 적용하면 안 됩니다.
+대안 (1) live `signal_log`에 이미 기록된 `macd` 값을 ground truth로
+쓰는 Live-Aligned Episode 방식이면 재계산 없이 평가 가능,
+(2) 일봉을 파일로 저장하는 수집기를 추가한 뒤 재검증.
+
+### B. Candidate Discovery Fidelity
+
+precision 5.2%는 예상된 결과입니다 — replay는
+`min_trading_value=0`이고 조건검색 universe·cooldown·보유 상태·
+daily risk limit을 재현하지 않아 후보를 991개 만듭니다. **낮은
+precision을 replay 결함으로 판단하면 안 됩니다.**
+
+### 가드레일 3건 반영
+
+1. `signal_rows`를 `(거래일, 종목)` 단위로 인덱싱하고 전달 전
+   `assert`로 혼입 차단. `replay_runner.main()`이 signal_log를 읽지
+   않으므로 fidelity 도구가 직접 로드해 전달.
+2. full-window 용어를 `aligned` / `legacy_buy_candidate` /
+   `accepted_buy`로 분리.
+3. prev_close 계층화 — Tier A(`SAME_FILE_PRETARGET`,
+   `SIGNAL_LOG_INFERRED`) / Tier B(`PREVIOUS_DATA_DAY_EOD`) /
+   Excluded(`PARTIAL`, `UNAVAILABLE`).
+
+### 테스트
+
+**accepted BUY 3소스 교차검증 추가**: `final_decision` 하나만 믿으면
+그 필드의 의미가 바뀌었을 때 조용히 틀립니다(`signal == "BUY"`
+오집계가 정확히 그런 사례). `entry_quality_shadow`
+(`order_attempted AND order_accepted`)와 `trades.csv`(side=BUY)를
+함께 세고, 세 값이 다르면 리포트에 경고를 출력합니다.
+
+`test_replay_fidelity.py` 신규 **47건**. 기존 회귀는 매매·replay
+로직만 보므로 **분석기 자체의 집계 오류는 잡지 못합니다** — 실제로
+`250/250` 버그가 15/15를 통과한 채 리포트에 실렸습니다.
+`final_decision` 기준 검증, recall/eligible recall/unexplained 산출,
+accepted BUY 분류(억지로 2/2로 만들지 않는지), reason_code 상수,
+Tier 정의, 가드레일 1·2, MACD limitation, 체결가/종가 한계.
+
+**전체 회귀**: 16개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+
+### 1K 방향 조정 제안
+
+replay가 하루 전체를 독립 발굴하는 방식(precision 5.2%)보다,
+**과거 `signal_log`의 `legacy_buy_candidate=True` 시점을 ground
+truth로 쓰는 Live-Aligned Episode**가 더 강합니다. 조건검색
+universe·cooldown 등 live가 이미 통과시킨 표본이므로 "기존 live BUY
+후보 중 어떤 gate가 나쁜 후보만 제거했는가"를 직접 볼 수 있고,
+MACD도 기록된 값을 그대로 쓸 수 있습니다.
+- Primary: 실제 live candidate episode
+- Secondary: replay-discovered episode (limitation 병기)
+
+---
+
+## 1J.5.2: fidelity 분석기 의미 정정 (2026-08-07)
+
+1J.5.1에 대한 GPT 코드리뷰 반영. **fidelity 분석기는 이 단계로
+종료하고 1K Live-Aligned Episode Gate Study로 넘어갑니다.**
+매매 로직 무변경.
+
+### P0-1: `final_decision == "BUY"`는 accepted BUY가 아님
+
+운영 코드가 명시합니다 — `trading_service.py:2515`:
+```
+final_decision="BUY"라도 result.accepted가 False일 수 있음
+```
+broker가 거절해도 `final_decision`은 `BLOCKED`로 바뀌지 않습니다.
+게다가 `trades.csv` 교차검증도 `side == BUY`만 세서 **거절된 주문까지
+accepted로 집계**하고 있었습니다.
+
+**수정** — `collect_accepted_buy()` 순수 helper:
+- 1순위: `entry_quality_shadow`의
+  `order_attempted AND order_accepted` (order_id 있으면 unique)
+- 교차: `trades.csv`의 `side=BUY AND accepted=True`
+  (side=BUY 전체·거절 건수도 함께 표시)
+- `final_decision=BUY`는 `BUY_DECISION` 참고값으로만 표기
+
+8/7 결과는 세 소스가 모두 3건이라 숫자는 그대로:
+```
+Accepted BUY (shadow 기준)   3
+  source: entry_quality_shadow order_attempted AND order_accepted [OK]
+교차검증 trades accepted=True 3  (side=BUY 전체 3, 거절 0) [OK]
+참고 BUY_DECISION(final_decision=BUY) 3  ← broker accepted 여부가 아님
+```
+
+### P0-2: recall 분모가 후보를 구조적으로 누락
+
+`live_cand`를 `aligned`에서 만들어서, `NO_MINUTE_DATA` /
+`BAR_NOT_FOUND`로 정렬조차 안 된 candidate가 **분모에서 통째로
+사라졌습니다**. 극단적으로 "실제 후보 100개 중 30개가 minute data
+없음"이면 `70/70 = 100%`로 보고됩니다.
+
+**수정** — 분모를 **raw signal_log의 candidate 전체**로.
+`classify_candidate_fidelity()`가 `REPRODUCED` /
+`PREV_CLOSE_UNAVAILABLE` / `NO_MINUTE_DATA` / `BAR_NOT_FOUND` /
+`PARTIAL_HISTORY` / `VALUE_MISMATCH` / `UNKNOWN`으로 100% 분류하고,
+`calculate_recall()`이 overall/eligible을 계산합니다.
+
+8/7은 제외 25행 중 candidate가 0건이라 결과가 그대로 재현됩니다:
+```
+Live unique candidates   67  (raw signal_log 기준)
+Replay reproduced        52
+Data-ineligible          15
+Unexplained mismatch      0
+overall recall        52/67 (77.6%)
+eligible recall       52/52 (100.0%)
+```
+
+### P1: 교차검증 입력을 명시적으로
+
+`--signal-log`만 지정 가능하고 shadow/trades는 `logs/`에서
+하드코딩으로 읽어서, **bundle signal log와 서버 logs를 섞어 비교**할
+수 있었습니다(1J.5.1 리포트의 `3/0/0`이 정확히 그 사례).
+
+`--entry-quality-shadow` / `--trades` CLI 추가. 미지정 시
+signal-log와 같은 폴더의 sibling을 자동 탐색하며, **실제 사용 경로를
+리포트 상단에 항상 출력**합니다. 상태를 `OK` /`FILE_MISSING` /
+`NO_TARGET_DATE_DATA` / `PARSE_ERROR`로 구분 — **"실제 0건"과
+"그 날짜 자료 없음"은 다릅니다.** 파싱 예외도 silent pass하지 않고
+상태·에러를 남깁니다.
+
+### P1: 테스트를 실행 기반으로
+
+1J.5.1의 47건은 분석기 로직을 테스트 쪽에 다시 구현해서
+**"final_decision == accepted BUY"라는 잘못된 가정을 코드와 함께
+공유**했고, 그래서 47/47이 통과했습니다.
+
+순수 helper(`collect_accepted_buy` / `classify_candidate_fidelity` /
+`calculate_recall` / `_read_day_rows`)를 **실제 호출**하는 fixture로
+전환. 기존 invariant는 삭제하지 않고 유지했습니다.
+
+핵심 fixture 2종:
+- broker rejected BUY(`shadow accepted=False`, `trades accepted=False`)
+  → **accepted BUY 0** (1J.5.1 구현은 이걸 통과하지 못했습니다)
+- live candidate 3건 중 1건 `NO_MINUTE_DATA`
+  → overall 2/3, data-ineligible 1, **eligible 2/2**
+
+### P1: MACD 정책 정정 — 1K에서 완전 제외하지 않음
+
+replay로 MACD를 **재계산**할 수 없다는 한계는 그대로입니다(일봉
+미저장). 그러나 1K Primary가 Live-Aligned Episode이므로 **live가
+실제로 쓴 값이 signal_log에 이미 저장돼 있어 재계산이 불필요**합니다.
+
+8/7 coverage 실측:
+```
+macd                전체 5196/5256   candidate 250/250
+macd_signal         전체 5196/5256   candidate 250/250
+macd_above_signal   전체 5196/5256   candidate 250/250
+macd_hist_direction 전체 5196/5256   candidate 250/250
+score               전체 1330/5256   candidate 250/250
+```
+
+```
+Primary (Live-Aligned)       → MACD 평가 가능
+  A) hard gate     : macd_above_signal == False → block
+  B) dead + score5 : macd_above_signal == False AND score < 5 → block
+Secondary (Replay Discovery) → MACD 평가 불가 (일봉 없음)
+```
+coverage가 없는 표본은 N/A 처리.
+
+### 테스트
+
+`test_replay_fidelity.py` 47건 → **78건** (10절 실행 기반 27건 +
+MACD 정책 정정 반영). **전체 회귀 16개 파일 통과**, 1개 스킵.
+`compileall` 정상.
+
+**8/7 핵심 결과 재현**: eligible recall 52/52 = 100%,
+accepted BUY 3(shadow/trades/decision 3/3/3), unexplained 0.
+
+---
+
+## 1J.5.3: fidelity 분석기 집계 정확도 마무리 (2026-08-07)
+
+1J.5.2에 대한 GPT 코드리뷰 반영. **fidelity 분석기는 이 단계로
+완전히 종료하고 1K Live-Aligned Episode Gate Study로 넘어갑니다.**
+매매 로직 무변경.
+
+### 1. accepted BUY의 order_id dedupe가 반대로 작동 (재현 확인)
+
+```python
+shadow_n = len(ids) if len(ids) == len(acc) and ids else len(acc)
+```
+이 조건은 **중복 order_id가 있을 때 오히려 dedupe를 건너뜁니다**
+(`len(ids) != len(acc)`가 되므로 `else` 분기로 감).
+
+**재현**: 같은 `order_id=O1` accepted 2행
+→ `accepted_count=2`, `accepted_keys=[('A','T1'), ('A','T1')]`.
+실제로는 주문 1건입니다. trades도 동일.
+
+**수정** — `_dedupe()` 내부 함수:
+- order_id가 **전부 있으면** order_id 기준 unique
+- **하나라도 비어 있으면** 조용히 row count로 fallback하지 않고
+  `shadow_order_id_missing` / `trades_order_id_missing`을 True로 두고
+  리포트에 `⚠ ORDER_ID_MISSING` 경고 출력
+- `accepted_keys`도 unique 기준으로 반환
+
+### 2. `BAR_NOT_FOUND`가 죽은 코드였음 (재현 확인)
+
+`classify_candidate_fidelity()`가 `a.get("_bar_not_found")`를 보는데
+**그 키를 설정하는 코드가 프로젝트 어디에도 없었습니다**
+(등장 1회 = 읽기만, 쓰기 0회). 따라서 분봉 CSV는 있는데 해당
+`latest_bar_timestamp` 봉만 없는 candidate까지 전부
+`NO_MINUTE_DATA`로 오분류됐습니다.
+
+**수정** — alignment 단계에서 `alignment_status[(symbol, lbt)]`에
+`ALIGNED` / `NO_MINUTE_DATA` / `BAR_NOT_FOUND`를 보존하고
+`classify_candidate_fidelity(..., alignment_status)`로 전달.
+상태 map이 없으면 보수적으로 `NO_MINUTE_DATA`로 처리합니다.
+죽은 `_bar_not_found` 참조는 제거.
+
+### 3. 테스트에 1J.5.1의 잘못된 가정이 남아 있었음
+
+가장 아이러니한 부분입니다. **1J.5.2가 "final_decision ≠ accepted
+BUY"를 고친 버전인데, 테스트 앞부분은 여전히 옛 가정을 검증**하고
+있었습니다(`"actual_buy가 final_decision 기준으로 집계됨"`).
+
+두 개념을 분리해 재작성:
+```
+BUY_DECISION = final_decision == "BUY"      (broker accepted 아님)
+ACCEPTED_BUY = collect_accepted_buy(...)     (shadow/trades 기준)
+```
+fixture로 `final_decision=BUY` 1건 + broker 거절 → **accepted BUY 0**을
+검증합니다.
+
+또 `"accepted_buy_full_window_pct" in src`는 **파일 상단 docstring에
+그 문자열이 있어서 PASS**하던 false pass였습니다(실제 리포트 항목은
+`buy_decision_full_window_pct`). AST로 docstring을 걷어낸 실행
+코드에서만 검사하도록 바꾸고, "docstring에만 있는 문자열은 통과시키지
+않는다"를 별도 검사(7-1b)로 고정했습니다.
+
+### 4. sibling 자동 탐색이 날짜를 무시
+
+`sorted(glob(...))[0]`이라 같은 폴더에
+`entry_quality_shadow_20260806/07/10.csv`가 있으면 8/10 분석에도
+**8/06 파일**을 골랐습니다.
+
+**수정** — `_pick_sibling()`: (1) 파일명에 target 날짜가 들어간 것을
+최우선, (2) 없으면 target-date row가 실제 존재하는 파일을 탐색,
+(3) 후보가 둘 이상이면 경고 후 CLI 명시 요구.
+
+### 8/7 핵심 결과 — 그대로 재현
+
+```
+입력 signal_log : b7/raw/signal_log_20260807.csv
+입력 shadow     : b7/raw/entry_quality_shadow_20260807.csv   ← 날짜 정확 매칭
+입력 trades     : b7/raw/trades_20260807.csv
+
+Live unique candidates   67  (raw signal_log 기준)
+Replay reproduced        52
+Data-ineligible          15
+Unexplained mismatch      0
+eligible recall       52/52 (100.0%)
+
+Accepted BUY (shadow 기준)   3
+교차검증 trades accepted=True 3  (side=BUY 전체 3, 거절 0) [OK]
+참고 BUY_DECISION(final_decision=BUY) 3  ← broker accepted 여부가 아님
+```
+
+### 테스트
+
+`test_replay_fidelity.py` 78건 → **102건**:
+- 1절 재작성 — BUY_DECISION / ACCEPTED_BUY 분리, broker 거절 fixture.
+- 11절(17건) 중복 order_id dedupe(1건으로), 서로 다른 id는 2건 유지,
+  order_id 누락 시 MISSING 표시, `NO_MINUTE_DATA`와 `BAR_NOT_FOUND`
+  실제 구분, 상태 map 부재 시 보수적 처리, 죽은 코드 제거 확인.
+- 12절(6건) sibling 날짜 우선 — 8/10 분석 시 8/06이 아니라 8/10을
+  고르는지, 예전 방식(`sorted[0]`)이었다면 틀렸을 것도 함께 고정.
+- 7-1b docstring false pass 방지.
+
+**전체 회귀**: 16개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+
+---
+

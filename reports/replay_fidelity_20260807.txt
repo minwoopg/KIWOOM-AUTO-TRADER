@@ -1,0 +1,133 @@
+==================================================================
+  🔬 Live ↔ Replay Fidelity  2026-08-07
+==================================================================
+  analyzer_mode = LIVE_MINUTE_ANALYZER   minute_bar_count = 60
+  signal_log 행 5,281 / 종목 65
+  입력 signal_log : /home/claude/work/b7/raw/signal_log_20260807.csv
+  입력 shadow     : /home/claude/work/b7/raw/entry_quality_shadow_20260807.csv
+  입력 trades     : /home/claude/work/b7/raw/trades_20260807.csv
+  분봉 보유 종목 87  (교집합 64)
+
+  ※ 이 단계는 replay를 고치지 않고 '얼마나 재현되는가'만 측정합니다.
+
+  ⚠ 분봉이 60봉 미만인 종목 42개 — 이 종목은 full-window 표본을 만들 수 없습니다.
+
+──────────────────────────────────────────────────────────────────
+  [ A. Aligned Value Fidelity ]
+──────────────────────────────────────────────────────────────────
+  live 평가 시점 5,281건 중 replay 정렬 성공 5,256건
+    제외 BAR_NOT_FOUND                        23건
+    제외 NO_MINUTE_DATA                        2건
+
+  Primary Set   1,185건  (full_window + TierA source + LIVE analyzer + error 0)
+  Secondary Set 4,071건
+
+  full-window 비율 (대상별 — evaluation-point coverage와 다릅니다)
+    aligned_live_rows_full_window_pct      5128/5256 (97.6%)
+    legacy_buy_candidate_full_window_pct   250/250 (100.0%)
+    buy_decision_full_window_pct           3/3 (100.0%)   (final_decision=BUY — accepted 아님)
+
+  prev_close source 분포
+    UNAVAILABLE                   2,163건  [제외]
+    PREVIOUS_DATA_DAY_EOD         1,822건  [Tier B]
+    SIGNAL_LOG_INFERRED           1,262건  [Tier A]
+    PREVIOUS_DATA_DAY_PARTIAL         9건  [제외]
+
+  항목                      n      중앙오차       p90    ≤0.1   ≤0.25    ≤0.5
+  가격                   1185    0.0552    0.1961   65.2%   95.6%   99.0%
+  등락률                  1185    0.0595    0.2083   65.2%   94.6%   98.3%
+  VWAP 거리              1185    0.0582    0.1976   67.7%   94.9%   99.0%
+  상승여력                 1185    0.0600    0.2000   66.0%   95.6%   99.3%
+  ※ 단위: 가격은 %, 나머지는 %p. live는 결정 시점의 실시간 체결가를,
+    replay는 분봉 종가를 씁니다 — 형성 중인 봉에서는 구조적으로 다릅니다
+    (LIVE_TICK_VS_BAR_CLOSE).
+
+  V                 1185/1185    100.0%
+  PR                1171/1185     98.8%
+  패턴 조합             1148/1185     96.9%
+
+──────────────────────────────────────────────────────────────────
+  [ A-2. Daily Indicator (MACD) Fidelity ]
+──────────────────────────────────────────────────────────────────
+  MACD field coverage (1K Primary가 ground truth로 사용할 값)
+    macd                   전체  5196/5256    candidate  250/250 
+    macd_signal            전체  5196/5256    candidate  250/250 
+    macd_above_signal      전체  5196/5256    candidate  250/250 
+    macd_hist_direction    전체  5196/5256    candidate  250/250 
+    score                  전체  1330/5256    candidate  250/250 
+  ⚠ 일봉 데이터가 저장되지 않습니다 (data/에는 minute_bars만 존재).
+
+  live의 MACD는 MinuteAnalyzer가 아니라 TradingService가
+  `cached_daily_bars`(일봉 API 응답)로 계산합니다:
+    trading_service.py:1050  closes = [bar.close_price for bar in bars]
+    trading_service.py:1056  regime_classifier._calc_macd(closes, ...)
+  이 일봉은 메모리 캐시일 뿐 파일로 저장되지 않으므로,
+  과거 시점의 MACD를 재현할 원본 자료가 없습니다.
+
+  → reason_code: MACD_DAILY_BARS_NOT_PERSISTED
+
+  ※ 1J.5.2 정책 정정 — 1K에서 MACD를 완전히 제외하지 않습니다.
+    replay로 MACD를 **재계산**할 수 없다는 한계는 그대로지만,
+    1K Primary는 Live-Aligned Episode이므로 live가 실제로 쓴 값이
+    signal_log에 이미 저장돼 있어 재계산이 필요 없습니다.
+
+    Primary (Live-Aligned)   → MACD 평가 **가능**
+      A) hard gate      : macd_above_signal == False → block
+      B) dead + score5  : macd_above_signal == False AND score < 5 → block
+    Secondary (Replay Discovery) → MACD 평가 **불가** (일봉 없음)
+
+    coverage가 없는 표본은 N/A로 처리하십시오.
+
+──────────────────────────────────────────────────────────────────
+  [ B. Candidate Discovery Fidelity ]
+──────────────────────────────────────────────────────────────────
+  Live unique candidates         67  (raw signal_log 기준)
+  Replay reproduced              52
+  Data-ineligible                15
+  Unexplained mismatch            0
+
+  overall recall              52/67 (77.6%)
+  eligible recall             52/52 (100.0%)   ← 핵심 지표
+  precision (replay→live)     52/991 (5.2%)
+
+  미재현 reason_code 분포
+    PREV_CLOSE_UNAVAILABLE              15
+    NO_MINUTE_DATA                       0
+    BAR_NOT_FOUND                        0
+    PARTIAL_HISTORY                      0
+    VALUE_MISMATCH                       0
+    UNKNOWN                              0
+
+  미재현 상세 (상위 8건)
+    119850 20260807130100  full_window=True  UNAVAILABLE                PREV_CLOSE_UNAVAILABLE
+    119850 20260807132500  full_window=True  UNAVAILABLE                PREV_CLOSE_UNAVAILABLE
+    119850 20260807135400  full_window=True  UNAVAILABLE                PREV_CLOSE_UNAVAILABLE
+    119850 20260807140000  full_window=True  UNAVAILABLE                PREV_CLOSE_UNAVAILABLE
+    119850 20260807141100  full_window=True  UNAVAILABLE                PREV_CLOSE_UNAVAILABLE
+    119850 20260807141500  full_window=True  UNAVAILABLE                PREV_CLOSE_UNAVAILABLE
+    119850 20260807142500  full_window=True  UNAVAILABLE                PREV_CLOSE_UNAVAILABLE
+    119850 20260807142600  full_window=True  UNAVAILABLE                PREV_CLOSE_UNAVAILABLE
+  종목별: {'119850': 12, '233740': 3}
+
+  [ 실제 accepted BUY 재현 ]
+    Accepted BUY (shadow 기준)   3
+      source: entry_quality_shadow order_attempted AND order_accepted [OK]
+    교차검증 trades accepted=True 3  (side=BUY 전체 3, 거절 0) [OK]
+    참고 BUY_DECISION(final_decision=BUY) 3  ← broker accepted 여부가 아님
+    Full-window                  3/3
+    Replay candidate reproduced  1/3
+    Data-ineligible(prev_close)  2/3
+    Unexplained mismatch         0/3
+      005930 20260807090400  → 재현
+      233740 20260807105500  → 평가불가(prev_close)
+      119850 20260807130100  → 평가불가(prev_close)
+
+  ※ replay가 재현하지 않는 것 (낮은 수치를 replay 결함으로 보면 안 됨)
+    - 조건검색 universe 미재현
+    - 거래대금 필터 미재현(min_trading_value=0)
+    - cooldown 미재현
+    - 보유 상태 미재현
+    - daily risk limit 미재현
+    - acc_volume이 파일 volume 누적이라 live와 다를 수 있음
+
+==================================================================
