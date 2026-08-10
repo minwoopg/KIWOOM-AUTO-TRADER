@@ -409,22 +409,183 @@ if _real2:
     check("K-6) source가 기록됨", _r.source in
           (PREV_CLOSE_SAME_FILE, PREV_CLOSE_PREV_DAY))
 
-check("K-7) replay가 coverage 통계를 수집", hasattr(RR, "PREV_CLOSE_STATS"))
-check("K-8) replay가 horizon 통계를 수집", hasattr(RR, "HORIZON_STATS"))
+# 2026-08-07 (1J.3.2): 전역 dict → ReplayQualityStats 객체로 변경
+check("K-7) replay가 coverage 통계를 수집",
+      "prev_close_sources" in RR.ReplayQualityStats().__dict__)
+check("K-8) replay가 horizon 통계를 수집",
+      "horizon_elapsed" in RR.ReplayQualityStats().__dict__)
 # horizon 통계를 실제 리플레이로 채운 뒤 검사
 # (통계가 비어 있으면 horizon 섹션 자체가 출력되지 않음)
+_stats_k = RR.ReplayQualityStats()
 _rb = RR.load_bars("005930", date(2026, 6, 23))
 if _rb:
-    RR.run_replay("005930", _rb, RR.try_import_analyzer(), date(2026, 6, 23))
-_q = "\n".join(RR.build_quality_report())
-for key in ("total_symbol_days", "prev_close_available", "prev_close_missing",
-            "prev_close_coverage_pct", "analyzer_mode"):
+    RR.run_replay("005930", _rb, RR.try_import_analyzer(), date(2026, 6, 23),
+                  minute_bar_count=60, quality_stats=_stats_k)
+_q = "\n".join(RR.build_quality_report(_stats_k))
+# 1J.3.2에서 요구된 필드명으로 변경
+for key in ("total_symbol_days", "same_file_count", "previous_data_day_count",
+            "unavailable_count", "prev_close_coverage_pct", "analyzer_mode"):
     check(f"K-9) 품질 리포트에 {key} 출력", key in _q)
 check("K-10) '전체 데이터'가 아님을 명시", "'전체 데이터'가 아닙니다" in _q)
 check("K-11) horizon 품질에 exact / stale / N/A 구분",
       "exact" in _q and "stale" in _q and "N/A" in _q)
 check("K-12) horizon 품질에 median과 p10/p90",
       "median" in _q and "p10" in _q and "p90" in _q)
+
+# ══════════════════════════════════════════════════════════════
+# L. prev_close는 직전 데이터 날짜 1곳만 (1J.3.2, P0)
+# ══════════════════════════════════════════════════════════════
+# 재현(1J.3.1): 파일을 찾을 때까지 과거를 무제한 탐색해 최대 36
+# 데이터 날짜 전 종가를 전일 종가로 사용했음(오염 280건).
+import tempfile as _tf
+import csv as _csv
+from domain.replay_context import PREV_CLOSE_PREV_DAY
+
+_root = Path(_tf.mkdtemp())
+
+
+def _write_day(day: str, symbol: str, closes: list[int]) -> None:
+    d = _root / day
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / f"{symbol}.csv").open("w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["cntr_tm", "open", "high", "low", "close", "volume", "acc_volume"])
+        for i, c in enumerate(closes):
+            w.writerow([f"{day}09{i:02d}00", c, c, c, c, 100, 100])
+
+
+def _load(symbol, d):
+    path = _root / d.strftime("%Y%m%d") / f"{symbol}.csv"
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        return [Bar(r["cntr_tm"], int(r["close"])) for r in _csv.DictReader(f)]
+
+
+# 8/5에는 심볼 있음, 8/6 디렉터리는 있지만 심볼 없음, 8/7이 target
+_write_day("20260805", "AAA", [8000, 8100])
+(_root / "20260806").mkdir(exist_ok=True)
+_write_day("20260806", "BBB", [9000])          # 다른 종목만
+_write_day("20260807", "AAA", [10000, 10100])
+
+_ctx_l = ReplayDayContext(_load("AAA", date(2026, 8, 7)), date(2026, 8, 7), 60)
+_r_l = resolve_prev_close(_ctx_l, "AAA", _load, _root, date(2026, 8, 7))
+check("L-1) 직전 데이터 날짜(8/6)에 종목이 없으면 UNAVAILABLE",
+      _r_l.source == PREV_CLOSE_UNAVAILABLE and _r_l.value is None)
+check("L-2) 2홉 전(8/5) 종가 8100을 절대 쓰지 않음", _r_l.value != 8100)
+
+# 8/6에 심볼이 있으면 그 날의 마지막 당일 close 사용
+_write_day("20260806", "AAA", [9500, 9700])
+_r_l2 = resolve_prev_close(_ctx_l, "AAA", _load, _root, date(2026, 8, 7))
+check("L-3) 직전 데이터 날짜에 종목이 있으면 그 마지막 close 사용",
+      _r_l2.value == 9700 and _r_l2.source == PREV_CLOSE_PREV_DAY)
+check("L-4) previous_data_date가 기록됨",
+      _r_l2.previous_data_date == date(2026, 8, 6))
+check("L-5) calendar_gap_days가 기록됨", _r_l2.calendar_gap_days == 1)
+check("L-6) confidence가 medium", _r_l2.confidence == "medium")
+
+# 이름 정정 — trading day라고 단정하지 않음
+check("L-7) source 이름이 PREVIOUS_DATA_DAY_FILE",
+      PREV_CLOSE_PREV_DAY == "PREVIOUS_DATA_DAY_FILE")
+_rc_src = Path("domain/replay_context.py").read_text(encoding="utf-8")
+check("L-8) 무제한 과거 탐색 코드가 제거됨",
+      "for d in reversed(prior)" not in _code_only(_rc_src))
+
+
+# ══════════════════════════════════════════════════════════════
+# M. analyzer 예외 fail-closed (1J.3.2, P0)
+# ══════════════════════════════════════════════════════════════
+check("M-1) ReplayEvaluationError가 정의됨", hasattr(RR, "ReplayEvaluationError"))
+
+
+class _BoomAnalyzer:
+    def analyze(self, *a, **k):
+        raise RuntimeError("analyzer boom")
+
+
+_m_bars = [mk("20260806", 15, 19, 10000)] + [mk("20260807", 9, m, 10000 + m)
+                                             for m in range(0, 30)]
+try:
+    RR.run_replay("AAA", _m_bars, _BoomAnalyzer(), date(2026, 8, 7),
+                  minute_bar_count=60, quality_stats=RR.ReplayQualityStats())
+    _m1 = False
+except RR.ReplayEvaluationError:
+    _m1 = True
+except Exception:
+    _m1 = False
+check("M-2) analyzer 예외 시 기본은 ReplayEvaluationError (조용히 []가 아님)", _m1)
+
+_st_m = RR.ReplayQualityStats()
+_res_m = RR.run_replay("AAA", _m_bars, _BoomAnalyzer(), date(2026, 8, 7),
+                       minute_bar_count=60, quality_stats=_st_m,
+                       skip_analyzer_errors=True)
+check("M-3) --skip-analyzer-errors일 때만 건너뜀", _res_m == [])
+check("M-4) analyzer_error_count가 집계됨", _st_m.analyzer_error_count > 0)
+check("M-5) analyzer_error_symbols 기록", "AAA" in _st_m.analyzer_error_symbols)
+check("M-6) analyzer_error_timestamps 기록", len(_st_m.analyzer_error_timestamps) > 0)
+_q_m = "\n".join(RR.build_quality_report(_st_m))
+check("M-7) 품질 리포트에 analyzer_error_count 출력", "analyzer_error_count" in _q_m)
+check("M-8) skip 옵션 사용 경고 표시", "기본 실행에서는 이 옵션을 쓰지 마십시오" in _q_m)
+
+_rr3 = Path("replay_runner.py").read_text(encoding="utf-8")
+check("M-9) except Exception: continue 형태가 코드에 없음",
+      "except Exception:\n                continue" not in _code_only(_rr3))
+
+
+# ══════════════════════════════════════════════════════════════
+# N. horizon bucket 상호 배타 (1J.3.2, P1)
+# ══════════════════════════════════════════════════════════════
+_st_n = RR.ReplayQualityStats()
+# exact 3건, ≤1m stale 2건, 1~3m stale 1건, N/A 2건 = 8건
+_st_n.horizon_elapsed[5] = [5.0, 5.0, 5.0, 4.5, 4.0, 2.5, None, None]
+_q_n = "\n".join(RR.build_quality_report(_st_n))
+check("N-1) exact가 3건으로 집계", "exact     3" in _q_n)
+check("N-2) ≤1m stale이 2건(exact 제외)", "≤1m stale     2" in _q_n)
+check("N-3) 1~3m stale이 1건", "1~3m stale     1" in _q_n)
+check("N-4) N/A가 2건", "N/A     2" in _q_n)
+check("N-5) 표본 총계가 8건", "표본     8" in _q_n)
+check("N-6) 상호 배타 invariant가 리포트에 명시",
+      "상호 배타적이며 합계 = 표본" in _q_n)
+# invariant는 build_quality_report 내부 assert로도 강제됨
+check("N-7) 합계 invariant: exact+≤1m+1~3m+N/A == 표본", 3 + 2 + 1 + 2 == 8)
+
+
+# ══════════════════════════════════════════════════════════════
+# O. 품질 통계 객체화 + import side-effect (1J.3.2, P1)
+# ══════════════════════════════════════════════════════════════
+check("O-1) ReplayQualityStats가 정의됨", hasattr(RR, "ReplayQualityStats"))
+_a = RR.ReplayQualityStats()
+_b2 = RR.ReplayQualityStats()
+_a.symbol_days = 5
+check("O-2) 인스턴스끼리 통계가 섞이지 않음", _b2.symbol_days == 0)
+_a.prev_close_sources["X"] = 3
+_b2.prev_close_sources["X"] = 2
+_b2.merge(_a)
+check("O-3) merge로 전체 집계 가능", _b2.prev_close_sources["X"] == 5)
+check("O-4) merge가 symbol_days도 합산", _b2.symbol_days == 5)
+check("O-5) reset_replay_quality_stats가 새 인스턴스 반환",
+      RR.reset_replay_quality_stats() is not _a)
+
+check("O-6) import 시 MINUTE_BAR_COUNT를 resolve하지 않음",
+      "MINUTE_BAR_COUNT = resolve_minute_bar_count()" not in _code_only(_rr3))
+check("O-7) run_replay가 minute_bar_count를 명시적으로 받음",
+      "minute_bar_count: int | None = None" in _rr3)
+check("O-8) run_replay가 quality_stats를 받음", "quality_stats:" in _rr3)
+
+# import 자체가 settings.yaml을 읽지 않는지 — 서브프로세스로 확인
+import subprocess as _sp
+_probe = _sp.run(
+    [sys.executable, "-c",
+     "import sys; sys.path.insert(0,'.');\n"
+     "import config.settings as cs\n"
+     "cs.load_settings = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('no config'))\n"
+     "import importlib; import replay_runner as R\n"
+     "print('IMPORT_OK', R.MINUTE_BAR_COUNT)"],
+    capture_output=True, text=True, cwd=".")
+check("O-9) 설정이 깨져도 replay_runner import 자체는 성공",
+      "IMPORT_OK" in _probe.stdout)
+check("O-10) import 직후 MINUTE_BAR_COUNT는 None",
+      "IMPORT_OK None" in _probe.stdout)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

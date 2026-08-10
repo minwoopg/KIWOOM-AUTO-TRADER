@@ -68,14 +68,63 @@ def resolve_minute_bar_count(*, allow_fallback: bool = False) -> int:
     return value
 
 
-MINUTE_BAR_COUNT = resolve_minute_bar_count()
+# 2026-08-07 (1J.3.2): import 시 config I/O 금지.
+# 예전엔 여기서 즉시 resolve해서, 설정이 정말 깨졌을 때
+# `--allow-config-fallback`을 줘도 main()에 도달하기 전에
+# ReplayConfigError가 나 옵션이 무용지물이었음.
+# main()에서 CLI 파싱 후 resolve하고, run_replay에는 명시적으로
+# 전달합니다(1J.5가 이 모듈을 import하므로 side-effect 최소화).
+MINUTE_BAR_COUNT: int | None = None
 
 # 2026-08-07 (1J.3.1): prev_close 복원 결과와 horizon 품질을 집계해
 # 리포트에 노출합니다. "전체 데이터를 분석했다"고 말하지 않기 위함 —
 # 실측상 같은 CSV만으로는 51.7%만 복원됩니다.
-PREV_CLOSE_STATS: dict[str, int] = {}
-HORIZON_STATS: dict[int, list[float | None]] = {5: [], 10: [], 20: []}
-ANALYZER_MODE = "LIVE_MINUTE_ANALYZER"
+class ReplayEvaluationError(RuntimeError):
+    """리플레이 평가 중 analyzer가 실패했을 때 발생합니다."""
+
+
+@dataclass
+class ReplayQualityStats:
+    """거래일별로 분리 가능한 리플레이 품질 통계 (1J.3.2).
+
+    예전엔 module global이라 같은 프로세스에서 51거래일을 돌리면
+    통계가 계속 누적됐습니다. 1K가 멀티데이 분석이므로 객체로
+    분리해 거래일별/전체 집계를 따로 낼 수 있게 합니다.
+    """
+
+    prev_close_sources: dict[str, int] = field(default_factory=dict)
+    calendar_gaps: dict[int, int] = field(default_factory=dict)
+    horizon_elapsed: dict[int, list] = field(
+        default_factory=lambda: {5: [], 10: [], 20: []})
+    analyzer_error_symbols: list[str] = field(default_factory=list)
+    analyzer_error_timestamps: list[str] = field(default_factory=list)
+    symbol_days: int = 0
+    analyzer_mode: str = "LIVE_MINUTE_ANALYZER"
+
+    @property
+    def analyzer_error_count(self) -> int:
+        return len(self.analyzer_error_timestamps)
+
+    def merge(self, other: "ReplayQualityStats") -> None:
+        for k, v in other.prev_close_sources.items():
+            self.prev_close_sources[k] = self.prev_close_sources.get(k, 0) + v
+        for k, v in other.calendar_gaps.items():
+            self.calendar_gaps[k] = self.calendar_gaps.get(k, 0) + v
+        for m in self.horizon_elapsed:
+            self.horizon_elapsed[m].extend(other.horizon_elapsed.get(m, []))
+        self.analyzer_error_symbols.extend(other.analyzer_error_symbols)
+        self.analyzer_error_timestamps.extend(other.analyzer_error_timestamps)
+        self.symbol_days += other.symbol_days
+
+
+# 하위호환 — 단일 거래일 CLI 실행용 기본 인스턴스
+_DEFAULT_STATS = ReplayQualityStats()
+
+
+def reset_replay_quality_stats() -> ReplayQualityStats:
+    global _DEFAULT_STATS
+    _DEFAULT_STATS = ReplayQualityStats()
+    return _DEFAULT_STATS
 COST_MODEL = load_cost_model()
 TOTAL_COST_PCT = COST_MODEL.base_roundtrip_pct   # 하위호환(Base 시나리오)
 ROUND_TRIP_COST_PCT = TOTAL_COST_PCT
@@ -176,7 +225,10 @@ def get_time_bucket(cntr_tm: str) -> str:
 
 
 def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
-               target_date: date | None = None) -> list[dict]:
+               target_date: date | None = None,
+               *, minute_bar_count: int | None = None,
+               quality_stats: "ReplayQualityStats | None" = None,
+               skip_analyzer_errors: bool = False) -> list[dict]:
     # 2026-08-07 (1J.3): target_date를 명시적으로 받습니다 —
     # 파일에 전일 꼬리 봉이 섞여 있어 봉만 보고는 어느 날의
     # candidate를 평가해야 하는지 알 수 없기 때문입니다.
@@ -193,9 +245,16 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
     #   - 전일 꼬리 봉은 history로만 쓰고 candidate에서는 제외
     #   - analyzer window는 현재봉 포함 최근 minute_bar_count(=60)개
     #   - prev_close는 target_date 이전 마지막 봉의 close
-    ctx = ReplayDayContext(bars, target_date, minute_bar_count=MINUTE_BAR_COUNT)
+    stats = quality_stats if quality_stats is not None else _DEFAULT_STATS
+    mbc = minute_bar_count if minute_bar_count is not None else (
+        MINUTE_BAR_COUNT if MINUTE_BAR_COUNT is not None else resolve_minute_bar_count())
+    ctx = ReplayDayContext(bars, target_date, minute_bar_count=mbc)
     pc = resolve_prev_close(ctx, symbol, load_bars, MINUTE_BARS_DIR, target_date)
-    PREV_CLOSE_STATS[pc.source] = PREV_CLOSE_STATS.get(pc.source, 0) + 1
+    stats.symbol_days += 1
+    stats.prev_close_sources[pc.source] = stats.prev_close_sources.get(pc.source, 0) + 1
+    if pc.calendar_gap_days is not None:
+        stats.calendar_gaps[pc.calendar_gap_days] = \
+            stats.calendar_gaps.get(pc.calendar_gap_days, 0) + 1
     if not pc.available:
         # 임의 추정하지 않고 skip — 등락률 A조건에 직접 들어가는 값이라
         # 잘못 넣으면 결과가 조용히 왜곡됨.
@@ -236,8 +295,21 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
                 if analysis.is_valid_rebound:        pats.append("B")
                 if analysis.is_valid_pulldown:       pats.append("C")
                 patterns = "/".join(pats) if pats else "-"
-            except Exception:
-                continue
+            except Exception as exc:
+                # 2026-08-07 (1J.3.2): 예전엔 조용히 continue라
+                # analyzer 오류로 사라진 후보를 "전략 불일치"로
+                # 오해할 수 있었음(1J.5 fidelity에서 특히 위험).
+                stats.analyzer_error_symbols.append(symbol)
+                stats.analyzer_error_timestamps.append(str(current.cntr_tm))
+                if skip_analyzer_errors:
+                    continue
+                raise ReplayEvaluationError(
+                    f"analyzer 평가 실패 — symbol={symbol} "
+                    f"target_date={target_date} cntr_tm={current.cntr_tm} "
+                    f"window_len={len(window)} prev_close={prev_close}: {exc}\n"
+                    f"(후보가 조용히 사라지면 fidelity를 오판하므로 즉시 중단합니다 — "
+                    f"장기 실행에서 건너뛰려면 --skip-analyzer-errors)"
+                ) from exc
         else:
             chg = (current.close_price - prev_close) / prev_close * 100
             if not (2.0 <= chg <= 18.0):
@@ -260,7 +332,7 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
             else:
                 after_pcts[m] = None
                 elapsed[m] = None
-            HORIZON_STATS[m].append(elapsed[m])
+            stats.horizon_elapsed[m].append(elapsed[m])
 
         mfe, mae = ctx.mfe_mae(entry_dt, entry_price, minutes=20)
 
@@ -300,43 +372,55 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
 
 
 
-def build_quality_report() -> list[str]:
-    """리플레이 데이터 품질 요약 (1J.3.1).
+def build_quality_report(stats: "ReplayQualityStats | None" = None) -> list[str]:
+    """리플레이 데이터 품질 요약 (1J.3.1 → 1J.3.2).
 
     "전체 데이터를 분석했다"고 말할 수 없는 이유를 수치로 드러냅니다.
     """
+    st = stats if stats is not None else _DEFAULT_STATS
     L: list[str] = []
     L.append("")
     L.append("── 리플레이 데이터 품질 ──")
-    L.append(f"  analyzer_mode = {ANALYZER_MODE}")
-    if ANALYZER_MODE == "SIMPLE_FALLBACK":
+    L.append(f"  analyzer_mode = {st.analyzer_mode}")
+    if st.analyzer_mode == "SIMPLE_FALLBACK":
         L.append("  ⚠ 간이 전략(A simple)입니다 — 실제 전략과 다르므로")
         L.append("    1K enforce 판단에 사용하지 마십시오.")
     L.append(f"  minute_bar_count = {MINUTE_BAR_COUNT} (live와 동일)")
 
-    total = sum(PREV_CLOSE_STATS.values())
-    if total:
-        avail = total - PREV_CLOSE_STATS.get("UNAVAILABLE", 0)
+    if st.analyzer_error_count:
         L.append("")
-        L.append(f"  total_symbol_days        {total}")
-        L.append(f"  prev_close_available     {avail}")
-        L.append(f"  prev_close_missing       {PREV_CLOSE_STATS.get('UNAVAILABLE', 0)}")
-        L.append(f"  prev_close_coverage_pct  {avail / total * 100:.1f}%")
-        for src in ("SAME_FILE_PRETARGET", "PREVIOUS_TRADING_DAY_FILE",
-                    "SIGNAL_LOG_INFERRED", "UNAVAILABLE"):
-            n = PREV_CLOSE_STATS.get(src, 0)
-            if n:
-                L.append(f"    {src:26s} {n:5d} ({n / total * 100:.1f}%)")
-        L.append("  ※ prev_close를 복원하지 못한 종목-일은 제외됩니다.")
-        L.append("    따라서 이 결과는 '전체 데이터'가 아닙니다.")
+        L.append(f"  ⚠ analyzer_error_count      {st.analyzer_error_count}")
+        L.append(f"    analyzer_error_symbols    "
+                 f"{sorted(set(st.analyzer_error_symbols))[:10]}")
+        L.append(f"    analyzer_error_timestamps {st.analyzer_error_timestamps[:5]}")
+        L.append("    ※ --skip-analyzer-errors로 건너뛴 결과입니다.")
+        L.append("      1J.5/1K 기본 실행에서는 이 옵션을 쓰지 마십시오.")
 
-    # horizon 품질 — "5분 결과"가 실제 몇 분 가격으로 구성됐는지
-    any_h = any(HORIZON_STATS[m] for m in HORIZON_STATS)
-    if any_h:
+    total = st.symbol_days
+    if total:
+        src = st.prev_close_sources
+        avail = total - src.get("UNAVAILABLE", 0)
+        L.append("")
+        L.append(f"  total_symbol_days          {total}")
+        L.append(f"  same_file_count            {src.get('SAME_FILE_PRETARGET', 0)}")
+        L.append(f"  previous_data_day_count    {src.get('PREVIOUS_DATA_DAY_FILE', 0)}")
+        L.append(f"  unavailable_count          {src.get('UNAVAILABLE', 0)}")
+        L.append(f"  prev_close_coverage_pct    {avail / total * 100:.1f}%")
+        L.append("  ※ prev_close는 **바로 직전 데이터 날짜 1곳**만 봅니다.")
+        L.append("    (과거를 무제한으로 거슬러 올라가면 며칠 전 종가를")
+        L.append("     전일 종가로 쓰게 되어 등락률·A조건이 왜곡됩니다)")
+        L.append("  ※ 복원하지 못한 종목-일은 제외되므로 '전체 데이터'가 아닙니다.")
+        if st.calendar_gaps:
+            gaps = ", ".join(f"{k}일:{v}" for k, v in sorted(st.calendar_gaps.items()))
+            L.append(f"  previous_data_day의 calendar_gap 분포: {gaps}")
+            L.append("    (주말·공휴일을 건너뛰면 3~4일이 정상입니다)")
+
+    # horizon 품질 — bucket은 상호 배타적
+    if any(st.horizon_elapsed.get(m) for m in (5, 10, 20)):
         L.append("")
         L.append("  horizon 품질 (target 대비 실제 경과 시간)")
         for m in (5, 10, 20):
-            vals = HORIZON_STATS.get(m, [])
+            vals = st.horizon_elapsed.get(m, [])
             if not vals:
                 continue
             ok = [v for v in vals if v is not None]
@@ -344,17 +428,26 @@ def build_quality_report() -> list[str]:
             if not ok:
                 L.append(f"    {m:2d}분: 표본 {len(vals)} / 전부 N/A")
                 continue
-            exact = sum(1 for v in ok if abs(v - m) < 1e-9)
-            le1 = sum(1 for v in ok if 0 <= (m - v) <= 1)
-            s13 = sum(1 for v in ok if 1 < (m - v) <= 3)
+            # 2026-08-07 (1J.3.2): 예전엔 exact가 ≤1m stale에도
+            # 중복 집계돼 "exact 251 / ≤1m stale 251"처럼 보였음.
+            # 서로 배타적으로 나누고 합계 invariant를 보장합니다.
+            exact = sum(1 for v in ok if abs(m - v) < 1e-9)
+            under1 = sum(1 for v in ok if 0 < (m - v) <= 1)
+            one_to_3 = sum(1 for v in ok if 1 < (m - v) <= 3)
+            other = len(ok) - exact - under1 - one_to_3
             sv = sorted(ok)
             med = sv[len(sv) // 2]
             p10 = sv[int(len(sv) * 0.10)]
             p90 = sv[int(len(sv) * 0.90)]
-            L.append(f"    {m:2d}분: 표본 {len(vals):5d}  exact {exact:5d}"
-                     f"  ≤1m stale {le1:5d}  1~3m stale {s13:5d}  N/A {na:5d}")
+            line = (f"    {m:2d}분: 표본 {len(vals):5d}  exact {exact:5d}"
+                    f"  ≤1m stale {under1:5d}  1~3m stale {one_to_3:5d}  N/A {na:5d}")
+            if other:
+                line += f"  기타 {other}"
+            L.append(line)
             L.append(f"          실제경과 median {med:.1f}분  p10 {p10:.1f}  p90 {p90:.1f}")
+            assert exact + under1 + one_to_3 + other + na == len(vals)
         L.append("  ※ 최대 3분 stale 봉까지 mark-to-market으로 인정합니다.")
+        L.append("  ※ exact / ≤1m / 1~3m / N/A는 상호 배타적이며 합계 = 표본입니다.")
     return L
 
 
@@ -603,7 +696,9 @@ def main():
     global MINUTE_BAR_COUNT, ANALYZER_MODE
     allow_simple = "--allow-simple-fallback" in sys.argv
     allow_config = "--allow-config-fallback" in sys.argv
-    for _flag in ("--allow-simple-fallback", "--allow-config-fallback"):
+    skip_errors = "--skip-analyzer-errors" in sys.argv
+    for _flag in ("--allow-simple-fallback", "--allow-config-fallback",
+                  "--skip-analyzer-errors"):
         while _flag in sys.argv:
             sys.argv.remove(_flag)
     MINUTE_BAR_COUNT = resolve_minute_bar_count(allow_fallback=allow_config)
@@ -626,7 +721,8 @@ def main():
         sys.exit(1)
 
     analyzer = try_import_analyzer(allow_simple_fallback=allow_simple)
-    ANALYZER_MODE = "LIVE_MINUTE_ANALYZER" if analyzer is not None else "SIMPLE_FALLBACK"
+    stats = reset_replay_quality_stats()
+    stats.analyzer_mode = "LIVE_MINUTE_ANALYZER" if analyzer is not None else "SIMPLE_FALLBACK"
     all_reports = []
     all_results: dict[str, list[dict]] = {}
 
@@ -635,7 +731,10 @@ def main():
         bars    = load_bars(symbol, target_date)
         if not bars:
             continue
-        results = run_replay(symbol, bars, analyzer, target_date)
+        results = run_replay(symbol, bars, analyzer, target_date,
+                             minute_bar_count=MINUTE_BAR_COUNT,
+                             quality_stats=stats,
+                             skip_analyzer_errors=skip_errors)
         all_results[symbol] = results
         report  = format_report(symbol, results, target_date)
         print(report)
@@ -651,7 +750,7 @@ def main():
     REPORTS_DIR.mkdir(exist_ok=True)
     fname = REPORTS_DIR / f"replay_{target_date.strftime('%Y%m%d')}.txt"
     # 2026-08-07 (1J.3.1): 데이터 품질을 결과와 함께 남깁니다.
-    quality = "\n".join(build_quality_report())
+    quality = "\n".join(build_quality_report(stats))
     print(quality)
     all_reports.append(quality)
     fname.write_text("\n\n".join(all_reports), encoding="utf-8")

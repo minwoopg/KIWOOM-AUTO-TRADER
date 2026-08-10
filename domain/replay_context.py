@@ -256,7 +256,10 @@ class ReplayDayContext:
 # (source)와 신뢰도(confidence)를 항상 함께 반환해 리포트에
 # 노출합니다.
 PREV_CLOSE_SAME_FILE = "SAME_FILE_PRETARGET"
-PREV_CLOSE_PREV_DAY = "PREVIOUS_TRADING_DAY_FILE"
+# 2026-08-07 (1J.3.2): 이름 정정. 실제 거래소 캘린더를 쓰지 않으므로
+# "trading day"라고 단정할 수 없음 — 우리가 아는 건 "데이터가 있는
+# 직전 날짜"뿐입니다.
+PREV_CLOSE_PREV_DAY = "PREVIOUS_DATA_DAY_FILE"
 PREV_CLOSE_SIGNAL_INFERRED = "SIGNAL_LOG_INFERRED"
 PREV_CLOSE_UNAVAILABLE = "UNAVAILABLE"
 
@@ -266,6 +269,8 @@ class PrevCloseResult:
     value: int | None
     source: str
     confidence: str = "high"
+    previous_data_date: date | None = None
+    calendar_gap_days: int | None = None
 
     @property
     def available(self) -> bool:
@@ -277,19 +282,37 @@ def resolve_prev_close(ctx: "ReplayDayContext", symbol: str,
                        target_date: date | None = None) -> PrevCloseResult:
     """우선순위에 따라 prev_close를 복원합니다.
 
-    1순위 동일 CSV의 target_date 이전 마지막 close
-    2순위 직전 거래일 폴더 동일 종목의 마지막 당일 close
-    3순위 (미구현) signal_log price/change_rate_pct 역산 —
-          여러 행에서 값이 일관될 때만. 이상치가 있어 무조건
-          쓰면 안 되므로 별도 조사 후 도입.
-    4순위 불가능하면 UNAVAILABLE
+    1순위 동일 CSV의 target_date 이전 마지막 close (confidence=high)
+    2순위 **바로 직전 데이터 날짜** 폴더의 동일 종목 마지막 당일 close
+          (confidence=medium)
+    3순위 (미구현) signal_log price/change_rate_pct 역산 — 이상치가
+          있어 무조건 쓰면 안 되므로 별도 조사 후 도입
+    4순위 UNAVAILABLE
+
+    ── 2026-08-07 (1J.3.2, 재현 확인) ──
+    1J.3.1의 2순위는 파일을 찾을 때까지 **과거를 무제한으로 거슬러**
+    올라갔습니다. 실측 결과 2홉 이상 거슬러 간 것이 280건이었고
+    최대 **36 데이터 날짜 전** 종가를 전일 종가로 사용했습니다:
+
+        1홉 전  322건  ← 유일하게 허용
+        2홉 전   97건 / 3홉 53건 / ... / 36홉 1건   (오염 280건)
+
+    그 결과 보고했던 coverage 85.4% 중 15.7%p가 오염된 표본이었고,
+    등락률·A조건이 완전히 틀어질 수 있었습니다. **틀린 데이터로
+    85%를 채우는 것보다 정확한 70%가 낫습니다.**
+
+    이제 **바로 직전 데이터 날짜 딱 하나만** 확인하고, 거기에 해당
+    종목 파일이 없으면 UNAVAILABLE입니다.
+
+    주말·공휴일을 건너뛰면 calendar gap이 3~4일일 수 있으므로 gap
+    자체로 오류 판정하지 않고 `calendar_gap_days`로 기록만 합니다.
     """
     # 1순위
     v = ctx.previous_close
     if v is not None:
         return PrevCloseResult(v, PREV_CLOSE_SAME_FILE, "high")
 
-    # 2순위
+    # 2순위 — 바로 직전 데이터 날짜 1곳만
     if load_bars_fn is not None and minute_bars_dir is not None and target_date is not None:
         from pathlib import Path as _P
         root = _P(minute_bars_dir)
@@ -297,17 +320,19 @@ def resolve_prev_close(ctx: "ReplayDayContext", symbol: str,
                       if d.is_dir() and d.name.isdigit() and len(d.name) == 8)
         key = target_date.strftime("%Y%m%d")
         prior = [d for d in days if d < key]
-        for d in reversed(prior):
-            if not (root / d / f"{symbol}.csv").exists():
-                continue
-            prev_date = datetime.strptime(d, "%Y%m%d").date()
-            pbars = load_bars_fn(symbol, prev_date)
-            if not pbars:
-                continue
-            pctx = ReplayDayContext(pbars, prev_date, ctx.minute_bar_count)
-            tb = pctx.target_bars
-            if tb:
-                return PrevCloseResult(bar_close(tb[-1]), PREV_CLOSE_PREV_DAY, "medium")
-            break
+        if prior:
+            previous_day = prior[-1]          # 바로 직전 데이터 날짜만
+            if (root / previous_day / f"{symbol}.csv").exists():
+                prev_date = datetime.strptime(previous_day, "%Y%m%d").date()
+                pbars = load_bars_fn(symbol, prev_date)
+                if pbars:
+                    pctx = ReplayDayContext(pbars, prev_date, ctx.minute_bar_count)
+                    tb = pctx.target_bars
+                    if tb:
+                        return PrevCloseResult(
+                            bar_close(tb[-1]), PREV_CLOSE_PREV_DAY, "medium",
+                            previous_data_date=prev_date,
+                            calendar_gap_days=(target_date - prev_date).days,
+                        )
 
     return PrevCloseResult(None, PREV_CLOSE_UNAVAILABLE, "none")

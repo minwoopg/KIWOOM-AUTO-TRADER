@@ -33,7 +33,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from domain.cost_model import load_cost_model  # noqa: E402
 from domain.replay_context import ReplayDayContext  # noqa: E402
-from replay_runner import MINUTE_BAR_COUNT as REPLAY_MINUTE_BAR_COUNT  # noqa: E402
+# 2026-08-07 (1J.3.2): replay_runner가 import 시 config를 읽지 않게
+# 바뀌어 MINUTE_BAR_COUNT가 None이므로, 필요한 시점에 직접 resolve.
+from replay_runner import resolve_minute_bar_count  # noqa: E402
+REPLAY_MINUTE_BAR_COUNT = resolve_minute_bar_count()
 COST_MODEL = load_cost_model()
 TOTAL_COST_PCT = COST_MODEL.base_roundtrip_pct   # 하위호환(Base alias)
 # replay_runner import 시점에 sys.stdout이 이미 UTF-8로 재래핑됨 (중복 래핑 금지)

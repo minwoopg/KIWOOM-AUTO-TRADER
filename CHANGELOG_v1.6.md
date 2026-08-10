@@ -4824,3 +4824,137 @@ full fidelity를 주장하지 않고, live `signal_log`의 `bar_amount`와
 
 ---
 
+## 1J.3.2: prev_close 오염 제거 + replay 인프라 마무리 (2026-08-07)
+
+1J.3.1에 대한 GPT 코드리뷰 반영. 매매 로직 무변경.
+**이 단계로 replay 인프라 작업을 종료하고 1J.5로 넘어갑니다.**
+
+### ⚠️ P0-1 정정: coverage 85.4%는 오염된 수치였음 (재현 확인)
+
+1J.3.1의 2순위는 파일을 찾을 때까지 **과거를 무제한으로 거슬러**
+올라갔습니다. 실측한 "데이터 날짜 홉" 분포:
+
+```
+ 1홉 전  322건   ← 유일하게 허용돼야 함
+ 2홉 전   97건 / 3홉 53 / 4홉 28 / 5홉 18 / ...
+36홉 전    1건
+합계 오염 280건 (15.7%p)
+```
+**최대 36 데이터 날짜 전 종가를 전일 종가로 사용**하고 있었습니다.
+등락률·A조건이 완전히 틀어지는 오염입니다.
+
+**수정**: 2순위는 `prior[-1]`, 즉 **바로 직전 데이터 날짜 딱 1곳만**
+확인합니다. 거기에 종목 파일이 없으면 `UNAVAILABLE`.
+
+**재산출 결과**:
+```
+                        1J.3.1(오염)   1J.3.2(정정)
+same_file_count              920           920
+previous_data_day_count      601           321
+unavailable_count            260           540
+coverage_pct               85.4%         69.7%
+calendar_gap 분포: {1일:266, 2일:1, 3일:46, 4일:8}
+```
+**틀린 데이터로 85%를 채우는 것보다 정확한 70%가 낫습니다.**
+gap 3일 46건은 금→월 주말이라 정상이며, gap만으로 오류 판정하지
+않고 기록만 합니다.
+
+`PREVIOUS_TRADING_DAY_FILE` → **`PREVIOUS_DATA_DAY_FILE`**로 개명.
+실제 거래소 캘린더를 쓰지 않으므로 "trading day"라고 단정할 수
+없습니다. `previous_data_date`, `calendar_gap_days`도 함께 기록.
+
+### P0-2: analyzer 평가 예외의 silent continue 제거
+
+analyzer **생성**은 1J.3.1에서 fail-closed로 바꿨지만, **평가 중**
+예외는 여전히 `except Exception: continue`로 후보를 조용히
+삭제했습니다. 1J.5에서 live에는 있는 후보가 replay에서 사라지면
+**"전략 불일치"로 오해**하게 되는 위험한 형태입니다.
+
+`ReplayEvaluationError` 신규 — symbol / target_date / cntr_tm /
+window_len / prev_close / 원래 예외를 메시지에 포함해 즉시 중단.
+`--skip-analyzer-errors`를 명시할 때만 건너뛰며, 그 경우
+`analyzer_error_count` / `analyzer_error_symbols` /
+`analyzer_error_timestamps`를 품질 리포트에 출력하고
+"1J.5/1K 기본 실행에서는 쓰지 마십시오" 경고를 붙입니다.
+
+### P1-3: horizon bucket 중복 집계 수정
+
+`exact`가 `≤1m stale`에도 다시 포함돼 "exact 251 / ≤1m stale 251"
+처럼 보였습니다(stale이 251건이라는 뜻이 아니라 **같은 표본을 두 번
+센 것**). 상호 배타적으로 분리:
+```
+exact      : |m - v| < eps
+≤1m stale  : 0 < (m - v) <= 1
+1~3m stale : 1 < (m - v) <= 3
+N/A        : 별도
+```
+`exact + ≤1m + 1~3m + 기타 + N/A == 표본` invariant를
+`build_quality_report()` 내부 `assert`로 강제하고 리포트에도 명시.
+실측 예(6/23, 20분): exact 137 / ≤1m 1 / 1~3m 2 / N/A 5 = 145.
+
+### P1-4: 품질 통계 객체화
+
+`PREV_CLOSE_STATS`/`HORIZON_STATS` 전역 dict라 같은 프로세스에서
+51거래일을 돌리면 통계가 계속 누적됐습니다. `ReplayQualityStats`
+dataclass로 분리 — `prev_close_sources`, `calendar_gaps`,
+`horizon_elapsed`, `analyzer_error_*`, `symbol_days`,
+`analyzer_mode` + `merge()`. `run_replay(..., quality_stats=stats)`
+로 전달해 **거래일별 / 전체 집계를 분리**할 수 있습니다.
+`reset_replay_quality_stats()`도 함께 제공.
+
+### P1-5: import 시 config I/O 제거
+
+`MINUTE_BAR_COUNT = resolve_minute_bar_count()`가 모듈 최상위에서
+실행돼, **설정이 정말 깨졌을 때 `--allow-config-fallback`을 줘도
+main()에 도달하기 전에 예외**가 났습니다. 옵션이 필요한 상황에서
+작동하지 않는 구조였습니다.
+
+`MINUTE_BAR_COUNT: int | None = None`으로 두고 `main()`에서 CLI
+파싱 후 resolve. `run_replay(..., minute_bar_count=...)`로 명시
+전달. 1J.5가 이 모듈을 import하므로 side-effect를 줄이는 것이
+중요합니다. 서브프로세스 테스트로 **설정이 깨져도 import 자체는
+성공**하고 `MINUTE_BAR_COUNT`가 `None`임을 고정했습니다.
+
+`analyze_v_drop_backtest.py` / `simulate_pullback_removal.py`도
+import 시점 상수 참조에서 `resolve_minute_bar_count()` 직접 호출로
+변경(회귀로 검출됨).
+
+### P1-6: prev_close 품질 리포트
+
+`total_symbol_days` / `same_file_count` / `previous_data_day_count` /
+`unavailable_count` / `prev_close_coverage_pct` + `calendar_gap`
+분포를 출력하고, **"바로 직전 데이터 날짜 1곳만 봅니다"**와
+**"'전체 데이터'가 아닙니다"**를 명시합니다.
+
+### 테스트
+
+`test_replay_time_axis.py` 98건 → **133건**:
+- L절(8건) prev_close 1홉 제한 — 8/6에 종목 없고 8/5에 있을 때
+  UNAVAILABLE, 8/5 종가를 쓰지 않음, 8/6에 있으면 그 마지막 close,
+  `previous_data_date`/`calendar_gap_days`/confidence 기록,
+  무제한 탐색 코드 부재.
+- M절(9건) analyzer fail-closed — 기본 `ReplayEvaluationError`,
+  옵션 시에만 skip, 오류 집계·리포트 출력, `except Exception:
+  continue` 부재.
+- N절(7건) bucket 상호 배타 — exact 3 / ≤1m 2 / 1~3m 1 / N/A 2 = 8.
+- O절(10건) 통계 객체화 + import side-effect — 인스턴스 격리,
+  `merge()`, 설정이 깨져도 import 성공 및 `MINUTE_BAR_COUNT is None`.
+- K절은 변경된 필드명·API에 맞춰 갱신.
+
+`test_cost_model.py` **101건 유지**.
+
+**전체 회귀**: 15개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+**실행 스모크**: replay / crash / v-drop / pullback 4종 정상.
+
+### 1J.5 진입 조건 충족
+
+- prev_close가 2개 이상 데이터 날짜를 거슬러 가지 않음 ✅
+- 85.4% → 69.7% 재산출 및 정정 ✅
+- analyzer runtime error가 조용히 candidate를 삭제하지 않음 ✅
+- horizon bucket 합계 = total ✅
+- 멀티데이 실행 시 날짜별 통계 분리 ✅
+- import 자체가 settings.yaml을 읽지 않음 ✅
+- fallback CLI가 실제 config 오류 상황에서도 작동 ✅
+
+---
+
