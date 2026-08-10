@@ -587,6 +587,138 @@ check("O-9) 설정이 깨져도 replay_runner import 자체는 성공",
 check("O-10) import 직후 MINUTE_BAR_COUNT는 None",
       "IMPORT_OK None" in _probe.stdout)
 
+# ══════════════════════════════════════════════════════════════
+# P. history 완전성 (1J.3.3, P0)
+# ══════════════════════════════════════════════════════════════
+# 재현: prev_close만 복원하고 history를 안 채우면 같은 09:05에도
+# live 60봉 vs replay 6봉이 되어, 1J.5에서 낮은 일치율이 나와도
+# 계산식 차이인지 history 결손인지 구분할 수 없음.
+from domain.replay_context import (
+    build_day_context, is_full_window,
+    HISTORY_SAME_FILE_COMPLETE, HISTORY_PREVIOUS_DAY_RECONSTRUCTED,
+    HISTORY_INCOMPLETE_INTRADAY,
+)
+
+_root2 = Path(_tf.mkdtemp())
+
+
+def _wd(day: str, symbol: str, bars_spec: list[tuple[int, int, int]]) -> None:
+    d = _root2 / day
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / f"{symbol}.csv").open("w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["cntr_tm", "open", "high", "low", "close", "volume", "acc_volume"])
+        for hh, mm, c in bars_spec:
+            w.writerow([f"{day}{hh:02d}{mm:02d}00", c, c, c, c, 100, 100])
+
+
+def _load2(symbol, d):
+    path = _root2 / d.strftime("%Y%m%d") / f"{symbol}.csv"
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        return [Bar(r["cntr_tm"], int(r["close"])) for r in _csv.DictReader(f)]
+
+
+# fixture 1: 전일 60봉 별도 파일 + 당일 09:00 시작
+_wd("20260806", "AAA", [(14, m, 9000 + m) for m in range(0, 60)])
+_wd("20260807", "AAA", [(9, m, 10000 + m) for m in range(0, 30)])
+_ctx1, _hs1 = build_day_context("AAA", _load2("AAA", date(2026, 8, 7)),
+                                date(2026, 8, 7), 60, _load2, _root2)
+check("P-1) 장초 파일은 직전 날짜 tail로 history 복원",
+      _hs1 == HISTORY_PREVIOUS_DAY_RECONSTRUCTED)
+_i1 = _ctx1.target_indices[5]                      # 09:05
+_w1 = _ctx1.analysis_window(_i1)
+check("P-2) 09:05 시점 window가 60봉으로 구성됨(기존엔 6봉)", len(_w1) == 60)
+check("P-3) 현재봉이 window의 마지막",
+      _w1[-1].cntr_tm == _ctx1.all_bars[_i1].cntr_tm)
+check("P-4) window에 전일 봉이 history로 포함됨",
+      any(b.cntr_tm.startswith("20260806") for b in _w1))
+check("P-5) candidate는 여전히 당일 봉만",
+      all(_ctx1.all_bars[i].cntr_tm.startswith("20260807")
+          for i in _ctx1.target_indices))
+check("P-6) prev_close가 전일 마지막 close",
+      resolve_prev_close(_ctx1, "AAA", _load2, _root2, date(2026, 8, 7)).value == 9059)
+check("P-7) history가 minute_bar_count를 넘지 않음", len(_w1) <= 60)
+
+# fixture 2: 당일 파일 첫 봉 10:43, same-day 과거 없음
+_wd("20260807", "BBB", [(10, 43 + m, 20000 + m) for m in range(0, 10)])
+_wd("20260806", "BBB", [(14, m, 19000 + m) for m in range(0, 60)])
+_ctx2, _hs2 = build_day_context("BBB", _load2("BBB", date(2026, 8, 7)),
+                                date(2026, 8, 7), 60, _load2, _root2)
+check("P-8) 장중 시작 파일은 INCOMPLETE_INTRADAY",
+      _hs2 == HISTORY_INCOMPLETE_INTRADAY)
+check("P-9) 전일 tail로 가짜 복원하지 않음",
+      not any(b.cntr_tm.startswith("20260806") for b in _ctx2.all_bars))
+check("P-10) full window가 아님(fidelity eligible=False)",
+      not is_full_window(_ctx2, _ctx2.target_indices[-1]))
+
+# fixture 3: same-file에 전일 tail이 이미 있음
+_wd("20260807", "CCC",
+    [(14, m, 30000 + m) for m in range(0, 60)] + [(9, m, 31000 + m) for m in range(0, 10)])
+_bars3 = _load2("CCC", date(2026, 8, 7))
+# 앞 60봉을 전일로 만들기 위해 날짜를 바꿔 재구성
+_bars3 = ([Bar(f"20260806{b.cntr_tm[8:]}", b.close_price) for b in _bars3[:60]]
+          + _bars3[60:])
+_ctx3, _hs3 = build_day_context("CCC", _bars3, date(2026, 8, 7), 60, _load2, _root2)
+check("P-11) same-file에 pretarget이 있으면 SAME_FILE_COMPLETE",
+      _hs3 == HISTORY_SAME_FILE_COMPLETE)
+check("P-12) 중복 prepend가 없음(봉 수가 그대로)",
+      len(_ctx3.all_bars) == len(_bars3))
+
+# fixture 4: programmatic 실행에서 minute_bar_count가 리포트에 정확히
+_st_p = RR.ReplayQualityStats()
+_p_bars = [mk("20260806", 15, 19, 10000)] + [mk("20260807", 9, m, 10000 + m)
+                                             for m in range(0, 30)]
+RR.run_replay("ZZZ", _p_bars, None, date(2026, 8, 7),
+              minute_bar_count=60, quality_stats=_st_p)
+check("P-13) stats에 minute_bar_count가 기록됨", _st_p.minute_bar_count == 60)
+_q_p = "\n".join(RR.build_quality_report(_st_p))
+check("P-14) 리포트가 전역값이 아닌 stats의 minute_bar_count 출력",
+      "minute_bar_count = 60" in _q_p)
+check("P-15) 전역 MINUTE_BAR_COUNT는 여전히 None", RR.MINUTE_BAR_COUNT is None)
+
+# full/partial 집계
+check("P-16) full/partial candidate가 집계됨",
+      _st_p.total_candidate_points == _st_p.full_window_candidates
+      + _st_p.partial_window_candidates)
+check("P-17) 리포트에 full_window_coverage_pct 출력",
+      "full_window_coverage_pct" in _q_p)
+check("P-18) 리포트에 history_status 출력",
+      "history 완전성" in _q_p)
+check("P-19) first_full_window가 기록됨(있는 경우)",
+      isinstance(_st_p.first_full_window, dict))
+
+# merge 시 설정 혼재 감지
+_m1s = RR.ReplayQualityStats(); _m1s.minute_bar_count = 60
+_m2s = RR.ReplayQualityStats(); _m2s.minute_bar_count = 90
+_m1s.merge(_m2s)
+check("P-20) 서로 다른 minute_bar_count가 섞이면 MIXED_CONFIG",
+      _m1s.minute_bar_count == "MIXED_CONFIG")
+_a1 = RR.ReplayQualityStats(); _a1.analyzer_mode = "LIVE_MINUTE_ANALYZER"
+_a2 = RR.ReplayQualityStats(); _a2.analyzer_mode = "SIMPLE_FALLBACK"
+_a1.merge(_a2)
+check("P-21) 서로 다른 analyzer_mode가 섞이면 MIXED_CONFIG",
+      _a1.analyzer_mode == "MIXED_CONFIG")
+check("P-22) MIXED_CONFIG 경고가 리포트에 표시",
+      "1K에서 사용 금지" in "\n".join(RR.build_quality_report(_m1s)))
+
+
+# ══════════════════════════════════════════════════════════════
+# Q. pullback 정책 통일 (1J.3.3, P1)
+# ══════════════════════════════════════════════════════════════
+_pb3 = Path("simulate_pullback_removal.py").read_text(encoding="utf-8")
+check("Q-1) pullback이 resolve_prev_close를 사용", "resolve_prev_close(" in _pb3)
+check("Q-2) pullback이 build_day_context를 사용", "build_day_context(" in _pb3)
+check("Q-3) pullback에 ctx.previous_close 직접 사용이 없음",
+      "prev_close = ctx.previous_close" not in _code_only(_pb3))
+check("Q-4) pullback의 analyzer silent continue 제거",
+      "except Exception:\n            continue" not in _code_only(_pb3))
+check("Q-5) pullback이 ReplayEvaluationError를 사용",
+      "ReplayEvaluationError(" in _pb3)
+check("Q-6) pullback에 skip 옵션과 오류 집계가 있음",
+      "SKIP_ANALYZER_ERRORS" in _pb3 and "ANALYZER_ERRORS" in _pb3)
+
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
 if failed:

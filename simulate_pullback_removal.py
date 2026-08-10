@@ -55,10 +55,18 @@ AFTER_MINUTES   = [5, 10, 20]
 # daily_report는 0.90%를 쓰고 있어 두 기준이 갈라져 있었습니다.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from domain.cost_model import load_cost_model  # noqa: E402
-from domain.replay_context import ReplayDayContext  # noqa: E402
+from domain.replay_context import (  # noqa: E402
+    ReplayDayContext, resolve_prev_close, build_day_context,
+)
 # 2026-08-07 (1J.3.2): replay_runner가 import 시 config를 읽지 않게
 # 바뀌어 MINUTE_BAR_COUNT가 None이므로, 필요한 시점에 직접 resolve.
-from replay_runner import resolve_minute_bar_count  # noqa: E402
+from replay_runner import (  # noqa: E402
+    resolve_minute_bar_count, ReplayEvaluationError, MINUTE_BARS_DIR, load_bars,
+)
+
+# 2026-08-07 (1J.3.3): analyzer 오류는 기본 fail-closed.
+SKIP_ANALYZER_ERRORS = "--skip-analyzer-errors" in sys.argv
+ANALYZER_ERRORS: list[str] = []
 REPLAY_MINUTE_BAR_COUNT = resolve_minute_bar_count()
 COST_MODEL = load_cost_model()
 TOTAL_COST_PCT = COST_MODEL.base_roundtrip_pct   # 하위호환(Base 시나리오)
@@ -203,23 +211,38 @@ def run_symbol_day(symbol: str, target_date: date, analyzer) -> dict:
     if len(bars) < 5:
         return out
     # 2026-08-07 (1J.3): replay_runner와 동일한 공용 시간축 컨텍스트.
-    ctx = ReplayDayContext(bars, target_date, minute_bar_count=REPLAY_MINUTE_BAR_COUNT)
-    prev_close = ctx.previous_close
-    if prev_close is None:
+    # 2026-08-07 (1J.3.3): replay_runner와 동일한 prev_close 복원 계층과
+    # history 완전성 정책을 사용합니다. 예전엔 ctx.previous_close만 써서
+    # PREVIOUS_DATA_DAY_FILE fallback을 활용하지 못했습니다.
+    ctx, _history_status = build_day_context(
+        symbol, bars, target_date, REPLAY_MINUTE_BAR_COUNT,
+        load_bars, MINUTE_BARS_DIR)
+    _pc = resolve_prev_close(ctx, symbol, load_bars, MINUTE_BARS_DIR, target_date)
+    if not _pc.available:
         return out          # 임의 추정 금지 — 등락률 조건이 왜곡됨
+    prev_close = _pc.value
 
     for i in ctx.target_indices:
         if i < 5:
             continue
         window = ctx.analysis_window(i)      # 현재봉 포함 최근 60봉
-        current = bars[i]
+        current = ctx.all_bars[i]   # history prepend로 인덱스가 확장되므로 ctx 기준
         entry_dt = ctx.bar_dt(i)
         if entry_dt is None:
             continue
         try:
             a = analyzer.analyze(window, prev_close)
-        except Exception:
-            continue
+        except Exception as exc:
+            # 2026-08-07 (1J.3.3): silent continue 제거 — 기본 fail-closed.
+            ANALYZER_ERRORS.append(f"{symbol}@{current.cntr_tm}")
+            if SKIP_ANALYZER_ERRORS:
+                continue
+            raise ReplayEvaluationError(
+                f"analyzer 평가 실패 — symbol={symbol} target_date={target_date} "
+                f"cntr_tm={current.cntr_tm} window_len={len(window)} "
+                f"prev_close={prev_close}: {exc}\n"
+                f"(--skip-analyzer-errors로 건너뛸 수 있으나 기본 실행에서는 금지)"
+            ) from exc
         if a is None:
             continue
 

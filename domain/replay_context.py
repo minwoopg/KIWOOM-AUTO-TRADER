@@ -336,3 +336,79 @@ def resolve_prev_close(ctx: "ReplayDayContext", symbol: str,
                         )
 
     return PrevCloseResult(None, PREV_CLOSE_UNAVAILABLE, "none")
+
+
+# ── history 완전성 (1J.3.3) ──────────────────────────────────────
+# prev_close 숫자만 복원하고 60봉 history는 복원하지 않으면,
+# 같은 09:05에도 live는 60봉(전일 오후 + 당일), replay는 6봉을
+# analyzer에 넣게 됩니다. VWAP·고저가·pullback·V/PR·MA5·거래량
+# 평균이 전부 달라지므로, 1J.5에서 낮은 일치율이 나와도 그게
+# 계산식 차이인지 history 결손인지 구분할 수 없습니다.
+#
+# 실측(누적 1,781 symbol-day): full-window candidate 비율 61.4%.
+HISTORY_SAME_FILE_COMPLETE = "SAME_FILE_COMPLETE"
+HISTORY_PREVIOUS_DAY_RECONSTRUCTED = "PREVIOUS_DAY_RECONSTRUCTED"
+HISTORY_INCOMPLETE_INTRADAY = "INCOMPLETE_INTRADAY"
+
+# 장 시작 부근으로 인정할 첫 봉 시각. 이보다 늦게 시작한 파일은
+# 그 앞의 **당일** 봉을 모르는 것이므로 전일 봉으로 채우면 안 됩니다.
+MARKET_OPEN_TOLERANCE_HHMM = "0902"
+
+
+def build_day_context(symbol: str, bars, target_date: date,
+                      minute_bar_count: int = 60,
+                      load_bars_fn=None, minute_bars_dir=None
+                      ) -> tuple["ReplayDayContext", str]:
+    """history 완전성을 고려해 컨텍스트를 만듭니다. (ctx, history_status)
+
+    A) 파일 첫 봉이 장 시작 부근(<=09:02)이고 same-file pretarget이
+       없으면, 직전 데이터 날짜의 tail을 **필요한 만큼만** prepend.
+       → PREVIOUS_DAY_RECONSTRUCTED
+    B) 파일이 장중부터 시작하고 그 앞 당일 봉이 없으면 **아무것도
+       채우지 않습니다**. 10:43 시점 live의 최근 60봉은 당일
+       09:44~10:43에 가까우므로 전일 오후 봉으로 대체하면 또 다른
+       오염입니다.
+       → INCOMPLETE_INTRADAY
+    C) same-file에 pretarget이 이미 있으면 그대로.
+       → SAME_FILE_COMPLETE
+    """
+    ctx = ReplayDayContext(bars, target_date, minute_bar_count)
+    if ctx.previous_close is not None:
+        return ctx, HISTORY_SAME_FILE_COMPLETE
+
+    ti = ctx.target_indices
+    if not ti:
+        return ctx, HISTORY_INCOMPLETE_INTRADAY
+    first_dt = ctx.bar_dt(ti[0])
+    if first_dt is None or first_dt.strftime("%H%M") > MARKET_OPEN_TOLERANCE_HHMM:
+        return ctx, HISTORY_INCOMPLETE_INTRADAY      # 장중 시작 → 복원 금지
+
+    if load_bars_fn is None or minute_bars_dir is None:
+        return ctx, HISTORY_INCOMPLETE_INTRADAY
+
+    from pathlib import Path as _P
+    root = _P(minute_bars_dir)
+    days = sorted(d.name for d in root.iterdir()
+                  if d.is_dir() and d.name.isdigit() and len(d.name) == 8)
+    prior = [d for d in days if d < target_date.strftime("%Y%m%d")]
+    if not prior or not (root / prior[-1] / f"{symbol}.csv").exists():
+        return ctx, HISTORY_INCOMPLETE_INTRADAY
+
+    prev_date = datetime.strptime(prior[-1], "%Y%m%d").date()
+    pbars = load_bars_fn(symbol, prev_date)
+    if not pbars:
+        return ctx, HISTORY_INCOMPLETE_INTRADAY
+    tail = ReplayDayContext(pbars, prev_date, minute_bar_count).target_bars
+    if not tail:
+        return ctx, HISTORY_INCOMPLETE_INTRADAY
+
+    # minute_bar_count를 넘지 않게 필요한 만큼만
+    need = max(0, minute_bar_count - 1)
+    merged = list(tail[-need:]) + list(bars)
+    return (ReplayDayContext(merged, target_date, minute_bar_count),
+            HISTORY_PREVIOUS_DAY_RECONSTRUCTED)
+
+
+def is_full_window(ctx: "ReplayDayContext", index: int) -> bool:
+    """이 시점의 analyzer window가 live와 같은 크기인가."""
+    return len(ctx.analysis_window(index)) >= ctx.minute_bar_count

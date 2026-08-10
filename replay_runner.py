@@ -31,7 +31,9 @@ AFTER_MINUTES   = [5, 10, 20]
 # daily_report는 0.90%를 쓰고 있어 두 기준이 갈라져 있었습니다.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from domain.cost_model import load_cost_model  # noqa: E402
-from domain.replay_context import ReplayDayContext, resolve_prev_close  # noqa: E402
+from domain.replay_context import (  # noqa: E402
+    ReplayDayContext, resolve_prev_close, build_day_context, is_full_window,
+)
 from config.settings import load_settings  # noqa: E402
 
 class ReplayConfigError(RuntimeError):
@@ -100,12 +102,39 @@ class ReplayQualityStats:
     analyzer_error_timestamps: list[str] = field(default_factory=list)
     symbol_days: int = 0
     analyzer_mode: str = "LIVE_MINUTE_ANALYZER"
+    # 2026-08-07 (1J.3.3): programmatic 실행(run_replay를 직접 호출)
+    # 에서는 전역 MINUTE_BAR_COUNT가 None일 수 있어 리포트가 실제와
+    # 다르게 표시됐음. 실제 사용값을 stats에 기록합니다.
+    minute_bar_count: int | None = None
+    # history 완전성 (1J.3.3)
+    history_status: dict[str, int] = field(default_factory=dict)
+    full_window_candidates: int = 0
+    partial_window_candidates: int = 0
+    first_full_window: dict[str, str] = field(default_factory=dict)
 
     @property
     def analyzer_error_count(self) -> int:
         return len(self.analyzer_error_timestamps)
 
+    @property
+    def total_candidate_points(self) -> int:
+        return self.full_window_candidates + self.partial_window_candidates
+
     def merge(self, other: "ReplayQualityStats") -> None:
+        # 2026-08-07 (1J.3.3): 서로 다른 설정이 섞이면 1K에서 쓰면
+        # 안 되므로 MIXED_CONFIG로 표시합니다.
+        if self.minute_bar_count is None:
+            self.minute_bar_count = other.minute_bar_count
+        elif other.minute_bar_count is not None and \
+                other.minute_bar_count != self.minute_bar_count:
+            self.minute_bar_count = "MIXED_CONFIG"
+        if other.analyzer_mode != self.analyzer_mode:
+            self.analyzer_mode = "MIXED_CONFIG"
+        for k, v in other.history_status.items():
+            self.history_status[k] = self.history_status.get(k, 0) + v
+        self.full_window_candidates += other.full_window_candidates
+        self.partial_window_candidates += other.partial_window_candidates
+        self.first_full_window.update(other.first_full_window)
         for k, v in other.prev_close_sources.items():
             self.prev_close_sources[k] = self.prev_close_sources.get(k, 0) + v
         for k, v in other.calendar_gaps.items():
@@ -248,7 +277,14 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
     stats = quality_stats if quality_stats is not None else _DEFAULT_STATS
     mbc = minute_bar_count if minute_bar_count is not None else (
         MINUTE_BAR_COUNT if MINUTE_BAR_COUNT is not None else resolve_minute_bar_count())
-    ctx = ReplayDayContext(bars, target_date, minute_bar_count=mbc)
+    stats.minute_bar_count = mbc
+    # 2026-08-07 (1J.3.3): prev_close만이 아니라 **history**도 함께
+    # 복원합니다. 장초 파일은 직전 데이터 날짜 tail을 prepend하고,
+    # 장중부터 시작한 파일은 억지로 채우지 않습니다.
+    ctx, history_status = build_day_context(
+        symbol, bars, target_date, mbc, load_bars, MINUTE_BARS_DIR)
+    stats.history_status[history_status] = \
+        stats.history_status.get(history_status, 0) + 1
     pc = resolve_prev_close(ctx, symbol, load_bars, MINUTE_BARS_DIR, target_date)
     stats.symbol_days += 1
     stats.prev_close_sources[pc.source] = stats.prev_close_sources.get(pc.source, 0) + 1
@@ -265,10 +301,21 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
         if i < 5:
             continue
         window  = ctx.analysis_window(i)
-        current = bars[i]
+        current = ctx.all_bars[i]
         entry_dt = ctx.bar_dt(i)
         if entry_dt is None:
             continue
+        # 2026-08-07 (1J.3.3): live와 같은 60봉이 확보된 시점인지.
+        # 1J.5 A(Aligned Value Fidelity)는 full-window 표본을 주
+        # 평가 대상으로 삼습니다(partial은 별도 limitation).
+        full_window = is_full_window(ctx, i)
+        if full_window:
+            stats.full_window_candidates += 1
+            key = f"{symbol}@{target_date.isoformat()}"
+            if key not in stats.first_full_window:
+                stats.first_full_window[key] = str(current.cntr_tm)
+        else:
+            stats.partial_window_candidates += 1
         is_v = is_pr = False
         patterns = "-"
 
@@ -338,6 +385,8 @@ def run_replay(symbol: str, bars: list[MinuteBarRow], analyzer,
 
         results.append({
             "entry_time":  entry_time,
+            "full_window": full_window,
+            "history_status": history_status,
             "entry_price": entry_price,
             "patterns":    patterns,
             "is_v":        is_v,
@@ -385,7 +434,9 @@ def build_quality_report(stats: "ReplayQualityStats | None" = None) -> list[str]
     if st.analyzer_mode == "SIMPLE_FALLBACK":
         L.append("  ⚠ 간이 전략(A simple)입니다 — 실제 전략과 다르므로")
         L.append("    1K enforce 판단에 사용하지 마십시오.")
-    L.append(f"  minute_bar_count = {MINUTE_BAR_COUNT} (live와 동일)")
+    L.append(f"  minute_bar_count = {st.minute_bar_count} (live와 동일)")
+    if st.minute_bar_count == "MIXED_CONFIG" or st.analyzer_mode == "MIXED_CONFIG":
+        L.append("  ⚠ 서로 다른 설정이 섞였습니다 — 1K에서 사용 금지.")
 
     if st.analyzer_error_count:
         L.append("")
@@ -414,6 +465,27 @@ def build_quality_report(stats: "ReplayQualityStats | None" = None) -> list[str]
             gaps = ", ".join(f"{k}일:{v}" for k, v in sorted(st.calendar_gaps.items()))
             L.append(f"  previous_data_day의 calendar_gap 분포: {gaps}")
             L.append("    (주말·공휴일을 건너뛰면 3~4일이 정상입니다)")
+
+    # history 완전성 (1J.3.3)
+    if st.history_status or st.total_candidate_points:
+        L.append("")
+        L.append("  history 완전성")
+        for k in ("SAME_FILE_COMPLETE", "PREVIOUS_DAY_RECONSTRUCTED",
+                  "INCOMPLETE_INTRADAY"):
+            n = st.history_status.get(k, 0)
+            if n:
+                L.append(f"    {k:28s} {n:5d}")
+        tcp = st.total_candidate_points
+        if tcp:
+            L.append(f"    total_candidate_points       {tcp:5d}")
+            L.append(f"    full_window_candidate_count  {st.full_window_candidates:5d}")
+            L.append(f"    partial_window_candidate_count {st.partial_window_candidates:5d}")
+            L.append(f"    full_window_coverage_pct     "
+                     f"{st.full_window_candidates / tcp * 100:.1f}%")
+        L.append("  ※ 장초 파일은 직전 데이터 날짜 tail로 history를 복원하고,")
+        L.append("    장중부터 시작한 파일은 억지로 채우지 않습니다(INCOMPLETE_INTRADAY).")
+        L.append("  ※ 1J.5 Aligned Value Fidelity는 full-window 표본을 주 대상으로,")
+        L.append("    partial 표본은 별도 limitation으로 다루십시오.")
 
     # horizon 품질 — bucket은 상호 배타적
     if any(st.horizon_elapsed.get(m) for m in (5, 10, 20)):

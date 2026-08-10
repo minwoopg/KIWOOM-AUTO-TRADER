@@ -4958,3 +4958,113 @@ import 시점 상수 참조에서 `resolve_minute_bar_count()` 직접 호출로
 
 ---
 
+## 1J.3.3: History Completeness (2026-08-07)
+
+1J.3.2에 대한 GPT 코드리뷰 반영. **이 단계로 replay 인프라 작업을
+종료하고 1J.5로 넘어갑니다.** 매매 로직 무변경.
+
+### P0: prev_close 숫자만 복원하고 60봉 history는 복원 안 됐음
+
+1J.3.2는 `PREVIOUS_DATA_DAY_FILE`로 **prev_close 숫자만** 가져왔고
+`ReplayDayContext.all_bars`는 당일 CSV 그대로였습니다. 그래서:
+
+```
+같은 09:05 시점
+  live   : get_minute_bars(count=60) → 전일 오후 + 당일 ≈ 60봉
+  replay : 당일 09:00~09:05          → 6봉
+```
+VWAP·고저가·pullback·V/PR·MA5·거래량 평균이 전부 달라집니다.
+**이 상태로 1J.5를 재면 낮은 일치율의 원인이 계산식 차이인지
+history 결손인지 구분할 수 없습니다.**
+
+**`build_day_context()` 신규** — 세 경우를 구분:
+
+| 상황 | 처리 | history_status |
+|---|---|---|
+| same-file에 pretarget 있음 | 그대로 | `SAME_FILE_COMPLETE` |
+| 첫 봉 ≤09:02, pretarget 없음 | 직전 데이터 날짜 tail을 **필요한 만큼만** prepend | `PREVIOUS_DAY_RECONSTRUCTED` |
+| 첫 봉이 장중(예: 10:43) | **아무것도 채우지 않음** | `INCOMPLETE_INTRADAY` |
+
+장중 시작 파일에 전일 오후 봉을 붙이지 않는 것이 핵심입니다 —
+10:43 시점 live의 최근 60봉은 당일 09:44~10:43에 가까우므로,
+전일 봉으로 대체하면 **또 다른 오염**이 됩니다. `candidate`는 어느
+경우에도 target_date 봉으로만 한정하고, prepend는
+`minute_bar_count`를 넘지 않습니다.
+
+**51거래일 재산출**:
+```
+SAME_FILE_COMPLETE             920 (51.7%)
+PREVIOUS_DAY_RECONSTRUCTED      11 (0.6%)
+INCOMPLETE_INTRADAY            850 (47.7%)
+
+total_candidate_points        174,454
+full_window_candidate_count   107,443
+partial_window_candidate_count 67,011
+full_window_coverage_pct      61.6%
+```
+복원 대상(장초 시작 + pretarget 없음)이 11건뿐인 이유는, 실제로는
+대부분의 파일이 **장중부터 저장**되기 시작했기 때문입니다. 즉
+history 결손의 주원인은 "전일 봉이 없어서"가 아니라 "그날 봇이
+장중에 뜨거나 종목이 장중에 편입돼서"입니다. 이 47.7%는 **원리적으로
+복원 불가**이며 억지로 채우지 않습니다.
+
+**`full_window_coverage_pct 61.6%`가 1J.5의 핵심 지표입니다.**
+Aligned Value Fidelity는 full-window 표본을 주 평가 대상으로 삼고,
+partial 표본은 별도 limitation으로 출력합니다. 결과 행에도
+`full_window` / `history_status`를 기록합니다.
+
+### P1: minute_bar_count를 stats에 기록
+
+`build_quality_report()`가 전역 `MINUTE_BAR_COUNT`를 출력해서,
+1J.5처럼 `run_replay(..., minute_bar_count=60)`으로 import 실행하면
+전역은 `None`이라 리포트에 `minute_bar_count = None`이 찍혔습니다.
+`ReplayQualityStats.minute_bar_count`에 기록하고 리포트가 이를
+출력합니다.
+
+`merge()`에서 서로 다른 `minute_bar_count` 또는 `analyzer_mode`가
+섞이면 **`MIXED_CONFIG`**로 표시하고 "1K에서 사용 금지" 경고를
+붙입니다.
+
+### P1: pullback도 동일 정책으로 통일
+
+`simulate_pullback_removal.py`가 아직 `ctx.previous_close`만 쓰고
+`except Exception: continue`가 남아 있었습니다. 즉 "네 분석기가 같은
+replay infrastructure를 사용한다"는 표현이 시간축에는 맞았지만
+prev_close·analyzer-error 정책까지는 아니었습니다.
+`build_day_context()` + `resolve_prev_close()` + `ReplayEvaluationError`
+로 통일하고 `--skip-analyzer-errors` + `ANALYZER_ERRORS` 집계 추가.
+
+history prepend로 인덱스 기준이 `ctx.all_bars`로 바뀌면서
+`current = bars[i]`가 `IndexError`를 냈고, 실행 스모크에서 검출해
+수정했습니다.
+
+### 테스트
+
+`test_replay_time_axis.py` 133건 → **161건**:
+- P절(22건) history 완전성 — GPT 지정 fixture 4종:
+  (1) 전일 60봉 별도 파일 + 당일 09:00 시작 → window 60봉 구성,
+      현재봉이 마지막, candidate는 당일만, prev_close 9059;
+  (2) 첫 봉 10:43 → `INCOMPLETE_INTRADAY`, 전일 봉 미포함,
+      full-window 아님;
+  (3) same-file pretarget 존재 → `SAME_FILE_COMPLETE`, 중복 prepend
+      없음;
+  (4) programmatic 실행 → 리포트에 `minute_bar_count = 60`,
+      전역은 `None` 유지.
+  + `MIXED_CONFIG` 감지 및 경고.
+- Q절(6건) pullback 정책 통일 검증.
+
+`test_cost_model.py` **101건 유지**.
+
+**전체 회귀**: 15개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+**실행 스모크**: replay / crash / v-drop / pullback 4종 정상.
+
+### 1J.5 진입 조건 충족
+
+- history가 없는 장초는 안전하게 복원 ✅
+- history가 없는 장중은 억지 복원하지 않음 ✅
+- full-window coverage를 수치로 확보 (61.6%) ✅
+- 1J.5가 partial history 때문에 낮은 fidelity를 계산하지 않음 ✅
+- pullback도 같은 prev_close/analyzer-error 정책 ✅
+
+---
+
