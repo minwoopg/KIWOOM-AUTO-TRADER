@@ -33,6 +33,45 @@ class PositionLifecycle(str, Enum):
     ERROR = "ERROR"
 
 
+
+# ══════════════════════════════════════════════════════════════
+# 매도 결정 — 단일 진입점 (1P0.5)
+# ══════════════════════════════════════════════════════════════
+# 1P0.1~1P0.4에서 차단 규칙이 6종으로 늘었고, 조합에 따라 매도가
+# 아예 나가지 않는 구간이 실제로 생겼습니다(재현 확인):
+#   - orphan TTL 600초 동안 비강제 매도 전면 차단
+#   - MAX_RETRY 도달 후 '체결 성공' 외에는 리셋 경로 없음 → 영구 차단
+#
+# 규칙을 흩어놓지 않고 하나의 함수에서 **명시적 우선순위**로 평가하고,
+# 어떤 경우에도 최종 청산 경로가 열려 있음을 보장합니다.
+
+
+class SellDecision(str, Enum):
+    ALLOW = "ALLOW"                  # 정상 매도
+    ALLOW_FORCED = "ALLOW_FORCED"    # 손절·강제청산 (SOFT block만 우회)
+    THROTTLED = "THROTTLED"          # 최소 간격 미달
+    BLOCKED = "BLOCKED"              # 차단 (HARD 또는 SOFT)
+    # 2026-08-10 (1P0.7, GPT 코드리뷰): ALLOW_ESCALATED를 제거했습니다.
+    # "시간이 지나면 사유 불문 허용"은 orphan/BUY_PENDING/ERROR처럼
+    # 원 주문 상태를 모르는 상황에서 이중 주문으로 이어질 수 있습니다
+    # (재현: orphan 5분 경과 → forced SELL 허용 → 이중 매도 가능).
+    # HARD block은 시간이 지나도 여전히 BLOCKED이며, 다만 이 상태를
+    # RECONCILIATION_REQUIRED로 승격해 CRITICAL로 노출합니다 — 매도를
+    # 열어주는 것이 아니라 "사람이 지금 확인해야 한다"는 신호입니다.
+    RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
+
+
+@dataclass(frozen=True)
+class SellDecisionResult:
+    decision: SellDecision
+    code: str = ""
+    detail: str = ""
+
+    @property
+    def allowed(self) -> bool:
+        return self.decision in (SellDecision.ALLOW, SellDecision.ALLOW_FORCED)
+
+
 @dataclass
 class SymbolPositionState:
     """종목 하나의 현재 생명주기 상태와 관련 메타데이터."""
@@ -40,10 +79,58 @@ class SymbolPositionState:
     lifecycle: PositionLifecycle = PositionLifecycle.FLAT
     pending_order_id: str | None = None
     pending_quantity: int = 0          # 진행 중인 주문의 요청 수량
-    known_quantity: int = 0            # 이 상태머신이 마지막으로 확인한 실제 보유수량
+    known_quantity: int = 0            # 마지막으로 확인한 실제 보유수량(관찰값)
     requested_at: datetime | None = None
     last_filled_at: datetime | None = None
     last_error: str | None = None
+
+    # 2026-08-10 (1P0.1, 재현 확인): 주문 시작 시점의 **불변 스냅샷**.
+    #
+    # 기존 `expected_min = known_quantity + pending_quantity`는 부분체결로
+    # known_quantity가 늘어날 때마다 목표수량이 함께 움직였습니다.
+    # 8/10 047040 실제 로그:
+    #     BUY 353 요청 → broker 146 → known=146
+    #     다음 기대값 146+353 = 499  ← 도달 불가능
+    #     353주 전량 체결 후에도 PENDING_STILL_UNCONFIRMED 반복
+    #
+    # expected_final_quantity는 그 주문이 terminal이 될 때까지 절대
+    # 변경하지 않습니다. known_quantity는 관찰값 역할만 유지하고,
+    # **목표 계산에 다시 쓰지 않습니다.**
+    base_quantity_before_order: int = 0    # 주문 직전 실제 보유수량
+    requested_quantity: int = 0            # 이번 주문의 요청 수량
+    expected_final_quantity: int = 0       # base + requested (불변)
+    observed_quantity: int = 0             # 관찰된 최신 브로커 수량
+    sell_base_quantity: int = 0            # SELL 주문 직전 보유수량(불변)
+
+    # 2026-08-10 (1P0.2): 브로커 거부에 대한 재시도 backoff.
+    # 8/10 047040은 "매도가능수량 부족"을 16초 간격으로 11회 반복해
+    # 브로커 rate limit 위험과 로그 노이즈를 만들었습니다.
+    # 2026-08-10 (1P0.3): PENDING 진입 시각. 브로커 응답이 오지 않는
+    # 구간이 무한정 이어지면 청산 자체가 막히므로 타임아웃이 필요합니다.
+    pending_since: datetime | None = None
+    partial_fill_since: datetime | None = None
+
+    # 2026-08-10 (1P0.4, 재현 확인): 타임아웃으로 OPEN/FLAT을 확정해도
+    # **브로커에 남아 있는 원 주문은 사라지지 않습니다**. 1P0.3은
+    # pending_order_id를 None으로 지워 그 사실 자체를 잊었고, 그 뒤
+    # 새 SELL을 내면 원 주문 + 새 주문이 동시에 체결될 수 있습니다.
+    # 주문을 취소할 수 없으므로(브로커 API 미지원) 최소한 "미확인
+    # 주문이 있다"는 상태를 보존하고, 그 구간의 매도를 제한합니다.
+    # 2026-08-10 (1P0.5): 연속 차단 추적. 어떤 사유든 오래 막히면
+    # 청산 경로를 강제로 열어야 합니다(안전밸브).
+    # 1P0.6: ERROR 진입 시각. 자동 회복 판단 기준.
+    error_since: datetime | None = None
+    last_forced_sell_at: datetime | None = None
+    blocked_since: datetime | None = None
+    blocked_count: int = 0
+    last_block_code: str | None = None
+
+    orphan_order_id: str | None = None
+    orphan_since: datetime | None = None
+    orphan_expected_delta: int = 0     # 원 주문이 체결되면 예상되는 수량 변화
+    sell_reject_count: int = 0
+    sell_reject_last_at: datetime | None = None
+    sell_reject_last_reason: str | None = None
 
 
 class PositionStateMachine:
@@ -148,6 +235,13 @@ class PositionStateMachine:
         state.lifecycle = PositionLifecycle.BUY_PENDING
         state.pending_order_id = order_id
         state.pending_quantity = quantity
+        # 1P0.1: 이 주문의 목표를 여기서 한 번만 고정합니다.
+        state.pending_since = datetime.now()
+        state.partial_fill_since = None
+        state.base_quantity_before_order = state.known_quantity
+        state.requested_quantity = quantity
+        state.expected_final_quantity = state.known_quantity + quantity
+        state.observed_quantity = state.known_quantity
         state.requested_at = datetime.now()
         self._log_event(symbol, "BUY_REQUESTED", prev, state.lifecycle, detail=f"qty={quantity}")
 
@@ -201,49 +295,64 @@ class PositionStateMachine:
         if state.lifecycle != PositionLifecycle.BUY_PENDING:
             return  # BUY_PENDING이 아니면 호출 대상 아님
 
-        expected_min = state.known_quantity + state.pending_quantity
-        if broker_quantity == expected_min:
-            # 요청한 수량만큼 정확히 잔고가 늘어남 -> 전량 체결로 판단
+        # 1P0.1: 불변 스냅샷 기준으로만 판정합니다.
+        base = state.base_quantity_before_order
+        expected_final = state.expected_final_quantity
+        state.observed_quantity = broker_quantity
+
+        if broker_quantity == expected_final:
+            # 목표 수량에 정확히 도달 -> 전량 체결
             state.lifecycle = PositionLifecycle.OPEN
             state.known_quantity = broker_quantity
             state.last_filled_at = datetime.now()
             state.pending_order_id = None
             state.pending_quantity = 0
+            state.requested_quantity = 0
             state.last_error = None
-            self._log_event(symbol, "BUY_CONFIRMED", prev, state.lifecycle, broker_quantity, "FILLED")
-        elif broker_quantity > expected_min:
-            # 2026-07-24: 요청분보다 많이 늘어난 이상 상황 — 자동으로
-            # "체결됐다"고 확정하지 않고 ERROR로 전이. 원인 후보:
-            # 동시에 다른 매수가 겹침(재매수 경합), 브로커 API 응답
-            # 오류, 외부 매매 개입 등. 사람이 실제 계좌를 확인해야
-            # 하는 상황이므로 CRITICAL로 남김.
-            #
-            # 2026-07-24 (11차 수정, GPT 코드리뷰): lifecycle만
-            # ERROR로 바꾸고 known_quantity는 그대로 뒀었음 — 이러면
-            # ERROR 진입 시점의 known_quantity가 "실제로 관찰된 값
-            # (broker_quantity)"이 아니라 "매수 시도 전의 낡은 값"에
-            # 머물러서, 이 시점에 CRITICAL 로그나 다른 로직이
-            # known_quantity를 참조하면 부정확한 값을 보게 됨.
-            # known_quantity를 실제 관찰값으로 갱신 — "우리가 마지막
-            # 으로 확인한 사실"을 정확히 반영. pending_*는 일부러
-            # 지우지 않고 남겨서 "무엇을 기대했다가 어긋났는지"도
-            # 함께 보존(사람이 확인할 때 원인 추적에 필요).
+            state.pending_since = None
+            state.partial_fill_since = None
+            # 2026-08-10 (1P0.7, 재현 확인): base==0이면 FLAT에서 새로
+            # 시작한 포지션입니다 — 이전 사이클의 sell_reject_count/
+            # blocked_since가 남아있으면 첫 SELL이 즉시
+            # RECONCILIATION_REQUIRED로 오판될 수 있습니다.
+            if base == 0:
+                self._reset_transient_block_state(state)
+            self._log_event(symbol, "BUY_CONFIRMED", prev, state.lifecycle,
+                            broker_quantity, f"FILLED(expected_final={expected_final})")
+        elif broker_quantity > expected_final:
+            # 요청분보다 많이 늘어난 이상 상황 — 자동 확정하지 않고 ERROR.
+            # pending_*는 일부러 지우지 않아 "무엇을 기대했다가 어긋났는지"
+            # 를 사람이 추적할 수 있게 남깁니다.
             state.lifecycle = PositionLifecycle.ERROR
             state.known_quantity = broker_quantity
             state.last_error = "UNEXPECTED_QUANTITY_EXCESS"
+            state.error_since = datetime.now()
             self._log_event(
                 symbol, "BUY_CONFIRMED", prev, state.lifecycle, broker_quantity,
-                f"UNEXPECTED_QUANTITY_EXCESS(expected={expected_min}, actual={broker_quantity})",
+                f"UNEXPECTED_QUANTITY_EXCESS(expected_final={expected_final}, "
+                f"actual={broker_quantity})",
             )
-        elif broker_quantity > state.known_quantity:
-            # 늘긴 늘었는데 요청한 만큼은 아님 -> 부분체결, 계속 대기
-            # (남은 수량에 대한 재주문 여부는 상위 로직의 몫 — 여기서는
-            # 상태만 정확히 반영)
+        elif base < broker_quantity < expected_final:
+            # 부분체결 — 목표에 미달했으므로 BUY_PENDING 유지.
+            # known_quantity는 관찰값으로 갱신하되 목표는 건드리지 않습니다.
             state.known_quantity = broker_quantity
             state.last_error = "PARTIAL_FILL"
-            self._log_event(symbol, "BUY_CONFIRMED", prev, prev, broker_quantity, "PARTIAL_FILL_PENDING")
+            if state.partial_fill_since is None:
+                state.partial_fill_since = datetime.now()
+            self._log_event(symbol, "BUY_CONFIRMED", prev, prev, broker_quantity,
+                            f"PARTIAL_FILL_PENDING(base={base}, "
+                            f"expected_final={expected_final})")
+        elif broker_quantity < base:
+            # 주문 전보다 줄어듦 — 외부 매도 등 설명되지 않는 상황
+            state.lifecycle = PositionLifecycle.ERROR
+            state.known_quantity = broker_quantity
+            state.last_error = "UNEXPECTED_QUANTITY_DECREASE"
+            state.error_since = datetime.now()
+            self._log_event(
+                symbol, "BUY_CONFIRMED", prev, state.lifecycle, broker_quantity,
+                f"UNEXPECTED_QUANTITY_DECREASE(base={base}, actual={broker_quantity})",
+            )
         else:
-            # 잔고 변화 없음 -> 아직 브로커 API에 미반영, BUY_PENDING 유지
             self._log_event(symbol, "BUY_CONFIRMED", prev, prev, broker_quantity, "PENDING_STILL_UNCONFIRMED")
 
     def on_sell_requested(self, symbol: str, quantity: int, order_id: str) -> None:
@@ -263,12 +372,19 @@ class PositionStateMachine:
         state.pending_order_id = order_id
         state.pending_quantity = quantity
         state.requested_at = datetime.now()
+        # 1P0.1: SELL 주문 직전 보유수량을 고정합니다. 부분체결 판정의
+        # 기준을 known_quantity(갱신됨)가 아니라 이 값으로 삼습니다.
+        state.pending_since = datetime.now()
+        state.partial_fill_since = None
+        state.sell_base_quantity = state.known_quantity
+        state.observed_quantity = state.known_quantity
         detail = f"qty={quantity}"
         if was_error:
             detail += " (직전 ERROR 상태에서 매도 시도 — 이상치 정리 시도로 추정)"
         self._log_event(symbol, "SELL_REQUESTED", prev, state.lifecycle, detail=detail)
 
-    def on_sell_result(self, symbol: str, accepted: bool, broker_quantity: int) -> None:
+    def on_sell_result(self, symbol: str, accepted: bool, broker_quantity: int,
+                       reject_reason: str | None = None) -> None:
         """매도 주문 결과 처리. broker_quantity는 매도 시도 '이후' 다음
         폴링에서 확인한 실제 잔고 — 이 값으로 전량/부분/미체결을 판단.
         """
@@ -280,19 +396,51 @@ class PositionStateMachine:
             state.last_error = "SELL_REJECTED"
             state.pending_order_id = None
             state.pending_quantity = 0
-            self._log_event(symbol, "SELL_RESULT", prev, state.lifecycle, broker_quantity, "SELL_REJECTED")
+            # 1P0.2: 연속 거부 횟수를 누적해 backoff 근거로 씁니다.
+            state.sell_reject_count += 1
+            state.sell_reject_last_at = datetime.now()
+            state.sell_reject_last_reason = reject_reason
+            self._log_event(
+                symbol, "SELL_RESULT", prev, state.lifecycle, broker_quantity,
+                f"SELL_REJECTED(count={state.sell_reject_count}"
+                + (f", reason={reject_reason}" if reject_reason else "") + ")",
+            )
             return
 
+        sell_base = state.sell_base_quantity or state.known_quantity
+        state.observed_quantity = broker_quantity
+
         if broker_quantity == 0:
-            # 전량 체결
+            # 전량 체결 — 여기서만 FLAT
             state.lifecycle = PositionLifecycle.FLAT
             state.known_quantity = 0
+            state.sell_base_quantity = 0
+            self._reset_transient_block_state(state)
             detail = "FILLED_FULL"
-        elif broker_quantity == state.known_quantity:
+        elif 0 < broker_quantity < sell_base:
+            # 2026-08-10 (1P0.2, 재현 확인): 기존엔 부분체결을 OPEN으로
+            # 되돌리고 pending 정보를 지웠습니다. 그러면 원 SELL 주문의
+            # 나머지가 아직 살아 있는데도 "새 포지션"으로 보여 추가 SELL을
+            # 발행합니다.
+            #   8/10 047040: SELL 353 accepted → broker 343
+            #     → OPEN 전환 → 343주 재매도 → "매도가능수량 부족" 11회
+            # 부분체결만으로 OPEN 전환하지 않고 SELL_PENDING을 유지하며,
+            # pending order 정보도 보존합니다.
+            state.known_quantity = broker_quantity
+            state.last_error = "PARTIAL_FILL"
+            if state.partial_fill_since is None:
+                state.partial_fill_since = datetime.now()
+            self._log_event(
+                symbol, "SELL_RESULT", prev, prev, broker_quantity,
+                f"PARTIAL_FILL_PENDING(sell_base={sell_base}, "
+                f"remaining={broker_quantity})",
+            )
+            return
+        elif broker_quantity == sell_base:
             # 매도 시도 당시 수량과 동일 — 아직 API 미반영, SELL_PENDING 유지
             self._log_event(symbol, "SELL_RESULT", prev, prev, broker_quantity, "PENDING_STILL_UNCONFIRMED")
             return
-        elif broker_quantity > state.known_quantity:
+        elif broker_quantity > sell_base:
             # 2026-07-24 (9차 수정, GPT 코드리뷰): 매도 요청 중인데
             # 잔고가 오히려 늘어난 이상 상황 — 기존엔 이것도 "부분체결"
             # else 분기에 섞여 있었음(잘못된 해석: 매도인데 수량이
@@ -302,28 +450,457 @@ class PositionStateMachine:
             # 갱신 — confirm_buy_from_broker()와 동일한 원칙. 로그
             # 메시지에는 갱신 "전" 값을 남겨야 "얼마에서 얼마로
             # 튀었는지" 알 수 있으므로 미리 변수에 저장해둠.
-            known_before = state.known_quantity
+            known_before = sell_base
             state.lifecycle = PositionLifecycle.ERROR
             state.known_quantity = broker_quantity
             state.last_error = "UNEXPECTED_QUANTITY_INCREASE"
+            state.error_since = datetime.now()
             self._log_event(
                 symbol, "SELL_RESULT", prev, state.lifecycle, broker_quantity,
                 f"UNEXPECTED_QUANTITY_INCREASE(known_before={known_before}, actual={broker_quantity})",
             )
             return
         else:
-            # 부분체결 — 잔여수량으로 OPEN 유지, 재시도 필요
-            state.lifecycle = PositionLifecycle.OPEN
+            # 위 분기가 모든 경우를 덮으므로 여기 오면 안 됩니다.
+            state.lifecycle = PositionLifecycle.ERROR
             state.known_quantity = broker_quantity
-            state.last_error = "PARTIAL_FILL"
-            detail = "PARTIAL_FILL"
+            state.last_error = "UNREACHABLE_SELL_BRANCH"
+            state.error_since = datetime.now()
+            detail = f"UNREACHABLE(sell_base={sell_base}, actual={broker_quantity})"
 
         state.last_filled_at = datetime.now()
         state.pending_order_id = None
         state.pending_quantity = 0
+        # 체결이 진행됐으므로 거부 backoff 해제
+        state.sell_reject_count = 0
+        state.sell_reject_last_at = None
+        state.sell_reject_last_reason = None
+        state.pending_since = None
+        state.partial_fill_since = None
         self._log_event(symbol, "SELL_RESULT", prev, state.lifecycle, broker_quantity, detail)
 
+    # ── 주문 전 guard (1P0.2에서 enforce로 전환) ────────────────
+    # 2026-08-10: 1P0.1에서는 shadow(경고만)였습니다. 그러나 8/10
+    # 실서버에서 "매도가능수량 부족" 11회가 실제로 발생했고, 이는
+    # **정상 운영에서 나오면 안 되는 실패**입니다. 브로커 rate limit
+    # 위험도 있어 shadow 상태로 며칠 더 두는 것이 오히려 위험하다고
+    # 판단해 enforce로 올립니다.
+    #
+    # 상태머신은 브로커 응답으로만 전이하므로, guard가 잘못 잠기면
+    # 청산 자체가 막힐 수 있습니다. 그래서 (1) SELL은 최대 대기
+    # 시간을 두고, (2) 하드 손절·강제청산 경로는 force=True로 우회
+    # 가능하게 하고, (3) 모든 차단을 [LIFECYCLE_BLOCK]으로 남깁니다.
+    # 재시도 backoff — 연속 거부 n회마다 대기 시간을 늘립니다.
+    SELL_RETRY_BACKOFF_SECONDS = (0, 30, 60, 120, 300)
+    SELL_REJECT_MAX_RETRY = 5
+    # 2026-08-10 (1P0.5): 거부 카운터가 '체결 성공'으로만 리셋돼,
+    # MAX_RETRY 도달 후 영구 차단되는 경로가 있었습니다(재현 확인).
+    # 마지막 거부로부터 이 시간이 지나면 카운터를 감쇠시켜
+    # 재시도 기회를 회복합니다.
+    SELL_REJECT_DECAY_SEC = 300
+
+    # 2026-08-10 (1P0.3): PENDING 타임아웃.
+    # 1P0.2는 부분체결 시 SELL_PENDING을 유지하면서 _try_sell을 막아,
+    # 잔여수량이 **영원히 매도되지 않는** 상태를 만들었습니다(재현 확인).
+    # 브로커 응답이 오지 않는 구간을 무한정 신뢰하지 않습니다.
+    SELL_PENDING_TIMEOUT_SEC = 60        # 이후 잔여수량 재매도 허용
+    BUY_PENDING_TIMEOUT_SEC = 120        # 이후 관측값 기준으로 상태 확정
+
+    def _elapsed(self, at: "datetime | None") -> float:
+        return (datetime.now() - at).total_seconds() if at else 0.0
+
+    # 2026-08-10 (1P0.7): TTL로 orphan을 자동 해제하지 않습니다
+    # (TTL 경과는 주문 종료의 증거가 아님). 진단 로그의 "age" 표시용
+    # 참고값으로만 남깁니다.
+    ORPHAN_TTL_SEC = 600
+
+    def has_orphan_order(self, symbol: str) -> bool:
+        """orphan 주문이 미확인 상태인가.
+
+        2026-08-10 (1P0.7, GPT 코드리뷰 재현 확인): TTL 경과는 주문
+        종료의 증거가 아닙니다. TTL로 자동 해제하던 것을 제거했습니다
+        — orphan은 명시적 확인(`observe_for_orphan`의 정확한 목표
+        도달, 또는 `acknowledge_orphan`) 없이는 영원히 유지됩니다.
+        """
+        return bool(self.get(symbol).orphan_order_id)
+
+    def clear_orphan(self, symbol: str, note: str = "") -> None:
+        """orphan 주문이 해소됐다고 표시합니다."""
+        state = self.get(symbol)
+        if not state.orphan_order_id:
+            return
+        prev_id = state.orphan_order_id
+        state.orphan_order_id = None
+        state.orphan_since = None
+        state.orphan_expected_delta = 0
+        self._log_event(symbol, "ORPHAN_CLEARED", state.lifecycle, state.lifecycle,
+                        state.known_quantity, f"order={prev_id} {note}")
+
+    def acknowledge_orphan(self, symbol: str, note: str) -> None:
+        """사람이 브로커에서 원 주문 상태를 직접 확인한 뒤 해제합니다.
+
+        2026-08-10 (1P0.7): 자동 해제 경로(부분 잔고 변화, TTL)를
+        제거했으므로, 명확한 증거가 없는 orphan은 이 메서드로만
+        해소됩니다. `note`에 확인 근거를 남기십시오.
+        """
+        if not note:
+            raise ValueError("acknowledge_orphan에는 확인 근거(note)가 필요합니다")
+        self.clear_orphan(symbol, f"ACKNOWLEDGED: {note}")
+
+    def observe_for_orphan(self, symbol: str, broker_quantity: int) -> str | None:
+        """잔고가 **정확히 목표에 도달**했을 때만 orphan을 자동 해소합니다.
+
+        2026-08-10 (1P0.7, GPT 코드리뷰, 재현 확인): 이전엔 "잔고가
+        줄기만 하면" SELL orphan을 해소했습니다. 343→300은 43주가
+        추가로 체결된 것뿐일 수 있고, 원 주문의 나머지 300주는 여전히
+        브로커에 살아있을 수 있습니다. 부분 변화는 증거가 아닙니다.
+
+        이 시스템은 항상 전량매도만 하므로(설계 불변), SELL orphan의
+        유일한 확실한 종료 증거는 **잔고 0 도달**입니다. BUY orphan은
+        `expected_final_quantity`(주문 시작 시 고정된 목표)에 정확히
+        도달했을 때만 확정합니다. 그 외의 모든 변화는 진단 로그만
+        남기고 orphan을 유지합니다 — 필요하면 `acknowledge_orphan()`
+        으로 사람이 명시적으로 해소하십시오.
+        """
+        state = self.get(symbol)
+        if not state.orphan_order_id:
+            return None
+        if state.orphan_expected_delta < 0 and broker_quantity == 0:
+            note = "잔고 0 도달 (SELL orphan 완전 체결 확인)"
+            self.clear_orphan(symbol, note)
+            return note
+        if state.orphan_expected_delta > 0 and broker_quantity == state.expected_final_quantity:
+            note = f"목표수량({state.expected_final_quantity}) 도달 (BUY orphan 완전 체결 확인)"
+            self.clear_orphan(symbol, note)
+            return note
+        if broker_quantity != state.known_quantity:
+            self._log_event(
+                symbol, "ORPHAN_PARTIAL_OBSERVED", state.lifecycle, state.lifecycle,
+                broker_quantity,
+                f"order={state.orphan_order_id} 잔고 변화 감지"
+                f"({state.known_quantity}→{broker_quantity})했으나 목표 미도달 — "
+                f"orphan 유지(진단 전용, 자동 해소 아님)",
+            )
+        return None
+
+    def sell_pending_stale(self, symbol: str) -> bool:
+        """SELL_PENDING이 타임아웃을 넘겼는가 (`resolve_stale_pending`용)."""
+        state = self.get(symbol)
+        if state.lifecycle != PositionLifecycle.SELL_PENDING:
+            return False
+        base = state.partial_fill_since or state.pending_since
+        return self._elapsed(base) >= self.SELL_PENDING_TIMEOUT_SEC
+
+    def _reset_transient_block_state(self, state: SymbolPositionState) -> None:
+        """새 포지션 사이클 시작(FLAT 확정) 시 임시 차단 흔적을 지웁니다.
+
+        2026-08-10 (1P0.7, GPT 코드리뷰, 재현 확인): 이전 사이클의
+        `sell_reject_count`/`blocked_since`가 다음 사이클로 넘어가,
+        새로 산 종목의 **첫 SELL이 즉시 RECONCILIATION_REQUIRED로
+        승격**되는 사고가 재현됐습니다. FLAT 확정 시점에 반드시
+        초기화합니다.
+        """
+        state.sell_reject_count = 0
+        state.sell_reject_last_at = None
+        state.sell_reject_last_reason = None
+        state.blocked_since = None
+        state.blocked_count = 0
+        state.last_block_code = None
+        state.last_forced_sell_at = None
+        state.error_since = None
+        # orphan은 FLAT이 됐다는 것 자체가 강한 종료 증거이므로 함께 정리.
+        state.orphan_order_id = None
+        state.orphan_since = None
+        state.orphan_expected_delta = 0
+
+    def resolve_stale_pending(self, symbol: str, broker_quantity: int) -> str | None:
+        """타임아웃된 PENDING을 관측값 기준으로 확정합니다.
+
+        2026-08-10 (1P0.3): 상태머신이 브로커 응답만 기다리다 잠기는
+        것을 막는 탈출구입니다. 매 폴링에서 호출하며, 타임아웃 전에는
+        아무것도 하지 않습니다.
+
+        **주의(1P0.7)**: 이 함수는 lifecycle을 SELL_PENDING/BUY_PENDING
+        에서 벗어나게 할 뿐, `decide_sell()`/`would_block_buy_detail()`
+        guard를 풀어주지 않습니다 — 잔여수량이 있으면 orphan으로
+        이관되어 계속 HARD block됩니다. 잔여수량이 0이면(=완전 청산
+        확인) FLAT으로 확정하고 임시 차단 상태를 초기화합니다.
+        """
+        state = self.get(symbol)
+        prev = state.lifecycle
+        if prev == PositionLifecycle.SELL_PENDING:
+            base = state.partial_fill_since or state.pending_since
+            if self._elapsed(base) < self.SELL_PENDING_TIMEOUT_SEC:
+                return None
+            if broker_quantity <= 0:
+                state.lifecycle = PositionLifecycle.FLAT
+                state.known_quantity = 0
+            else:
+                # 잔여수량이 남았으므로 OPEN으로 되돌리되, orphan HARD
+                # block으로 이관해 새 SELL을 계속 막습니다(아래).
+                state.lifecycle = PositionLifecycle.OPEN
+                state.known_quantity = broker_quantity
+            if broker_quantity > 0 and state.pending_order_id:
+                state.orphan_order_id = state.pending_order_id
+                state.orphan_since = datetime.now()
+                state.orphan_expected_delta = -broker_quantity
+            state.pending_order_id = None
+            state.pending_quantity = 0
+            state.pending_since = None
+            state.partial_fill_since = None
+            if state.lifecycle == PositionLifecycle.FLAT:
+                self._reset_transient_block_state(state)
+            detail = (f"SELL_PENDING_TIMEOUT({self.SELL_PENDING_TIMEOUT_SEC}s) "
+                      f"→ {state.lifecycle.value}(qty={broker_quantity})"
+                      + (f" ORPHAN({state.orphan_order_id}) — 여전히 HARD block"
+                         if state.orphan_order_id else ""))
+            self._log_event(symbol, "PENDING_TIMEOUT", prev, state.lifecycle,
+                            broker_quantity, detail)
+            return detail
+        if prev == PositionLifecycle.BUY_PENDING:
+            base = state.partial_fill_since or state.pending_since
+            if self._elapsed(base) < self.BUY_PENDING_TIMEOUT_SEC:
+                return None
+            state.lifecycle = (PositionLifecycle.OPEN if broker_quantity > 0
+                               else PositionLifecycle.FLAT)
+            state.known_quantity = max(0, broker_quantity)
+            if state.pending_order_id:
+                state.orphan_order_id = state.pending_order_id
+                state.orphan_since = datetime.now()
+                state.orphan_expected_delta = max(
+                    0, state.expected_final_quantity - broker_quantity)
+            state.pending_order_id = None
+            state.pending_quantity = 0
+            state.requested_quantity = 0
+            state.pending_since = None
+            state.partial_fill_since = None
+            if state.lifecycle == PositionLifecycle.FLAT:
+                self._reset_transient_block_state(state)
+            detail = (f"BUY_PENDING_TIMEOUT({self.BUY_PENDING_TIMEOUT_SEC}s) "
+                      f"→ {state.lifecycle.value}(qty={broker_quantity})"
+                      + (f" ORPHAN({state.orphan_order_id}) — 여전히 HARD block"
+                         if state.orphan_order_id else ""))
+            self._log_event(symbol, "PENDING_TIMEOUT", prev, state.lifecycle,
+                            broker_quantity, detail)
+            return detail
+        return None
+
+    def decay_sell_rejects(self, symbol: str) -> bool:
+        """마지막 거부 후 충분히 지났으면 카운터를 감쇠합니다 (SOFT block 전용)."""
+        state = self.get(symbol)
+        if not state.sell_reject_count or state.sell_reject_last_at is None:
+            return False
+        if self._elapsed(state.sell_reject_last_at) < self.SELL_REJECT_DECAY_SEC:
+            return False
+        state.sell_reject_count = max(0, state.sell_reject_count - 1)
+        state.sell_reject_last_at = datetime.now()
+        if state.sell_reject_count == 0:
+            state.sell_reject_last_reason = None
+        return True
+
+    def sell_backoff_remaining(self, symbol: str) -> float:
+        """다음 SELL 재시도까지 남은 초. 0이면 즉시 가능."""
+        self.decay_sell_rejects(symbol)
+        state = self.get(symbol)
+        if not state.sell_reject_count or state.sell_reject_last_at is None:
+            return 0.0
+        idx = min(state.sell_reject_count, len(self.SELL_RETRY_BACKOFF_SECONDS) - 1)
+        wait = self.SELL_RETRY_BACKOFF_SECONDS[idx]
+        elapsed = (datetime.now() - state.sell_reject_last_at).total_seconds()
+        return max(0.0, wait - elapsed)
+
+    # 2026-08-10 (1P0.7, GPT 코드리뷰): 차단을 HARD와 SOFT로 명확히
+    # 분리합니다.
+    #   HARD  — 미확인 주문(BUY_PENDING/SELL_PENDING/orphan) 또는 ERROR.
+    #           forced로도 절대 우회할 수 없고, 시간이 지나도 ALLOW로
+    #           풀리지 않습니다. MAX_BLOCK_DURATION_SEC을 넘기면
+    #           RECONCILIATION_REQUIRED로 승격되어 CRITICAL 로그를
+    #           남기지만 **여전히 매도를 허용하지 않습니다** — 손절이
+    #           막히더라도, "이미 살아있을 수 있는 주문 위에 새 주문을
+    #           더 얹는 것"보다 사람의 확인을 기다리는 편이 안전하다는
+    #           판단입니다(재현: orphan 상태에서 forced가 새 SELL을
+    #           허용해 이중 매도로 이어질 수 있었음).
+    #   SOFT  — 재시도 backoff/MAX_RETRY. 이건 우리 시스템의 자체
+    #           재시도 제한일 뿐 브로커 주문 상태와 무관하므로, forced는
+    #           우회할 수 있고 시간(decay)으로 자연히 풀립니다.
+    MAX_BLOCK_DURATION_SEC = 300
+    FORCED_SELL_MIN_INTERVAL_SEC = 30
+
+    def _evaluate_hard_sell_blocks(self, symbol: str) -> tuple[str, str] | None:
+        state = self.get(symbol)
+        if state.lifecycle == PositionLifecycle.BUY_PENDING:
+            return ("BLOCK_BUY_PENDING_SELL",
+                    f"pending_order={state.pending_order_id}, "
+                    f"expected_final={state.expected_final_quantity}, "
+                    f"observed={state.observed_quantity}")
+        if state.lifecycle == PositionLifecycle.SELL_PENDING:
+            return ("BLOCK_DUPLICATE_SELL",
+                    f"pending_order={state.pending_order_id}, "
+                    f"sell_base={state.sell_base_quantity}, "
+                    f"observed={state.observed_quantity}")
+        if self.has_orphan_order(symbol):
+            return ("BLOCK_SELL_ORPHAN_ORDER",
+                    f"order={state.orphan_order_id}, "
+                    f"age={self._elapsed(state.orphan_since):.0f}s")
+        if state.lifecycle == PositionLifecycle.ERROR:
+            return ("BLOCK_SELL_ERROR_STATE", f"last_error={state.last_error}")
+        return None
+
+    def _evaluate_soft_sell_blocks(self, symbol: str) -> tuple[str, str] | None:
+        state = self.get(symbol)
+        self.decay_sell_rejects(symbol)
+        remain = self.sell_backoff_remaining(symbol)
+        if remain > 0:
+            return ("BLOCK_SELL_RETRY_BACKOFF",
+                    f"count={state.sell_reject_count}, wait={remain:.0f}s, "
+                    f"reason={state.sell_reject_last_reason}")
+        if state.sell_reject_count >= self.SELL_REJECT_MAX_RETRY:
+            return ("BLOCK_SELL_MAX_RETRY",
+                    f"count={state.sell_reject_count}, "
+                    f"reason={state.sell_reject_last_reason}")
+        return None
+
+    def _evaluate_sell_blocks(self, symbol: str,
+                              now: "datetime | None" = None) -> tuple[str, str] | None:
+        """하위호환 — HARD를 먼저, 없으면 SOFT를 확인합니다."""
+        return self._evaluate_hard_sell_blocks(symbol) or self._evaluate_soft_sell_blocks(symbol)
+
+    def check_block_escalation(self, symbol: str,
+                               now: "datetime | None" = None) -> str | None:
+        """HARD block 지속 시간을 **폴링마다** 확인합니다.
+
+        2026-08-10 (1P0.6→1P0.7): `decide_sell()`이 SELL 신호가 있을
+        때만 호출되므로, 신호가 없는 동안 차단이 조용히 지속됩니다.
+        이 함수를 sync 루프에서 매 폴링 호출해 HARD block만 감시하고
+        CRITICAL을 즉시 노출합니다. **상태를 바꾸거나 매도를 허용하지
+        않습니다** — RECONCILIATION_REQUIRED는 사람의 개입 신호일
+        뿐입니다.
+        """
+        now = now or datetime.now()
+        state = self.get(symbol)
+        hard = self._evaluate_hard_sell_blocks(symbol)
+        if hard is None:
+            if state.blocked_since is not None:
+                self._clear_block_tracking(state)
+            return None
+        code, detail = hard
+        if state.blocked_since is None:
+            state.blocked_since = now
+        state.last_block_code = code
+        blocked_for = (now - state.blocked_since).total_seconds()
+        if blocked_for >= self.MAX_BLOCK_DURATION_SEC:
+            return (f"RECONCILIATION_REQUIRED(code={code}, "
+                    f"blocked_for={blocked_for:.0f}s, detail={detail})")
+        return None
+
+    def decide_sell(self, symbol: str, *, forced: bool = False,
+                    now: "datetime | None" = None) -> SellDecisionResult:
+        """매도 가능 여부를 단일 진입점에서 결정합니다.
+
+        **우선순위**
+          1. HARD block — BUY_PENDING/SELL_PENDING/orphan/ERROR.
+             forced로도 우회 불가. 5분 초과 시 RECONCILIATION_REQUIRED
+             (여전히 BLOCKED — 사람 개입 필요).
+          2. forced — HARD block이 없을 때만 평가. throttle 적용.
+          3. SOFT block — 재시도 backoff/MAX_RETRY. forced가 우회.
+          4. ALLOW
+        """
+        now = now or datetime.now()
+        state = self.get(symbol)
+
+        # ── 1. HARD block ────────────────────────────────────────
+        hard = self._evaluate_hard_sell_blocks(symbol)
+        if hard is not None:
+            code, detail = hard
+            if state.blocked_since is None:
+                state.blocked_since = now
+            state.blocked_count += 1
+            state.last_block_code = code
+            blocked_for = (now - state.blocked_since).total_seconds()
+            if blocked_for >= self.MAX_BLOCK_DURATION_SEC:
+                self._log_event(
+                    symbol, "RECONCILIATION_REQUIRED", state.lifecycle, state.lifecycle,
+                    state.known_quantity,
+                    f"{code} 지속 {blocked_for:.0f}s — 자동 해제하지 않음, "
+                    f"사람 확인 필요: {detail}",
+                )
+                return SellDecisionResult(
+                    SellDecision.RECONCILIATION_REQUIRED, code, detail)
+            return SellDecisionResult(SellDecision.BLOCKED, code, detail)
+
+        # HARD block이 없으면 그 추적은 정리(SOFT는 별도 카운터로 관리).
+        if state.blocked_since is not None:
+            self._clear_block_tracking(state)
+
+        # ── 2. forced ───────────────────────────────────────────
+        if forced:
+            last = state.last_forced_sell_at
+            if last and (now - last).total_seconds() < self.FORCED_SELL_MIN_INTERVAL_SEC:
+                return SellDecisionResult(
+                    SellDecision.THROTTLED, "FORCED_SELL_THROTTLED",
+                    f"min_interval={self.FORCED_SELL_MIN_INTERVAL_SEC}s")
+            state.last_forced_sell_at = now
+            return SellDecisionResult(SellDecision.ALLOW_FORCED, "FORCED")
+
+        # ── 3. SOFT block ───────────────────────────────────────
+        soft = self._evaluate_soft_sell_blocks(symbol)
+        if soft is not None:
+            code, detail = soft
+            return SellDecisionResult(SellDecision.BLOCKED, code, detail)
+
+        return SellDecisionResult(SellDecision.ALLOW)
+
+    @staticmethod
+    def _clear_block_tracking(state: SymbolPositionState) -> None:
+        state.blocked_since = None
+        state.blocked_count = 0
+        state.last_block_code = None
+
+    def would_block_sell(self, symbol: str) -> str | None:
+        """하위호환 조회용. 실제 판단은 `decide_sell()`을 쓰십시오."""
+        block = self._evaluate_sell_blocks(symbol)
+        if block is None:
+            return None
+        return f"{block[0]}({block[1]})"
+
+    def would_block_buy_detail(self, symbol: str) -> tuple[str, str] | None:
+        """(안정적 code, 상세) 형태로 반환합니다.
+
+        2026-08-10 (1P0.7, GPT 코드리뷰): SELL_PENDING과 orphan에서도
+        신규 BUY가 가능했습니다(재현: 원 주문 상태를 모르면 해당
+        종목의 모든 신규 자동 주문을 잠가야 함). SELL 쪽 HARD block과
+        동일한 조건을 공유합니다.
+        """
+        state = self.get(symbol)
+        if state.lifecycle == PositionLifecycle.BUY_PENDING:
+            return ("BLOCK_BUY_WHILE_PENDING",
+                    f"pending_order={state.pending_order_id}, "
+                    f"expected_final={state.expected_final_quantity}, "
+                    f"observed={state.observed_quantity}")
+        if state.lifecycle == PositionLifecycle.SELL_PENDING:
+            return ("BLOCK_BUY_WHILE_SELL_PENDING",
+                    f"pending_order={state.pending_order_id}, "
+                    f"sell_base={state.sell_base_quantity}")
+        if self.has_orphan_order(symbol):
+            return ("BLOCK_BUY_ORPHAN_ORDER",
+                    f"order={state.orphan_order_id}, "
+                    f"age={self._elapsed(state.orphan_since):.0f}s")
+        if state.lifecycle == PositionLifecycle.ERROR:
+            return ("BLOCK_BUY_IN_ERROR", f"last_error={state.last_error}")
+        return None
+
+    def would_block_buy(self, symbol: str) -> str | None:
+        """이 시점에 BUY를 내보내면 미결/미확인 주문과 겹치는지."""
+        detail = self.would_block_buy_detail(symbol)
+        if detail is None:
+            return None
+        return f"{detail[0]}({detail[1]})"
+
     def check_invariant(self, symbol: str, broker_quantity: int) -> str | None:
+        # 1P0.4: orphan 주문이 살아 있으면 잔고 불일치가 정상입니다 —
+        # CRITICAL 오탐을 막기 위해 이 구간은 검사에서 제외합니다.
+        if self.has_orphan_order(symbol):
+            return None
         """불변조건 위반 여부를 확인합니다.
 
         위반 예시: 브로커 잔고 > 0인데 로컬 상태가 FLAT — 이건 항상

@@ -211,6 +211,12 @@ class TradingService:
         # 검증 완료 후 실제 교체 예정 — domain/position/lifecycle.py 참고.
         self._position_state_machine = PositionStateMachine(logger=self.position_lifecycle_logger)
         self._position_state_machine_initialized = False
+        # 1P0.4: 종목별 마지막 강제 매도 시각(최소 간격 적용용)
+        self._last_forced_sell_at: dict[str, datetime] = {}
+        # 1P0.6: 강제 매도가 브로커에 거부된 연속 횟수(종목별)
+        self._forced_sell_failures: dict[str, int] = {}
+        # 1P0.7: SELL accepted~완전 청산 확정 사이 대기 중인 side-effect 컨텍스트
+        self._pending_sell_side_effects: dict[str, dict] = {}
 
         # 일일 리포트 생성기
         self._reporter = DailyReporter(
@@ -1758,6 +1764,7 @@ class TradingService:
                 symbol=symbol,
                 quantity=pos.quantity,
                 current_price=current,
+                force=True,   # 1P0.2: 이월 방지는 반드시 나가야 하는 경로
                 exit_reason=(
                     f"이월 방지 강제청산 — "
                     f"{force_h:02d}:{force_m:02d} 이후 수익 쿠션 없음 ({pnl_pct:+.2f}%)"
@@ -2001,6 +2008,21 @@ class TradingService:
 
             # 불변조건 검사 — PENDING 상태는 정상적으로 일시 불일치가
             # 날 수 있으므로 검사 대상에서 제외
+            # 1P0.4: 잔고 변화로 orphan 주문 해소 여부를 먼저 확인.
+            # 1P0.6: 신호와 무관하게 매 폴링 감시.
+            # (a) 차단이 오래 지속되면 즉시 드러냅니다 — decide_sell만
+            #     의존하면 SELL 신호가 없는 동안 조용히 갇힙니다.
+            _esc = psm.check_block_escalation(symbol)
+            if _esc:
+                self.app_logger.critical(f"[LIFECYCLE_STUCK] {symbol} {_esc}")
+            # 2026-08-10 (1P0.7, GPT 코드리뷰): ERROR 자동 회복(900초)을
+            # 제거했습니다. "시간이 지났다"는 원 주문이 terminal이라는
+            # 증거가 아닙니다 — check_block_escalation()의
+            # RECONCILIATION_REQUIRED로만 노출하고, 실제 해제는
+            # acknowledge_error()로 사람이 확인 후 수행합니다.
+            _orphan = psm.observe_for_orphan(symbol, broker_qty)
+            if _orphan:
+                self.app_logger.warning(f"[LIFECYCLE_ORPHAN] {symbol} 해소 | {_orphan}")
             violation = psm.check_invariant(symbol, broker_qty)
             if violation:
                 self.app_logger.critical(f"[POSITION_STATE_MISMATCH][SHADOW] {violation}")
@@ -2010,12 +2032,25 @@ class TradingService:
                 # 매도 요청 다음 폴링 — 브로커 잔고를 다시 조회해 실제로
                 # 전량/부분/미체결인지 판정 (on_sell_result 내부 로직)
                 psm.on_sell_result(symbol, accepted=True, broker_quantity=broker_qty)
+                # 1P0.7: 이 폴링에서 FLAT이 확정됐으면(완전 청산 확인)
+                # 보류해뒀던 손실/쿨다운/알림 side effect를 지금 실행합니다.
+                if psm.get(symbol).lifecycle == PositionLifecycle.FLAT:
+                    self._apply_deferred_sell_side_effects(symbol)
+                # 1P0.3: 브로커가 응답하지 않아 PENDING이 굳는 것을 방지.
+                _resolved = psm.resolve_stale_pending(symbol, broker_qty)
+                if _resolved:
+                    self.app_logger.warning(f"[LIFECYCLE_TIMEOUT] {symbol} {_resolved}")
+                    if psm.get(symbol).lifecycle == PositionLifecycle.FLAT:
+                        self._apply_deferred_sell_side_effects(symbol)
             elif state.lifecycle == PositionLifecycle.BUY_PENDING:
                 # 2026-07-23: 매도와 대칭 — 매수 요청 다음 폴링에서
                 # 브로커 잔고를 다시 조회해 실제로 체결됐는지 확인.
                 # 기존엔 이 분기가 없어서 BUY_PENDING을 그냥 지나쳤음
                 # (매수는 _try_buy 안에서 즉시 확정했었으므로).
                 psm.confirm_buy_from_broker(symbol, broker_qty)
+                _resolved = psm.resolve_stale_pending(symbol, broker_qty)
+                if _resolved:
+                    self.app_logger.warning(f"[LIFECYCLE_TIMEOUT] {symbol} {_resolved}")
             else:
                 psm.sync_from_broker(symbol, broker_qty)
 
@@ -2114,6 +2149,31 @@ class TradingService:
             self._run_replay_today(now.date())
             self._run_bb_block_impact_today(now.date())
             self._run_shadow_analysis_today(now.date())
+            self._export_daily_bundle_today(now.date())
+
+    def _export_daily_bundle_today(self, target_date) -> None:
+        """분석용 일일 번들(exports/bundle_YYYYMMDD.zip)을 생성합니다.
+
+        2026-08-06 (1I단계): 분석 때마다 signal_log.csv(65MB,
+        22만행)와 app.log(9MB) 전체를 올려야 했음. 해당 거래일
+        몫만 잘라내면 실측 74MB → 0.5MB. **모든 리포트가 생성된
+        뒤에 실행**해야 그날 리포트까지 함께 담기므로 마지막에 둠.
+        """
+        try:
+            import subprocess, sys
+            date_str = target_date.strftime("%Y-%m-%d")
+            result = subprocess.run(
+                [sys.executable, "export_daily_bundle.py", date_str],
+                capture_output=True, text=True, timeout=300,
+                cwd=str(Path(__file__).resolve().parents[2]),
+                encoding="utf-8", errors="replace",
+            )
+            if result.returncode == 0:
+                self.app_logger.info("[EXPORT] 분석용 일일 번들 생성 완료 → exports/ 저장")
+            else:
+                self.app_logger.warning(f"[EXPORT] 번들 생성 실패:\n{result.stderr}")
+        except Exception as exc:
+            self.app_logger.warning(f"[EXPORT] 번들 생성 오류: {exc}")
 
     def _run_shadow_analysis_today(self, target_date) -> None:
         """장 마감 후 shadow 관측 데이터 리포트를 자동 생성합니다.
@@ -2282,6 +2342,22 @@ class TradingService:
         """매수 주문 가능 여부를 검사한 뒤 실제 주문을 시도합니다.
         반환값: 차단 사유 문자열 (차단 없으면 빈 문자열)
         """
+
+        # ── 1P0.2: 미결 주문 중 재매수 차단 ─────────────────────
+        # 8/10 006360/017900: BUY 부분체결로 BUY_PENDING인 상태에서
+        # 추가 주문이 겹쳐 UNEXPECTED_QUANTITY_INCREASE(ERROR)가
+        # 발생했습니다. ERROR 상태에서의 매수도 함께 막습니다 —
+        # 사람이 확인하지 않은 이상치 위에 새 포지션을 쌓으면 안 됩니다.
+        # 1P0.3: order_block_reason에는 **파라미터 없는 code**만 넣습니다.
+        # 상세(expected_final=174, observed=7 등)를 그대로 넣으면 값마다
+        # 다른 사유가 되어 skip_reason 분포가 오염됩니다.
+        _buy_block = self._position_state_machine.would_block_buy_detail(symbol)
+        if _buy_block:
+            _code, _detail = _buy_block
+            self.app_logger.warning(
+                f"[LIFECYCLE_BLOCK] {symbol} BUY 차단 | {_code} | {_detail}"
+            )
+            return _code
 
         # ── excluded_symbols 차단 ───────────────────────────────
         excluded = getattr(self.settings.trading, 'excluded_symbols', [])
@@ -2597,6 +2673,27 @@ class TradingService:
                         f"— {_msg}"
                     )
 
+    # 손절·강제청산으로 간주할 사유 키워드. 이 사유의 매도는 guard를
+    # 우회합니다 — 막히면 손실이 무한정 커지기 때문입니다.
+    FORCED_EXIT_KEYWORDS = ("손절", "강제청산", "이월 방지", "stop", "긴급")
+    # 1P0.4: 강제 매도도 최소 간격을 둡니다(무제한 재시도 방지).
+    FORCED_SELL_MIN_INTERVAL_SEC = 30
+
+    @classmethod
+    def _is_forced_exit_reason(cls, exit_reason: str) -> bool:
+        text = str(exit_reason or "")
+        return any(k in text for k in cls.FORCED_EXIT_KEYWORDS)
+
+    # ── 1P0.2: 모든 SELL 경로의 단일 관문 ──────────────────────
+    # 8/10 047040은 "매도가능수량 부족"을 16초 간격으로 11회 반복
+    # 했습니다. 1P0.1은 lifecycle 상태만 고쳤을 뿐 `_try_sell` 호출
+    # 자체를 막지 못했습니다 — 호출부마다 guard를 넣으면 새 경로가
+    # 생길 때 빠지므로, `_try_sell`을 dispatcher로 만들어 **모든
+    # 경로가 반드시 통과**하게 합니다.
+    #
+    # force=True는 하드 손절·강제청산처럼 반드시 나가야 하는 경로용
+    # 우회구입니다. guard가 잘못 잠겨 청산이 막히는 상황을 피하기
+    # 위한 안전판이며, 사용 시 반드시 로그에 남깁니다.
     def _try_sell(
         self,
         symbol: str,
@@ -2604,8 +2701,62 @@ class TradingService:
         current_price: int = 0,
         exit_reason: str = "",
         avg_buy_price: int = 0,
+        force: bool = False,
     ) -> None:
-        """매도 주문을 생성하고 브로커로 전달합니다."""
+        """매도 결정을 상태머신 단일 진입점에 위임합니다 (1P0.5).
+
+        1P0.2~1P0.4는 서비스 계층과 상태머신 양쪽에 차단 규칙이
+        흩어져 있어 조합을 검증하기 어려웠습니다. 이제 판단은
+        `decide_sell()` 한 곳에서만 하고, 여기서는 결과를 기록하고
+        실행할지만 정합니다.
+        """
+        if not force and self._is_forced_exit_reason(exit_reason):
+            force = True
+        decision = self._position_state_machine.decide_sell(symbol, forced=force)
+
+        if decision.decision.value == "RECONCILIATION_REQUIRED":
+            # 2026-08-10 (1P0.7, GPT 코드리뷰): HARD block이 5분 이상
+            # 지속됐다는 신호입니다. 매도를 허용하지 않습니다 — 원
+            # 주문 상태를 모르는 채로 새 주문을 더 얹는 것보다, 사람이
+            # 브로커에서 직접 확인하는 편이 안전합니다. 손절이어도
+            # 여기서 막힙니다(의도된 동작).
+            self.app_logger.critical(
+                f"[RECONCILIATION_REQUIRED] {symbol} SELL 차단(장시간) | "
+                f"{decision.code} | {decision.detail} | "
+                f"요청수량={quantity} 사유={exit_reason} — 브로커에서 직접 확인 필요"
+            )
+            return
+        if decision.decision.value == "BLOCKED":
+            self.app_logger.warning(
+                f"[LIFECYCLE_BLOCK] {symbol} SELL 차단 | {decision.code} | "
+                f"{decision.detail} | 요청수량={quantity} 사유={exit_reason}"
+            )
+            return
+        if decision.decision.value == "THROTTLED":
+            self.app_logger.warning(
+                f"[LIFECYCLE_FORCE_THROTTLE] {symbol} 강제매도 최소간격 미달 | "
+                f"{decision.code} | 사유={exit_reason}"
+            )
+            return
+        if decision.decision.value == "ALLOW_FORCED":
+            self.app_logger.warning(
+                f"[LIFECYCLE_FORCE] {symbol} 강제 매도 경로 | 사유={exit_reason}"
+            )
+
+        self._try_sell_unchecked(
+            symbol, quantity, current_price, exit_reason, avg_buy_price,
+        )
+
+    def _try_sell_unchecked(
+        self,
+        symbol: str,
+        quantity: int,
+        current_price: int = 0,
+        exit_reason: str = "",
+        avg_buy_price: int = 0,
+    ) -> None:
+        """실제 매도 주문 발행. **직접 호출하지 마십시오** — guard를
+        건너뜁니다. 반드시 `_try_sell()`을 통해 호출하십시오."""
         order = OrderRequest(symbol=symbol, side=OrderSide.SELL, quantity=quantity)
         # ── 포지션 상태머신 shadow 통지 (2026-07-22) ────────────────
         # on_sell_result는 여기서 바로 호출하지 않음 — "체결됐는지"는
@@ -2615,7 +2766,24 @@ class TradingService:
         self._position_state_machine.on_sell_requested(symbol, quantity, "pending")
         result = self.broker.place_order(order)
         if not result.accepted:
-            self._position_state_machine.on_sell_result(symbol, accepted=False, broker_quantity=0)
+            self._position_state_machine.on_sell_result(
+                symbol, accepted=False, broker_quantity=0,
+                reject_reason=str(getattr(result, "message", "") or "")[:80],
+            )
+            # 1P0.6: 강제 매도(손절·강제청산)가 브로커에 거부되면
+            # 시스템이 자체 해결할 수 없습니다 — 조용히 넘기지 않고
+            # CRITICAL로 즉시 노출합니다.
+            if self._is_forced_exit_reason(exit_reason):
+                self._forced_sell_failures[symbol] = (
+                    self._forced_sell_failures.get(symbol, 0) + 1
+                )
+                self.app_logger.critical(
+                    f"[FORCED_SELL_FAILED] {symbol} 강제 매도 거부 "
+                    f"(연속 {self._forced_sell_failures[symbol]}회) | "
+                    f"사유={exit_reason} | 브로커={getattr(result, 'message', '')}"
+                )
+        else:
+            self._forced_sell_failures.pop(symbol, None)
 
         # 보유 시간 계산
         hold_minutes = ""
@@ -2667,97 +2835,132 @@ class TradingService:
                 self._sold_today_qty_snapshot: dict[str, int] = {}
             self._sold_today_qty_snapshot[symbol] = quantity
 
-            # 매도 시각 기록 → 재진입 쿨다운에 사용
-            now_iso = datetime.now().isoformat()
-            self.state.last_sold_at_by_symbol[symbol] = now_iso
-            self.state.entry_time_by_symbol.pop(symbol, None)
-
-            # ── 재진입 제한 state 업데이트 ──────────────
-            avg_p = avg_buy_price if avg_buy_price > 0 else 0
-            sold_price = current_price
-            is_loss = avg_p > 0 and sold_price < avg_p
-            is_stoploss = "손절" in exit_reason
-            is_trail_loss = "트레일링" in exit_reason and is_loss
-
-            if is_loss:
-                cnt = self.state.symbol_loss_count_today.get(symbol, 0) + 1
-                self.state.symbol_loss_count_today[symbol] = cnt
-                # ── 전역 연속손절 카운터는 '새로운 종목'의 손실만 반영 ──
-                # 2026-06-15: 한 종목 반복매매(같은 종목 2회 이상 손실)가
-                # 전역 max_consecutive_losses를 소진시켜 계좌 전체가
-                # 차단되는 문제 발생(005930 3연속 손절 → 전체 매수 중단).
-                # cnt==1(해당 종목 첫 손실)일 때만 전역 카운터 증가.
-                # 같은 종목 반복 손실은 symbol_loss_count_today(종목별
-                # DAILY_LOSS_LIMIT, 한도 2)로 별도 차단됨.
-                if cnt == 1:
-                    self.state.consecutive_losses += 1
-                self.app_logger.info(
-                    f"[LOSS_CNT] {symbol} | 당일 손실 {cnt}회 "
-                    f"| 연속손절(전역) {self.state.consecutive_losses}회 "
-                    f"| 수익률 {(sold_price - avg_p) / avg_p * 100 if avg_p else 0:+.2f}%"
-                )
-            else:
-                # 수익 매도 시 연속손절 초기화
-                if self.state.consecutive_losses > 0:
-                    self.app_logger.info(
-                        f"[CONSEC_RESET] {symbol} | 수익 매도 → 연속손절 초기화"
-                    )
-                self.state.consecutive_losses = 0
-            if is_stoploss:
-                self.state.symbol_stoploss_at[symbol] = now_iso
-                cooldown_until = (datetime.now() + __import__('datetime').timedelta(seconds=1800)).strftime('%H:%M')
-                self.app_logger.info(
-                    f"[SYMBOL_COOLDOWN] {symbol} "
-                    f"reason=STOPLOSS "
-                    f"cooldown_until={cooldown_until} "
-                    f"loss_count={self.state.symbol_loss_count_today.get(symbol, 0)}"
-                )
-                # ── NEUTRAL 손절 → 당일 재진입 완전 금지 ──────────
-                is_neutral_stoploss = "[중립]" in exit_reason
-                if is_neutral_stoploss:
-                    self.state.symbol_block_today.add(symbol)
-                    self.app_logger.info(
-                        f"[SYMBOL_BLOCK_TODAY] {symbol} "
-                        f"reason=NEUTRAL_STOPLOSS — "
-                        f"NEUTRAL 손절 발생 → 당일 재진입 금지"
-                    )
-            if is_trail_loss:
-                trail_list = self.state.symbol_trail_loss_at.get(symbol, [])
-                trail_list.append(now_iso)
-                # 최근 60분 이내 기록만 유지
-                now_dt = datetime.now()
-                trail_list = [
-                    t for t in trail_list
-                    if (now_dt - datetime.fromisoformat(t)).total_seconds() < 3600
-                ]
-                self.state.symbol_trail_loss_at[symbol] = trail_list
-                if len(trail_list) >= 2:
-                    cooldown_until = (datetime.now() + __import__('datetime').timedelta(seconds=3600)).strftime('%H:%M')
-                    self.app_logger.info(
-                        f"[SYMBOL_COOLDOWN] {symbol} "
-                        f"reason=TRAILING_LOSS_{len(trail_list)} "
-                        f"cooldown_until={cooldown_until} "
-                        f"loss_count={self.state.symbol_loss_count_today.get(symbol, 0)}"
-                    )
-
+            # 2026-08-10 (1P0.7, GPT 코드리뷰, 재현 확인): accepted != full fill.
+            # 047040에서 SELL accepted 후 343주가 남았던 실측 사례처럼, 부분체결이면
+            # quantity(=요청 수량) 기준으로 손실/쿨다운/재진입차단/알림을 지금 계산하면
+            # 안 됩니다 — 실제 포지션이 아직 살아있을 수 있습니다. side effect는 브로커가
+            # 잔고 0(완전 청산)을 확인해줄 때까지 보류하고, 컨텍스트만 저장합니다.
+            # sync 루프가 FLAT 확정을 감지하면 _apply_deferred_sell_side_effects()를
+            # 호출합니다.
+            self._pending_sell_side_effects[symbol] = {
+                "exit_reason": exit_reason,
+                "avg_buy_price": avg_buy_price,
+                "current_price": current_price,
+                "quantity": quantity,
+                "recorded_at": datetime.now(),
+            }
             self.app_logger.info(
                 f"[ORDER] {symbol} | 매도 주문 접수 완료 | 수량 {quantity}주 | 주문번호 {result.order_id}"
             )
-            # ── 카카오 알림 ──────────────────────────────
-            if avg_buy_price > 0:
-                pnl_pct = (current_price - avg_buy_price) / avg_buy_price * 100
-                pnl_amt = int((current_price - avg_buy_price) * quantity)
-                icon = "🔴" if pnl_amt < 0 else "🟡"
-                self._notifier.send(
-                    f"{icon} [매도] {symbol}\n"
-                    f"가격: {current_price:,}원 | 수량: {quantity}주\n"
-                    f"수익률: {pnl_pct:+.2f}% | 손익: {pnl_amt:+,}원\n"
-                    f"사유: {exit_reason[:40]}"
-                )
         else:
             self.app_logger.warning(
                 f"[FAIL ] {symbol} | 매도 주문 실패 | 사유: {result.message}"
             )
+
+
+    def _apply_deferred_sell_side_effects(self, symbol: str) -> None:
+        """SELL이 완전 청산으로 확정됐을 때만 실행되는 후속 처리.
+
+        2026-08-10 (1P0.7, GPT 코드리뷰): 손실 카운트·쿨다운·재진입
+        차단·알림이 SELL `accepted` 시점에 즉시 실행돼, 047040처럼
+        343주가 남은 부분체결에도 "완전 청산했다"고 전제한 계산이
+        적용되고 있었습니다. sync 루프가 브로커 잔고 0(FLAT 확정)을
+        본 시점에만 호출합니다.
+        """
+        ctx = self._pending_sell_side_effects.pop(symbol, None)
+        if ctx is None:
+            return
+        exit_reason = ctx["exit_reason"]
+        avg_buy_price = ctx["avg_buy_price"]
+        current_price = ctx["current_price"]
+        quantity = ctx["quantity"]
+
+        # 매도 시각 기록 → 재진입 쿨다운에 사용
+        now_iso = datetime.now().isoformat()
+        self.state.last_sold_at_by_symbol[symbol] = now_iso
+        self.state.entry_time_by_symbol.pop(symbol, None)
+
+        # ── 재진입 제한 state 업데이트 ──────────────
+        avg_p = avg_buy_price if avg_buy_price > 0 else 0
+        sold_price = current_price
+        is_loss = avg_p > 0 and sold_price < avg_p
+        is_stoploss = "손절" in exit_reason
+        is_trail_loss = "트레일링" in exit_reason and is_loss
+
+        if is_loss:
+            cnt = self.state.symbol_loss_count_today.get(symbol, 0) + 1
+            self.state.symbol_loss_count_today[symbol] = cnt
+            # ── 전역 연속손절 카운터는 '새로운 종목'의 손실만 반영 ──
+            # 2026-06-15: 한 종목 반복매매(같은 종목 2회 이상 손실)가
+            # 전역 max_consecutive_losses를 소진시켜 계좌 전체가
+            # 차단되는 문제 발생(005930 3연속 손절 → 전체 매수 중단).
+            # cnt==1(해당 종목 첫 손실)일 때만 전역 카운터 증가.
+            # 같은 종목 반복 손실은 symbol_loss_count_today(종목별
+            # DAILY_LOSS_LIMIT, 한도 2)로 별도 차단됨.
+            if cnt == 1:
+                self.state.consecutive_losses += 1
+            self.app_logger.info(
+                f"[LOSS_CNT] {symbol} | 당일 손실 {cnt}회 "
+                f"| 연속손절(전역) {self.state.consecutive_losses}회 "
+                f"| 수익률 {(sold_price - avg_p) / avg_p * 100 if avg_p else 0:+.2f}%"
+            )
+        else:
+            # 수익 매도 시 연속손절 초기화
+            if self.state.consecutive_losses > 0:
+                self.app_logger.info(
+                    f"[CONSEC_RESET] {symbol} | 수익 매도 → 연속손절 초기화"
+                )
+            self.state.consecutive_losses = 0
+        if is_stoploss:
+            self.state.symbol_stoploss_at[symbol] = now_iso
+            cooldown_until = (datetime.now() + __import__('datetime').timedelta(seconds=1800)).strftime('%H:%M')
+            self.app_logger.info(
+                f"[SYMBOL_COOLDOWN] {symbol} "
+                f"reason=STOPLOSS "
+                f"cooldown_until={cooldown_until} "
+                f"loss_count={self.state.symbol_loss_count_today.get(symbol, 0)}"
+            )
+            # ── NEUTRAL 손절 → 당일 재진입 완전 금지 ──────────
+            is_neutral_stoploss = "[중립]" in exit_reason
+            if is_neutral_stoploss:
+                self.state.symbol_block_today.add(symbol)
+                self.app_logger.info(
+                    f"[SYMBOL_BLOCK_TODAY] {symbol} "
+                    f"reason=NEUTRAL_STOPLOSS — "
+                    f"NEUTRAL 손절 발생 → 당일 재진입 금지"
+                )
+        if is_trail_loss:
+            trail_list = self.state.symbol_trail_loss_at.get(symbol, [])
+            trail_list.append(now_iso)
+            # 최근 60분 이내 기록만 유지
+            now_dt = datetime.now()
+            trail_list = [
+                t for t in trail_list
+                if (now_dt - datetime.fromisoformat(t)).total_seconds() < 3600
+            ]
+            self.state.symbol_trail_loss_at[symbol] = trail_list
+            if len(trail_list) >= 2:
+                cooldown_until = (datetime.now() + __import__('datetime').timedelta(seconds=3600)).strftime('%H:%M')
+                self.app_logger.info(
+                    f"[SYMBOL_COOLDOWN] {symbol} "
+                    f"reason=TRAILING_LOSS_{len(trail_list)} "
+                    f"cooldown_until={cooldown_until} "
+                    f"loss_count={self.state.symbol_loss_count_today.get(symbol, 0)}"
+                )
+
+
+        # ── 카카오 알림 ──────────────────────────────
+        if avg_buy_price > 0:
+            pnl_pct = (current_price - avg_buy_price) / avg_buy_price * 100
+            pnl_amt = int((current_price - avg_buy_price) * quantity)
+            icon = "🔴" if pnl_amt < 0 else "🟡"
+            self._notifier.send(
+                f"{icon} [매도] {symbol}\n"
+                f"가격: {current_price:,}원 | 수량: {quantity}주\n"
+                f"수익률: {pnl_pct:+.2f}% | 손익: {pnl_amt:+,}원\n"
+                f"사유: {exit_reason[:40]}"
+            )
+
 
     def _generate_daily_report(self) -> None:
         """장 마감 후 일일 리포트를 생성하고 로그에 출력합니다."""

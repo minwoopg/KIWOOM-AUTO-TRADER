@@ -203,6 +203,17 @@ with tempfile.TemporaryDirectory() as tmpdir:
     service._try_sell(symbol, 103, current_price=58400,
                        exit_reason="트레일링 스탑 — 테스트", avg_buy_price=58000)
 
+    # 2026-08-10 (1P0.7, GPT 코드리뷰): SELL 체결 확인은 다음 폴링에서만
+    # 이뤄집니다(_sync_position_state_machine_shadow). 이 테스트는 그
+    # 폴링을 생략하고 바로 _try_buy를 호출했는데, 실제 운영에서는 신호
+    # 판단 전에 항상 sync가 먼저 돕니다. SELL_PENDING이 풀리지 않은 채
+    # BUY를 시도하는 것은 006360/017900 사고의 재현 조건이므로, 이제는
+    # BUY guard가 정확히 차단합니다(의도된 동작) — 테스트에서도 실제
+    # 흐름대로 sync를 먼저 시뮬레이션합니다.
+    service._position_state_machine.on_sell_result(
+        symbol, accepted=True, broker_quantity=0)  # 전량 체결 확인 → FLAT
+    service._apply_deferred_sell_side_effects(symbol)
+
     service.broker._prices[symbol] = 58700
     buy_signal = Signal(type=SignalType.BUY, reason="테스트 매수")
     with patch("domain.service.trading_service.now_kst", return_value=FIXED_MARKET_TIME):

@@ -5582,3 +5582,733 @@ Accepted BUY (shadow 기준)   3
 
 ---
 
+## 1P0.1: 부분체결 lifecycle 정확성 (2026-08-10)
+
+**1K 결과(게이트 무효)보다 이것이 먼저입니다.** 8/10 실서버에서
+부분체결이 상태머신을 오염시켜 중복 주문·ERROR 상태를 만들었고,
+그 상태로 수집한 데이터는 신뢰할 수 없기 때문입니다.
+
+### 재현 — 8/10 실서버 3건
+
+```
+047040  BUY 353 요청
+  11:40:00  broker 146  PARTIAL_FILL_PENDING
+  11:41:10  broker 353  PARTIAL_FILL_PENDING   ← 전량인데도 미확정
+  11:41:27  broker 353  PENDING_STILL_UNCONFIRMED
+  13:34:49  SELL 353 → broker 343  PARTIAL_FILL → OPEN 전환
+  13:34:50  343주 재매도 → SELL_REJECTED
+            (app.log: "매도가능수량 부족" 11회)
+
+006360  BUY 174 → broker 7 (BUY_PENDING)
+  11:42:01  SELL 7 발행 → broker 167  UNEXPECTED_QUANTITY_INCREASE → ERROR
+
+017900  BUY 670 → broker 66 (BUY_PENDING)
+  12:25:37  SELL 66 발행 → broker 604 → ERROR
+  13:56:57  ERROR 상태에서 604 매도 → 14:00:01 FLAT
+```
+
+### P0-1: expected 수량이 부분체결마다 함께 움직였음
+
+```python
+expected_min = state.known_quantity + state.pending_quantity
+```
+부분체결로 `known_quantity`가 갱신되면 목표도 같이 올라갑니다.
+047040은 146 체결 후 목표가 `146+353=499`가 되어 **353주 전량이
+들어와도 영원히 도달 불가**였습니다.
+
+**수정** — 주문 시작 시점의 불변 스냅샷:
+```
+base_quantity_before_order   주문 직전 실제 보유수량
+requested_quantity           이번 주문 요청 수량
+expected_final_quantity      base + requested   ← terminal까지 불변
+observed_quantity            관찰된 최신 브로커 수량
+```
+`known_quantity`는 관찰값 역할만 하고 **목표 계산에 다시 쓰지
+않습니다**. 판정:
+```
+broker == expected_final          → OPEN (전량 체결)
+broker >  expected_final          → ERROR (EXCESS)
+base < broker < expected_final    → BUY_PENDING 유지 (부분체결)
+broker <  base                    → ERROR (DECREASE, 신규)
+그 외                              → PENDING_STILL_UNCONFIRMED
+```
+
+**수정 후 047040**: `146 → BUY_PENDING`, `353 → OPEN`.
+
+### P0-2: SELL 부분체결이 OPEN으로 되돌아가 중복 매도 유발
+
+부분체결 시 `OPEN`으로 전이하고 `pending_order_id`를 지웠습니다.
+그러면 원 SELL 주문의 나머지가 살아 있는데 "새 포지션"으로 보여
+잔여수량에 대한 **추가 SELL을 발행**합니다.
+
+**수정** — `sell_base_quantity`(SELL 직전 보유수량)를 고정하고,
+`0 < broker < sell_base`면 `SELL_PENDING`을 유지하며 pending order
+정보도 보존합니다. **`broker == 0`일 때만 FLAT**입니다.
+
+### P0-3 / P0-4: 주문 guard (shadow — 관측 전용)
+
+`would_block_sell()` / `would_block_buy()` 추가:
+- `SELL_PENDING` 중 추가 SELL → `WOULD_BLOCK_DUPLICATE_SELL`
+- `BUY_PENDING` 중 추가 BUY → `WOULD_BLOCK_BUY_WHILE_PENDING`
+- `ERROR` 상태 BUY → `WOULD_BLOCK_BUY_IN_ERROR`
+
+**현재는 주문을 막지 않습니다.** `_try_sell()`에서 사유를
+`[LIFECYCLE_SHADOW]` 경고로만 남기고 주문은 그대로 진행합니다 —
+shadow 검증 없이 enforce하지 않는다는 원칙에 따릅니다. guard 호출이
+상태를 변경하지 않는 것도 테스트로 고정했습니다(4-9).
+
+### 테스트
+
+`test_partial_fill_lifecycle.py` 신규 **51건**:
+- 1절 BUY 부분체결 → 전량 체결(047040), 목표 불변 확인, 다중
+  부분체결에도 목표 353 유지.
+- 2절 기존 보유분(100) + 추가매수(50) → 120 부분 → 150 완결,
+  초과 EXCESS, 감소 DECREASE.
+- 3절 SELL 부분체결(047040), 0일 때만 FLAT, 미반영/거부/증가(006360).
+- 4절 guard — 중복 SELL 감지, FLAT 후 해제, BUY_PENDING·ERROR,
+  관측 전용 확인, 실매매 경로가 shadow인지.
+- 5절 AST로 옛 `known + pending` 방식이 실행 코드에 없는지 고정.
+
+**전체 회귀**: 17개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+
+### 다음
+
+- 1P0.2 SELL 재시도 정책 (`매도가능수량 부족` 11회 → backoff)
+- 1P0.3 shadow 관측 후 guard enforce 전환
+- 그 다음에 Entry Timing / Regime Study
+
+---
+
+## 1P0.2: SELL 중복/재시도 enforce + BUY guard 실경로 적용 (2026-08-10)
+
+1P0.1에 대한 GPT 코드리뷰 반영. **매매 실행 경로를 실제로 변경합니다.**
+
+### 왜 shadow에서 enforce로 올렸는가
+
+1P0.1은 lifecycle 상태만 정확히 만들고 guard는 경고만 남겼습니다.
+그러나 **1P0.1을 적용해도 8/10과 같은 상황이 다시 발생합니다** —
+`_try_sell` 호출 자체를 막지 않기 때문입니다. 8/10 실측:
+```
+13:34:50 ~ 13:37:xx  "매도가능수량이 부족합니다"  11회 (16초 간격)
+```
+정상 운영에서 나오면 안 되는 실패이고 브로커 rate limit 위험도
+있어, shadow로 며칠 더 두는 것이 오히려 위험하다고 판단했습니다.
+
+### P0-A: `_try_sell`을 단일 관문(dispatcher)으로
+
+호출부마다 guard를 넣으면 새 경로가 생길 때 빠집니다. 그래서
+`_try_sell`을 dispatcher로 만들고 실제 주문 발행을
+`_try_sell_unchecked`로 분리했습니다. **모든 SELL 경로가 반드시
+guard를 통과**합니다(호출부 2곳 무수정).
+
+`force=True`는 하드 손절·강제청산처럼 반드시 나가야 하는 경로용
+우회구입니다. guard가 잘못 잠겨 청산이 막히는 상황을 피하기 위한
+안전판이며, 사용 시 `[LIFECYCLE_FORCE]`로 남깁니다. 이월 방지
+강제청산 경로에 적용했습니다.
+
+차단은 `[LIFECYCLE_BLOCK]`으로 기록합니다.
+
+### P0-B: 재시도 backoff
+
+브로커 거부 시 `sell_reject_count` / `sell_reject_last_at` /
+`sell_reject_last_reason`을 누적하고, 지수적으로 대기합니다.
+```
+SELL_RETRY_BACKOFF_SECONDS = (0, 30, 60, 120, 300)
+SELL_REJECT_MAX_RETRY = 5
+```
+체결이 진행되면 카운터를 리셋합니다.
+
+**8/10 재현 결과**: 동일 조건 11회 시도 →
+**실제 발행 1회 / 차단 10회**.
+
+### P0-C: BUY guard를 실제 매수 경로에 적용
+
+`_try_buy()` 최상단에서 `would_block_buy()`를 확인하고 차단 사유를
+반환합니다(기존 반환 시그니처 그대로라 상위 로직이 `order_block_reason`
+으로 기록). `BUY_PENDING` 중 재매수와 `ERROR` 상태 매수를 막습니다 —
+8/10 006360/017900에서 부분체결 미확정 상태에 주문이 겹쳐
+`UNEXPECTED_QUANTITY_INCREASE(ERROR)`가 발생한 경로입니다.
+
+### 명칭 정리
+
+`WOULD_BLOCK_*` → `BLOCK_*`. shadow가 아니라 실제 차단이므로
+이름이 동작과 일치해야 합니다.
+
+### 테스트
+
+`test_partial_fill_lifecycle.py` 51건 → **69건**:
+- 6절(18건) — dispatcher 구조(`_try_sell_unchecked` 호출이 내부
+  1곳뿐인지 정규식 확인), `force=True` 우회, BUY guard 실경로,
+  backoff 누적·해제·최대 재시도·체결 시 리셋, **8/10 11회 시나리오가
+  1회 발행으로 줄어드는지**, guard 조회가 상태를 바꾸지 않는지.
+- 4절은 enforce 전환에 맞춰 갱신.
+
+**전체 회귀**: 17개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+
+### 다음 거래일 확인 사항
+
+- `[LIFECYCLE_BLOCK]` 발생 빈도 — 과도하면 guard가 정상 매도까지
+  막고 있다는 신호
+- `[LIFECYCLE_FORCE]` 발생 여부 — 강제청산이 guard에 걸렸는지
+- `매도가능수량 부족` 재발 여부 (0이어야 정상)
+- `UNEXPECTED_QUANTITY_INCREASE` 재발 여부
+
+---
+
+## 1P0.3: PENDING 타임아웃 — 손절 영구 봉쇄 방지 (2026-08-10)
+
+1P0.2에 대한 GPT 코드리뷰 반영. **1P0.2를 그대로 배포하면 안 됩니다.**
+
+### 🔴 P0-A: 부분체결 후 잔여수량이 영구 미매도 (재현 확인)
+
+1P0.2는 두 변경을 겹쳤는데, 조합이 치명적이었습니다.
+- SELL 부분체결 시 `SELL_PENDING` 유지 (1P0.1)
+- `SELL_PENDING`이면 `_try_sell` 차단 (1P0.2)
+
+브로커가 잔여수량을 체결하지 않으면 `SELL_PENDING`이 풀리지 않고,
+그동안 **손절 신호가 와도 모두 차단**됩니다.
+
+**재현**:
+```
+SELL 353 → broker 343 (10주만 체결)
+  폴링1~5: SELL_PENDING  known=343  → _try_sell 차단
+  → 343주가 영원히 매도 불가. 손실이 무한정 커짐.
+```
+제가 1P0.2 보고에서 "손절 지연"을 우려했는데, 실제로는 **지연이
+아니라 영구 봉쇄**였습니다.
+
+**수정** — PENDING 타임아웃:
+```
+SELL_PENDING_TIMEOUT_SEC = 60     이후 잔여수량 재매도 허용
+BUY_PENDING_TIMEOUT_SEC  = 120    이후 관측값으로 상태 확정
+```
+- `sell_pending_stale()`이 타임아웃을 넘긴 PENDING을 판별하고,
+  `would_block_sell()`이 그 경우 차단하지 않습니다.
+- `resolve_stale_pending()`이 관측 잔고 기준으로 상태를 확정합니다
+  (`잔고>0 → OPEN`, `잔고=0 → FLAT`). `_sync_position_state_machine_shadow`
+  에서 매 폴링 호출하며 `[LIFECYCLE_TIMEOUT]`으로 기록합니다.
+- 기준 시각은 `partial_fill_since or pending_since` — 부분체결이
+  계속 진행 중이면 그 시점부터 다시 셉니다.
+
+미결 주문이 살아 있는데 재매도할 위험은 남지만, **손절을 영구히
+막는 것보다 재시도 가능 상태가 안전**하다고 판단했습니다.
+
+### P0-B: 손절·강제청산이 guard보다 우선
+
+1P0.2는 `force=True`를 이월 방지 경로에만 붙였습니다. 하드 손절이
+중복 SELL guard에 막히면 손실이 커집니다.
+
+`FORCED_EXIT_KEYWORDS = ("손절", "강제청산", "이월 방지", "stop", "긴급")`
+로 `exit_reason`을 판별해 **자동으로 우회**합니다. 우회 시
+`[LIFECYCLE_FORCE]`로 남깁니다.
+```
+"손절 — 평균단가 대비 -3.0%"        → force
+"이월 방지 강제청산"                 → force
+"트레일링 청산"                      → guard 통과
+"entry_watch 최소수익미달청산"        → guard 통과
+```
+
+### P0-C: BUY_PENDING 무기한 방지
+
+미체결 잔량이 취소돼도 상태머신은 알 수 없어 `BUY_PENDING`이 굳고
+재매수가 영구 차단됐습니다. `BUY_PENDING_TIMEOUT_SEC`(120초) 후
+`resolve_stale_pending()`이 관측 잔고로 확정합니다
+(`잔고>0 → OPEN`, `0 → FLAT`).
+
+### P0-D: BUY 차단 사유 오염
+
+`order_block_reason`에 `BLOCK_BUY_WHILE_PENDING(pending_order=b1,
+expected_final=174, observed=7)`처럼 파라미터가 섞인 문자열이 그대로
+들어가, **값마다 다른 사유**가 되어 skip_reason 분포·집계가
+오염됐습니다.
+
+`would_block_buy_detail()`이 `(code, detail)`을 분리 반환하고,
+`order_block_reason`에는 **파라미터 없는 code만** 넣습니다. 상세는
+`[LIFECYCLE_BLOCK]` 로그로만 남깁니다.
+
+### 테스트
+
+`test_partial_fill_lifecycle.py` 69건 → **96건**:
+- 7절(15건) 타임아웃 — 부분체결 직후 차단(정상), 타임아웃 전 resolve
+  무동작, 타임아웃 후 guard 해제, OPEN/FLAT 확정, BUY_PENDING
+  타임아웃, 정상 체결은 무관, sync 연결·로그.
+- 8절(6건) 강제 경로 — 손절/강제청산 우회, 일반 청산은 guard 통과,
+  dispatcher 자동 판별.
+- 9절(5건) 차단 code 안정성 — 수량이 달라도 code 동일, code에
+  파라미터 없음, detail은 로그로만.
+- 4·6절은 API 변경에 맞춰 갱신.
+
+**전체 회귀**: 17개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+
+### 다음 거래일 확인 사항 (우선순위 순)
+
+1. **`[LIFECYCLE_TIMEOUT]`** — 자주 뜨면 타임아웃이 너무 짧거나
+   브로커 반영이 느린 것
+2. **`[LIFECYCLE_BLOCK]` SELL** — 과도하면 정상 매도를 막고 있음
+3. **`[LIFECYCLE_FORCE]`** — 손절이 guard에 걸린 횟수
+4. `매도가능수량 부족` / `UNEXPECTED_QUANTITY_INCREASE` — 0이어야 정상
+5. `order_block_reason` 분포에 `BLOCK_BUY_*`가 정상 집계되는지
+
+---
+
+## 1P0.4: Orphan order 추적 — 타임아웃 후 이중 매도 방지 (2026-08-10)
+
+1P0.3에 대한 GPT 코드리뷰 반영.
+
+### 🔴 P0-A: 타임아웃이 원 주문의 존재를 지웠음 (재현 확인)
+
+1P0.3의 `resolve_stale_pending()`은 `pending_order_id`를 `None`으로
+지웠습니다. 그런데 **브로커에 남아 있는 원 주문은 사라지지 않습니다.**
+
+**재현**:
+```
+SELL 353 → broker 343 (부분체결)
+타임아웃 후: OPEN  known=343  pending_id=None
+→ 새 SELL 발행 가능: True   (원 주문 s1은 브로커에 살아있을 수 있음)
+```
+원 주문 + 새 주문이 동시에 체결되면 **이중 매도**입니다.
+
+**수정** — orphan 주문으로 이관:
+```
+orphan_order_id        원 주문 id (잊지 않음)
+orphan_since           이관 시각
+orphan_expected_delta  체결 시 예상 수량 변화 (SELL 음수 / BUY 양수)
+```
+`has_orphan_order()`가 True인 구간에는
+`BLOCK_SELL_ORPHAN_ORDER(order=s1, age=..s)`로 새 SELL을 막습니다.
+**손절은 `force`로 우회하므로 이 차단이 손절을 막지는 않습니다.**
+
+브로커가 주문 취소 API를 제공하지 않으므로 취소는 못 하고, "미확인
+주문이 있다"는 사실을 보존해 그 구간의 매도를 제한하는 방식입니다.
+
+### P0-B: sync가 PENDING 종목을 skip — 해당 없음
+
+확인 결과 `_sync_position_state_machine_shadow`는
+`set(self.targets) | set(psm._states.keys()) | set(broker_qty_by_symbol)`
+를 순회하므로, **잔고에서 사라진 종목도 `broker_qty=0`으로 커버**되고
+`SELL_PENDING`/`BUY_PENDING` 분기에서 매 폴링 처리됩니다. 수정
+불필요합니다.
+
+### P0-C: orphan 자동 해소
+
+`observe_for_orphan()` — 브로커가 주문 조회 API를 주지 않으므로
+**잔고 변화로만** 추정합니다.
+```
+SELL orphan + 잔고 감소  → 체결로 간주, 해소
+BUY  orphan + 잔고 증가  → 체결로 간주, 해소
+ORPHAN_TTL_SEC(600s) 경과 → 미체결로 간주, 해제
+```
+`_sync_position_state_machine_shadow`에서 매 폴링 호출하고
+`[LIFECYCLE_ORPHAN]`으로 기록합니다.
+
+### P1: orphan 구간 invariant 오탐 방지
+
+orphan 주문이 살아 있으면 로컬 상태와 브로커 잔고가 어긋나는 것이
+정상입니다. `check_invariant()`가 이 구간에는 `None`을 반환해
+`POSITION_STATE_MISMATCH` CRITICAL 오탐을 막습니다.
+
+### P1: 강제 매도 최소 간격
+
+1P0.3은 `force=True`면 guard를 완전히 우회했습니다. 8/10처럼 브로커가
+계속 거부하면 손절 사유로 **16초마다 영원히 재시도**하게 됩니다.
+
+`FORCED_SELL_MIN_INTERVAL_SEC = 30`을 두고, 미달 시
+`[LIFECYCLE_FORCE_THROTTLE]`로 남기고 발행하지 않습니다.
+**guard에 걸리지 않은 정상 손절은 throttle 대상이 아닙니다**
+(`if block and force:` 안에서만 적용) — 손절 자체가 지연되지
+않습니다.
+
+### 테스트
+
+`test_partial_fill_lifecycle.py` 96건 → **122건**:
+- 10절(21건) orphan — 타임아웃 detail의 ORPHAN 표기, 기록/차단/
+  사유 형식, 잔고 감소·증가로 해소, 변화 없으면 유지, TTL 자동 해제,
+  BUY orphan, invariant 오탐 방지(FLAT+잔고 fixture로 정정), sync 연결.
+- 11절(5건) 강제 매도 throttle — 상수, 종목별 기록, 차단, 발행 전
+  return 순서, guard 없을 때는 미적용.
+
+**전체 회귀**: 17개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+
+### 다음 거래일 확인 사항
+
+1. `[LIFECYCLE_ORPHAN]` — 해소 사유가 "잔고 감소/증가"인지 "TTL"인지.
+   TTL이 많으면 타임아웃이 짧아 orphan을 과하게 만드는 것
+2. `[LIFECYCLE_BLOCK] ... ORPHAN` — 빈도
+3. `[LIFECYCLE_FORCE_THROTTLE]` — 손절이 30초 간격에 걸린 횟수
+4. `[LIFECYCLE_TIMEOUT]` / `매도가능수량 부족` / `UNEXPECTED_QUANTITY_INCREASE`
+
+---
+
+## 1P0.5: 매도 결정 단일화 + 영구 봉쇄 안전밸브 (2026-08-10)
+
+1P0.4에 대한 GPT 코드리뷰 반영. **1P0.1~1P0.4를 배포 가능한 상태로
+수렴시키는 단계입니다.**
+
+### 문제 — 차단 규칙 6종이 흩어져 조합 검증 불가
+
+```
+BLOCK_DUPLICATE_SELL / BLOCK_SELL_ORPHAN_ORDER / BLOCK_SELL_RETRY_BACKOFF
+BLOCK_SELL_MAX_RETRY / BLOCK_BUY_WHILE_PENDING / BLOCK_BUY_IN_ERROR
++ PENDING 타임아웃 2종 + ORPHAN TTL + FORCE throttle
+```
+서비스 계층과 상태머신 양쪽에 판단이 나뉘어 있어, 조합에 따라
+매도가 아예 나가지 않는 구간이 실제로 존재했습니다.
+
+**재현 A — orphan 무한 차단**:
+```
+0s / 60s / 300s / 599s 경과 → 전부 차단
+→ TTL 600초 동안 비강제 매도 전면 차단
+```
+**재현 B — MAX_RETRY 영구 차단**:
+```
+count=6, 대기 무한경과 → BLOCK_SELL_MAX_RETRY
+→ 카운터가 리셋되는 유일한 경로가 '체결 성공'뿐
+   그런데 매도가 차단돼 체결될 수 없음 = 영구 봉쇄
+```
+
+### 해결 1 — `decide_sell()` 단일 진입점
+
+모든 판단을 한 함수에서 **명시적 우선순위**로 평가합니다.
+```
+1. 안전밸브    연속 차단 >= MAX_BLOCK_DURATION_SEC(300s) → ALLOW_ESCALATED
+2. forced      손절·강제청산 → throttle만 적용하고 통과
+3. 중복 SELL   SELL_PENDING (타임아웃 전)
+4. orphan      미확인 원 주문
+5. backoff     재시도 대기 / MAX_RETRY
+6. 그 외       ALLOW
+```
+`SellDecision`(ALLOW / ALLOW_FORCED / ALLOW_ESCALATED / THROTTLED /
+BLOCKED)과 `SellDecisionResult(code, detail)`을 반환합니다. 차단
+규칙은 `_evaluate_sell_blocks()` 한 곳에만 있습니다.
+
+서비스 계층은 판단하지 않고 **기록과 실행만** 합니다.
+`_last_forced_sell_at` throttle도 상태머신으로 이관해 이중 적용을
+없앴습니다.
+
+### 해결 2 — 안전밸브 (영구 봉쇄 최후 보루)
+
+`blocked_since` / `blocked_count` / `last_block_code`로 연속 차단을
+추적하고, 300초를 넘으면 **사유 불문 매도를 허용**합니다
+(`ALLOW_ESCALATED`). 사람이 반드시 확인해야 하므로
+`[LIFECYCLE_ESCALATED]` **CRITICAL**로 남깁니다.
+
+### 해결 3 — 거부 카운터 시간 감쇠
+
+`SELL_REJECT_DECAY_SEC = 300`. 마지막 거부 후 5분이 지나면 카운터를
+1씩 줄여 재시도 기회를 회복합니다. '체결 성공'만이 유일한 탈출구였던
+구조를 바꿉니다.
+
+### 차단 조합 매트릭스 (테스트로 증명)
+
+```
+상태               일반매도        강제(손절)         5분경과
+clean                 ALLOW      ALLOW_FORCED           ALLOW
+sell_pending        BLOCKED      ALLOW_FORCED  ALLOW_ESCALATED
+orphan              BLOCKED      ALLOW_FORCED  ALLOW_ESCALATED
+backoff             BLOCKED      ALLOW_FORCED  ALLOW_ESCALATED
+max_retry           BLOCKED      ALLOW_FORCED  ALLOW_ESCALATED
+orphan+backoff      BLOCKED      ALLOW_FORCED  ALLOW_ESCALATED
+pending+orphan      BLOCKED      ALLOW_FORCED  ALLOW_ESCALATED
+```
+**모든 조합에서 (1) 손절은 항상 통과하고 (2) 5분 후 해제됩니다.**
+영구 봉쇄가 존재하지 않음을 매트릭스로 고정했습니다(12-1, 12-2).
+
+### 테스트
+
+`test_partial_fill_lifecycle.py` 122건 → **140건**:
+- 12절(18건) 조합 매트릭스 7종 × 3시나리오, 안전밸브 동작·추적
+  리셋, MAX_RETRY 감쇠 회복, 단일 진입점 구조 검증.
+- 6·11절은 새 구조에 맞춰 갱신.
+
+**전체 회귀**: 17개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+
+### 배포 시 확인 (우선순위)
+
+1. **`[LIFECYCLE_ESCALATED]` (CRITICAL)** — 안전밸브가 열린 것.
+   자주 뜨면 차단 규칙이 과합니다.
+2. `[LIFECYCLE_BLOCK]` 특정 종목 반복 — 즉시 중단 검토
+3. `[LIFECYCLE_ORPHAN]` 해소 사유가 "잔고 변화"인지 "TTL"인지
+4. `[LIFECYCLE_TIMEOUT]` / `[LIFECYCLE_FORCE_THROTTLE]`
+5. `매도가능수량 부족` / `UNEXPECTED_QUANTITY_INCREASE` — 0이어야 정상
+
+---
+
+## 1P0.6: 폴링 기반 안전밸브 + ERROR 자동 회복 (2026-08-10)
+
+1P0.5에 대한 GPT 코드리뷰 반영.
+
+### 🔴 P0-A: 안전밸브가 SELL 신호에 의존 (재현 확인)
+
+1P0.5의 안전밸브는 `decide_sell()` 안에만 있었습니다. `blocked_since`
+갱신도 거기서만 일어납니다. 그런데 `decide_sell()`은 **SELL 신호가
+있을 때만** 호출됩니다.
+
+**재현**:
+```
+t=0    decide_sell 호출 → BLOCKED (blocked_since 기록)
+       이후 전략이 HOLD만 반환하면 decide_sell이 호출되지 않음
+t=400  (SELL 신호가 다시 왔을 때에야) → ALLOW_ESCALATED
+```
+그 사이 포지션은 **조용히 갇혀 있습니다.** 안전밸브가 "5분 후 열린다"
+가 아니라 "5분 후 SELL 신호가 오면 열린다"였습니다.
+
+**수정** — `check_block_escalation()`을 `_sync_position_state_machine_shadow`
+에서 **매 폴링 호출**합니다. 신호와 무관하게 차단 지속을 감시하고,
+`MAX_BLOCK_DURATION_SEC`를 넘기면 `[LIFECYCLE_STUCK]` **CRITICAL**로
+즉시 노출합니다. 차단이 해소되면 추적도 자동 리셋합니다.
+
+### 🔴 P0-B: ERROR 상태에서 매수 영구 차단 (재현 확인)
+
+`BLOCK_BUY_IN_ERROR`는 `acknowledge_error()`로만 풀리는데, 이 함수는
+**사람이 계좌를 확인한 뒤 호출하는 인터페이스**라 무인 운영에서는
+호출되지 않습니다.
+
+**재현**:
+```
+ERROR 진입 후
+      0s → BLOCK_BUY_IN_ERROR
+   3600s → BLOCK_BUY_IN_ERROR
+  86400s → BLOCK_BUY_IN_ERROR   (하루 지나도 그대로)
+```
+
+**수정** — `auto_recover_error()`. ERROR 진입 시각(`error_since`)을
+기록하고 `ERROR_AUTO_RECOVERY_SEC`(900초) 경과 시 **브로커 잔고를
+신뢰해** 상태를 확정합니다(`잔고>0 → OPEN`, `0 → FLAT`).
+sync 루프에서 매 폴링 호출하며 `[LIFECYCLE_ERROR_RECOVERY]`로
+기록합니다. 사람 확인용 `acknowledge_error()`는 그대로 유지합니다.
+
+### P1: 강제 매도 실패 escalation
+
+손절·강제청산이 브로커에 거부되면 시스템이 자체 해결할 수 없습니다.
+연속 실패 횟수를 종목별로 추적하고 `[FORCED_SELL_FAILED]`
+**CRITICAL**로 즉시 노출합니다(성공 시 카운터 리셋).
+
+### P1: throttle보다 안전밸브 우선
+
+`decide_sell()`의 평가 순서상 안전밸브(1번)가 forced/throttle(2번)보다
+먼저이므로 이미 보장돼 있었습니다. 의도를 주석으로 명시하고
+테스트(16-1)로 고정했습니다 — 장시간 차단된 포지션에 손절이 반복
+들어와도 `ALLOW_ESCALATED`로 빠져나갑니다.
+
+### 테스트
+
+`test_partial_fill_lifecycle.py` 140건 → **166건**:
+- 13절(7건) 폴링 감시 — SELL 신호 없이도 장시간 차단 감지,
+  blocked_since/code 기록, 해소 시 리셋, sync 연결.
+- 14절(13건) ERROR 자동 회복 — error_since 기록, 회복 전/후,
+  OPEN·FLAT 확정, 매수 차단 해제, acknowledge_error 유지.
+- 15절(4건) 강제 매도 실패 escalation.
+- 16절(2건) throttle보다 안전밸브 우선, 정상 구간 throttle 동작.
+
+차단 조합 매트릭스는 1P0.5 그대로 유지됩니다 — 모든 조합에서
+손절 통과, 5분 후 해제.
+
+**전체 회귀**: 17개 파일 전부 통과, 1개 스킵. `compileall` 정상.
+
+### 배포 시 확인 (우선순위)
+
+1. **`[LIFECYCLE_STUCK]` (CRITICAL)** — 신호와 무관하게 감지되는
+   장시간 차단. 뜨면 차단 규칙이 과합니다.
+2. **`[FORCED_SELL_FAILED]` (CRITICAL)** — 손절이 브로커에 거부됨.
+   시스템이 해결할 수 없으므로 즉시 개입 필요.
+3. `[LIFECYCLE_ESCALATED]` — 안전밸브 발동
+4. `[LIFECYCLE_ERROR_RECOVERY]` — 자동 회복 빈도
+5. `[LIFECYCLE_BLOCK]` 특정 종목 반복 여부
+6. `매도가능수량 부족` / `UNEXPECTED_QUANTITY_INCREASE` — 0이어야 정상
+
+---
+
+## 1P0.7: 안전-우선 재설계 — HARD/SOFT 분리, 자동회복 제거 (2026-08-10)
+
+1P0.6에 대한 GPT 코드리뷰 **배포 불가(🔴) 판정** 반영. GPT가 지적한
+5개 P0 전부를 재현 후 수정했고, "숫자를 늘리는 방향"이 아니라
+**GPT 권장 15단계 중 실행 가능한 항목을 반영해 구조를 단순화**했습니다.
+order_id 실연결·브로커 주문조회/취소 연동(GPT 권장 9~11번)은 브로커
+API 제약으로 이번 범위 밖입니다 — 이 한계를 명시적으로 남깁니다.
+
+### 근본 문제 진단 (GPT)
+
+> 브로커의 실제 주문 상태를 모르면서 시간과 잔고만으로 주문 종료를
+> 추론하고 있기 때문입니다.
+
+1P0.1~1P0.6은 "얼마나 기다리면 풀어줄까"를 계속 정교하게 만들었는데,
+그 방향 자체가 틀렸다는 지적입니다. 이번엔 반대로 갑니다 —
+**증거 없이는 절대 풀지 않는다.**
+
+### P0-1: BUY_PENDING 중 SELL 미차단 (006360/017900 사고 원인 그대로 재현)
+
+```
+BUY174 → broker7 → BUY_PENDING
+decide_sell → ALLOW   ← 차단해야 하는데 통과
+```
+`_evaluate_sell_blocks()`에 `BUY_PENDING` 검사가 아예 없었습니다.
+`_evaluate_hard_sell_blocks()`에 추가 — **forced로도 우회 불가**.
+
+### P0-2: `ERROR_AUTO_RECOVERY_SEC=900`은 증거 없는 자동 정상화
+
+```
+ERROR(UNEXPECTED_QUANTITY_INCREASE) → 900초 후 → OPEN(qty) 자동 확정
+→ BUY guard 해제
+```
+"15분이 지났다"는 원 주문이 terminal이라는 증거가 아닙니다.
+`auto_recover_error()`를 **완전히 제거**했습니다. ERROR는 이제
+`acknowledge_error()`로 사람이 실제 계좌를 확인한 뒤에만 해제됩니다.
+`ERROR_AUTO_RECOVERY_SEC` 상수도 제거.
+
+### P0-3: `ALLOW_ESCALATED` 자체가 위험 — 5분 경과가 안전을 보장하지 않음
+
+```
+SELL353 원 주문 살아 있음 → SELL_PENDING → 5분 경과 → ALLOW_ESCALATED
+→ 새 SELL343 → 이중 SELL 가능
+```
+`SellDecision.ALLOW_ESCALATED`를 **제거**하고
+`RECONCILIATION_REQUIRED`로 교체했습니다. HARD block은 5분이 지나도
+**여전히 BLOCKED**이며, `RECONCILIATION_REQUIRED`는 매도를 허용하는
+게 아니라 CRITICAL 로그로 "사람이 지금 확인해야 한다"를 알릴 뿐입니다.
+
+### P0-4: `forced=True`가 HARD safety까지 우회
+
+```
+orphan 상태에서 forced SELL → ALLOW_FORCED
+```
+GPT 제안대로 차단을 두 종류로 명확히 분리했습니다.
+
+| 분류 | 예 | force 우회 |
+|---|---|---|
+| **HARD** | BUY_PENDING, SELL_PENDING, orphan, ERROR | **절대 금지** |
+| SOFT | retry backoff, MAX_RETRY | 가능 |
+
+`_evaluate_hard_sell_blocks()` / `_evaluate_soft_sell_blocks()`로
+분리. `decide_sell()`은 HARD를 먼저 평가하고, HARD가 있으면 forced
+여부와 무관하게 `BLOCKED`(5분 경과 시 `RECONCILIATION_REQUIRED`)를
+반환합니다 — **손절이어도 여기서 막힙니다(의도된 동작)**. "이미
+살아있을 수 있는 주문 위에 새 주문을 더 얹는 것"보다 사람의 확인을
+기다리는 편이 안전하다는 GPT의 판단을 그대로 반영했습니다.
+
+### P0-5: orphan 부분잔고 변화/TTL 자동 해제 제거
+
+```
+343 → 300 (43주만 추가체결) → orphan clear   ← 300주가 여전히 살아있을 수 있는데 clear됨
+ORPHAN_TTL_SEC=600 경과 → 자동 해제           ← TTL도 종료 증거 아님
+```
+`observe_for_orphan()`을 재설계 — 이 시스템은 항상 전량매도만
+하므로(설계 불변), **SELL orphan은 잔고 0 도달**, **BUY orphan은
+`expected_final_quantity` 정확 도달**만 자동 해소합니다. 그 외
+모든 변화는 진단 로그(`ORPHAN_PARTIAL_OBSERVED`)만 남기고 유지.
+`acknowledge_orphan(symbol, note)` 신규 — 사람이 브로커에서 직접
+확인한 뒤 근거와 함께 명시적으로 해제(빈 note는 `ValueError`).
+
+### BUY guard 확장 — SELL_PENDING/orphan도 BUY 차단
+
+```
+SELL_PENDING → BUY 가능   ← 원 주문 상태를 모르는데 신규 진입 가능했음
+SELL orphan  → BUY 가능
+```
+`would_block_buy_detail()`에 `BLOCK_BUY_WHILE_SELL_PENDING` /
+`BLOCK_BUY_ORPHAN_ORDER` 추가. 원 주문 상태를 모르면 해당 종목의
+**모든 신규 자동 주문**을 잠급니다(BUY_PENDING/SELL_PENDING/
+orphan/ERROR 전부).
+
+### accepted SELL 부작용을 완전 청산 확정 시점으로 지연 (P0)
+
+```python
+accepted != full fill
+```
+`result.accepted=True` 직후 손실 카운트·연속손절·쿨다운·재진입
+차단·트레일링 추적·카카오 알림이 **즉시 실행**되고 있었습니다.
+047040에서 SELL accepted 후 343주가 남았던 실측 사례가 근거입니다.
+
+`_try_sell_unchecked()`의 accepted 분기를 분리:
+- **즉시 유지**: 잔고 캐시 무효화, `_sold_today` 추가(중복 주문
+  요청 방지 목적, side effect 아님), `[ORDER]` 로그.
+- **완전 청산까지 지연**: `_pending_sell_side_effects[symbol]`에
+  `exit_reason`/`avg_buy_price`/`current_price`/`quantity` 저장.
+  손실 카운트·재진입 제한·쿨다운·트레일링 추적·카카오 알림 전체를
+  `_apply_deferred_sell_side_effects()`로 이동.
+
+`_sync_position_state_machine_shadow`가 `on_sell_result()` 호출 후
+lifecycle이 `FLAT`으로 전환된 걸 감지하면(완전 청산 확인)
+`_apply_deferred_sell_side_effects()`를 호출합니다.
+`resolve_stale_pending()` 타임아웃 경로에서 `broker_quantity<=0`으로
+`FLAT`이 확정되는 경우도 동일하게 호출.
+
+### cross-cycle 오염 방지 (재현 확인)
+
+```
+이전 거래의 reject_count=5, blocked_since 존재
+새 BUY 체결 → OPEN
+첫 SELL → 이전 사이클의 blocked_since 때문에 즉시 escalation
+```
+`_reset_transient_block_state()` 신규 — `sell_reject_*` /
+`blocked_since` / `blocked_count` / `last_block_code` /
+`last_forced_sell_at` / `error_since` / `orphan_*`를 한 번에 초기화.
+**FLAT 확정 시점(사이클 종료)과 새 포지션 OPEN 확정 시점(사이클
+시작, `base_quantity_before_order==0`일 때)** 양쪽에서 호출해
+어느 경로로 사이클이 바뀌어도 흔적이 남지 않게 했습니다.
+
+### GPT 권장 15단계 중 이번에 반영/미반영
+
+| # | 항목 | 상태 |
+|---|---|---|
+| 1~3 | BUY_PENDING/SELL_PENDING/ORPHAN·ERROR→BUY = HARD BLOCK | ✅ 반영 |
+| 4 | forced가 HARD BLOCK 우회 금지 | ✅ 반영 |
+| 5 | 5분 경과도 HARD BLOCK 해제 안 함 | ✅ 반영 |
+| 6 | 5분 경과 → RECONCILIATION_REQUIRED + CRITICAL | ✅ 반영 |
+| 7 | ERROR 자동 900초 회복 제거 | ✅ 반영 |
+| 8 | orphan 부분잔고/TTL 자동해제 제거 | ✅ 반영 |
+| 13 | full SELL terminal 후에만 side effect 실행 | ✅ 반영 |
+| 14 | 새 cycle 시작/FLAT 확정 시 transient state reset | ✅ 반영 |
+| 9~11 | 실제 order_id 연결, 브로커 조회/취소 연동 | ❌ 브로커 API 제약, 범위 밖 |
+| 12, 15 | FILLED/CANCELLED 등 terminal 확인, restart reconciliation | ❌ 9~11 선행 필요 |
+
+**9~11번이 없다는 것은 여전히 근본 한계입니다.** `pending_order_id`/
+`orphan_order_id`는 지금도 실제 주문 식별자가 아니라 `"pending"`
+리터럴입니다. 이번 변경은 "잘못된 자동화를 줄이고 사람이 개입할
+지점을 명확히 하는" 방어적 조치이지, 근본 해결(order_id →
+status/cancel/terminal reconciliation)을 대체하지 않습니다.
+
+### 테스트 — 성공 조건을 반대로 재작성
+
+GPT 지적대로 "166이라는 숫자가 커져도 안전성 증거가 되지 않는다"에
+따라, 기존 테스트가 검증하던 **잘못된 성공 조건 자체를 뒤집었습니다**:
+
+```
+이전: BUY_PENDING 중 SELL guard 없음               → PASS 조건
+이후: BUY_PENDING 중 SELL은 HARD block             → PASS 조건
+
+이전: orphan 잔고 일부 변화 → 자동 해제             → PASS 조건
+이후: 잔고 0(SELL)/목표수량 정확 도달(BUY)만 해제   → PASS 조건
+
+이전: 모든 forced SELL은 통과                       → PASS 조건
+이후: HARD block은 forced도 통과 못 함              → PASS 조건
+
+이전: 모든 block은 5분 후 ALLOW_ESCALATED           → PASS 조건
+이후: HARD block은 5분 후에도 BLOCKED(RECONCILIATION만 승격) → PASS 조건
+
+이전: ERROR 15분 후 자동 OPEN/FLAT                  → PASS 조건
+이후: ERROR는 acknowledge_error()로만 해제           → PASS 조건
+```
+
+`test_partial_fill_lifecycle.py` **182건** (섹션 4·7·10·12·14·16
+전면 재작성, 17절 신규 7건 — 지연 side-effect 구조 검증).
+
+부수 발견: `test_sold_today_qty_based.py`의 시나리오 6이 SELL 체결
+확인 폴링을 생략하고 바로 `_try_buy`를 호출해, 새 SELL_PENDING→BUY
+guard에 정상적으로 걸렸습니다. 실제 운영에서는 신호 판단 전에 항상
+sync가 먼저 도므로, 테스트에 그 폴링을 시뮬레이션하는 코드를
+추가해 실제 흐름과 일치시켰습니다(가드를 약화하지 않음).
+
+**전체 회귀**: 17개 파일 전부 통과(1개 스킵), **GPT가 지적한
+"config.settings 의존으로 독립 검증 불가" 문제까지 실제 실행으로
+확인**. `compileall` 정상.
+
+### 다음 세션 확인 필요 (배포 전)
+
+1. GPT 재검토 — 이번에도 배포 전 확인 필수
+2. `[RECONCILIATION_REQUIRED]` 빈도 — HARD block이 5분을 넘기는
+   빈도가 높으면 근본 원인(브로커 응답 지연? 주문 방식?)을 봐야 함
+3. order_id 실연결 로드맵 — 다음 단계로 반드시 필요
+4. 실계좌 투입 시점 재논의 — 9~11번이 없는 상태이므로 신중 필요
+
+---
+
