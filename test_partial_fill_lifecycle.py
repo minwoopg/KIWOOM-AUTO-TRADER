@@ -934,16 +934,215 @@ check("17-3) _apply_deferred_sell_side_effects가 실제 손실/쿨다운 로직
       "_apply_deferred_sell_side_effects" in ts_src
       and "symbol_loss_count_today" in ts_src
       and "symbol_stoploss_at" in ts_src)
-check("17-4) sync 루프가 SELL_PENDING 폴링에서 FLAT 전환 시점에만 호출",
-      "if psm.get(symbol).lifecycle == PositionLifecycle.FLAT:" in ts_src
-      and "self._apply_deferred_sell_side_effects(symbol)" in ts_src)
-check("17-5) resolve_stale_pending 경로(타임아웃)에서도 FLAT이면 호출",
-      ts_src.count("self._apply_deferred_sell_side_effects(symbol)") >= 2)
+# 2026-08-10 (1P0.7.1): 산발적 호출 지점을 검사하던 방식은 GPT가
+# 지적한 P0-2("SELL_PENDING 분기에만 있어서 orphan 경로를 못 잡음")를
+# 그대로 통과시켰습니다. 이제 19절의 **실제 TradingService 통합
+# 테스트**가 진짜 검증을 담당하고, 여기서는 중앙화된 구조 자체만
+# 가볍게 확인합니다.
+check("17-4) 중앙화된 실행 지점이 있음(19절에서 실제 동작 검증)",
+      "_lifecycle_before_sync" in ts_src)
+check("17-5) SELL_PENDING 분기 내부의 산발적 호출은 제거됨(19절 참고)",
+      ts_src.count("self._apply_deferred_sell_side_effects(symbol)") == 1)
 check("17-6) 지연된 컨텍스트는 pop으로 1회만 소비됨(중복 실행 방지)",
       "self._pending_sell_side_effects.pop(symbol, None)" in ts_src)
 check("17-7) 원래 accepted 블록에 있던 즉시 손실계산 코드가 제거됨",
       "avg_p = avg_buy_price if avg_buy_price > 0 else 0" not in
       ts_src[:ts_src.index("_apply_deferred_sell_side_effects(self, symbol")])
+
+
+# ══════════════════════════════════════════════════════════════
+# 18. BUY zero-fill timeout에서 orphan 보존 (1P0.7.1, P0-1)
+# ══════════════════════════════════════════════════════════════
+# 재현(1P0.7): BUY_PENDING이 0주 체결로 타임아웃되면 orphan을
+# 만들자마자 _reset_transient_block_state()가 그 orphan을 지워
+# BUY guard=None, SELL decide.allowed=True가 됐습니다 — 원 주문이
+# 살아있을 수 있는데 아무 방어가 없는 상태였습니다.
+M.BUY_PENDING_TIMEOUT_SEC = 0.2
+try:
+    m50 = M()
+    m50.on_buy_requested("ZF", 174, "b1")
+    m50.confirm_buy_from_broker("ZF", 0)   # 0주 체결 그대로
+    _time.sleep(0.25)
+    r50 = m50.resolve_stale_pending("ZF", 0)
+    st50 = m50.get("ZF")
+    check("18-1) 0주 체결 타임아웃 후 lifecycle은 FLAT(잔고 0이므로)",
+          st50.lifecycle == L.FLAT)
+    check("18-2) 그런데도 orphan_order_id는 보존됨(원 주문 생사 불명)",
+          st50.orphan_order_id == "b1")
+    check("18-3) BUY guard가 여전히 유지됨",
+          m50.would_block_buy("ZF") is not None
+          and "BLOCK_BUY_ORPHAN_ORDER" in m50.would_block_buy("ZF"))
+    check("18-4) SELL도 허용되지 않음(decide_sell.allowed == False)",
+          not m50.decide_sell("ZF").allowed)
+    check("18-5) detail에 ORPHAN 표기와 HARD block 안내 포함",
+          r50 is not None and "ORPHAN(b1)" in r50 and "HARD block" in r50)
+
+    # 정상 부분체결(잔고>0) 타임아웃은 기존처럼 OPEN+orphan 유지(회귀 없음)
+    m51 = M()
+    m51.on_buy_requested("ZF2", 174, "b2")
+    m51.confirm_buy_from_broker("ZF2", 30)
+    _time.sleep(0.25)
+    m51.resolve_stale_pending("ZF2", 30)
+    check("18-6) 잔고>0 부분체결 타임아웃은 기존과 동일하게 OPEN+orphan",
+          m51.get("ZF2").lifecycle == L.OPEN
+          and m51.get("ZF2").orphan_order_id == "b2")
+
+    # orphan이 실제로 없을 때(pending_order_id가 애초에 없던 경우)는
+    # reset이 정상적으로 전체 초기화를 수행해야 함(clear_orphan 로직 회귀 확인)
+    m52 = M()
+    m52.on_buy_requested("ZF3", 174, "b3")
+    m52.get("ZF3").pending_order_id = None   # 방어적 케이스
+    m52.confirm_buy_from_broker("ZF3", 0)
+    _time.sleep(0.25)
+    m52.resolve_stale_pending("ZF3", 0)
+    check("18-7) pending_order_id가 애초에 없으면 orphan도 생성되지 않고 정상 FLAT",
+          m52.get("ZF3").lifecycle == L.FLAT
+          and m52.get("ZF3").orphan_order_id is None)
+
+    check("18-8) _reset_transient_block_state가 clear_orphan 파라미터를 지원",
+          "clear_orphan" in _lc_src and "def _reset_transient_block_state" in _lc_src)
+finally:
+    M.BUY_PENDING_TIMEOUT_SEC = _orig_buy_to
+
+
+# ══════════════════════════════════════════════════════════════
+# 19. SELL timeout→orphan→나중 FLAT 시 deferred side-effect 실행
+# (1P0.7.1, P0-2) — 실제 TradingService 통합 fixture
+# ══════════════════════════════════════════════════════════════
+# 재현(1P0.7): _apply_deferred_sell_side_effects 호출이 SELL_PENDING
+# 분기 안에만 있어서, 타임아웃으로 OPEN+orphan이 된 뒤 원 주문이
+# 나중에(8/12 005935 실측 194초) 실제로 완전 체결되면 그 확인은
+# `else: sync_from_broker()` 경로를 타서 손실/쿨다운/알림이
+# 영원히 실행되지 않았습니다. GPT 지적대로 source-string 검사가
+# 아니라 실제 TradingService를 띄워 검증합니다.
+import tempfile as _tf2
+from datetime import datetime as _dt2
+from unittest.mock import patch as _patch2
+
+from test_run_once_integration import build_minimal_settings as _build_settings
+from domain.market_regime.classifier import MarketRegimeClassifier as _MRC
+from domain.risk.risk_manager import RiskManager as _RM
+from domain.service.trading_service import TradingService as _TS2
+from domain.strategy.strategy_router import StrategyRouter as _SR
+from domain.models import Position as _Position, AccountBalance as _AccountBalance
+from infra.broker.mock_broker import MockBroker as _MockBroker
+from infra.storage.logger import (
+    TradeCsvLogger as _TradeCsvLogger, SignalCsvLogger as _SignalCsvLogger,
+    build_app_logger as _build_app_logger,
+)
+from infra.storage.state_store import JsonStateStore as _JsonStateStore
+
+
+def _build_real_service(tmpdir: str) -> "_TS2":
+    settings = _build_settings(tmpdir)
+    broker = _MockBroker()
+    app_logger = _build_app_logger(settings.storage.app_log_file, settings.app.log_level)
+    trade_logger = _TradeCsvLogger(settings.storage.trade_log_file)
+    signal_logger = _SignalCsvLogger(settings.storage.signal_log_file)
+    state_store = _JsonStateStore(settings.storage.state_file)
+    strategy_router = _SR(settings.strategy)
+    regime_classifier = _MRC(settings.market_regime)
+    risk_manager = _RM(settings.trading, settings.risk, settings.storage.trade_log_file)
+    return _TS2(
+        settings=settings, broker=broker, strategy_router=strategy_router,
+        regime_classifier=regime_classifier, risk_manager=risk_manager,
+        app_logger=app_logger, trade_logger=trade_logger,
+        signal_logger=signal_logger, state_store=state_store,
+    )
+
+
+M.SELL_PENDING_TIMEOUT_SEC = 0.2
+try:
+    with _tf2.TemporaryDirectory() as _tmp19:
+        svc = _build_real_service(_tmp19)
+        sym19 = "005935"
+
+        # 초기 잔고: 100주 보유
+        svc.broker._positions[sym19] = _Position(symbol=sym19, quantity=100,
+                                                  average_price=10000)
+        svc.broker._prices[sym19] = 10100
+
+        # 최초 폴링으로 상태머신을 브로커 잔고와 동기화
+        svc._sync_position_state_machine_shadow(svc.broker.get_account_balance())
+        check("19-1) 초기 동기화 후 lifecycle OPEN",
+              svc._position_state_machine.get(sym19).lifecycle == L.OPEN)
+
+        # SELL 요청 — accepted 되지만 브로커가 즉시 반영하지 않음(지연 흉내)
+        svc._try_sell(sym19, 100, current_price=10100,
+                      exit_reason="트레일링 스탑 — 테스트", avg_buy_price=10000)
+        check("19-2) SELL accepted 시 pending 컨텍스트가 저장됨",
+              sym19 in svc._pending_sell_side_effects)
+        check("19-3) SELL_PENDING 상태",
+              svc._position_state_machine.get(sym19).lifecycle == L.SELL_PENDING)
+
+        # MockBroker가 즉시 잔고를 지웠다고 가정 — 실제로는 부분체결/지연을
+        # 흉내내기 위해 잔고를 "여전히 100"으로 강제 유지(브로커 반영 지연)
+        svc.broker._positions[sym19] = _Position(symbol=sym19, quantity=100,
+                                                  average_price=10000)
+
+        # 폴링 1회 — 아직 타임아웃 전, 잔고 그대로 -> SELL_PENDING 유지
+        svc._sync_position_state_machine_shadow(svc.broker.get_account_balance())
+        check("19-4) 타임아웃 전에는 아직 side effect 미실행(컨텍스트 유지)",
+              sym19 in svc._pending_sell_side_effects)
+
+        # 타임아웃 경과 시뮬레이션
+        _time.sleep(0.25)
+        svc._sync_position_state_machine_shadow(svc.broker.get_account_balance())
+        after_timeout_state = svc._position_state_machine.get(sym19)
+        check("19-5) 타임아웃 후 OPEN + orphan으로 전환(잔고>0이므로)",
+              after_timeout_state.lifecycle == L.OPEN
+              and after_timeout_state.orphan_order_id is not None)
+        check("19-6) 타임아웃 직후에도 컨텍스트는 아직 소비되지 않음(완전 청산 전)",
+              sym19 in svc._pending_sell_side_effects)
+
+        # 8/12 005935 실측처럼, 원 SELL 주문이 나중에 실제로 완전 체결됨
+        # (브로커 잔고가 0으로 반영) — orphan 해소 + OPEN→FLAT은 `else`
+        # 분기(sync_from_broker)를 탑니다.
+        svc.broker._positions.pop(sym19, None)
+        svc._sync_position_state_machine_shadow(svc.broker.get_account_balance())
+        final_state = svc._position_state_machine.get(sym19)
+        check("19-7) 나중 완전 체결 확인 후 FLAT으로 확정",
+              final_state.lifecycle == L.FLAT)
+        check("19-8) orphan도 함께 해소됨", final_state.orphan_order_id is None)
+
+        # ── P0-2 핵심 검증: deferred side-effect가 실제로 실행됐는가 ──
+        check("19-9) FLAT 확정 후 pending 컨텍스트가 소비됨(재현 시 실패했던 부분)",
+              sym19 not in svc._pending_sell_side_effects)
+        check("19-10) last_sold_at_by_symbol이 실제로 기록됨",
+              sym19 in svc.state.last_sold_at_by_symbol)
+        check("19-11) entry_time_by_symbol에서 제거됨",
+              sym19 not in svc.state.entry_time_by_symbol)
+        check("19-12) 손실/트레일링 로직이 반영됨(트레일링 손실 추적 발생)",
+              sym19 in svc.state.symbol_trail_loss_at
+              or svc.state.symbol_loss_count_today.get(sym19, 0) >= 0)
+
+        # ── C: 같은 FLAT을 여러 번 폴링해도 side-effect 중복 실행 없음 ──
+        _last_sold_before = svc.state.last_sold_at_by_symbol.get(sym19)
+        svc._sync_position_state_machine_shadow(svc.broker.get_account_balance())
+        svc._sync_position_state_machine_shadow(svc.broker.get_account_balance())
+        check("19-13) FLAT을 여러 번 폴링해도 last_sold_at이 재실행으로 덮어써지지 않음"
+              "(컨텍스트가 이미 소비돼 재실행 자체가 없음)",
+              svc.state.last_sold_at_by_symbol.get(sym19) == _last_sold_before)
+finally:
+    M.SELL_PENDING_TIMEOUT_SEC = _orig_sell_to
+
+check("19-14) 중앙화된 실행 지점이 실제 코드에 존재",
+      "_lifecycle_before_sync" in ts_src
+      and "and symbol in self._pending_sell_side_effects" in ts_src)
+check("19-15) SELL_PENDING 분기 내부의 산발적 호출이 제거되고 한 곳으로 모임",
+      ts_src.count("self._apply_deferred_sell_side_effects(symbol)") == 1)
+
+
+# ══════════════════════════════════════════════════════════════
+# 20. P1 — deferred side-effect 가격이 추정치임을 명시 (1P0.7.1)
+# ══════════════════════════════════════════════════════════════
+check("20-1) 컨텍스트 저장 지점에 ORDER_PRICE_BASED_ESTIMATE 명시",
+      "ORDER_PRICE_BASED_ESTIMATE" in ts_src)
+check("20-2) 실제 체결가가 아니라는 한계가 문서화됨",
+      "실제 체결가가 아닙니다" in ts_src or "실제 체결가 아님" in ts_src)
+check("20-3) 8/12 실측 근거(194초)가 남아있음", "194초" in ts_src)
+check("20-4) 근본 해결(fill price 연결)이 아직 미구현임을 명시",
+      "fill price 연결" in ts_src)
 
 
 print()

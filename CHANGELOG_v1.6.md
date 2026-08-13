@@ -6312,3 +6312,138 @@ sync가 먼저 도므로, 테스트에 그 폴링을 시뮬레이션하는 코�
 
 ---
 
+## 1P0.7.1: Safety Closure — 남은 P0 두 건 (2026-08-12)
+
+1P0.7에 대한 GPT 재검토("조건부 승인 🟡, 실계좌 배포는 아직 보류")
+반영. **범위를 GPT가 지정한 두 P0로 좁혀서** 재현 후 수정했습니다.
+threshold나 전략 로직은 변경하지 않았습니다.
+
+### P0-1: BUY zero-fill timeout에서 orphan이 즉시 사라짐 (재현 확인)
+
+`resolve_stale_pending()`의 BUY_PENDING 분기가 0주 체결로
+타임아웃되면:
+```
+BUY_PENDING → orphan 생성(원 주문이 살아있을 수 있음)
+→ lifecycle=FLAT(잔고 0)이니까 reset
+→ 방금 만든 orphan을 그 reset이 지워버림
+```
+`_reset_transient_block_state()`가 항상 orphan까지 함께 지웠기
+때문입니다. **재현 결과**:
+```
+BUY 174 accepted → 120초 동안 0주 체결 → 타임아웃
+after: FLAT / pending_order_id=None / orphan_order_id=None
+BUY guard = None   SELL decide.allowed = True
+```
+원 BUY 주문이 브로커에 살아있을 수 있는데도 시스템은 "미결 주문
+없음"으로 믿는 상태였습니다.
+
+**수정**: `_reset_transient_block_state(state, *, clear_orphan=True)`
+에 파라미터 추가. `resolve_stale_pending()`의 BUY_PENDING 분기에서
+같은 호출 안에 orphan을 방금 만들었다면 `clear_orphan=False`로
+호출해 보존합니다. "FLAT이 됐다"(잔고 0)와 "원 주문이 종료됐다는
+증거가 있다"는 다른 이야기라는 GPT의 지적을 그대로 반영했습니다.
+
+**수정 후**:
+```
+lifecycle: FLAT
+orphan_order_id: b1                                    ← 보존됨
+BUY guard: BLOCK_BUY_ORPHAN_ORDER(order=b1, age=0s)
+SELL decide.allowed: False
+```
+
+### P0-2: SELL timeout→orphan→나중 FLAT에서 deferred side-effect 누락 (재현 확인)
+
+8/12 실측(`005935` SELL accepted → 잔고 0 반영까지 약 194초)이
+근거입니다. `SELL_PENDING_TIMEOUT_SEC=60`이라 60초 후 `OPEN+orphan`
+으로 넘어가는데, 그 뒤 원 주문이 실제로 완전 체결되면:
+```
+observe_for_orphan() → orphan clear
+sync_from_broker()   → OPEN → FLAT   (`else` 분기)
+```
+경로를 탑니다. `_apply_deferred_sell_side_effects()` 호출이
+**`SELL_PENDING` 분기 안에만** 있었기 때문에, `else` 분기로
+FLAT이 확정되는 이 경로는 **영원히 호출되지 않았습니다**:
+```
+after later fill: lifecycle=FLAT, orphan=None
+pending_sell_side_effect context = 아직 있음
+last_sold_at = None   loss_count = None
+```
+실제로 완전 청산됐는데도 손실 카운트·연속손절·쿨다운·재진입
+차단·트레일링 추적·알림이 전부 적용되지 않는 상태였습니다.
+
+**수정**: 실행 지점을 중앙화했습니다. sync 루프에서 각 종목의
+`_lifecycle_before_sync`를 기록해두고, 어떤 경로(SELL_PENDING 즉시
+완결 / timeout 후 orphan 해소 / 일반 `sync_from_broker`)로
+처리됐든 이 폴링에서 **처음 FLAT이 됐고** 대기 컨텍스트가 있으면
+정확히 1회 실행합니다.
+```python
+if (psm.get(symbol).lifecycle == PositionLifecycle.FLAT
+        and _lifecycle_before_sync != PositionLifecycle.FLAT
+        and symbol in self._pending_sell_side_effects):
+    self._apply_deferred_sell_side_effects(symbol)
+```
+`_pending_sell_side_effects.pop()`이 이미 1회 소비를 보장하므로
+여러 폴링에서 중복 실행되지 않습니다.
+
+### 검증 — 실제 TradingService fixture (GPT 요구 반영)
+
+GPT 지적: "단순 source-string 테스트 말고 실제 서비스 fixture를
+넣으십시오. 우리가 1J에서 계속 당했던 '코드와 테스트가 같은 구조적
+가정을 공유해서 모두 PASS' 패턴을 여기서 끊어야 합니다."
+
+19절을 `TradingService` + `MockBroker`를 실제로 띄운 통합 테스트로
+작성했습니다:
+```
+초기 100주 OPEN
+→ SELL 요청(accepted, 브로커 반영 지연 흉내)
+→ 폴링 1회(타임아웃 전) — 컨텍스트 유지 확인
+→ 타임아웃 경과 → OPEN+orphan 전환 확인
+→ 원 주문이 나중에 실제 완전 체결(잔고 0)
+→ FLAT 확정 확인
+→ [핵심] pending 컨텍스트 소비, last_sold_at 기록,
+  entry_time 제거, 트레일링/손실 로직 반영 확인
+→ 같은 FLAT을 여러 번 폴링해도 재실행 없음(C 요구사항)
+```
+17절의 옛 source-string 검사 2건(`ts_src.count(...)`)은 코드가
+중앙화로 옮겨지며 실패 처리됐고, **19절의 실제 실행 검증으로
+대체**했습니다.
+
+### P1: deferred side-effect 가격이 실제 체결가가 아님을 명시
+
+```
+SELL 요청 시점   10,100원
+실제 최종체결    9,900원 (예시, 8/12 194초 지연 사례 근거)
+```
+근본 해결(실제 fill price 연결)은 아직 없습니다. 컨텍스트 저장
+지점과 `_apply_deferred_sell_side_effects()` docstring 양쪽에
+`ORDER_PRICE_BASED_ESTIMATE` 주석을 남겨, 이 값이 "실제 체결
+손익"이 아니라 주문가 기준 추정치임을 명시했습니다.
+
+### 테스트
+
+`test_partial_fill_lifecycle.py` 182건 → **209건**:
+- 18절(8건) BUY zero-fill timeout orphan 보존 — 0주 체결 시 FLAT이면서
+  orphan 유지, 잔고>0 부분체결 회귀 없음, `pending_order_id` 애초에
+  없는 방어적 케이스.
+- 19절(15건) **실제 TradingService 통합 테스트** — P0-2 전체 시나리오.
+- 20절(4건) P1 문서화 확인.
+- 17절 2건은 중앙화 구조 확인으로 축소, 실질 검증은 19절로 이관.
+
+**전체 회귀**: 17개 파일 전부 통과(1개 스킵). `compileall` 정상.
+
+### 근본 한계 — 이번에도 해결되지 않음 (GPT 명시)
+
+> `pending_order_id`/`orphan_order_id`는 실제 주문번호가 아닙니다.
+> `result.order_id`는 trade log/state에는 들어가지만 lifecycle에는
+> 연결되지 않습니다. lifecycle과 `_pending_sell_side_effects` 둘 다
+> **메모리 전용**입니다 — 프로그램 재시작 시 pending/orphan/deferred
+> 컨텍스트가 전부 소실되고, 원 주문은 브로커에서 계속 살아있을 수
+> 있습니다.
+
+이번 수정 범위에 포함하지 않았습니다. GPT는 이를 **"무인 실계좌
+운영의 배포 blocker"**로 규정했고, 다음 단계로
+`order_id → outstanding/order status → cancel → FILLED/CANCELLED/
+REJECTED` 연결을 명시적으로 요구했습니다.
+
+---
+

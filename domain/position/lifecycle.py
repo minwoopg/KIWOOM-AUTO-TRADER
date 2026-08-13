@@ -591,7 +591,8 @@ class PositionStateMachine:
         base = state.partial_fill_since or state.pending_since
         return self._elapsed(base) >= self.SELL_PENDING_TIMEOUT_SEC
 
-    def _reset_transient_block_state(self, state: SymbolPositionState) -> None:
+    def _reset_transient_block_state(self, state: SymbolPositionState,
+                                      *, clear_orphan: bool = True) -> None:
         """새 포지션 사이클 시작(FLAT 확정) 시 임시 차단 흔적을 지웁니다.
 
         2026-08-10 (1P0.7, GPT 코드리뷰, 재현 확인): 이전 사이클의
@@ -599,6 +600,22 @@ class PositionStateMachine:
         새로 산 종목의 **첫 SELL이 즉시 RECONCILIATION_REQUIRED로
         승격**되는 사고가 재현됐습니다. FLAT 확정 시점에 반드시
         초기화합니다.
+
+        2026-08-10 (1P0.7.1, GPT 코드리뷰 P0, 재현 확인): 기존엔 항상
+        orphan까지 함께 지웠는데, **BUY_PENDING이 0주 체결로 타임아웃
+        되면 방금 이 함수를 부르기 직전에 orphan을 새로 만들어두고,
+        곧바로 이 함수가 그 orphan을 지워버렸습니다**:
+        ```
+        BUY 174 accepted → 120초 동안 0주 체결
+        → orphan 생성(원 주문이 여전히 살아있을 수 있음)
+        → lifecycle=FLAT이니까 reset → 방금 만든 orphan을 삭제
+        → BUY guard=None, SELL decide.allowed=True
+        ```
+        "FLAT이 됐다"는 것과 "이번에 만든 orphan이 종료됐다"는 것은
+        다른 이야기입니다 — 여기서는 잔고가 0이라 FLAT일 뿐, 원 BUY
+        주문의 생사는 전혀 확인되지 않았습니다. 호출부가 orphan을
+        같은 호출에서 막 만들었다면 `clear_orphan=False`로 보존을
+        명시해야 합니다.
         """
         state.sell_reject_count = 0
         state.sell_reject_last_at = None
@@ -608,10 +625,11 @@ class PositionStateMachine:
         state.last_block_code = None
         state.last_forced_sell_at = None
         state.error_since = None
-        # orphan은 FLAT이 됐다는 것 자체가 강한 종료 증거이므로 함께 정리.
-        state.orphan_order_id = None
-        state.orphan_since = None
-        state.orphan_expected_delta = 0
+        if clear_orphan:
+            # orphan은 FLAT이 됐다는 것 자체가 강한 종료 증거일 때만 정리.
+            state.orphan_order_id = None
+            state.orphan_since = None
+            state.orphan_expected_delta = 0
 
     def resolve_stale_pending(self, symbol: str, broker_quantity: int) -> str | None:
         """타임아웃된 PENDING을 관측값 기준으로 확정합니다.
@@ -664,18 +682,30 @@ class PositionStateMachine:
             state.lifecycle = (PositionLifecycle.OPEN if broker_quantity > 0
                                else PositionLifecycle.FLAT)
             state.known_quantity = max(0, broker_quantity)
+            # 2026-08-10 (1P0.7.1, GPT 코드리뷰 P0, 재현 확인): 0주
+            # 체결로 타임아웃돼도 원 주문이 브로커에 살아있을 수
+            # 있으므로 **broker_quantity와 무관하게** 항상 orphan으로
+            # 이관합니다. 기존엔 broker_quantity 조건이 없어 이 부분은
+            # 이미 항상 실행됐지만, 바로 아래 reset이 그걸 지웠습니다.
+            orphan_created_now = False
             if state.pending_order_id:
                 state.orphan_order_id = state.pending_order_id
                 state.orphan_since = datetime.now()
                 state.orphan_expected_delta = max(
                     0, state.expected_final_quantity - broker_quantity)
+                orphan_created_now = True
             state.pending_order_id = None
             state.pending_quantity = 0
             state.requested_quantity = 0
             state.pending_since = None
             state.partial_fill_since = None
             if state.lifecycle == PositionLifecycle.FLAT:
-                self._reset_transient_block_state(state)
+                # 1P0.7.1: 방금 orphan을 만들었다면 이 reset이 그걸
+                # 지우면 안 됩니다 — FLAT(잔고 0)과 "원 주문 종료 확인"
+                # 은 다른 이야기입니다. orphan을 보존한 채 나머지
+                # 임시 차단 상태만 정리합니다.
+                self._reset_transient_block_state(
+                    state, clear_orphan=not orphan_created_now)
             detail = (f"BUY_PENDING_TIMEOUT({self.BUY_PENDING_TIMEOUT_SEC}s) "
                       f"→ {state.lifecycle.value}(qty={broker_quantity})"
                       + (f" ORPHAN({state.orphan_order_id}) — 여전히 HARD block"

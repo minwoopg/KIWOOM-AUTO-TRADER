@@ -2028,20 +2028,28 @@ class TradingService:
                 self.app_logger.critical(f"[POSITION_STATE_MISMATCH][SHADOW] {violation}")
 
             # PENDING이 아닌 종목만 잔고로 재동기화 (다음 폴링을 위한 갱신)
+            # 2026-08-10 (1P0.7.1, GPT 코드리뷰 P0, 재현 확인): 이전엔
+            # _apply_deferred_sell_side_effects() 호출이 SELL_PENDING
+            # 분기 안에만 있었습니다. 그런데 SELL_PENDING이 타임아웃돼
+            # OPEN+orphan으로 전환된 뒤, 원 주문이 나중에(예: 8/12
+            # 005935 실측 194초) 실제로 완전 체결되면 그 확인은
+            # observe_for_orphan()이 orphan을 지우고 `else` 분기의
+            # sync_from_broker()가 OPEN→FLAT으로 넘기는 경로를 타는데,
+            # 그 경로에는 deferred side-effect 호출이 없어 손실 카운트·
+            # 쿨다운·재진입차단·알림이 **영원히 실행되지 않았습니다**.
+            # 어느 경로로 FLAT이 확정되든 놓치지 않도록, 이 폴링의
+            # 시작 시점 lifecycle과 끝난 뒤 lifecycle을 비교해 "이번에
+            # 처음 FLAT이 됐고 대기 중인 컨텍스트가 있는 경우"에만
+            # 한 곳에서 실행합니다(중복 실행 방지).
+            _lifecycle_before_sync = state.lifecycle
             if state.lifecycle == PositionLifecycle.SELL_PENDING:
                 # 매도 요청 다음 폴링 — 브로커 잔고를 다시 조회해 실제로
                 # 전량/부분/미체결인지 판정 (on_sell_result 내부 로직)
                 psm.on_sell_result(symbol, accepted=True, broker_quantity=broker_qty)
-                # 1P0.7: 이 폴링에서 FLAT이 확정됐으면(완전 청산 확인)
-                # 보류해뒀던 손실/쿨다운/알림 side effect를 지금 실행합니다.
-                if psm.get(symbol).lifecycle == PositionLifecycle.FLAT:
-                    self._apply_deferred_sell_side_effects(symbol)
                 # 1P0.3: 브로커가 응답하지 않아 PENDING이 굳는 것을 방지.
                 _resolved = psm.resolve_stale_pending(symbol, broker_qty)
                 if _resolved:
                     self.app_logger.warning(f"[LIFECYCLE_TIMEOUT] {symbol} {_resolved}")
-                    if psm.get(symbol).lifecycle == PositionLifecycle.FLAT:
-                        self._apply_deferred_sell_side_effects(symbol)
             elif state.lifecycle == PositionLifecycle.BUY_PENDING:
                 # 2026-07-23: 매도와 대칭 — 매수 요청 다음 폴링에서
                 # 브로커 잔고를 다시 조회해 실제로 체결됐는지 확인.
@@ -2053,6 +2061,16 @@ class TradingService:
                     self.app_logger.warning(f"[LIFECYCLE_TIMEOUT] {symbol} {_resolved}")
             else:
                 psm.sync_from_broker(symbol, broker_qty)
+
+            # 1P0.7.1: 중앙화된 deferred side-effect 실행 지점.
+            # 어떤 경로(SELL_PENDING 즉시 완결 / timeout 후 orphan 해소
+            # / 일반 sync_from_broker)로 FLAT이 됐든, 이번 폴링에서
+            # **새로 FLAT이 됐고** 대기 중인 컨텍스트가 있으면 정확히
+            # 1회 실행합니다.
+            if (psm.get(symbol).lifecycle == PositionLifecycle.FLAT
+                    and _lifecycle_before_sync != PositionLifecycle.FLAT
+                    and symbol in self._pending_sell_side_effects):
+                self._apply_deferred_sell_side_effects(symbol)
 
             # 2026-07-24 (9차 수정, GPT 코드리뷰): 이상치(예상 밖 수량)
             # 감지 시 ERROR로 전이되는데, 이게 position_lifecycle.csv
@@ -2842,10 +2860,18 @@ class TradingService:
             # 잔고 0(완전 청산)을 확인해줄 때까지 보류하고, 컨텍스트만 저장합니다.
             # sync 루프가 FLAT 확정을 감지하면 _apply_deferred_sell_side_effects()를
             # 호출합니다.
+            # 2026-08-10 (1P0.7.1, GPT 코드리뷰 P1): 여기 저장하는
+            # current_price는 **SELL 주문 발행 시점 가격**이지 실제
+            # 체결가가 아닙니다(ORDER_PRICE_BASED_ESTIMATE). 오늘처럼
+            # 체결 확정까지 194초가 걸리면 요청 시점 10,100원과 실제
+            # 체결가 9,900원이 부호까지 다를 수 있어, 연속손절 카운터·
+            # trailing loss 판단이 뒤집힐 수 있습니다. 근본 해결은 실제
+            # fill price 연결이며(아직 미구현), 그 전까지는 이 추정치를
+            # "실제 체결 손익"이 아니라 주문가 기준 추정으로만 씁니다.
             self._pending_sell_side_effects[symbol] = {
                 "exit_reason": exit_reason,
                 "avg_buy_price": avg_buy_price,
-                "current_price": current_price,
+                "current_price": current_price,  # ORDER_PRICE_BASED_ESTIMATE — 실제 체결가 아님
                 "quantity": quantity,
                 "recorded_at": datetime.now(),
             }
@@ -2866,13 +2892,23 @@ class TradingService:
         343주가 남은 부분체결에도 "완전 청산했다"고 전제한 계산이
         적용되고 있었습니다. sync 루프가 브로커 잔고 0(FLAT 확정)을
         본 시점에만 호출합니다.
+
+        2026-08-10 (1P0.7.1, GPT 코드리뷰 P1 — 미해결 한계):
+        `ctx["current_price"]`는 실제 체결가가 아니라 SELL 주문
+        발행 시점 가격(ORDER_PRICE_BASED_ESTIMATE)입니다. 체결
+        확정까지 오래 걸리면(8/12 실측 최대 194초) 이 값과 실제
+        체결가가 부호까지 다를 수 있어, 아래에서 계산하는 손익
+        판정·연속손절 카운터·trailing loss가 뒤집힐 수 있습니다.
+        근본 해결은 실제 fill price 연결이며, 그 전까지 이 메서드가
+        내는 손익은 "실제 체결 손익"이 아니라 주문가 기준 추정치로만
+        취급하십시오.
         """
         ctx = self._pending_sell_side_effects.pop(symbol, None)
         if ctx is None:
             return
         exit_reason = ctx["exit_reason"]
         avg_buy_price = ctx["avg_buy_price"]
-        current_price = ctx["current_price"]
+        current_price = ctx["current_price"]  # ORDER_PRICE_BASED_ESTIMATE
         quantity = ctx["quantity"]
 
         # 매도 시각 기록 → 재진입 쿨다운에 사용
