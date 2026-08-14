@@ -6890,3 +6890,134 @@ stale 문구 수정, ④ 관련 테스트 추가)가 모두 완료되어 **1P0.8
 
 ---
 
+## 1P0.8-B.1: ka10075/ka10076 read-only 진단 프로브 (2026-08-14)
+
+1P0.8-A.1 종료 직후, 민우님이 실제 키움 공식 REST 가이드(모의투자
+도메인 `mockapi.kiwoom.com`, ka10075/ka10076 공식 코드 샘플과 예시
+JSON 포함)를 근거로 1P0.8-B.1의 확정 설계를 직접 제시했습니다. 이번
+단계는 그 사양을 그대로 구현한 것이며, 별도 검토 라운드 없이 바로
+반영했습니다.
+
+**목적**: `get_open_orders()`/`get_order_status()` 같은 도메인
+인터페이스를 설계하기 전에, 실제 키움 모의계좌가 미체결(`ka10075`)/
+체결(`ka10076`) 조회에 대해 어떤 원시 응답을 주는지부터 확보합니다.
+raw 응답을 보기 전에 우리 쪽 상태 모델(PENDING/FILLED/CANCELLED 등)
+을 먼저 설계하면, 키움 응답을 우리 예상에 끼워 맞추는 위험이 있기
+때문입니다(민우님 설계 사유).
+
+### 새 파일
+
+- **`tools/order_reconciliation_probe.py`** — read-only CLI 진단
+  스크립트. `--symbol`/`--order-id`로 지정한 종목·주문에 대해
+  T+0/1/3/10초(기본, `--intervals`로 조정 가능) 시점마다 ka10075,
+  ka10076을 각각 호출해 JSONL 한 줄에 한 API 호출씩 기록합니다.
+- **`test_order_reconciliation_probe.py`** — 50건, 아래 12개 안전
+  요건을 전부 커버.
+
+### 구조적 안전장치 (민우님 사양 그대로)
+
+1. **주문 기능 없음**: `place_order()`/`cancel_order()`를 이 스크립트
+   가 직접 호출하지 않습니다. 주문은 항상 기존 프로그램이나 HTS/
+   영웅문에서 사람이 먼저 넣고, 그 `ord_no`를 `--order-id`로 전달하는
+   구조라 이 진단기가 매매 사고를 일으킬 가능성이 구조적으로 0에
+   가깝습니다.
+2. **mock 도메인만 허용**: `settings.broker.base_url`의 host가 정확히
+   `mockapi.kiwoom.com`이 아니면 즉시 거부(`assert_mock_domain`).
+   부분 문자열 포함이 아니라 정확히 일치해야 통과 — `mockapi.kiwoom.
+   com.evil.example` 같은 우회도 차단합니다. 우회 옵션(플래그로 검사
+   끄기)은 의도적으로 만들지 않았습니다.
+3. **api-id 허용 목록**: `ALLOWED_API_IDS = {"ka10075", "ka10076"}`.
+   다른 값이 들어오면(코드 수정 실수 포함) 네트워크 호출 자체를 하지
+   않고 즉시 `DisallowedApiId` 예외.
+4. **`order_id` fail-closed 검증**: `None`/빈 문자열/공백뿐/
+   `"pending"`/`"UNKNOWN_ORDER_ID"`는 모두 거부(`validate_order_id`).
+   뒤의 두 값은 PositionStateMachine이 남기는 placeholder/sentinel
+   리터럴(1P0.8-A.1)이며 실제 주문번호가 아닙니다. 참고로 ka10075/
+   ka10076 요청 바디 자체가 종목코드 기준 조회라 `order_id`를 키움에
+   보내는 파라미터로 쓰지도 않습니다 — `--order-id`는 JSONL 레코드에
+   붙는 라벨일 뿐입니다.
+5. **민감정보 미기록**: 요청 헤더 전체를 절대 덤프하지 않고,
+   응답 헤더는 `api-id`/`cont-yn`/`next-key`만 allow-list로 뽑습니다.
+   응답 바디는 원본을 그대로 저장하되(가공 없음 원칙), `acnt_no`
+   등 계좌번호로 보이는 키·`token`/`appkey`/`secretkey` 계열 키는
+   값만 `"[REDACTED]"`로 치환합니다(`redact_sensitive`) — 실측 ka10075
+   응답 예시에 `acnt_no`가 실제로 포함돼 있음을 확인했고, 계좌정보
+   비저장은 raw-dump 원칙보다 우선하는 절대 원칙이기 때문입니다.
+6. **실패를 위장하지 않음**: 네트워크 예외(타임아웃/연결 실패 등)는
+   삼키지 않고 `http_status=None` + `{"probe_transport_error":
+   "<예외 타입명>"}`으로 명시적으로 남깁니다. 예외 원문 문자열은
+   기록하지 않습니다(일부 requests 예외는 문자열에 요청 정보가 섞여
+   나올 수 있어 타입명만 사용). 업무 오류(`return_code != 0`)나
+   HTTP 오류(4xx/5xx)도 예외를 던지지 않고 그대로 반환·기록합니다 —
+   "조회 실패"라는 신호 자체가 중요한 데이터이기 때문입니다.
+7. **`Broker` 추상 인터페이스는 건드리지 않음**: `get_open_orders()`
+   같은 정식 계약을 아직 추가하지 않았습니다. `KiwoomBroker`의 기존
+   `authenticate()`/`session`/`access_token`만 재사용해 원시 HTTP
+   호출을 별도로 수행합니다.
+
+### JSONL 스키마 (민우님 확정 사양)
+
+한 줄 = API 호출 하나. `schema_version`/`run_id`/`scenario`/
+`captured_at_kst`/`elapsed_ms`/`environment`/`symbol`/`side`/
+`order_id`/`requested_quantity`/`api_id`/`request_body`/`http_status`/
+`response_headers`/`response_body`. 상태값(`status`/`filled_qty`/
+`remaining_qty` 등) 같은 정규화 필드는 의도적으로 아직 만들지
+않았습니다 — 실측 후 1P0.8-B.2에서 설계합니다.
+
+### 테스트: `test_order_reconciliation_probe.py` 50건 (신규 파일)
+
+민우님이 제시한 12개 체크리스트를 절 번호로 그대로 매핑:
+mock 도메인 정확 일치·우회 거부(1), 허용 안 된 api-id 즉시 거부(2),
+authorization/토큰이 결과 어디에도 없음(3), 리스트에 중첩된 `acnt_no`
+까지 재귀 redaction(4), `UNKNOWN_ORDER_ID`/`pending`/`None` 거부(5),
+공백뿐인 order_id 거부(6), 비민감 필드·리스트 순서/길이 보존(7),
+`cont-yn`/`next-key` 값 보존(8), 업무 오류·HTTP 500 응답도 예외 없이
+반환(9), `main()` 통합 테스트로 호출 1회=JSONL 1줄 보장(10), run_id/
+elapsed_ms/schema_version 필드 검증(11), 네트워크 예외 시 조용히
+정상값으로 위장하지 않음(12). 추가로 소스 레벨 구조 검증(13):
+`.place_order(`/`.cancel_order(` 실호출 없음, `PositionStateMachine`/
+`TradingService` import 없음, 요청 바디에 `order_id` 파라미터 없음.
+
+전체 회귀: `run_regression_tests.py` 19개 파일 중 18개 통과(신규
+테스트 파일 포함, 자동 발견됨). `test_replay_time_axis.py`만 기존
+pre-existing failure(이번 변경과 무관, 178건 중 10건, 위 절 참고).
+`compileall` 정상.
+
+### `.gitignore`
+
+`diagnostics/`를 추가했습니다 — 이 프로브가 만드는 JSONL은
+민감정보가 redact되긴 하지만 실제 종목/주문번호/시각 등 실거래
+활동 패턴을 담고 있어 커밋 대상이 아닙니다.
+
+### 범위 밖으로 명시적으로 남긴 것
+
+- `BrokerOrder`/`OrderStatus` 내부 표준 모델, `PENDING`/
+  `PARTIALLY_FILLED`/`FILLED`/`CANCELLED`/`REJECTED`/`UNKNOWN` 매핑
+  — 실측 JSONL을 먼저 확보한 뒤 1P0.8-B.2에서.
+- `Broker.get_open_orders()`/`get_order_status()`/`cancel_order()`
+  정식 계약 — 1P0.8-C 이후.
+- "ka10075에서 사라짐 = FILLED" 같은 해석/추론 — 이 프로브는 절대
+  하지 않습니다. `ka10076`(체결이력)과 교차 확인해야 판단 가능하다는
+  것은 민우님이 명시적으로 강조했고, 그 판단 로직 자체가 아직
+  존재하지 않습니다(원시 데이터만 모으는 단계).
+
+### 다음 (1P0.8-B.2 이후, 민우님 확정 순서)
+
+```
+1P0.8-B.1 (완료): raw diagnostic → 실제 모의계좌 JSONL 획득 (민우님이 로컬에서 실행)
+1P0.8-B.2: 획득한 JSONL을 fixture로 고정 → BrokerOrder 모델 설계 →
+           PENDING/PARTIALLY_FILLED/FILLED/CANCELLED/REJECTED/UNKNOWN 매핑
+1P0.8-C: Broker read interface (get_open_orders/get_order_status)
+1P0.8-D: PSM reconciliation
+1P0.8-E: restart reconciliation
+그 후: cancel_order
+```
+
+이 프로브 자체는 실행해도 아무 것도 안전하게 바뀌지 않습니다(read-
+only, TradingService/PSM 미접촉). **다음 세션에서 필요한 것은 민우님이
+실제 모의계좌에서 이 스크립트를 실행해 JSONL을 확보하는 것**입니다 —
+전량체결/미체결(지정가, 취소는 HTS에서 사람이 수행)/가능하면
+부분체결까지 세 가지 사례를 모으는 것을 권장합니다(민우님 설계 참고).
+
+---
+
