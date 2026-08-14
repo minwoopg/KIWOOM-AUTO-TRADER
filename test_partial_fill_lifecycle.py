@@ -1230,8 +1230,14 @@ check("22-1) 모듈/클래스 문서가 stale shadow 설명임을 스스로 인�
       "stale한 shadow" in _lc_src)
 check("22-2) enforce 상태임을 명시",
       "enforce로 차단" in _lc_src or "enforce" in _lc_src.split('"""')[1])
-check("22-3) order_id 미연결 한계가 문서에 명시됨(pending 리터럴)",
-      "리터럴입니다" in _lc_src)
+check("22-3) order_id 연결 상태(1P0.8-A.1)가 문서에 명시됨"
+      "(더 이상 모든 주문이 pending 리터럴을 공유하지 않음)",
+      "confirm_pending_order_id" in _lc_src
+      and "더 이상 모든 주문이" in _lc_src)
+check("22-3b) 하지만 조회/취소 인터페이스는 여전히 없다는 한계가 명시됨"
+      "(식별자 연결과 실제 reconciliation은 별개)",
+      "이것은 식별자를 연결한 것일 뿐입니다" in _lc_src
+      and "get_open_orders()" in _lc_src)
 check("22-4) 재시작 시 소실되는 한계가 문서에 명시됨",
       "재시작 시 전부 소실" in _lc_src or "재시작 시 소실" in _lc_src)
 check("22-5) 무인 실계좌 운영 blocker임이 명시됨",
@@ -1345,6 +1351,508 @@ check("23-15) 소스에 first_fill 시점 판정 로직이 존재",
       and "base_quantity_before_order" in ts_src)
 check("23-16) BUY accepted 로그가 '미확정'임을 명시",
       "매수 주문 접수 완료(미확정)" in ts_src)
+
+
+# ══════════════════════════════════════════════════════════════
+# 24. orphan 수동 해제 파일 명령(ack_orphan) + pending 컨텍스트 정리
+# (2026-08-14, GPT 코드리뷰 P0, 1P0.7.2 후속)
+# ══════════════════════════════════════════════════════════════
+# GPT 지적: acknowledge_orphan()은 있지만 실행 중인 프로세스에서 사람이
+# 호출할 운영 인터페이스가 없어, zero-fill BUY orphan은 재시작 전까지
+# 영구 HARD block. 게다가 acknowledge_orphan()이 PSM 상태만 지우고
+# TradingService의 pending BUY/SELL side-effect 컨텍스트는 그대로 남아,
+# 나중에 같은 종목 잔고가 다른 이유로 움직이면 오래된 컨텍스트가 그
+# 체결을 "이번 주문의 첫 체결/완전청산"으로 오인할 수 있음.
+import os as _os
+
+_orig_cwd_24 = _os.getcwd()
+
+
+def _run_ack_orphan_in_tmp(svc, symbol: str, payload_json: str) -> bool:
+    """commands/ack_orphan_{symbol}.json을 임시 CWD에 만들어 처리.
+
+    코드가 Path("commands")로 CWD 상대경로를 쓰므로, 실제 저장소를
+    건드리지 않도록 임시 디렉터리로 chdir했다가 반드시 원복합니다.
+    반환값: 처리 후에도 명령 파일이 남아있으면 True(정상은 삭제되므로 False).
+    """
+    with _tf2.TemporaryDirectory() as work_dir:
+        _os.chdir(work_dir)
+        try:
+            _os.makedirs("commands", exist_ok=True)
+            cmd_path = _os.path.join("commands", f"ack_orphan_{symbol}.json")
+            with open(cmd_path, "w", encoding="utf-8") as f:
+                f.write(payload_json)
+            svc._process_pending_ack_orphan_commands()
+            return _os.path.exists(cmd_path)
+        finally:
+            _os.chdir(_orig_cwd_24)
+
+
+def _make_orphaned_zero_fill_buy(tmpdir: str, symbol: str):
+    """BUY accepted → 0주 체결 → timeout → orphan (23절과 동일 패턴)."""
+    svc = _build_real_service(tmpdir)
+    svc.broker._cash = 100_000_000
+    svc.broker._positions.pop(symbol, None)
+    svc.broker._prices[symbol] = 1000
+    svc._sync_position_state_machine_shadow(svc.broker.get_account_balance())
+
+    balance = svc.broker.get_account_balance()
+    buy_signal = _Signal(type=_SignalType.BUY, reason="테스트 매수")
+    with _patch2("domain.service.trading_service.now_kst",
+                return_value=_dt2(2026, 8, 12, 11, 0, 0)):
+        svc._try_buy(symbol, 1000, balance, signal=buy_signal,
+                     regime=_MarketRegime.BULLISH, minute_analysis=None)
+    svc.broker._positions.pop(symbol, None)
+    for _ in range(3):
+        _time.sleep(0.1)
+        svc._sync_position_state_machine_shadow(svc.broker.get_account_balance())
+    return svc
+
+
+# ── BUY orphan: 정상 ack로 해제 + pending BUY 컨텍스트 정리 ─────────
+with _tf2.TemporaryDirectory() as _tmp25a:
+    M.BUY_PENDING_TIMEOUT_SEC = 0.2
+    try:
+        svc25a = _make_orphaned_zero_fill_buy(_tmp25a, "888001")
+    finally:
+        M.BUY_PENDING_TIMEOUT_SEC = _orig_buy_to
+    sym25a = "888001"
+    st25a = svc25a._position_state_machine.get(sym25a)
+    check("24-1) 사전조건: zero-fill BUY가 orphan으로 이관됨",
+          st25a.orphan_order_id is not None)
+    check("24-2) 사전조건: pending BUY 컨텍스트가 아직 남아있음",
+          sym25a in svc25a._pending_buy_side_effects)
+
+    _file_left_25a = _run_ack_orphan_in_tmp(
+        svc25a, sym25a, '{"note": "브로커 콘솔에서 원 주문 취소 확인(테스트)"}'
+    )
+    check("24-3) ack_orphan 명령 처리 후 orphan 해제됨",
+          svc25a._position_state_machine.get(sym25a).orphan_order_id is None)
+    check("24-4) pending BUY 컨텍스트도 함께 정리됨(GPT 핵심 지적)",
+          sym25a not in svc25a._pending_buy_side_effects)
+    check("24-5) 명령 파일은 처리 후 삭제됨", not _file_left_25a)
+
+# ── note 없음/빈 note는 fail-closed(해제되지 않고 orphan 유지) ──────
+with _tf2.TemporaryDirectory() as _tmp25b:
+    M.BUY_PENDING_TIMEOUT_SEC = 0.2
+    try:
+        svc25b = _make_orphaned_zero_fill_buy(_tmp25b, "888002")
+    finally:
+        M.BUY_PENDING_TIMEOUT_SEC = _orig_buy_to
+    sym25b = "888002"
+
+    _run_ack_orphan_in_tmp(svc25b, sym25b, "{}")  # note 누락
+    check("24-6) note 없는 명령은 무시됨(orphan 유지, fail-closed)",
+          svc25b._position_state_machine.get(sym25b).orphan_order_id is not None)
+    check("24-7) note 없는 명령 처리 중에도 pending BUY 컨텍스트는 보존됨",
+          sym25b in svc25b._pending_buy_side_effects)
+
+    _run_ack_orphan_in_tmp(svc25b, sym25b, '{"note": ""}')  # 빈 note
+    check("24-8) 빈 note 명령도 무시됨(acknowledge_orphan의 ValueError를 흡수)",
+          svc25b._position_state_machine.get(sym25b).orphan_order_id is not None)
+
+# ── SELL orphan에서도 대칭으로 pending SELL 컨텍스트가 정리됨 ───────
+with _tf2.TemporaryDirectory() as _tmp25c:
+    M.SELL_PENDING_TIMEOUT_SEC = 0.2
+    try:
+        svc25c = _build_real_service(_tmp25c)
+        sym25c = "888003"
+        svc25c.broker._positions[sym25c] = _Position(symbol=sym25c, quantity=100,
+                                                       average_price=10000)
+        svc25c.broker._prices[sym25c] = 10100
+        svc25c._sync_position_state_machine_shadow(svc25c.broker.get_account_balance())
+
+        svc25c._try_sell(sym25c, 100, current_price=10100,
+                          exit_reason="트레일링 스탑 — 테스트", avg_buy_price=10000)
+        # 브로커 반영 지연 흉내(19절과 동일 패턴) — 타임아웃까지 잔고 그대로 유지
+        svc25c.broker._positions[sym25c] = _Position(symbol=sym25c, quantity=100,
+                                                       average_price=10000)
+        _time.sleep(0.25)
+        svc25c._sync_position_state_machine_shadow(svc25c.broker.get_account_balance())
+
+        st25c = svc25c._position_state_machine.get(sym25c)
+        check("24-9) 사전조건: SELL 타임아웃도 orphan으로 이관됨",
+              st25c.orphan_order_id is not None)
+        check("24-10) 사전조건: pending SELL 컨텍스트가 남아있음",
+              sym25c in svc25c._pending_sell_side_effects)
+
+        _file_left_25c = _run_ack_orphan_in_tmp(
+            svc25c, sym25c, '{"note": "브로커 콘솔에서 원 주문 체결 확인(테스트)"}'
+        )
+        check("24-11) SELL orphan도 ack_orphan으로 해제됨",
+              svc25c._position_state_machine.get(sym25c).orphan_order_id is None)
+        check("24-12) SELL orphan 해제 시 pending SELL 컨텍스트도 정리됨(대칭 보완)",
+              sym25c not in svc25c._pending_sell_side_effects)
+        check("24-13) 명령 파일이 삭제됨", not _file_left_25c)
+    finally:
+        M.SELL_PENDING_TIMEOUT_SEC = _orig_sell_to
+
+check("24-14) 폴링 경로에 ack_orphan 처리가 연결됨",
+      "_process_pending_ack_orphan_commands()" in ts_src)
+
+
+# ── (1P0.7.3 재검토 P0) orphan이 실제로 없으면 fail-closed로 거부 ──
+# GPT 지적: acknowledge_orphan()→clear_orphan()은 orphan이 없어도 조용히
+# return하므로, stale ack_orphan_*.json이 정상 BUY_PENDING/SELL_PENDING
+# 위에 떨어지면 orphan 해제는 아무 일도 안 하는데 pending 컨텍스트만
+# 삭제돼버립니다. has_orphan_order()로 먼저 확인해야 합니다.
+with _tf2.TemporaryDirectory() as _tmp25d:
+    svc25d = _build_real_service(_tmp25d)
+    svc25d.broker._cash = 100_000_000
+    sym25d = "888004"
+    svc25d.broker._positions.pop(sym25d, None)
+    svc25d.broker._prices[sym25d] = 1000
+    svc25d._sync_position_state_machine_shadow(svc25d.broker.get_account_balance())
+
+    balance25d = svc25d.broker.get_account_balance()
+    buy_signal25d = _Signal(type=_SignalType.BUY, reason="테스트 매수")
+    svc25d._try_buy(sym25d, 1000, balance25d, signal=buy_signal25d,
+                    regime=_MarketRegime.BULLISH, minute_analysis=None)
+
+    st25d = svc25d._position_state_machine.get(sym25d)
+    check("24-15) 사전조건: 정상 BUY_PENDING, orphan 아님",
+          st25d.lifecycle == L.BUY_PENDING and st25d.orphan_order_id is None)
+    check("24-16) 사전조건: pending BUY 컨텍스트가 존재",
+          sym25d in svc25d._pending_buy_side_effects)
+
+    # orphan이 없는 종목에 (실수로) ack_orphan 명령이 옴 — note 자체는 유효
+    _run_ack_orphan_in_tmp(
+        svc25d, sym25d, '{"note": "실수로 만든 명령(테스트)"}'
+    )
+    check("24-17) orphan이 없으면 acknowledge가 거부됨(lifecycle 그대로 BUY_PENDING)",
+          svc25d._position_state_machine.get(sym25d).lifecycle == L.BUY_PENDING)
+    check("24-18) 핵심: 정상 pending BUY 컨텍스트가 파괴되지 않고 보존됨"
+          "(수동 복구 명령이 정상 주문을 망가뜨리면 안 됨)",
+          sym25d in svc25d._pending_buy_side_effects)
+
+# ── SELL 쪽도 동일하게: orphan 아닌 정상 SELL_PENDING 컨텍스트 보존 ──
+with _tf2.TemporaryDirectory() as _tmp25e:
+    svc25e = _build_real_service(_tmp25e)
+    sym25e = "888005"
+    svc25e.broker._positions[sym25e] = _Position(symbol=sym25e, quantity=100,
+                                                  average_price=10000)
+    svc25e.broker._prices[sym25e] = 10100
+    svc25e._sync_position_state_machine_shadow(svc25e.broker.get_account_balance())
+
+    svc25e._try_sell(sym25e, 100, current_price=10100,
+                     exit_reason="트레일링 스탑 — 테스트", avg_buy_price=10000)
+
+    st25e = svc25e._position_state_machine.get(sym25e)
+    check("24-19) 사전조건: 정상 SELL_PENDING, orphan 아님",
+          st25e.lifecycle == L.SELL_PENDING and st25e.orphan_order_id is None)
+    check("24-20) 사전조건: pending SELL 컨텍스트가 존재",
+          sym25e in svc25e._pending_sell_side_effects)
+
+    _run_ack_orphan_in_tmp(
+        svc25e, sym25e, '{"note": "실수로 만든 명령(테스트)"}'
+    )
+    check("24-21) orphan이 없으면 SELL 쪽도 거부됨(lifecycle 그대로 SELL_PENDING)",
+          svc25e._position_state_machine.get(sym25e).lifecycle == L.SELL_PENDING)
+    check("24-22) 핵심: 정상 pending SELL 컨텍스트가 파괴되지 않고 보존됨",
+          sym25e in svc25e._pending_sell_side_effects)
+
+# ── null/공백 note는 거부 (str(None) == "None"이 통과하던 버그) ──
+with _tf2.TemporaryDirectory() as _tmp25f:
+    M.BUY_PENDING_TIMEOUT_SEC = 0.2
+    try:
+        svc25f = _make_orphaned_zero_fill_buy(_tmp25f, "888006")
+    finally:
+        M.BUY_PENDING_TIMEOUT_SEC = _orig_buy_to
+    sym25f = "888006"
+
+    _run_ack_orphan_in_tmp(svc25f, sym25f, '{"note": null}')  # JSON null
+    check("24-23) note가 JSON null이면 거부됨(과거엔 str(None)='None'으로 통과)",
+          svc25f._position_state_machine.get(sym25f).orphan_order_id is not None)
+    check("24-24) null note 처리 중에도 pending BUY 컨텍스트는 보존됨",
+          sym25f in svc25f._pending_buy_side_effects)
+
+    _run_ack_orphan_in_tmp(svc25f, sym25f, '{"note": "   "}')  # 공백만
+    check("24-25) note가 공백뿐이면 거부됨",
+          svc25f._position_state_machine.get(sym25f).orphan_order_id is not None)
+
+    # 마지막으로 유효한 note로 정상 해제되는지 재확인(회귀 방지)
+    _run_ack_orphan_in_tmp(svc25f, sym25f, '{"note": "  실제 확인 완료  "}')
+    check("24-26) 앞뒤 공백이 있어도 유효한 note면 정상 해제됨(strip 처리)",
+          svc25f._position_state_machine.get(sym25f).orphan_order_id is None)
+    check("24-27) 정상 해제 시 pending BUY 컨텍스트는 정리됨",
+          sym25f not in svc25f._pending_buy_side_effects)
+
+check("24-28) 소스에 has_orphan_order() fail-closed 검증이 존재",
+      "if not self._position_state_machine.has_orphan_order(symbol):" in ts_src)
+check("24-29) 소스에 note가 비문자열/공백이면 거부하는 검증이 존재",
+      "not isinstance(raw_note, str) or not raw_note.strip()" in ts_src)
+
+
+# ══════════════════════════════════════════════════════════════
+# 25. 첫 체결 알림의 수량 표시 정확성 (2026-08-14, GPT 코드리뷰 P1)
+# ══════════════════════════════════════════════════════════════
+# 기존엔 4/83주만 체결된 시점에도 알림에 "수량 83주"라고 표시해
+# 운영자가 전량 체결로 오인할 수 있었음. "보유 N주 / 요청 M주"로
+# 구분해 표시하도록 수정.
+with _tf2.TemporaryDirectory() as _tmp26:
+    svc26 = _build_real_service(_tmp26)
+    svc26.broker._cash = 100_000_000
+    sym26 = "777001"
+    svc26.broker._positions.pop(sym26, None)
+    svc26.broker._prices[sym26] = 1000
+    svc26._sync_position_state_machine_shadow(svc26.broker.get_account_balance())
+
+    _sent_messages_26: list = []
+    svc26._notifier.send = lambda text: (_sent_messages_26.append(text) or True)
+
+    balance26 = svc26.broker.get_account_balance()
+    buy_signal26 = _Signal(type=_SignalType.BUY, reason="테스트 매수")
+    with _patch2("domain.service.trading_service.now_kst",
+                return_value=_dt2(2026, 8, 12, 11, 47, 17)):
+        # 2번째 인자는 quantity가 아니라 current_price — 실제 요청수량은
+        # 내부 포지션 사이징 로직이 계산하므로, accepted 직후 컨텍스트에서
+        # 그 값을 그대로 읽어옵니다(하드코딩하지 않음).
+        svc26._try_buy(sym26, 1000, balance26, signal=buy_signal26,
+                       regime=_MarketRegime.BULLISH, minute_analysis=None)
+
+    requested_qty_26 = svc26._pending_buy_side_effects[sym26]["quantity"]
+    # 요청수량의 일부만 먼저 체결된 상황을 흉내 — 반드시 요청수량보다
+    # 작아야 "부분체결" 시나리오가 성립함.
+    partial_qty_26 = max(1, requested_qty_26 // 4)
+    check("25-0) 사전조건: 부분체결 수량이 요청수량보다 작음(테스트 유효성)",
+          0 < partial_qty_26 < requested_qty_26)
+
+    svc26.broker._positions[sym26] = _Position(symbol=sym26, quantity=partial_qty_26,
+                                                average_price=1000)
+    svc26._sync_position_state_machine_shadow(svc26.broker.get_account_balance())
+
+    check("25-1) 첫 체결 알림이 정확히 1건 전송됨", len(_sent_messages_26) == 1)
+    _msg26 = _sent_messages_26[0] if _sent_messages_26 else ""
+    check("25-2) 알림에 실제 체결수량이 표시됨",
+          f"보유 {partial_qty_26}주" in _msg26)
+    check("25-3) 알림에 요청수량도 함께 표시됨",
+          f"요청 {requested_qty_26}주" in _msg26)
+    check("25-4) 부분체결을 요청수량 전량 체결로 오인시키는 옛 표현이 없음",
+          f"수량: {requested_qty_26}주" not in _msg26
+          and f"수량 {requested_qty_26}주" not in _msg26)
+    check("25-5) 가격이 추정치임을 명시", "ORDER_PRICE_BASED_ESTIMATE" in _msg26)
+
+check("25-6) _apply_first_fill_buy_side_effects가 filled_quantity 인자를 받음",
+      "def _apply_first_fill_buy_side_effects(self, symbol: str, filled_quantity: int)"
+      in ts_src)
+
+
+# ══════════════════════════════════════════════════════════════
+# 26. 실제 주문번호(order_id)를 PSM에 연결 (2026-08-14, 1P0.8-A.1)
+# ══════════════════════════════════════════════════════════════
+# GPT 지적: KiwoomBroker.place_order()는 이미 response.body["ord_no"]를
+# OrderResult.order_id로 정상 반환하고 있었지만, on_buy_requested/
+# on_sell_requested가 place_order() 호출 전에 PSM에 "pending" 리터럴을
+# 먼저 기록해서 그 뒤로 아무도 실제 값으로 교체하지 않았습니다.
+# confirm_pending_order_id()가 이걸 채웁니다.
+
+# ── PSM 단위 테스트 ──────────────────────────────────────────
+m26 = M()
+m26.on_buy_requested("P1", 100, "pending")
+check("26-1) 요청 시점엔 아직 pending 리터럴",
+      m26.get("P1").pending_order_id == "pending")
+m26.confirm_pending_order_id("P1", "REAL-ORDER-123")
+check("26-2) accepted 확인 후 실제 order_id로 교체됨",
+      m26.get("P1").pending_order_id == "REAL-ORDER-123")
+
+# 거부돼 pending_order_id가 이미 None이면 그 뒤 confirm 호출은 no-op
+m26b = M()
+m26b.on_buy_requested("P2", 100, "pending")
+m26b.on_buy_result("P2", accepted=False)
+check("26-3) 거부로 pending_order_id가 None이 됨(사전조건)",
+      m26b.get("P2").pending_order_id is None)
+m26b.confirm_pending_order_id("P2", "REAL-999")
+check("26-4) 거부 후 확인 호출은 아무 영향 없음(레이스 방지, no-op)",
+      m26b.get("P2").pending_order_id is None)
+
+# accepted인데 order_id가 비어있는 이상 응답 — 추측하지 않고 sentinel
+m26c = M()
+m26c.on_buy_requested("P3", 100, "pending")
+m26c.confirm_pending_order_id("P3", "")
+check("26-5) order_id가 빈 문자열이면 UNKNOWN_ORDER_ID sentinel로 남음(추측 안 함)",
+      m26c.get("P3").pending_order_id == "UNKNOWN_ORDER_ID")
+check("26-6) 이상 상황이 last_error에 기록됨",
+      m26c.get("P3").last_error == "ACCEPTED_WITHOUT_ORDER_ID")
+check("26-7) 그렇다고 lifecycle을 ERROR로 전이시키지는 않음"
+      "(그러면 이 종목 강제손절 SELL까지 막혀 더 위험함)",
+      m26c.get("P3").lifecycle == L.BUY_PENDING)
+
+# ── 실제 TradingService(MockBroker) 통합 — BUY ──────────────────
+with _tf2.TemporaryDirectory() as _tmp27a:
+    svc27a = _build_real_service(_tmp27a)
+    svc27a.broker._cash = 100_000_000
+    sym27a = "666001"
+    svc27a.broker._positions.pop(sym27a, None)
+    svc27a.broker._prices[sym27a] = 1000
+    svc27a._sync_position_state_machine_shadow(svc27a.broker.get_account_balance())
+
+    balance27a = svc27a.broker.get_account_balance()
+    buy_signal27a = _Signal(type=_SignalType.BUY, reason="테스트 매수")
+    svc27a._try_buy(sym27a, 1000, balance27a, signal=buy_signal27a,
+                    regime=_MarketRegime.BULLISH, minute_analysis=None)
+
+    real_order_id_27a = svc27a._position_state_machine.get(sym27a).pending_order_id
+    check("26-8) BUY accepted 직후 pending_order_id가 더 이상 'pending'이 아님",
+          real_order_id_27a != "pending")
+    check("26-9) 실제 MockBroker 주문번호 형식을 가짐",
+          isinstance(real_order_id_27a, str) and real_order_id_27a.startswith("MOCK-"))
+
+# ── 실제 TradingService(MockBroker) 통합 — SELL ─────────────────
+with _tf2.TemporaryDirectory() as _tmp27b:
+    svc27b = _build_real_service(_tmp27b)
+    sym27b = "666002"
+    svc27b.broker._positions[sym27b] = _Position(symbol=sym27b, quantity=100,
+                                                  average_price=10000)
+    svc27b.broker._prices[sym27b] = 10100
+    svc27b._sync_position_state_machine_shadow(svc27b.broker.get_account_balance())
+
+    svc27b._try_sell(sym27b, 100, current_price=10100,
+                     exit_reason="트레일링 스탑 — 테스트", avg_buy_price=10000)
+
+    real_order_id_27b = svc27b._position_state_machine.get(sym27b).pending_order_id
+    check("26-10) SELL accepted 직후에도 pending_order_id가 더 이상 'pending'이 아님"
+          "(on_sell_result(accepted=True)는 다음 폴링까지 지연되므로 별도 연결 필요)",
+          real_order_id_27b != "pending")
+    check("26-11) 실제 MockBroker 주문번호 형식을 가짐",
+          isinstance(real_order_id_27b, str) and real_order_id_27b.startswith("MOCK-"))
+
+# ── orphan도 실제 order_id를 물려받는지 (BUY zero-fill 시나리오) ──
+with _tf2.TemporaryDirectory() as _tmp27c:
+    M.BUY_PENDING_TIMEOUT_SEC = 0.2
+    try:
+        svc27c = _make_orphaned_zero_fill_buy(_tmp27c, "666003")
+    finally:
+        M.BUY_PENDING_TIMEOUT_SEC = _orig_buy_to
+    sym27c = "666003"
+    st27c = svc27c._position_state_machine.get(sym27c)
+    check("26-12) orphan_order_id도 실제 주문번호를 물려받음(더 이상 'pending' 아님)",
+          st27c.orphan_order_id is not None and st27c.orphan_order_id != "pending")
+    check("26-13) 실제 MockBroker 주문번호 형식을 가짐",
+          st27c.orphan_order_id.startswith("MOCK-"))
+
+check("26-14) 소스에 BUY accepted 직후 order_id 연결 호출이 존재",
+      "confirm_pending_order_id(symbol, result.order_id)" in ts_src)
+check("26-15) 소스에 SELL accepted 직후 order_id 연결 호출도 존재(같은 호출이 BUY/SELL 두 곳)",
+      ts_src.count("confirm_pending_order_id(symbol, result.order_id)") == 2)
+
+
+# ══════════════════════════════════════════════════════════════
+# 27. order_id 공백 정규화 + CRITICAL 로그 (2026-08-14, 1P0.8-A.1 재검토)
+# ══════════════════════════════════════════════════════════════
+# GPT 지적: confirm_pending_order_id()가 order_id를 strip()하지 않아
+# 공백만 있는 값("   ")도 유효한 order_id로 오인할 수 있었고,
+# order_id가 비어있을 때 실제 app_logger.critical()이 호출되지
+# 않아(CSV 이벤트 기록만 있었음) 운영자가 이를 놓칠 수 있었습니다.
+import dataclasses as _dc27
+
+# ── PSM 단위: 공백만 있는 order_id는 빈 값과 동일하게 취급 ──────
+m27 = M()
+m27.on_buy_requested("P4", 100, "pending")
+m27.confirm_pending_order_id("P4", "   ")
+check("27-1) 공백만 있는 order_id는 UNKNOWN_ORDER_ID sentinel로 처리(strip 후 빈 문자열)",
+      m27.get("P4").pending_order_id == "UNKNOWN_ORDER_ID")
+check("27-2) last_error도 동일하게 기록",
+      m27.get("P4").last_error == "ACCEPTED_WITHOUT_ORDER_ID")
+
+# 앞뒤 공백이 있는 정상 order_id는 strip되어 저장됨
+m27b = M()
+m27b.on_buy_requested("P5", 100, "pending")
+m27b.confirm_pending_order_id("P5", "  REAL-777  ")
+check("27-3) 앞뒤 공백은 제거되고 실제 order_id만 저장됨",
+      m27b.get("P5").pending_order_id == "REAL-777")
+
+# ── CRITICAL 로그: BUY accepted인데 order_id가 비어 있으면 발생 ──
+with _tf2.TemporaryDirectory() as _tmp28a:
+    svc28a = _build_real_service(_tmp28a)
+    svc28a.broker._cash = 100_000_000
+    sym28a = "666004"
+    svc28a.broker._positions.pop(sym28a, None)
+    svc28a.broker._prices[sym28a] = 1000
+    svc28a._sync_position_state_machine_shadow(svc28a.broker.get_account_balance())
+
+    _critical_calls_28a = []
+    svc28a.app_logger.critical = lambda msg: _critical_calls_28a.append(msg)
+
+    _orig_place_order_28a = svc28a.broker.place_order
+
+    def _place_order_empty_id_28a(order):
+        result = _orig_place_order_28a(order)
+        return _dc27.replace(result, order_id="")
+
+    svc28a.broker.place_order = _place_order_empty_id_28a
+
+    balance28a = svc28a.broker.get_account_balance()
+    buy_signal28a = _Signal(type=_SignalType.BUY, reason="테스트 매수(order_id 누락)")
+    svc28a._try_buy(sym28a, 1000, balance28a, signal=buy_signal28a,
+                    regime=_MarketRegime.BULLISH, minute_analysis=None)
+
+    check("27-4) BUY: order_id 비어있으면 CRITICAL 로그가 실제로 호출됨",
+          len(_critical_calls_28a) == 1)
+    check("27-5) CRITICAL 메시지에 ORDER_ID_MISSING, 종목, side=BUY 포함",
+          bool(_critical_calls_28a)
+          and "ORDER_ID_MISSING" in _critical_calls_28a[0]
+          and sym28a in _critical_calls_28a[0]
+          and "side=BUY" in _critical_calls_28a[0])
+
+# ── CRITICAL 로그: SELL accepted인데 order_id가 비어 있으면 발생 ──
+with _tf2.TemporaryDirectory() as _tmp28b:
+    svc28b = _build_real_service(_tmp28b)
+    sym28b = "666005"
+    svc28b.broker._positions[sym28b] = _Position(symbol=sym28b, quantity=100,
+                                                  average_price=10000)
+    svc28b.broker._prices[sym28b] = 10100
+    svc28b._sync_position_state_machine_shadow(svc28b.broker.get_account_balance())
+
+    _critical_calls_28b = []
+    svc28b.app_logger.critical = lambda msg: _critical_calls_28b.append(msg)
+
+    _orig_place_order_28b = svc28b.broker.place_order
+
+    def _place_order_empty_id_28b(order):
+        result = _orig_place_order_28b(order)
+        return _dc27.replace(result, order_id="")
+
+    svc28b.broker.place_order = _place_order_empty_id_28b
+
+    svc28b._try_sell(sym28b, 100, current_price=10100,
+                     exit_reason="트레일링 스탑 — 테스트(order_id 누락)", avg_buy_price=10000)
+
+    check("27-6) SELL: order_id 비어있으면 CRITICAL 로그가 실제로 호출됨",
+          len(_critical_calls_28b) == 1)
+    check("27-7) CRITICAL 메시지에 ORDER_ID_MISSING, 종목, side=SELL 포함",
+          bool(_critical_calls_28b)
+          and "ORDER_ID_MISSING" in _critical_calls_28b[0]
+          and sym28b in _critical_calls_28b[0]
+          and "side=SELL" in _critical_calls_28b[0])
+
+# ── 정상 케이스: order_id가 있으면 CRITICAL 로그가 발생하지 않음 (회귀 방지) ──
+with _tf2.TemporaryDirectory() as _tmp28c:
+    svc28c = _build_real_service(_tmp28c)
+    svc28c.broker._cash = 100_000_000
+    sym28c = "666006"
+    svc28c.broker._positions.pop(sym28c, None)
+    svc28c.broker._prices[sym28c] = 1000
+    svc28c._sync_position_state_machine_shadow(svc28c.broker.get_account_balance())
+
+    _critical_calls_28c = []
+    svc28c.app_logger.critical = lambda msg: _critical_calls_28c.append(msg)
+
+    balance28c = svc28c.broker.get_account_balance()
+    buy_signal28c = _Signal(type=_SignalType.BUY, reason="테스트 매수(정상)")
+    svc28c._try_buy(sym28c, 1000, balance28c, signal=buy_signal28c,
+                    regime=_MarketRegime.BULLISH, minute_analysis=None)
+
+    check("27-8) 정상 order_id가 있으면 CRITICAL 로그가 호출되지 않음(회귀 방지)",
+          len(_critical_calls_28c) == 0)
+
+check("27-9) 소스에 order_id strip() 정규화 로직 존재",
+      'order_id = str(order_id or "").strip()' in _lc_src)
+check("27-10) 소스에 BUY용 ORDER_ID_MISSING CRITICAL 로그 호출 존재",
+      "side=BUY" in ts_src and "ORDER_ID_MISSING" in ts_src)
+check("27-11) 소스에 SELL용 ORDER_ID_MISSING CRITICAL 로그 호출도 존재(BUY/SELL 두 곳)",
+      "side=SELL" in ts_src and ts_src.count("ORDER_ID_MISSING") >= 2)
+check("27-12) 모듈 docstring의 stale 'order_id 연결 예정(미착수)' 문구가 수정됨",
+      "1P0.8-A.1에서 완료" in _lc_src)
 
 
 print()

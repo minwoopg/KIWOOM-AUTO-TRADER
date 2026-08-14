@@ -6579,3 +6579,314 @@ false-pass 제거, 문서 정합성)를 마무리하는 데 집중했습니다.
 
 ---
 
+## 1P0.7.3: orphan 수동 해제 인터페이스 + 첫 체결 알림 수량 정확성 (2026-08-14)
+
+1P0.7.2 diff에 대한 GPT 재검토 결과, 핵심 수정(BUY side-effect 이연)은
+승인됐지만 1P0.8(Broker Order Reconciliation)로 넘어가기 전에 정리할
+2가지 지적이 있었습니다. (5분 보유 정책/first_fill_at·full_fill_at
+분리는 SELL 로직 변경에 해당해 별도 확인 후 진행 — 이번 단계에는
+포함하지 않음)
+
+### 지적 1 (P0): zero-fill orphan의 운영자 해제 경로 부재
+
+`PositionStateMachine.acknowledge_orphan()`은 1P0.7부터 존재했지만,
+이 프로세스가 REPL/디버거 연결 없는 백그라운드 asyncio라 실행 중
+호출할 인터페이스가 없었습니다. BUY accepted → 실제 0주 체결 →
+BUY_PENDING 타임아웃 → orphan이 되면, 프로세스를 재시작하지 않는 한
+해당 종목이 영구 HARD block — 그런데 재시작하면 이번엔 outstanding
+주문 정보 자체가 소실되는 더 큰 문제(근본 한계 3번)가 생깁니다.
+
+더 중요한 지적: orphan을 해제할 때 `acknowledge_orphan()`은
+PositionStateMachine 쪽 상태만 지우고, TradingService가 들고 있는
+`_pending_buy_side_effects[symbol]`(SELL orphan이면
+`_pending_sell_side_effects[symbol]`)은 그대로 남습니다. 정리하지
+않으면 나중에 같은 종목 잔고가 (재진입 등) 다른 이유로 다시 움직였을
+때, 오래된 컨텍스트가 그 체결을 "이번 주문의 첫 체결/완전청산"으로
+오인할 수 있습니다.
+
+**수정**: `commands/ack_error_{symbol}.json`과 동일한 파일 명령
+패턴으로 `commands/ack_orphan_{symbol}.json`을 추가했습니다
+(`_process_pending_ack_orphan_commands()`, 매 폴링에서
+`_process_pending_ack_error_commands()`와 나란히 호출). 처리 시
+`acknowledge_orphan()` 호출 직후 `_pending_buy_side_effects`와
+`_pending_sell_side_effects` 양쪽을 모두 정리합니다 — 한 종목이
+BUY/SELL pending 컨텍스트를 동시에 갖는 정상 상황은 없으므로, 존재
+하지 않는 쪽을 지워도 안전한 no-op입니다. note가 없거나 빈 문자열이면
+(`acknowledge_orphan()`의 ValueError) 처리하지 않고 파일만 삭제합니다
+(ack_error와 동일한 fail-closed 방식).
+
+사용법 (PowerShell):
+```
+$body = @{ note = "브로커 콘솔에서 원 주문 취소/미체결 확인" } | ConvertTo-Json
+$body | Out-File -Encoding utf8 commands\ack_orphan_475150.json
+```
+
+**재검토(같은 날) 추가 P0**: 위 초안을 GPT에게 다시 검토받은 결과,
+`acknowledge_orphan()` → `clear_orphan()`이 **orphan이 실제로 없어도
+예외 없이 조용히 return**한다는 게 드러났습니다. 즉 정상
+BUY_PENDING/SELL_PENDING(orphan 아님)인 종목에 실수로/stale
+`ack_orphan_*.json`이 있으면, orphan 해제는 아무 일도 안 하는데
+pending 컨텍스트만 삭제돼 "수동 복구 명령이 오히려 정상 주문을
+파괴"할 수 있었습니다. `has_orphan_order()`로 현재 orphan이 실제로
+있는지 먼저 fail-closed로 확인하도록 추가했습니다 — 없으면 아무
+상태도 건드리지 않고 예외만 던져 파일을 삭제합니다.
+
+같은 재검토에서 note 검증도 `str(payload["note"])`이면
+`{"note": null}`이 문자열 `"None"`으로 통과하던 것을 확인, 비어있지
+않은 문자열만 허용하도록(공백 strip 포함) 강화했습니다.
+
+### 지적 2 (P1): 첫 체결 알림의 수량 표시 오류
+
+`_apply_first_fill_buy_side_effects()`가 첫 부분체결(예: 83주 요청 중
+4주) 시점에도 알림/로그에 요청수량(83)을 그대로 써서 "수량 83주"라고
+표시했습니다. 실제로는 4주만 보유 중인데 전량 체결로 오인할 수
+있었습니다.
+
+**수정**: 폴링 루프에서 실제 체결수량(`known_quantity -
+base_quantity_before_order`)을 `filled_quantity` 인자로 넘기도록
+시그니처를 변경하고, 로그/알림을 "보유 N주 / 요청 M주"로 구분해
+표시합니다. 가격도 SELL 쪽과 동일하게 `ORDER_PRICE_BASED_ESTIMATE`
+(주문 시점 가격, 실제 체결가 아님)임을 명시했습니다.
+
+### 테스트
+
+`test_partial_fill_lifecycle.py` 242건 → **278건** (36건 신규):
+- 24절(29건): orphan 파일 명령 처리 —
+  - 정상 ack로 orphan+pending BUY 컨텍스트 정리(BUY orphan)
+  - note 누락/빈 문자열/JSON null/공백뿐인 문자열은 모두 fail-closed로
+    거부(`{"note": null}`이 과거 `str(None)="None"`으로 통과하던 버그
+    포함), 앞뒤 공백은 strip 후 정상 처리되는지도 회귀 확인
+  - SELL orphan에서도 대칭으로 pending SELL 컨텍스트 정리
+  - **재검토 P0**: orphan이 실제로 없는 정상 BUY_PENDING/SELL_PENDING
+    상태에 stale 명령이 오면 `has_orphan_order()`가 거부하고, lifecycle과
+    pending 컨텍스트가 전혀 훼손되지 않는지 BUY/SELL 양쪽 확인
+  - 폴링 경로 연결 확인
+  - 모두 실제 `TradingService` 통합 fixture로 검증(orphan을 실제로
+    만들거나, 일부러 orphan 아닌 정상 PENDING 상태를 만든 뒤 명령을
+    실행). `commands/`가 CWD 상대경로라 테스트는 임시 디렉터리로
+    chdir했다가 원복합니다.
+- 25절(7건): 첫 체결 알림의 수량 표시 — 실제 `_try_buy()`가 계산한
+  요청수량을 그대로 읽어와(하드코딩하지 않음) 그보다 작은 부분체결을
+  흉내내고, `_notifier.send()`를 가로채 메시지 내용을 직접 검증.
+
+**전체 회귀**: 18개 파일 중 17개 통과, 1개 스킵(`test_legacy_
+fixture_structure.py`, 기존과 동일한 사유). `compileall` 정상.
+
+threshold나 전략 로직(RSI/MACD/진입점수 등)은 변경하지 않았습니다.
+
+**known pre-existing failure**: `test_replay_time_axis.py`가 178건 중
+10건 실패합니다. 이번 변경분(`trading_service.py`,
+`test_partial_fill_lifecycle.py`)과는 무관함을 확인했습니다 — 이
+파일은 두 파일 어느 쪽도 import하지 않고, `git stash`로 변경분을
+걷어낸 **원본 HEAD `6e45736`**(1P0.7.2, 이번 단계 착수 시점 기준)에서
+`python test_replay_time_axis.py` 단독 실행 시 동일하게 178건 중
+10건이 실패합니다 — 1P0 계열 변경과 무관한 사전 존재 이슈이며, 이번
+단계의 blocker로 취급하지 않았습니다. 원인 조사는 별도 이슈로 남겨둠.
+(`websockets` 패키지 미설치로 인한 2개 파일 import 실패는 검증 환경
+차이일 뿐이라 별도로 취급 — websockets 설치 후 재실행하면 사라짐.)
+
+### 보류 — SELL 로직 변경이라 확인 필요 → 결론
+
+GPT는 "5분 보유" 규칙(`entry_watch`의 최소수익미달청산)이 여전히
+`first_fill_at` 기준이라, 전량체결(`full_fill_at`) 이후로는 여전히
+설계 의도보다 훨씬 이른 시점에 발동한다고 지적했습니다.
+
+민우님·GPT 재검토 결론: **`last_filled_at`을 그대로 entry timer로
+enforce 전환하지 않습니다.** 이유는 단순히 "보수적으로 미루자"가
+아니라, 현재 `last_filled_at`의 의미 자체가 정확하지 않기 때문입니다
+— `confirm_buy_from_broker()`는 `broker_quantity ==
+expected_final_quantity`일 때만 이 값을 기록하므로, 부분체결→
+BUY_PENDING timeout→OPEN+orphan 경로(전량체결이 없는 경로)에서는 이
+값 자체가 존재하지 않습니다. 게다가 lifecycle이 아직 메모리 전용이라
+재시작하면 이 값도 소실됩니다(근본 한계 2번). 그래서 필요한 개념은
+`full_fill_at`이 아니라 **`position_ready_at`**(이 BUY 주문으로 인한
+수량 변화가 더 이상 없다고 "확정"된 시점 — 정상 전량체결이면
+`full_fill_at`과 같지만, 부분체결 후 잔량이 CANCELLED로 확정되면 그
+시점)이며, 이건 실제 주문의 terminal state를 알아야 정확히 잡을 수
+있으므로 **1P0.8(actual order_id + get_order_status() +
+FILLED/CANCELLED/REJECTED + restart reconciliation)과 자연스럽게
+묶입니다.**
+
+1P0.8에서 확정할 예정인 배치:
+- `entry_watch`의 급락 손절 / VWAP 이탈(위험관리 성격) → 계속
+  `first_fill_at` 기준 유지(1주라도 보유 시작하면 즉시 위험관리 대상)
+- `entry_watch`의 5분 최소수익미달청산 → `position_ready_at` 기준으로
+  전환(의도한 포지션 구축이 끝난 뒤 5분을 줌)
+- 8/12 103590 예시로 검증: accepted 11:47:17 → first_fill 11:47:27
+  (위험관리 시작) → full_fill 11:50:42 = position_ready_at(정상
+  전량체결이므로) → 최소수익 평가 시작 11:50:42, 최초 평가는
+  약 11:55:42. 현재 방식(11:52:27부터 평가)이면 83주 전체 포지션에
+  사실상 1분 45초만 준 문제가 해소됨.
+- 이 정책 변경 자체(1P0.8에서)도 shadow 관측 없이 곧바로 enforce하지
+  않고, 실제 SELL 판단에 반영하기 전 별도 확인을 거칠 예정.
+
+---
+
+## 1P0.8-A.1: 실제 주문번호(order_id)를 PSM에 연결 (2026-08-14)
+
+1P0.7.3 승인 후 GPT가 1P0.8(Broker Order Reconciliation) 착수 전
+소스를 직접 검토해 중요한 사실을 확인했습니다: **실제 주문번호를
+못 받고 있는 게 아니라, 이미 받고 있는데 연결만 안 돼 있었습니다.**
+
+`KiwoomBroker.place_order()`는 이미 `response.body["ord_no"]`를
+`OrderResult.order_id`로 정상 추출해 반환합니다(공식 kt10000/kt10001
+매수/매도 API 사용). 문제는 `on_buy_requested()`/`on_sell_requested()`
+가 `place_order()` 호출 **전에** PSM에 `"pending"` 리터럴을 먼저
+기록하고, 그 뒤로 실제 `result.order_id`가 한 번도 PSM에 다시
+연결되지 않았다는 것이었습니다 — 모든 주문이 동일한 `"pending"`
+문자열을 공유해 서로 구분이 불가능했고, orphan으로 전이돼도
+(`orphan_order_id = pending_order_id`) 마찬가지였습니다.
+
+**수정**: `PositionStateMachine.confirm_pending_order_id(symbol,
+order_id)`를 새로 추가하고, `place_order()` accepted 직후(BUY/SELL
+공통) 호출해 `"pending"` placeholder를 실제 `ord_no`로 교체합니다.
+
+- BUY: `on_buy_result(symbol, result.accepted)` 직후 accepted면 호출.
+- SELL: `on_sell_result(accepted=True, ...)`는 다음 폴링까지 지연
+  호출되므로(체결 여부는 브로커 잔고 재조회로만 확인), place_order()
+  accepted 분기의 `else:`(기존 `_forced_sell_failures` 정리 위치)에서
+  별도로 호출.
+- accepted인데 `order_id`가 비어있는 이상 응답은 추측하지 않고
+  `"UNKNOWN_ORDER_ID"` sentinel + `last_error =
+  "ACCEPTED_WITHOUT_ORDER_ID"`로 명시적으로 남깁니다. lifecycle을
+  ERROR로 전이시키지는 않습니다 — 그러면 이 종목의 강제 손절 SELL까지
+  HARD block되어 order_id 하나 놓친 것보다 더 위험한 상황이 됩니다.
+- 이미 다른 사유(거부 등)로 `pending_order_id`가 `None`이면 no-op
+  (레이스 방지).
+
+`lifecycle.py` 모듈 docstring의 "근본 한계" 목록도 정정: order_id
+**연결**은 됐지만, 이 번호로 실제 조회/취소하는 Broker 인터페이스
+(`get_open_orders()`/`get_order_status()`/`cancel_order()`)는 아직
+없다는 것을 명확히 구분해서 남겼습니다 — 식별자 연결과 실제
+reconciliation은 별개입니다.
+
+**범위 밖으로 명시적으로 남긴 것**: 이 번호로 무언가를 조회/판단하는
+로직은 이번 단계에 전혀 없습니다. `get_open_orders()`/
+`get_order_status()`(ka10075/ka10076 기반)와 `cancel_order()`
+(kt10003)는 GPT 제안대로 다음 하위 단계(1P0.8-B 이후)에서, 실제 키움
+모의계좌 응답을 먼저 캡처·검증한 뒤 진행합니다 — 필드 의미를
+추측하지 않습니다.
+
+### 테스트
+
+`test_partial_fill_lifecycle.py` 278건 → **294건** (16건 신규, 26절):
+- PSM 단위: accepted 후 실제 order_id로 교체, 거부로 이미 None이면
+  no-op, order_id 빈 문자열이면 sentinel + last_error 기록하되
+  lifecycle은 ERROR로 전이하지 않음(BUY_PENDING 유지 확인)
+- 실제 `TradingService`(MockBroker) 통합: BUY/SELL 양쪽 모두 accepted
+  직후 pending_order_id가 더 이상 `"pending"`이 아니라 실제 MockBroker
+  주문번호(`MOCK-######`) 형식임을 확인
+- zero-fill BUY timeout → orphan 시나리오에서 orphan_order_id도 실제
+  주문번호를 물려받는지 확인
+- 22절 기존 체크(22-3)를 새 문서 상태에 맞게 갱신(예전엔 "여전히
+  pending 리터럴"을 확인했는데 이제는 사실이 아니므로) + 22-3b 신설
+  (조회/취소 인터페이스는 여전히 없다는 한계는 그대로 확인)
+
+**전체 회귀**: 18개 파일 중 17개 통과, 1개 스킵(기존과 동일).
+`test_replay_time_axis.py`는 여전히 same known pre-existing failure
+(위 1P0.7.3 절 참고, 이번 변경과 무관 재확인). `compileall` 정상.
+
+threshold나 전략 로직(RSI/MACD/진입점수 등)은 변경하지 않았습니다 —
+이 단계는 순수하게 이미 존재하던 데이터(order_id)를 올바른 곳에
+연결하는 배관(plumbing) 작업입니다.
+
+### 다음 (1P0.8-B 이후)
+
+```
+- Broker 추상 인터페이스에 get_open_orders()/get_order_status()/
+  cancel_order() 계약 추가, KiwoomBroker + MockBroker 양쪽 구현
+- 내부 표준 BrokerOrder/OrderStatus 모델(PENDING/PARTIALLY_FILLED/
+  FILLED/CANCELLED/REJECTED/UNKNOWN) — 키움 원시 응답과 분리
+- 실제 키움 모의계좌에서 BUY 발행 → ka10075(미체결) → 체결 후
+  ka10075/ka10076(체결) 응답을 먼저 캡처·검증 (민우님이 실측 제공
+  가능하다고 하셨음)
+- get_order_status()는 "미체결 목록에 없다"만으로 FILLED 단정하지
+  않음 — 체결 조회와 함께 판단, 모호하면 UNKNOWN으로 fail-close
+- cancel_order()(kt10003)는 조회 API 충분히 검증한 뒤 가장 마지막에
+- 이후 restart reconciliation(잔고+outstanding orders+저장된 pending
+  context 대조), 실제 fill price 연결, position_ready_at 도입
+```
+
+### 근본 한계 — 이번에도 해결되지 않음 (GPT 명시, 남은 우선순위 4~9)
+
+```
+4. actual order_id lifecycle 연결
+5. broker outstanding/status/cancel 인터페이스
+6. restart reconciliation / pending context persistence
+7. 실제 fill price 연결
+8. 그 후 실계좌 shadow/소액 검증
+9. 이후 Entry Timing Study 복귀
+```
+
+이번 단계는 1P0.8 착수 전 마지막 정리였습니다. GPT 최종 판정대로,
+다음 단계는 실제 주문 identity/status/cancel 연결(1P0.8)이며,
+`first_fill_at`/`full_fill_at` 명시적 분리도 그 작업에 함께 넣는 것이
+좋다는 제안을 받았습니다(정책 확정 후).
+
+### 1P0.8-A.1 재검토 — 커밋 전 최종 보강 2건 (2026-08-14)
+
+위 구현을 커밋하기 직전 GPT가 소스를 한 번 더 검토해 작은 구멍 2개를
+지적했습니다. 둘 다 순수 plumbing/관측성 보강이며 BUY/SELL/HOLD
+판단 로직은 전혀 건드리지 않았습니다.
+
+1. **`order_id` 공백 정규화 누락**: `confirm_pending_order_id()`가
+   전달받은 `order_id`를 `strip()`하지 않아, 공백만 있는 문자열
+   (`"   "` 등)이 "값이 있는" 정상 order_id로 오인되어 저장될 수
+   있었습니다. `state.pending_order_id = "UNKNOWN_ORDER_ID"` sentinel
+   경로가 트리거되지 않고 조회 불가능한 문자열이 그대로 남는 문제.
+   → 메서드 진입 직후 `order_id = str(order_id or "").strip()`을
+   추가해, 앞뒤 공백은 제거하고 공백만 있던 값은 빈 문자열로 정규화한
+   뒤 기존 sentinel 로직을 그대로 타도록 수정.
+
+2. **`order_id` 누락 시 실제 CRITICAL 로그 부재**: 메서드 docstring은
+   "CRITICAL 로그로 노출"한다고 적혀 있었지만, 실제 구현은
+   `_log_event()`(CSV 이벤트 기록)만 호출하고
+   `self.app_logger.critical()`은 한 번도 호출하지 않았습니다 —
+   운영자가 즉시 인지할 CRITICAL 알림이 실제로는 없었던 것입니다.
+   → PSM(`confirm_pending_order_id`)은 상태 관리만 계속 책임지고,
+   CRITICAL 알림은 호출부인 `TradingService`가 `result.order_id`를
+   직접 확인해 남기는 구조로 분리했습니다. `_try_buy()`(BUY,
+   `confirm_pending_order_id()` 호출 직후)와
+   `_try_sell_unchecked()`(SELL, accepted 분기의
+   `confirm_pending_order_id()` 호출 직후) 양쪽에 각각
+   `if not str(result.order_id or "").strip():
+   self.app_logger.critical(f"[ORDER_ID_MISSING] {symbol} | 주문
+   accepted=True지만 order_id가 비어 있음 | side=BUY|SELL")`를
+   추가.
+
+추가로, `lifecycle.py` 모듈 docstring의 하위 "다음 단계" 문단이
+여전히 order_id 연결을 "미착수" 상태로 서술하고 있던 stale 문구도
+발견돼 함께 정정했습니다 — 위쪽 "근본 한계" 목록은 이미
+1P0.8-A.1 완료를 반영하고 있었지만, 아래쪽 문단이 갱신되지 않아
+같은 문서 안에서 서로 모순된 상태였습니다.
+
+**테스트**: `test_partial_fill_lifecycle.py` 294건 → **306건**
+(12건 신규, 27절):
+- PSM 단위: 공백만 있는 order_id → sentinel 처리(27-1, 27-2), 앞뒤
+  공백이 있는 정상 order_id는 strip되어 저장(27-3)
+- 실제 `TradingService`(MockBroker, `place_order()`가 빈 order_id를
+  반환하도록 몽키패치) 통합: BUY accepted+order_id 빈 값 →
+  `app_logger.critical()`이 정확히 1회 호출되고 메시지에
+  `ORDER_ID_MISSING`/종목코드/`side=BUY` 포함 확인(27-4, 27-5),
+  SELL도 동일하게 `side=SELL`로 확인(27-6, 27-7)
+- 회귀 방지: 정상 order_id가 있는 정상 BUY 흐름에서는
+  `app_logger.critical()`이 전혀 호출되지 않음(27-8)
+- 소스 검증: strip() 정규화 로직 존재(27-9), BUY/SELL 양쪽 모두
+  `ORDER_ID_MISSING` CRITICAL 로그 호출 존재(27-10, 27-11), stale
+  docstring 문구가 정정됨(27-12)
+
+**전체 회귀**: 18개 파일 중 17개 통과, `test_replay_time_axis.py`만
+동일한 기존 pre-existing failure(178건 중 10건, 이번 변경과 무관,
+위 1P0.7.3 절 참고). `compileall` 정상.
+
+이 보강으로 GPT가 커밋 전 요구한 4개 체크리스트(① order_id 공백
+normalize, ② order_id 누락 시 실제 CRITICAL 로그, ③ lifecycle.py
+stale 문구 수정, ④ 관련 테스트 추가)가 모두 완료되어 **1P0.8-A.1을
+최종 종료**합니다. 다음 단계는 GPT 제안대로 **1P0.8-B.1**: 실제
+키움 모의계좌에서 ka10075(미체결)/ka10076(체결) 원시 JSON 응답을
+읽기 전용으로 캡처하는 진단 스크립트입니다 — `get_open_orders()`/
+`get_order_status()`/`cancel_order()` 실제 구현이나 SELL/BUY 판단
+변경은 이번에도 범위 밖입니다.
+
+---
+

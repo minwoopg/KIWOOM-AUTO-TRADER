@@ -15,13 +15,17 @@ GPT 검토(7.12/7.14절 관련)에서 제안된 5단계 상태 머신을 구현�
   더 이상 shadow(관측만)가 아닙니다.
 - BUY_PENDING/SELL_PENDING/orphan/ERROR는 HARD block으로, forced
   (손절·강제청산)로도 우회하지 못합니다(1P0.7).
-- **미구현·근본 한계**: `pending_order_id`/`orphan_order_id`는 아직
-  브로커의 실제 주문번호가 아니라 `"pending"` 리터럴입니다.
-  `result.order_id`는 trade log/state에는 기록되지만 이 lifecycle에는
-  아직 연결돼 있지 않습니다. 따라서 특정 주문 조회·취소·
-  FILLED/CANCELLED/REJECTED terminal 확인이 불가능합니다. 이 상태는
-  실제 주문 상태를 몰라도 시스템이 스스로 자신 있게 재개하지 않도록
-  막는 **방어막일 뿐, 근본 해결이 아닙니다**.
+- **부분 해결(2026-08-14, 1P0.8-A.1)**: `pending_order_id`/
+  `orphan_order_id`는 이제 `confirm_pending_order_id()`를 통해
+  place_order() accepted 직후 실제 브로커 주문번호(`ord_no`)로
+  교체됩니다 — 더 이상 모든 주문이 `"pending"` 리터럴을 공유하지
+  않습니다. **다만 이것은 식별자를 연결한 것일 뿐입니다.** 이 번호로
+  실제 조회(`get_open_orders()`/`get_order_status()`)·취소
+  (`cancel_order()`)를 하는 Broker 인터페이스는 아직 없습니다
+  (1P0.8-B/C에서 예정). 따라서 특정 주문의 FILLED/CANCELLED/
+  REJECTED terminal 확인은 여전히 불가능하고, 이 상태는 실제 주문
+  상태를 몰라도 시스템이 스스로 자신 있게 재개하지 않도록 막는
+  **방어막일 뿐, 근본 해결이 아닙니다**.
 - **재시작 시 전부 소실**: lifecycle 상태와
   `_pending_sell_side_effects`는 모두 메모리 전용입니다. 프로그램이
   재시작되면 BUY_PENDING/SELL_PENDING/orphan/보류 중이던 side-effect
@@ -42,12 +46,13 @@ GPT 검토(7.12/7.14절 관련)에서 제안된 5단계 상태 머신을 구현�
 - 전이는 브로커 응답(accepted 여부, 잔고 수량 변화)이 있어야만
   일어남 — 요청을 보냈다는 사실만으로는 상태를 바꾸지 않음.
 
-다음 단계(미착수, 브로커 인터페이스 확장 필요): 실제 `order_id`를
-lifecycle에 연결하고, 브로커에 `get_order_status()` /
-`get_open_orders()` / `cancel_order()`를 추가해 특정 주문의 terminal
-상태를 직접 확인·재시작 시 outstanding order를 reconciliation하는
-것. 그 전까지는 시간·잔고 변화로 추론하는 현재 방식의 한계 안에
-있습니다.
+다음 단계: 실제 `order_id` 연결은 **1P0.8-A.1에서 완료**
+(`confirm_pending_order_id()`). 남은 것은 브로커에
+`get_open_orders()` / `get_order_status()` / `cancel_order()`를
+추가해 이 번호로 특정 주문의 terminal 상태(FILLED/CANCELLED/
+REJECTED)를 직접 확인하고, 재시작 시 outstanding order를
+reconciliation하는 것(1P0.8-B 이후, 미착수). 그 전까지는 시간·잔고
+변화로 추론하는 현재 방식의 한계 안에 있습니다.
 """
 from __future__ import annotations
 
@@ -512,6 +517,67 @@ class PositionStateMachine:
         state.pending_since = None
         state.partial_fill_since = None
         self._log_event(symbol, "SELL_RESULT", prev, state.lifecycle, broker_quantity, detail)
+
+    def confirm_pending_order_id(self, symbol: str, order_id: str) -> None:
+        """place_order() 접수(accepted) 직후, "pending" placeholder를
+        브로커의 실제 주문번호로 교체합니다.
+
+        2026-08-14 (1P0.8-A.1, GPT 코드리뷰 제안 — 근본 한계 4번 착수):
+        `on_buy_requested()`/`on_sell_requested()`는 `place_order()`를
+        호출하기 **전에** PSM에 `"pending"` 리터럴을 먼저 기록합니다
+        (요청 자체를 반영하는 것뿐이라 이 시점엔 실제 주문번호를 아직
+        모름). 그런데 `KiwoomBroker.place_order()`는 이미
+        `response.body["ord_no"]`를 `OrderResult.order_id`로 정상
+        반환하고 있었습니다 — 다만 그 값이 그 뒤로 한 번도 PSM에
+        다시 연결되지 않아 `"pending"`이 그대로 남아있었습니다. 이
+        메서드는 place_order() 응답을 받은 직후(BUY/SELL 공통) 호출해
+        실제 값으로 승격시킵니다.
+
+        `orphan_order_id`는 orphan 전이 시 `pending_order_id`를 그대로
+        복사하므로(위 관련 코드 참고), 이 수정으로 orphan도 함께
+        실제 주문번호를 갖게 됩니다 — 이전엔 모든 orphan이 동일한
+        `"pending"` 문자열을 공유해 서로 구분이 불가능했습니다.
+
+        accepted였는데 브로커가 order_id를 비워서 반환하면(응답 이상)
+        추측하지 않고 `"UNKNOWN_ORDER_ID"` sentinel로 남겨 이후 order
+        status 조회(1P0.8-B)가 이 주문을 절대 추적할 수 없다는 사실을
+        명시적으로 남깁니다 — lifecycle을 ERROR로 전이시키지는
+        않습니다(그러면 이 종목의 강제 손절 매도까지 HARD block되어
+        더 위험합니다).
+
+        2026-08-14 (1P0.8-A.1 재검토, GPT 코드리뷰 지적): 이 메서드가
+        남기는 것은 `_log_event()`를 통한 CSV 이벤트 기록뿐이며,
+        `self.app_logger.critical()`을 호출하지 않으므로 실제로는
+        운영자가 즉시 보게 될 CRITICAL 경고가 없었습니다("추적키를
+        잃은 접수 성공 주문"은 심각한 상황이라 반드시 있어야 함).
+        PSM은 상태 관리만 책임지고, CRITICAL 알림은 호출부인
+        TradingService가 `result.order_id`를 직접 확인해 남기는
+        구조로 분리했습니다(`_try_buy`/`_try_sell_unchecked` 참고).
+
+        공백만 있는 order_id(`" "` 등)를 유효한 값으로 오인하지
+        않도록, 이 메서드에서 먼저 `strip()`합니다.
+
+        호출 시점에 이미 다른 사유(거부 등)로 `pending_order_id`가
+        `None`으로 지워졌다면 아무 것도 하지 않습니다.
+        """
+        state = self.get(symbol)
+        if state.pending_order_id is None:
+            return
+        order_id = str(order_id or "").strip()
+        if not order_id:
+            state.pending_order_id = "UNKNOWN_ORDER_ID"
+            state.last_error = "ACCEPTED_WITHOUT_ORDER_ID"
+            self._log_event(
+                symbol, "ORDER_ID_MISSING", state.lifecycle, state.lifecycle,
+                detail="accepted=True인데 브로커 응답에 order_id가 없음 — "
+                       "이 주문은 이후 order status 조회로 추적 불가",
+            )
+            return
+        state.pending_order_id = order_id
+        self._log_event(
+            symbol, "ORDER_ID_CONFIRMED", state.lifecycle, state.lifecycle,
+            detail=f"order_id={order_id}",
+        )
 
     # ── 주문 전 guard (1P0.2에서 enforce로 전환) ────────────────
     # 2026-08-10: 1P0.1에서는 shadow(경고만)였습니다. 그러나 8/10

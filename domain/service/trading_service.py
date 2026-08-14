@@ -1990,6 +1990,11 @@ class TradingService:
         #   {"broker_quantity": 100, "note": "HTS 직접 확인, 실제 100주"}
         self._process_pending_ack_error_commands()
 
+        # 2026-08-14 (GPT 코드리뷰 P0, 1P0.7.2 후속): orphan도 ack_error와
+        # 동일하게 사람이 파일 명령으로 수동 해제할 수 있어야 함 —
+        # commands/ack_orphan_{symbol}.json. 자세한 사유는 메서드 docstring 참고.
+        self._process_pending_ack_orphan_commands()
+
         # 프로세스(또는 이번 shadow 기능) 최초 실행 시 브로커 실제 잔고
         # 기준으로 초기화 — state.json 등 영속화된 옛 상태를 신뢰하지 않음
         if not self._position_state_machine_initialized:
@@ -2084,7 +2089,16 @@ class TradingService:
             _psm_state_now = psm.get(symbol)
             if (symbol in self._pending_buy_side_effects
                     and _psm_state_now.known_quantity > _psm_state_now.base_quantity_before_order):
-                self._apply_first_fill_buy_side_effects(symbol)
+                # 2026-08-14 (GPT 코드리뷰 P1, 1P0.7.2 후속): 첫 실체결
+                # 시점의 실제 보유수량(known-base)을 넘겨서, 알림이
+                # 요청수량을 "이미 다 체결된 것"처럼 표시하지 않게 함.
+                self._apply_first_fill_buy_side_effects(
+                    symbol,
+                    filled_quantity=(
+                        _psm_state_now.known_quantity
+                        - _psm_state_now.base_quantity_before_order
+                    ),
+                )
 
             # 2026-07-24 (9차 수정, GPT 코드리뷰): 이상치(예상 밖 수량)
             # 감지 시 ERROR로 전이되는데, 이게 position_lifecycle.csv
@@ -2159,6 +2173,103 @@ class TradingService:
                 # 상속해 여기 안 걸림, 의도적으로 유지)로 범위를 넓힘.
                 self.app_logger.error(
                     f"[ACK_ERROR_COMMAND] {symbol} | 명령 파일 처리 실패, 무시하고 "
+                    f"삭제합니다: {exc} — 파일을 다시 만들어 재시도하세요"
+                )
+            finally:
+                cmd_file.unlink(missing_ok=True)
+
+    def _process_pending_ack_orphan_commands(self) -> None:
+        """commands/ack_orphan_{symbol}.json 파일을 확인해 orphan을 해제합니다.
+
+        2026-08-14 (GPT 코드리뷰 P0, 1P0.7.2 후속): `PositionStateMachine.
+        acknowledge_orphan()`은 이미 존재하지만(1P0.7), ack_error와 달리
+        이 프로세스 실행 중에 호출할 운영 인터페이스가 없었습니다. 그
+        결과 zero-fill BUY(0주 체결로 끝난 주문)가 orphan으로 남으면,
+        해당 종목은 프로세스를 재시작하지 않는 한 영구 HARD block
+        상태가 됩니다 — 그런데 재시작하면 이번엔 outstanding 주문
+        정보 자체가 소실되는 더 큰 문제가 생깁니다(미해결 근본 한계
+        3번). `get_order_status()`가 생기기 전까지는 ack_error와
+        동일한 파일 명령 패턴으로 사람이 직접 확인 후 해제하는 수동
+        안전장치가 필요합니다.
+
+        사용법 (PowerShell):
+            $body = @{ note = "브로커 콘솔에서 원 주문 취소/미체결 확인" } | ConvertTo-Json
+            $body | Out-File -Encoding utf8 commands\\ack_orphan_475150.json
+
+        파일이 있으면 다음 폴링에서 읽어 처리하고 즉시 삭제합니다
+        (ack_error와 동일 — 중복 처리 방지). note가 없거나 비어있으면
+        처리하지 않고 오류 로그만 남긴 뒤 파일을 삭제합니다.
+
+        2026-08-14 (GPT 코드리뷰 P0, 1P0.7.2 후속 — 핵심 지적): orphan을
+        해제할 때 PositionStateMachine 쪽 상태만 지우고 TradingService가
+        들고 있는 pending BUY/SELL side-effect 컨텍스트
+        (`_pending_buy_side_effects`/`_pending_sell_side_effects`)를 그대로
+        두면, 나중에 같은 종목 잔고가 (재진입 등) 다른 이유로 다시
+        움직였을 때 오래된 컨텍스트가 "이번 주문의 첫 체결/완전청산"으로
+        오인될 수 있습니다. 그래서 acknowledge_orphan() 호출 직후 이
+        메서드에서 두 컨텍스트를 함께 정리합니다 — PositionStateMachine은
+        TradingService의 내부 상태를 모르므로(계층 분리), 정리는 이
+        호출부(TradingService)의 책임입니다. orphan 방향(BUY/SELL)을
+        굳이 구분하지 않고 둘 다 정리합니다 — 한 종목이 동시에 BUY/SELL
+        양쪽 pending 컨텍스트를 갖는 정상 상황은 없으므로 존재하지
+        않는 쪽을 pop()해도 안전한 no-op입니다.
+
+        2026-08-14 (GPT 코드리뷰 P0, 1P0.7.3 재검토 — 핵심 지적): 위
+        컨텍스트 정리를 `acknowledge_orphan()` 호출에 무조건 뒤따르게
+        하면 새로운 사고 경로가 생깁니다. `acknowledge_orphan()` →
+        `clear_orphan()`은 **orphan이 실제로 없어도 예외 없이 조용히
+        return**합니다(note만 검사). 따라서 정상 BUY_PENDING/SELL_PENDING
+        (orphan 아님) 상태인 종목에 실수로/stale `ack_orphan_*.json`
+        파일이 있으면, orphan 해제는 사실상 아무 일도 안 하는데
+        `_pending_buy_side_effects`/`_pending_sell_side_effects`는
+        그대로 삭제돼 정상 주문의 entry_time·진입횟수·손실카운트·
+        쿨다운·알림이 영원히 누락될 수 있습니다 — 수동 복구 명령이
+        오히려 정상 주문을 파괴하는 상황. `has_orphan_order()`로 현재
+        orphan이 실제로 있는지 먼저 fail-closed로 확인하고, 없으면
+        아무 상태도 건드리지 않은 채 예외를 던져 파일만 삭제합니다
+        (재시도 유도 — ack_error의 broker_quantity 검증과 동일한 사상).
+
+        2026-08-14 (GPT 코드리뷰 P0, 1P0.7.3 재검토): note 검증도
+        `str(payload["note"])`이면 `{"note": null}`도 문자열 `"None"`
+        으로 통과했습니다. 안전 명령이므로 비어있지 않은 문자열만
+        허용하도록 강화합니다.
+        """
+        commands_dir = Path("commands")
+        if not commands_dir.is_dir():
+            return
+        for cmd_file in sorted(commands_dir.glob("ack_orphan_*.json")):
+            symbol = cmd_file.stem[len("ack_orphan_"):]
+            try:
+                payload = json.loads(cmd_file.read_text(encoding="utf-8"))
+                raw_note = payload["note"]
+                if not isinstance(raw_note, str) or not raw_note.strip():
+                    raise ValueError("note는 비어 있지 않은 문자열이어야 합니다")
+                note = raw_note.strip()
+                # 1P0.7.3 재검토 P0: orphan이 실제로 없으면 아무 상태도
+                # 건드리지 않고 fail-closed. acknowledge_orphan()의
+                # clear_orphan()은 orphan이 없어도 조용히 return하므로,
+                # 이 확인 없이는 stale 명령 파일이 정상 pending 컨텍스트를
+                # 삭제해버릴 수 있습니다.
+                if not self._position_state_machine.has_orphan_order(symbol):
+                    raise ValueError(
+                        f"{symbol}: 현재 orphan 주문이 없어 ack_orphan을 적용할 수 없습니다"
+                    )
+                self._position_state_machine.acknowledge_orphan(symbol, note)
+                had_buy_ctx = symbol in self._pending_buy_side_effects
+                had_sell_ctx = symbol in self._pending_sell_side_effects
+                self._pending_buy_side_effects.pop(symbol, None)
+                self._pending_sell_side_effects.pop(symbol, None)
+                self.app_logger.warning(
+                    f"[ACK_ORPHAN_COMMAND] {symbol} | 파일 명령으로 orphan 해제 — "
+                    f"note={note!r}, buy_ctx_cleared={had_buy_ctx}, "
+                    f"sell_ctx_cleared={had_sell_ctx}"
+                )
+            except Exception as exc:
+                # ack_error와 동일한 이유로 Exception 전체를 잡음 — 이
+                # 명령 파일 하나의 처리 실패가 나머지 명령 처리나
+                # run_once() 전체를 끊으면 안 됨.
+                self.app_logger.error(
+                    f"[ACK_ORPHAN_COMMAND] {symbol} | 명령 파일 처리 실패, 무시하고 "
                     f"삭제합니다: {exc} — 파일을 다시 만들어 재시도하세요"
                 )
             finally:
@@ -2592,6 +2703,25 @@ class TradingService:
         self._position_state_machine.on_buy_requested(symbol, order.quantity, "pending")
         result = self.broker.place_order(order)
         self._position_state_machine.on_buy_result(symbol, result.accepted)
+        # 2026-08-14 (1P0.8-A.1, GPT 코드리뷰 제안): 브로커가 이미
+        # 반환한 실제 주문번호(result.order_id)를 "pending" placeholder
+        # 대신 PSM에 연결. 자세한 사유는 confirm_pending_order_id()
+        # docstring 참고.
+        if result.accepted:
+            self._position_state_machine.confirm_pending_order_id(symbol, result.order_id)
+            # 2026-08-14 (1P0.8-A.1 재검토, GPT 코드리뷰 지적): accepted=True인데
+            # order_id가 비어 있으면 이 주문은 이후 order status 조회로 추적할
+            # 방법이 없습니다. confirm_pending_order_id()는 CSV 이벤트
+            # (ORDER_ID_MISSING)만 남기고 실제로 운영자가 즉시 보게 될
+            # CRITICAL 로그는 남기지 않으므로, 호출부인 여기서 직접
+            # app_logger.critical()을 남깁니다(PSM=상태관리, TradingService=
+            # 운영 경고 책임 분리).
+            if not str(result.order_id or "").strip():
+                self.app_logger.critical(
+                    f"[ORDER_ID_MISSING] {symbol} | "
+                    f"주문 accepted=True지만 order_id가 비어 있음 | "
+                    f"side=BUY"
+                )
         # 2026-08-05 (3차 GPT 코드리뷰 지적 P1): 브로커 응답을
         # 즉시 저장 — _write_signal_log()가 이 시점의 실제 접수
         # 여부(result.accepted)를 order_accepted로 정확히 반영할
@@ -2820,6 +2950,22 @@ class TradingService:
                 )
         else:
             self._forced_sell_failures.pop(symbol, None)
+            # 2026-08-14 (1P0.8-A.1): SELL도 BUY와 동일하게, accepted
+            # 직후 실제 주문번호를 PSM에 연결. SELL은 on_sell_result
+            # (accepted=True)가 다음 폴링까지 지연 호출되므로("체결
+            # 여부는 브로커 잔고 재조회로만 확인") 이 시점에 별도로
+            # 호출해야 "pending" placeholder가 방치되지 않습니다.
+            self._position_state_machine.confirm_pending_order_id(symbol, result.order_id)
+            # 2026-08-14 (1P0.8-A.1 재검토, GPT 코드리뷰 지적): BUY와
+            # 동일하게, accepted=True인데 order_id가 비어 있으면 이
+            # 주문을 이후 order status 조회로 추적할 방법이 없습니다.
+            # 운영자가 즉시 인지할 수 있도록 CRITICAL 로그를 남깁니다.
+            if not str(result.order_id or "").strip():
+                self.app_logger.critical(
+                    f"[ORDER_ID_MISSING] {symbol} | "
+                    f"주문 accepted=True지만 order_id가 비어 있음 | "
+                    f"side=SELL"
+                )
 
         # 보유 시간 계산
         hold_minutes = ""
@@ -2903,7 +3049,7 @@ class TradingService:
 
 
 
-    def _apply_first_fill_buy_side_effects(self, symbol: str) -> None:
+    def _apply_first_fill_buy_side_effects(self, symbol: str, filled_quantity: int) -> None:
         """BUY의 첫 실체결이 확인됐을 때만 실행되는 진입 처리.
 
         2026-08-13 (1P0.7.2, GPT 코드리뷰 P0, 재현 근거 — 8/12 103590):
@@ -2921,12 +3067,19 @@ class TradingService:
 
         0주 체결로 끝난(취소/미체결) BUY는 이 메서드가 호출되지 않으므로
         진입횟수·쿨다운·알림을 전혀 소모하지 않습니다.
+
+        2026-08-14 (GPT 코드리뷰 P1, 1P0.7.2 후속): `filled_quantity`는
+        이 시점에 실제로 체결된 수량(예: 83주 요청 중 4주)입니다. 기존엔
+        요청수량(ctx["quantity"])을 그대로 로그/알림에 써서, 4주만
+        체결된 순간에도 "수량 83주"라고 표시해 운영자가 이미 전량
+        체결된 것으로 오인할 수 있었습니다. 요청수량은 별도로
+        표시하고("요청 N주"), 체결수량과 구분합니다.
         """
         ctx = self._pending_buy_side_effects.pop(symbol, None)
         if ctx is None:
             return
-        current_price = ctx["current_price"]
-        quantity = ctx["quantity"]
+        current_price = ctx["current_price"]  # ORDER_PRICE_BASED_ESTIMATE — 실제 체결가 아님
+        requested_quantity = ctx["quantity"]
         regime = ctx["regime"]
         signal_reason = ctx["signal_reason"]
         order_id = ctx["order_id"]
@@ -2940,12 +3093,13 @@ class TradingService:
         )
 
         self.app_logger.info(
-            f"[ORDER] {symbol} | 매수 첫 체결 확인 | 수량 {quantity}주 | 주문번호 {order_id}"
+            f"[ORDER] {symbol} | 매수 첫 체결 확인 | 보유 {filled_quantity}주 / "
+            f"요청 {requested_quantity}주 | 주문번호 {order_id}"
         )
         self._notifier.send(
             f"🟢 [매수] {symbol}\n"
-            f"가격: {current_price:,}원 | 수량: {quantity}주\n"
-            f"금액: {current_price * quantity:,}원\n"
+            f"첫 체결 확인: 보유 {filled_quantity}주 / 요청 {requested_quantity}주\n"
+            f"주문가격: {current_price:,}원 (ORDER_PRICE_BASED_ESTIMATE)\n"
             f"장세: {regime.value if regime else '-'} | 점수: {signal_reason[:30]}"
         )
 
