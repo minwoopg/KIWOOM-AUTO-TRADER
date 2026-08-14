@@ -1506,8 +1506,11 @@ with _tf2.TemporaryDirectory() as _tmp25d:
 
     balance25d = svc25d.broker.get_account_balance()
     buy_signal25d = _Signal(type=_SignalType.BUY, reason="테스트 매수")
-    svc25d._try_buy(sym25d, 1000, balance25d, signal=buy_signal25d,
-                    regime=_MarketRegime.BULLISH, minute_analysis=None)
+    # 14:50 이후 신규매수 차단 게이트로 인한 flaky 방지(23절과 동일 패턴)
+    with _patch2("domain.service.trading_service.now_kst",
+                return_value=_dt2(2026, 8, 12, 11, 47, 17)):
+        svc25d._try_buy(sym25d, 1000, balance25d, signal=buy_signal25d,
+                        regime=_MarketRegime.BULLISH, minute_analysis=None)
 
     st25d = svc25d._position_state_machine.get(sym25d)
     check("24-15) 사전조건: 정상 BUY_PENDING, orphan 아님",
@@ -1688,8 +1691,14 @@ with _tf2.TemporaryDirectory() as _tmp27a:
 
     balance27a = svc27a.broker.get_account_balance()
     buy_signal27a = _Signal(type=_SignalType.BUY, reason="테스트 매수")
-    svc27a._try_buy(sym27a, 1000, balance27a, signal=buy_signal27a,
-                    regime=_MarketRegime.BULLISH, minute_analysis=None)
+    # 2026-08-14 (실측 캡처 중 발견된 flaky 수정): _try_buy()에는 14:50
+    # 이후 신규매수를 차단하는 게이트가 있어, now_kst()를 고정하지 않으면
+    # 이 테스트가 실제 실행 시각(KST 14:50 이후)에 따라 우연히 실패함
+    # (23절과 동일 패턴으로 고정 — 1B.6절에서 이미 한 번 재현된 문제).
+    with _patch2("domain.service.trading_service.now_kst",
+                return_value=_dt2(2026, 8, 12, 11, 47, 17)):
+        svc27a._try_buy(sym27a, 1000, balance27a, signal=buy_signal27a,
+                        regime=_MarketRegime.BULLISH, minute_analysis=None)
 
     real_order_id_27a = svc27a._position_state_machine.get(sym27a).pending_order_id
     check("26-8) BUY accepted 직후 pending_order_id가 더 이상 'pending'이 아님",
@@ -1783,8 +1792,11 @@ with _tf2.TemporaryDirectory() as _tmp28a:
 
     balance28a = svc28a.broker.get_account_balance()
     buy_signal28a = _Signal(type=_SignalType.BUY, reason="테스트 매수(order_id 누락)")
-    svc28a._try_buy(sym28a, 1000, balance28a, signal=buy_signal28a,
-                    regime=_MarketRegime.BULLISH, minute_analysis=None)
+    # 14:50 이후 신규매수 차단 게이트로 인한 flaky 방지(위 27a와 동일 사유)
+    with _patch2("domain.service.trading_service.now_kst",
+                return_value=_dt2(2026, 8, 12, 11, 47, 17)):
+        svc28a._try_buy(sym28a, 1000, balance28a, signal=buy_signal28a,
+                        regime=_MarketRegime.BULLISH, minute_analysis=None)
 
     check("27-4) BUY: order_id 비어있으면 CRITICAL 로그가 실제로 호출됨",
           len(_critical_calls_28a) == 1)
@@ -1839,8 +1851,11 @@ with _tf2.TemporaryDirectory() as _tmp28c:
 
     balance28c = svc28c.broker.get_account_balance()
     buy_signal28c = _Signal(type=_SignalType.BUY, reason="테스트 매수(정상)")
-    svc28c._try_buy(sym28c, 1000, balance28c, signal=buy_signal28c,
-                    regime=_MarketRegime.BULLISH, minute_analysis=None)
+    # 14:50 이후 신규매수 차단 게이트로 인한 flaky 방지(위 27a와 동일 사유)
+    with _patch2("domain.service.trading_service.now_kst",
+                return_value=_dt2(2026, 8, 12, 11, 47, 17)):
+        svc28c._try_buy(sym28c, 1000, balance28c, signal=buy_signal28c,
+                        regime=_MarketRegime.BULLISH, minute_analysis=None)
 
     check("27-8) 정상 order_id가 있으면 CRITICAL 로그가 호출되지 않음(회귀 방지)",
           len(_critical_calls_28c) == 0)

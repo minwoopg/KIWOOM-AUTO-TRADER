@@ -18,11 +18,16 @@ from __future__ import annotations
 - 미체결/체결/취소 등 어떤 상태 전이가 실측으로 나타나는지는 사람이
   JSONL을 직접 읽어 판단합니다.
 
-사용 예:
+사용 예 (프로젝트 루트에서 실행, `.env`가 같은 위치에 있어야 함):
     python tools/order_reconciliation_probe.py \\
         --symbol 005930 --order-id 0000069 \\
         --side BUY --requested-quantity 1 \\
         --scenario market_buy_full_fill
+
+    `python -m tools.order_reconciliation_probe ...`로 실행해도 동일하게
+    동작합니다. 둘 다 실행 시점의 현재 디렉터리를 기준으로 `.env`/
+    `config/settings.yaml`을 찾으므로, 반드시 프로젝트 루트에서
+    실행하세요.
 
 안전장치 (fail-closed):
 1. `settings.broker.base_url`이 정확히 `https://mockapi.kiwoom.com`
@@ -63,6 +68,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -423,6 +429,32 @@ def default_out_path(run_id: str) -> Path:
     return Path("diagnostics") / "order_reconciliation_probe" / f"{run_id}.jsonl"
 
 
+def load_dotenv(path: str = ".env") -> None:
+    """`.env`를 읽어 `os.environ`에 채웁니다(이미 설정된 값은 덮어쓰지 않음).
+
+    `app/main.py`의 동명 함수와 동일한 동작입니다. `config/settings.yaml`은
+    `app_key: ${KIWOOM_APP_KEY}` 식으로 실제 값을 환경변수 치환에
+    의존하는데(`config/settings.py`의 `_substitute_env`), 이 치환은
+    환경변수가 없으면 **예외 없이 빈 문자열로 조용히 대체**합니다. `app/
+    main.py`는 실행 전에 자체 `load_dotenv()`를 호출해서 이 문제를 피하고
+    있었는데, 이 프로브는 그 호출이 빠져 있었습니다(2026-08-14, 실측
+    캡처 중 인증 실패로 발견) — 셸에 `KIWOOM_APP_KEY`/`KIWOOM_SECRET_KEY`
+    가 전역으로 설정돼 있지 않으면 `load_settings()`가 빈 문자열로 채운
+    App Key/Secret Key를 그대로 브로커에 넘겨, 키움이 정확히
+    "App Key와 Secret Key 검증에 실패했습니다"로 거부합니다 — 계정/키
+    등록 문제처럼 보이지만 실제로는 이 스크립트가 `.env`를 안 읽어서
+    생기는 문제였습니다.
+    """
+    dotenv_path = Path(path)
+    if not dotenv_path.exists():
+        return
+    for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        if not line or line.strip().startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -457,6 +489,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--settings", default="config/settings.yaml", help="settings.yaml 경로",
     )
     parser.add_argument(
+        "--env-file", default=".env",
+        help="app_key/secret_key 등 환경변수를 채울 .env 경로(기본: .env). "
+             "app/main.py와 동일하게, load_settings() 전에 이 파일을 먼저 읽습니다.",
+    )
+    parser.add_argument(
         "--max-pages", type=int, default=MAX_CONTINUATION_PAGES,
         help=f"연속조회(cont-yn=Y) 최대 페이지 수(무한 루프 방지, 기본 {MAX_CONTINUATION_PAGES})",
     )
@@ -479,6 +516,12 @@ def main(argv: list[str] | None = None) -> int:
     # 의존성 없이 가져다 쓸 수 있게 하기 위함입니다.
     from config.settings import load_settings
     from infra.broker.kiwoom_broker import KiwoomBroker
+
+    # app/main.py와 동일하게, settings.yaml의 ${KIWOOM_APP_KEY} 같은
+    # 환경변수 치환이 실제 값을 찾을 수 있도록 .env를 먼저 읽습니다.
+    # 이 호출이 없으면 _substitute_env()가 예외 없이 빈 문자열로 채우고,
+    # 키움은 "App Key와 Secret Key 검증에 실패했습니다"로 거부합니다.
+    load_dotenv(args.env_file)
 
     settings = load_settings(args.settings)
 

@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -53,6 +54,7 @@ from tools.order_reconciliation_probe import (
     build_record,
     call_kiwoom_api,
     fetch_paginated,
+    load_dotenv as probe_load_dotenv,
     main as probe_main,
     parse_intervals,
     redact_sensitive,
@@ -685,6 +687,99 @@ check("13-3) PositionStateMachine/TradingService를 import하지 않음(매매 �
 check("13-4) 요청 바디가 order_id를 파라미터로 담지 않음(ka10075/ka10076 모두 종목 기준 조회)",
       "order_id" not in json.dumps(build_ka10075_payload("005930"))
       and "order_id" not in json.dumps(build_ka10076_payload("005930")))
+
+
+# ══════════════════════════════════════════════════════════════
+# 19. .env 로딩 — 실측 캡처 중 발견된 인증 실패 버그 수정 (2026-08-14)
+# ══════════════════════════════════════════════════════════════
+# 민우님이 실제 모의계좌로 실행했을 때 "App Key와 Secret Key 검증에
+# 실패했습니다"(return_code=3)로 인증이 거부됐습니다. 원인은 계정/키
+# 등록 문제가 아니라, 이 프로브가 load_settings() 전에 .env를 읽지
+# 않아서 settings.yaml의 ${KIWOOM_APP_KEY} 치환이 조용히 빈 문자열이
+# 된 것이었습니다(config/settings.py의 _substitute_env는 환경변수가
+# 없으면 예외 없이 ""로 대체). app/main.py는 이미 자체 load_dotenv()를
+# 갖고 있었는데 이 프로브에는 그 호출 자체가 빠져 있었습니다.
+_ENV_TEST_KEYS = ("PROBE_TEST_APP_KEY", "PROBE_TEST_SECRET_KEY", "PROBE_TEST_ALREADY_SET")
+_saved_env19 = {k: os.environ.get(k) for k in _ENV_TEST_KEYS}
+try:
+    for _k in _ENV_TEST_KEYS:
+        os.environ.pop(_k, None)
+
+    with tempfile.TemporaryDirectory() as _tmp19:
+        _env_path19 = Path(_tmp19) / ".env"
+        _env_path19.write_text(
+            "# comment line, and a blank line below should be skipped\n"
+            "\n"
+            "PROBE_TEST_APP_KEY=file-app-key\n"
+            "PROBE_TEST_SECRET_KEY=file-secret-key\n",
+            encoding="utf-8",
+        )
+        probe_load_dotenv(str(_env_path19))
+        check("19-1) .env의 KEY=VALUE가 os.environ에 채워짐(주석/빈 줄은 건너뜀)",
+              os.environ.get("PROBE_TEST_APP_KEY") == "file-app-key"
+              and os.environ.get("PROBE_TEST_SECRET_KEY") == "file-secret-key")
+
+    os.environ["PROBE_TEST_ALREADY_SET"] = "original-value"
+    with tempfile.TemporaryDirectory() as _tmp19b:
+        _env_path19b = Path(_tmp19b) / ".env"
+        _env_path19b.write_text("PROBE_TEST_ALREADY_SET=from-file\n", encoding="utf-8")
+        probe_load_dotenv(str(_env_path19b))
+        check("19-2) 이미 설정된 환경변수는 .env 값으로 덮어쓰지 않음(setdefault, main.py와 동일 동작)",
+              os.environ.get("PROBE_TEST_ALREADY_SET") == "original-value")
+
+    try:
+        probe_load_dotenv(str(Path(_tmp19b) / "does-not-exist.env"))
+        check("19-3) .env 파일이 없어도 예외를 던지지 않고 조용히 넘어감", True)
+    except Exception:
+        check("19-3) .env 파일이 없어도 예외를 던지지 않고 조용히 넘어감", False)
+finally:
+    for _k, _v in _saved_env19.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
+_load_dotenv_pos19 = ts_probe_src.find("load_dotenv(args.env_file)")
+_load_settings_pos19 = ts_probe_src.find("settings = load_settings(args.settings)")
+check("19-4) main() 소스에서 load_dotenv()가 load_settings()보다 먼저 호출됨(버그 재발 방지)",
+      _load_dotenv_pos19 != -1 and _load_settings_pos19 != -1
+      and _load_dotenv_pos19 < _load_settings_pos19)
+
+
+# ══════════════════════════════════════════════════════════════
+# 20. main() 통합 — .env가 실제로 load_settings() 호출 전에 반영됨
+# ══════════════════════════════════════════════════════════════
+_captured_env20 = {}
+
+
+def _fake_load_settings_capturing_env(path):
+    _captured_env20["PROBE_TEST_INTEGRATION_KEY"] = os.environ.get("PROBE_TEST_INTEGRATION_KEY")
+    return _FakeSettings("https://mockapi.kiwoom.com")
+
+
+_saved20 = os.environ.get("PROBE_TEST_INTEGRATION_KEY")
+os.environ.pop("PROBE_TEST_INTEGRATION_KEY", None)
+try:
+    with tempfile.TemporaryDirectory() as _tmp20:
+        _env_path20 = Path(_tmp20) / "custom.env"
+        _env_path20.write_text("PROBE_TEST_INTEGRATION_KEY=from-env-file\n", encoding="utf-8")
+        _out_path20 = Path(_tmp20) / "probe20.jsonl"
+        with patch("config.settings.load_settings", _fake_load_settings_capturing_env), \
+             patch("infra.broker.kiwoom_broker.KiwoomBroker", _FakeKiwoomBroker):
+            _rc20 = probe_main([
+                "--symbol", "005930", "--order-id", "0000069",
+                "--intervals", "0",
+                "--out", str(_out_path20),
+                "--env-file", str(_env_path20),
+            ])
+        check("20-1) main()이 성공 종료", _rc20 == 0)
+        check("20-2) load_settings() 호출 시점에 이미 .env 값이 os.environ에 반영돼 있음(호출 순서 실증)",
+              _captured_env20.get("PROBE_TEST_INTEGRATION_KEY") == "from-env-file")
+finally:
+    if _saved20 is None:
+        os.environ.pop("PROBE_TEST_INTEGRATION_KEY", None)
+    else:
+        os.environ["PROBE_TEST_INTEGRATION_KEY"] = _saved20
 
 
 print()

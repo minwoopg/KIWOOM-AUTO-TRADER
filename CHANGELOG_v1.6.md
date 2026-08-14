@@ -7096,3 +7096,75 @@ Broker 인터페이스 미변경 원칙은 그대로 유지한 채 보강했습�
 
 ---
 
+## 1P0.8-B.1 실측 중 발견 — .env 미로딩 버그 수정 (2026-08-14)
+
+민우님이 실제 모의계좌(삼성전자 157897, 매수 5주 체결)로 프로브를
+처음 실행했을 때 인증 단계에서 다음 오류로 실패했습니다:
+
+```
+RuntimeError: token request failed: {'return_msg': '인증에 실패했습니다
+[8001:App Key와 Secret Key 검증에 실패했습니다]', 'return_code': 3}
+```
+
+**원인**: 계정/키 등록 문제가 아니라 이 프로브 자체의 버그였습니다.
+`config/settings.yaml`은 `app_key: ${KIWOOM_APP_KEY}` 식으로 실제
+값을 환경변수 치환에 의존하는데(`config/settings.py`의
+`_substitute_env`), 이 치환은 환경변수가 없으면 **예외를 던지지
+않고 조용히 빈 문자열로 대체**합니다. `app/main.py`는 실행 전에
+자체 `load_dotenv()`를 호출해 `.env`를 `os.environ`에 채운 뒤
+`load_settings()`를 호출하는데, `tools/order_reconciliation_probe.
+py`에는 이 호출이 아예 빠져 있었습니다 — 그래서 셸에
+`KIWOOM_APP_KEY`/`KIWOOM_SECRET_KEY`가 전역으로 설정돼 있지 않으면
+빈 App Key/Secret Key로 토큰을 요청했고, 키움은 정확히 이 오류로
+거부했습니다.
+
+**수정**: `app/main.py`의 `load_dotenv()`와 동일한 구현을
+`order_reconciliation_probe.py`에 추가하고, `main()`에서
+`load_settings()` 호출 **전에** 반드시 실행하도록 했습니다. `.env`
+경로는 `--env-file`로 조정 가능(기본 `.env`, 프로젝트 루트 기준).
+`main()`은 이제 이 순서를 지킵니다: CLI 파싱 → order_id/intervals
+검증 → **`load_dotenv()`** → `load_settings()` → mock-domain 검증 →
+브로커 인증.
+
+### 부수 발견 — `test_partial_fill_lifecycle.py`의 실행 시각 의존 flaky 4건
+
+위 수정을 검증하러 전체 회귀를 다시 돌리는 과정에서, `test_partial_
+fill_lifecycle.py`(1P0.8-A.1에서 작성)의 26/27절 중 BUY 관련 통합
+테스트 4곳이 **KST 14:50 이후에 실행하면 실패**하는 걸 발견했습니다.
+`_try_buy()`에는 "14:50 이후 신규매수 차단" 게이트가 있는데(6차
+GPT 코드리뷰에서 이미 한 번 문제 됐던 지점 — 주석에도 "1B.6절에서
+재현 확인"이라고 적혀 있음), 23절/24절/26절 앞부분의 통합 테스트는
+`domain.service.trading_service.now_kst`를 고정 시각으로 monkeypatch
+해서 이 문제를 피했는데, 26절 후반부(BUY/orphan 통합, 26-8~26-9)와
+27절의 BUY 관련 3곳(27-4/27-5, 27-8)은 이 patch 없이 실제
+`_try_buy()`를 호출하고 있었습니다 — 작성 당시(오전 시간대)엔
+우연히 통과했을 뿐, 원래도 flaky였습니다. 5곳 전부 23절과 동일한
+패턴(`with patch("domain.service.trading_service.now_kst",
+return_value=datetime(2026, 8, 12, 11, 47, 17)):`)으로 시각을
+고정해 수정했습니다. SELL 경로(`_try_sell`)는 이 게이트가 없어 원래
+영향받지 않았습니다.
+
+이건 이번 세션의 코드 변경(1P0.8-B.1)과는 무관하고, 이전에 작성된
+테스트의 잠재적 결함이 시간이 지나 실제로 발현된 것입니다 — 회귀
+검증을 실행 시각과 무관하게 항상 통과하도록 고쳤습니다.
+
+### 테스트
+
+- `test_partial_fill_lifecycle.py`: 306건 그대로(신규 추가 없음,
+  기존 5개 호출부에 시각 고정만 추가) — 전부 통과, 실행 시각과 무관.
+- `tools/order_reconciliation_probe.py`에 대한 신규 테스트 6건 추가
+  (`test_order_reconciliation_probe.py` 78건 → **84건**): `.env`
+  파싱(주석/빈 줄 skip, setdefault로 기존 값 보존, 파일 없어도 예외
+  없음), 소스 레벨로 `load_dotenv()`가 `load_settings()`보다 먼저
+  호출되는지 확인, `main()` 통합 테스트로 실제 실행 순서(.env 로드 →
+  settings 구성)를 실증.
+
+**전체 회귀**: 19개 파일 중 18개 통과. `test_replay_time_axis.py`만
+기존 pre-existing failure(무관). `compileall` 정상.
+
+민우님은 이제 다시 실행하시면 됩니다. `.env`가 프로젝트 루트에
+있는지만 확인해주세요(같은 디렉터리에서 `python -m tools.
+order_reconciliation_probe ...`로 실행).
+
+---
+
