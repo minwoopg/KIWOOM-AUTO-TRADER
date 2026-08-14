@@ -1112,9 +1112,17 @@ try:
               sym19 in svc.state.last_sold_at_by_symbol)
         check("19-11) entry_time_by_symbol에서 제거됨",
               sym19 not in svc.state.entry_time_by_symbol)
-        check("19-12) 손실/트레일링 로직이 반영됨(트레일링 손실 추적 발생)",
-              sym19 in svc.state.symbol_trail_loss_at
-              or svc.state.symbol_loss_count_today.get(sym19, 0) >= 0)
+        # 2026-08-13 (1P0.7.2, GPT 코드리뷰 지적): 이전 조건
+        # `symbol_loss_count_today.get(sym19, 0) >= 0`은 값이 없어도
+        # `0 >= 0`이 항상 True인 false-pass였습니다. 게다가 이 fixture는
+        # avg=10,000/sell=10,100인 **수익 거래**라 애초에 손실 branch를
+        # 지나지도 않습니다. 손실 branch 검증은 21절의 실제 손실
+        # fixture로 옮기고, 여기서는 "이 거래(수익)에서 손실 카운터가
+        # 잘못 증가하지 않았는지"만 정확히 봅니다.
+        check("19-12) 수익 거래이므로 손실 카운터가 증가하지 않음",
+              svc.state.symbol_loss_count_today.get(sym19, 0) == 0)
+        check("19-12b) 수익 매도 후 연속손절 카운터가 0으로 유지/초기화됨",
+              svc.state.consecutive_losses == 0)
 
         # ── C: 같은 FLAT을 여러 번 폴링해도 side-effect 중복 실행 없음 ──
         _last_sold_before = svc.state.last_sold_at_by_symbol.get(sym19)
@@ -1143,6 +1151,200 @@ check("20-2) 실제 체결가가 아니라는 한계가 문서화됨",
 check("20-3) 8/12 실측 근거(194초)가 남아있음", "194초" in ts_src)
 check("20-4) 근본 해결(fill price 연결)이 아직 미구현임을 명시",
       "fill price 연결" in ts_src)
+
+
+# ══════════════════════════════════════════════════════════════
+# 21. deferred side-effect의 손실 branch 실행 검증 (1P0.7.2)
+# ══════════════════════════════════════════════════════════════
+# 2026-08-13 (GPT 코드리뷰 지적): 19절은 수익 거래만 검증해서 손실
+# branch(symbol_loss_count_today 증가, consecutive_losses 증가,
+# symbol_stoploss_at 기록)가 실제로 실행되는지 전혀 보지 못했습니다.
+# GPT가 제시한 정확한 fixture — avg=10,000, sell=9,900(손실),
+# exit_reason에 "손절" 포함 — 로 timeout→orphan→나중 FLAT 경로에서도
+# 손실 카운터가 정확히 반영되는지 실제 TradingService로 검증합니다.
+M.SELL_PENDING_TIMEOUT_SEC = 0.2
+try:
+    with _tf2.TemporaryDirectory() as _tmp21:
+        svc21 = _build_real_service(_tmp21)
+        sym21 = "103590"
+
+        svc21.broker._positions[sym21] = _Position(symbol=sym21, quantity=100,
+                                                    average_price=10000)
+        svc21.broker._prices[sym21] = 9900   # 손실가
+        svc21._sync_position_state_machine_shadow(svc21.broker.get_account_balance())
+
+        # avg=10,000, 매도가=9,900(손실) + exit_reason에 "손절" 포함
+        svc21._try_sell(sym21, 100, current_price=9900,
+                        exit_reason="손절 테스트 — 평균단가 대비 -1.0%",
+                        avg_buy_price=10000)
+        check("21-1) SELL accepted 시 SELL_PENDING", 
+              svc21._position_state_machine.get(sym21).lifecycle == L.SELL_PENDING)
+
+        # 브로커 반영 지연 흉내(잔고 그대로 유지) → 타임아웃 → OPEN+orphan
+        svc21.broker._positions[sym21] = _Position(symbol=sym21, quantity=100,
+                                                    average_price=10000)
+        _time.sleep(0.25)
+        svc21._sync_position_state_machine_shadow(svc21.broker.get_account_balance())
+        check("21-2) 타임아웃 후 OPEN+orphan",
+              svc21._position_state_machine.get(sym21).lifecycle == L.OPEN
+              and svc21._position_state_machine.get(sym21).orphan_order_id is not None)
+        check("21-3) 타임아웃 시점까지는 손실 카운터 미반영(완전청산 전)",
+              svc21.state.symbol_loss_count_today.get(sym21, 0) == 0)
+
+        # 원 SELL 주문이 나중에 실제로 완전 체결
+        svc21.broker._positions.pop(sym21, None)
+        svc21._sync_position_state_machine_shadow(svc21.broker.get_account_balance())
+        check("21-4) 나중 완전 체결 확인 후 FLAT",
+              svc21._position_state_machine.get(sym21).lifecycle == L.FLAT)
+        check("21-5) pending 컨텍스트 소비됨",
+              sym21 not in svc21._pending_sell_side_effects)
+
+        # ── 핵심: 손실 branch가 실제로 실행됐는가 ──
+        check("21-6) symbol_loss_count_today가 정확히 1로 증가",
+              svc21.state.symbol_loss_count_today.get(sym21) == 1)
+        check("21-7) consecutive_losses가 1로 증가",
+              svc21.state.consecutive_losses == 1)
+        check("21-8) symbol_stoploss_at에 기록됨(exit_reason에 '손절' 포함)",
+              sym21 in svc21.state.symbol_stoploss_at)
+        check("21-9) last_sold_at_by_symbol도 함께 기록됨",
+              sym21 in svc21.state.last_sold_at_by_symbol)
+
+        # ── 추가 폴링에도 손실 카운터가 중복 증가하지 않음 ──
+        svc21._sync_position_state_machine_shadow(svc21.broker.get_account_balance())
+        svc21._sync_position_state_machine_shadow(svc21.broker.get_account_balance())
+        check("21-10) FLAT을 여러 번 폴링해도 손실 카운터가 그대로 1",
+              svc21.state.symbol_loss_count_today.get(sym21) == 1)
+        check("21-11) consecutive_losses도 중복 증가 없이 1 유지",
+              svc21.state.consecutive_losses == 1)
+finally:
+    M.SELL_PENDING_TIMEOUT_SEC = _orig_sell_to
+
+
+# ══════════════════════════════════════════════════════════════
+# 22. lifecycle.py 문서가 실제 enforce 상태를 반영 (1P0.7.2)
+# ══════════════════════════════════════════════════════════════
+# 2026-08-13 (GPT 코드리뷰 지적): 모듈 상단이 "shadow 모드로만 동작"
+# 이라고 돼 있었는데 1P0.2부터 이미 enforce였습니다. 다음 개발자가
+# "shadow니까 실제 주문에 영향 없겠네"라고 오판할 위험이 있었습니다.
+check("22-1) 모듈/클래스 문서가 stale shadow 설명임을 스스로 인지하고 정정함",
+      "stale한 shadow" in _lc_src)
+check("22-2) enforce 상태임을 명시",
+      "enforce로 차단" in _lc_src or "enforce" in _lc_src.split('"""')[1])
+check("22-3) order_id 미연결 한계가 문서에 명시됨(pending 리터럴)",
+      "리터럴입니다" in _lc_src)
+check("22-4) 재시작 시 소실되는 한계가 문서에 명시됨",
+      "재시작 시 전부 소실" in _lc_src or "재시작 시 소실" in _lc_src)
+check("22-5) 무인 실계좌 운영 blocker임이 명시됨",
+      "무인 실계좌" in _lc_src)
+
+
+# ══════════════════════════════════════════════════════════════
+# 23. BUY accepted side-effect를 첫 실체결 확인 시점으로 이연 (1P0.7.2)
+# ══════════════════════════════════════════════════════════════
+# 2026-08-13 (GPT 코드리뷰 P0, 재현 근거 — 8/12 103590 실측):
+#   11:47:17 BUY accepted
+#   11:47:27 4주만 체결
+#   11:50:42 83주 전량 확인
+# entry_time을 accepted 시각(11:47:17)에 기록해, "5분 최소수익 미달"
+# 판정이 실제 보유 1분 37초 만에 발동했습니다. SELL과 대칭으로
+# 실제 TradingService 통합 fixture로 검증합니다.
+from domain.models import Signal as _Signal, SignalType as _SignalType
+from domain.models import MarketRegime as _MarketRegime
+
+with _tf2.TemporaryDirectory() as _tmp23:
+    svc23 = _build_real_service(_tmp23)
+    svc23.broker._cash = 100_000_000  # 리스크 게이트(현금 버퍼) 회피
+    sym23 = "103590"
+    svc23.broker._positions.pop(sym23, None)
+    svc23.broker._prices[sym23] = 1000
+    # 콜드 초기화(프로세스 시작 시 1회)를 먼저 완료 — 이후 폴링만
+    # 정상적인 BUY_PENDING confirm 경로를 탑니다(실제 운영 순서와 일치).
+    svc23._sync_position_state_machine_shadow(svc23.broker.get_account_balance())
+
+    balance23 = svc23.broker.get_account_balance()
+    buy_signal23 = _Signal(type=_SignalType.BUY, reason="테스트 매수")
+    with _patch2("domain.service.trading_service.now_kst",
+                return_value=_dt2(2026, 8, 12, 11, 47, 17)):
+        svc23._try_buy(sym23, 1000, balance23, signal=buy_signal23,
+                       regime=_MarketRegime.BULLISH, minute_analysis=None)
+
+    check("23-1) BUY accepted 시점에는 entry_time을 아직 기록하지 않음",
+          sym23 not in svc23.state.entry_time_by_symbol)
+    check("23-2) accepted 시점에는 컨텍스트만 저장",
+          sym23 in svc23._pending_buy_side_effects)
+    check("23-3) accepted 시점에는 진입횟수 카운터도 아직 증가하지 않음",
+          svc23.state.symbol_entry_count_today.get(sym23, 0) == 0)
+    check("23-4) accepted 시점에는 bought_symbols_today에도 미등록",
+          sym23 not in svc23.state.bought_symbols_today)
+
+    # 첫 부분체결(4주) 확인 — 폴링
+    svc23.broker._positions[sym23] = _Position(symbol=sym23, quantity=4,
+                                                average_price=50000)
+    svc23._sync_position_state_machine_shadow(svc23.broker.get_account_balance())
+    check("23-5) 첫 실체결(4주) 확인 후 entry_time이 기록됨",
+          sym23 in svc23.state.entry_time_by_symbol)
+    check("23-6) 첫 실체결 시 진입횟수 카운터가 1로 증가",
+          svc23.state.symbol_entry_count_today.get(sym23) == 1)
+    check("23-7) 첫 실체결 시 bought_symbols_today에 등록됨",
+          sym23 in svc23.state.bought_symbols_today)
+    check("23-8) pending 컨텍스트가 소비됨",
+          sym23 not in svc23._pending_buy_side_effects)
+
+    _entry_time_at_first_fill = svc23.state.entry_time_by_symbol[sym23]
+
+    # 전량(83주) 체결 확인 — 추가 폴링에도 entry_time이 재기록되지 않음
+    svc23.broker._positions[sym23] = _Position(symbol=sym23, quantity=83,
+                                                average_price=50000)
+    svc23._sync_position_state_machine_shadow(svc23.broker.get_account_balance())
+    check("23-9) 전량 확인 폴링에도 entry_time이 첫 체결 시각 그대로",
+          svc23.state.entry_time_by_symbol[sym23] == _entry_time_at_first_fill)
+    check("23-10) 전량 확인에 진입횟수가 다시 증가하지 않음(1 유지)",
+          svc23.state.symbol_entry_count_today.get(sym23) == 1)
+
+
+# ── 극단적 사례: BUY accepted → 0주 체결로 끝남(취소/미체결) ──────
+with _tf2.TemporaryDirectory() as _tmp24:
+    M.BUY_PENDING_TIMEOUT_SEC = 0.2
+    try:
+        svc24 = _build_real_service(_tmp24)
+        svc24.broker._cash = 100_000_000
+        sym24 = "999999"
+        svc24.broker._positions.pop(sym24, None)
+        svc24.broker._prices[sym24] = 1000
+        svc24._sync_position_state_machine_shadow(svc24.broker.get_account_balance())
+
+        balance24 = svc24.broker.get_account_balance()
+        buy_signal24 = _Signal(type=_SignalType.BUY, reason="테스트 매수")
+        with _patch2("domain.service.trading_service.now_kst",
+                    return_value=_dt2(2026, 8, 12, 11, 0, 0)):
+            svc24._try_buy(sym24, 1000, balance24, signal=buy_signal24,
+                           regime=_MarketRegime.BULLISH, minute_analysis=None)
+
+        # MockBroker는 BUY를 즉시 전량 체결하므로, "결국 취소/미체결로
+        # 끝나는 주문"을 흉내내려면 체결분을 다시 없앤 상태로 강제
+        # 되돌려야 합니다(19절의 SELL 반영 지연 흉내와 동일한 패턴).
+        svc24.broker._positions.pop(sym24, None)
+        for _ in range(3):
+            _time.sleep(0.1)
+            svc24._sync_position_state_machine_shadow(svc24.broker.get_account_balance())
+
+        check("23-11) 0주 체결로 끝나면 entry_time이 끝까지 기록되지 않음",
+              sym24 not in svc24.state.entry_time_by_symbol)
+        check("23-12) 진입횟수 카운터를 전혀 소모하지 않음",
+              svc24.state.symbol_entry_count_today.get(sym24, 0) == 0)
+        check("23-13) bought_symbols_today에도 등록되지 않음",
+              sym24 not in svc24.state.bought_symbols_today)
+        check("23-14) BUY_PENDING 타임아웃 후에도 pending 컨텍스트가 남아있음"
+              "(첫 체결이 없었으므로 아직 소비되지 않음 — orphan으로 이관되어 계속 추적)",
+              sym24 in svc24._pending_buy_side_effects)
+    finally:
+        M.BUY_PENDING_TIMEOUT_SEC = _orig_buy_to
+
+check("23-15) 소스에 first_fill 시점 판정 로직이 존재",
+      "_apply_first_fill_buy_side_effects" in ts_src
+      and "base_quantity_before_order" in ts_src)
+check("23-16) BUY accepted 로그가 '미확정'임을 명시",
+      "매수 주문 접수 완료(미확정)" in ts_src)
 
 
 print()

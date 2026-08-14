@@ -1,11 +1,34 @@
 # -*- coding: utf-8 -*-
-"""포지션 생명주기 상태 머신 (2026-07-22, shadow 단계).
+"""포지션 생명주기 상태 머신 (2026-07-22 shadow 시작 → 2026-08-10 enforce).
 
 GPT 검토(7.12/7.14절 관련)에서 제안된 5단계 상태 머신을 구현합니다.
-현재는 shadow 모드로만 동작 — 기존 `_sold_today_qty_snapshot` 기반
-판정(7.14절)을 대체하지 않고 병행 계산만 하며, 두 방식의 판정이
-갈리는 경우를 로그로 남겨 검증합니다. 검증이 끝나면 실제 판정 로직을
-이 모듈로 교체합니다.
+
+2026-08-12 (1P0.7.1, GPT 코드리뷰 지적): 이 docstring이 여전히
+"shadow 모드로만 동작"이라고 돼 있었는데, **1P0.2부터 이미 실제
+주문 경로를 enforce로 차단하고 있어 현재 코드와 정반대였습니다.**
+다음 개발자가 "shadow니까 실제 주문에는 영향 없겠네"라고 잘못
+판단할 위험이 있어 정정합니다.
+
+**현재 상태 (1P0.7.1 기준)**:
+- `_try_buy()` / `_try_sell()`이 이 모듈의 `would_block_buy_detail()`
+  / `decide_sell()`을 실제로 호출해 **주문을 차단(enforce)**합니다.
+  더 이상 shadow(관측만)가 아닙니다.
+- BUY_PENDING/SELL_PENDING/orphan/ERROR는 HARD block으로, forced
+  (손절·강제청산)로도 우회하지 못합니다(1P0.7).
+- **미구현·근본 한계**: `pending_order_id`/`orphan_order_id`는 아직
+  브로커의 실제 주문번호가 아니라 `"pending"` 리터럴입니다.
+  `result.order_id`는 trade log/state에는 기록되지만 이 lifecycle에는
+  아직 연결돼 있지 않습니다. 따라서 특정 주문 조회·취소·
+  FILLED/CANCELLED/REJECTED terminal 확인이 불가능합니다. 이 상태는
+  실제 주문 상태를 몰라도 시스템이 스스로 자신 있게 재개하지 않도록
+  막는 **방어막일 뿐, 근본 해결이 아닙니다**.
+- **재시작 시 전부 소실**: lifecycle 상태와
+  `_pending_sell_side_effects`는 모두 메모리 전용입니다. 프로그램이
+  재시작되면 BUY_PENDING/SELL_PENDING/orphan/보류 중이던 side-effect
+  컨텍스트가 전부 사라지고, 새 프로세스는 브로커 잔고만 보고
+  초기화합니다 — 그 사이 미체결로 남아있던 원 주문의 존재를 모르게
+  됩니다. **이것이 현재 완전 무인 실계좌 운영의 배포 blocker입니다**
+  (GPT 판정).
 
 설계 배경:
 - 이 시스템의 `place_order()`는 동기 호출이라 원래 의미의 "주문 대기"
@@ -13,9 +36,18 @@ GPT 검토(7.12/7.14절 관련)에서 제안된 5단계 상태 머신을 구현�
   잔고 API에 아직 반영 안 된 짧은 구간"을 의미.
 - 상태는 영속화하지 않음(휘발성) — 재시작 시 브로커 실제 잔고를
   기준으로 다시 초기화하는 게 안전. state.json에 저장된 옛 PENDING
-  상태를 신뢰하면 오히려 위험할 수 있음.
+  상태를 신뢰하면 오히려 위험할 수 있음. 다만 이 "안전한 재초기화"가
+  위의 재시작 소실 문제를 없애주지는 않음 — 잔고만으로는 미체결
+  주문의 존재 자체를 알 수 없기 때문.
 - 전이는 브로커 응답(accepted 여부, 잔고 수량 변화)이 있어야만
   일어남 — 요청을 보냈다는 사실만으로는 상태를 바꾸지 않음.
+
+다음 단계(미착수, 브로커 인터페이스 확장 필요): 실제 `order_id`를
+lifecycle에 연결하고, 브로커에 `get_order_status()` /
+`get_open_orders()` / `cancel_order()`를 추가해 특정 주문의 terminal
+상태를 직접 확인·재시작 시 outstanding order를 reconciliation하는
+것. 그 전까지는 시간·잔고 변화로 추론하는 현재 방식의 한계 안에
+있습니다.
 """
 from __future__ import annotations
 
@@ -136,10 +168,12 @@ class SymbolPositionState:
 class PositionStateMachine:
     """종목별 SymbolPositionState를 관리하며 전이를 수행합니다.
 
-    shadow 모드: 이 클래스의 판정 결과는 아직 실제 매매 로직에
-    쓰이지 않습니다. TradingService가 매 폴링마다 이 상태머신에
-    이벤트를 통지하고, 실제 브로커 잔고와 대조해 기존 판정
-    (_sold_today_qty_snapshot)과 다른 결론이 나오는지 로그로만 남깁니다.
+    2026-08-13 (1P0.7.2, GPT 코드리뷰 지적): 이 docstring도 "판정
+    결과가 아직 실제 매매 로직에 쓰이지 않는다"는 stale한 shadow
+    시절 설명이었습니다. 실제로는 1P0.2부터 `_try_buy`/`_try_sell`이
+    `would_block_buy_detail()`/`decide_sell()`의 결과로 주문을
+    enforce로 차단합니다. TradingService가 매 폴링마다 이 상태머신에
+    이벤트를 통지하고, 브로커 잔고와 대조해 판정합니다.
 
     logger가 주어지면(2026-07-22 보강) 모든 이벤트(요청/결과/동기화/
     불변조건검사)를 CSV로 기록합니다 — 전이가 실제로 일어났는지
@@ -966,8 +1000,9 @@ class PositionStateMachine:
         (OPEN/FLAT)로 전이시킵니다. pending_* 필드도 정리합니다.
         누가 어떤 근거로 해제했는지 note로 남길 수 있음 — 로그에
         "ERROR였다가 사람이 확인 후 해제됐다"는 이력이 명확히 남도록.
-        이 메서드는 shadow 모드에서도 안전합니다 — 실제 매매 판정에는
-        관여하지 않고 관찰용 상태만 정정합니다.
+        이 메서드는 사람이 명시적으로 호출해야만 동작합니다 — 자동
+        폴링 경로에서는 절대 호출되지 않으므로, 잘못된 값을 넣어도
+        영향 범위가 이 종목의 lifecycle 정정 한 건으로 한정됩니다.
 
         2026-07-24 (12차 수정, GPT 코드리뷰): broker_quantity가
         음수여도, note가 빈 문자열이어도 예외 없이 조용히 받아들여

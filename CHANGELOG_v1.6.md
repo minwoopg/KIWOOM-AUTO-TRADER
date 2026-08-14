@@ -6447,3 +6447,135 @@ REJECTED` 연결을 명시적으로 요구했습니다.
 
 ---
 
+## 1P0.7.2: BUY side-effect 비대칭 해소 + 문서 정합성 (2026-08-13)
+
+1P0.7.1에 대한 GPT 재검토("두 P0는 승인, 남은 우선순위 9개") 반영.
+이번 세션에서는 GPT가 지정한 우선순위 1~3을 처리했습니다.
+4~9(order_id 실연결, 브로커 outstanding/status/cancel 인터페이스,
+restart reconciliation, 실제 fill price 연결)는 브로커 API 확장이
+필요해 이번에도 범위 밖으로 명시적으로 남깁니다.
+
+### 우선순위 1: BUY accepted side-effect를 첫 실체결 확인 시점으로 이연
+
+SELL은 1P0.7에서 이미 "accepted != full fill"로 고쳤는데, **BUY는
+비대칭적으로 그대로였습니다.** GPT가 8/12 실측으로 지적:
+
+```
+103590
+11:47:17  BUY accepted
+11:47:27  4주만 체결
+11:50:42  83주 전량 확인
+```
+
+`entry_time_by_symbol`이 **11:47:17(accepted 시각)**에 즉시 기록돼,
+11:52경 "5분 최소수익 미달" 청산이 발동했지만 실제 보유는
+**1분 37초**뿐이었습니다. 더 극단적으로는 accepted 후 실제 0주
+체결(취소/미체결)이어도 이미 당일 진입횟수·매수 쿨다운·알림이
+소모되고 있었습니다.
+
+**수정** — SELL과 대칭 구조로 재구성:
+```
+BUY accepted        → _pending_buy_side_effects[symbol]에 컨텍스트만 저장
+첫 실체결 확인       → _apply_first_fill_buy_side_effects() 실행
+  (known_quantity > base_quantity_before_order)
+```
+`entry_time_by_symbol` / `bought_symbols_today` /
+`symbol_entry_count_today` / 매수 알림을 **첫 실체결(first_fill_at)**
+시점으로 이연했습니다. `last_order_id_by_symbol`은 즉시 기록(추적
+목적이라 지연 불필요), `[ORDER]` 로그도 "접수 완료(미확정)"으로
+문구를 바꿔 완료로 오인하지 않게 했습니다.
+
+sync 루프에 감지 로직 추가 — `known_quantity`가
+`base_quantity_before_order`(주문 직전 실제 보유수량)보다 늘어난
+시점을 첫 체결로 판정합니다. lifecycle 전환(BUY_PENDING→OPEN) 여부와
+무관하게(부분체결로 여전히 BUY_PENDING이어도) 동작하며, pop 기반이라
+정확히 1회만 실행됩니다.
+
+GPT가 제시한 `first_fill_at`/`full_fill_at` 분리 제안 중,
+**`first_fill_at`만 채택**했습니다. "전체 포지션 완전 체결" 기준이
+필요한 규칙이 이 코드베이스에 아직 없어 `full_fill_at`을 별도
+필드로 두는 건 이번 범위에서 과했다고 판단했습니다 — 필요해지면
+`entry_time_by_symbol`과 나란히 추가할 수 있도록 주석에 남겼습니다.
+
+### 우선순위 2: false-pass 수정 + 손실 branch 실행 검증 추가
+
+GPT 지적:
+```python
+sym19 in svc.state.symbol_trail_loss_at
+or svc.state.symbol_loss_count_today.get(sym19, 0) >= 0   # 항상 True
+```
+`dict.get(key, 0) >= 0`은 키가 없어도 참이라 **사실상 항상
+통과하는 false-pass**였습니다. 게다가 19절 fixture(avg=10,000,
+sell=10,100)는 수익 거래라 애초에 손실 branch를 지나지 않습니다.
+
+**수정**: 19-12를 "수익 거래이므로 손실 카운터가 증가하지 않는다"는
+정확한 검증으로 바꾸고, GPT가 제시한 정확한 fixture(avg=10,000,
+sell=9,900 손실, `exit_reason`에 "손절" 포함)로 **21절에 손실 branch
+전용 통합 테스트**를 신설했습니다:
+```
+SELL(손절, 9,900) → timeout → OPEN+orphan → 나중 완전체결(FLAT)
+기대: symbol_loss_count_today=1, consecutive_losses=1,
+      symbol_stoploss_at 기록, 여러 폴링에도 카운터 중복 증가 없음
+```
+8건 전부 실제 실행으로 검증합니다.
+
+### 우선순위 3: lifecycle.py 문서가 실제 enforce 상태를 반영하도록 정정
+
+모듈 상단·클래스·메서드 docstring 세 곳이 여전히 "shadow 모드로만
+동작"이라고 돼 있었는데, **1P0.2부터 이미 `_try_buy`/`_try_sell`이
+실제로 enforce 차단**하고 있어 정반대였습니다. 다음 개발자가
+"shadow니까 실제 주문엔 영향 없겠네"라고 오판할 위험이 있었습니다.
+
+정정 내용:
+- 현재 enforce 상태임을 명시
+- `pending_order_id`/`orphan_order_id`가 아직 `"pending"` 리터럴이지
+  실제 주문번호가 아니라는 한계
+- lifecycle 상태와 `_pending_sell_side_effects`가 메모리 전용이라
+  재시작 시 전부 소실된다는 한계
+- 이것이 현재 **무인 실계좌 운영의 배포 blocker**라는 GPT 판정
+- 다음 단계(order_id 연결, 브로커 인터페이스 확장, restart
+  reconciliation)를 미착수 상태로 명시
+
+### 테스트
+
+`test_partial_fill_lifecycle.py` 210건 → **242건**:
+- 21절(11건) 손실 branch 실제 실행 검증(신규).
+- 22절(5건) 문서 정합성 확인.
+- 23절(16건) BUY 첫 실체결 이연 — 8/12 실측 시나리오(103590) 전 과정
+  실제 `TradingService` 통합 테스트, 0주 체결 극단 사례(진입횟수·
+  쿨다운·알림 전혀 미소모, pending 컨텍스트가 orphan으로 이관돼
+  계속 추적됨).
+- 19-12 false-pass 수정.
+
+실제 `TradingService` fixture 작성 중 두 가지를 확인/보정:
+- `_sync_position_state_machine_shadow`의 최초 호출은 콜드 초기화
+  경로(전체 포지션 일괄 `sync_from_broker`)를 타서 신규 감지 로직을
+  건너뜁니다 — 테스트에서 `_try_buy` 전에 초기 동기화를 1회 먼저
+  호출해 실제 운영 순서(프로세스 시작 → 초기 동기화 → 신호 평가)와
+  맞췄습니다.
+- MockBroker는 BUY를 항상 즉시 전량 체결하므로, "결국 취소/미체결로
+  끝나는 주문"을 흉내내려면 `_try_buy` 직후 포지션을 강제로 다시
+  비워야 했습니다(19절의 SELL 반영 지연 흉내와 동일한 패턴).
+
+**전체 회귀**: 17개 파일 전부 통과(1개 스킵). `compileall` 정상.
+threshold나 전략 로직은 변경하지 않았습니다.
+
+### 근본 한계 — 이번에도 해결되지 않음 (GPT 명시, 남은 우선순위 4~9)
+
+```
+4. actual order_id lifecycle 연결
+5. broker outstanding/status/cancel 인터페이스
+6. restart reconciliation / pending context persistence
+7. 실제 fill price 연결
+8. 그 후 실계좌 shadow/소액 검증
+9. 이후 Entry Timing Study 복귀
+```
+
+GPT 표현대로, "중복 주문 ↔ 영구 봉쇄" 왕복 문제는 1P0.7부터 상당 부분
+정리됐고, 이제부터는 상태머신 규칙을 더 붙이는 단계가 아니라 **실제
+브로커 주문 identity와 terminal 상태를 연결하는 단계**로 넘어가는 게
+맞다는 판단에 동의합니다. 이 세션은 그 직전 단계(BUY/SELL 대칭성,
+false-pass 제거, 문서 정합성)를 마무리하는 데 집중했습니다.
+
+---
+

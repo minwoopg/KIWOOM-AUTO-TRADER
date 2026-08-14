@@ -217,6 +217,8 @@ class TradingService:
         self._forced_sell_failures: dict[str, int] = {}
         # 1P0.7: SELL accepted~완전 청산 확정 사이 대기 중인 side-effect 컨텍스트
         self._pending_sell_side_effects: dict[str, dict] = {}
+        # 1P0.7.2: BUY accepted~첫 실체결 확인 사이 대기 중인 side-effect 컨텍스트
+        self._pending_buy_side_effects: dict[str, dict] = {}
 
         # 일일 리포트 생성기
         self._reporter = DailyReporter(
@@ -2062,7 +2064,7 @@ class TradingService:
             else:
                 psm.sync_from_broker(symbol, broker_qty)
 
-            # 1P0.7.1: 중앙화된 deferred side-effect 실행 지점.
+            # 1P0.7.1: 중앙화된 deferred SELL side-effect 실행 지점.
             # 어떤 경로(SELL_PENDING 즉시 완결 / timeout 후 orphan 해소
             # / 일반 sync_from_broker)로 FLAT이 됐든, 이번 폴링에서
             # **새로 FLAT이 됐고** 대기 중인 컨텍스트가 있으면 정확히
@@ -2071,6 +2073,18 @@ class TradingService:
                     and _lifecycle_before_sync != PositionLifecycle.FLAT
                     and symbol in self._pending_sell_side_effects):
                 self._apply_deferred_sell_side_effects(symbol)
+
+            # 2026-08-13 (1P0.7.2): deferred BUY side-effect 실행 지점.
+            # base_quantity_before_order(주문 직전 실제 보유수량)보다
+            # known_quantity가 늘어난 시점 = 첫 실체결입니다. 부분체결로
+            # BUY_PENDING이 유지되는 동안에도(lifecycle이 아직 OPEN으로
+            # 안 바뀌어도) 발동해야 하므로 lifecycle 전환이 아니라 수량
+            # 비교로 판정합니다. pop 기반이라 이후 폴링에서 재실행되지
+            # 않습니다.
+            _psm_state_now = psm.get(symbol)
+            if (symbol in self._pending_buy_side_effects
+                    and _psm_state_now.known_quantity > _psm_state_now.base_quantity_before_order):
+                self._apply_first_fill_buy_side_effects(symbol)
 
             # 2026-07-24 (9차 수정, GPT 코드리뷰): 이상치(예상 밖 수량)
             # 감지 시 ERROR로 전이되는데, 이게 position_lifecycle.csv
@@ -2603,11 +2617,24 @@ class TradingService:
         )
 
         if result.accepted:
-            # 매수 시각 기록 → entry_watch 용
-            self.state.entry_time_by_symbol[symbol] = datetime.now().isoformat()
-            self.state.bought_symbols_today.add(symbol)
+            # 2026-08-13 (1P0.7.2, GPT 코드리뷰 P0, 재현 확인 — 8/12
+            # 103590): accepted != 실제 진입. 종전엔 entry_time을
+            # accepted 시각(11:47:17)에 즉시 기록했는데, 실제 첫 체결은
+            # 11:47:27, 전량 확인은 11:50:42였습니다. entry_time을
+            # accepted 기준으로 쓰면 "5분 최소수익 미달" 같은 보유시간
+            # 판정이, 실제로는 1분 37초밖에 안 지났는데 발동합니다.
+            # 더 심하게는 accepted 후 실제 0주 체결(취소/미체결)이어도
+            # 이미 당일 진입횟수·매수 쿨다운·알림이 즉시 소모됐습니다.
+            # SELL과 대칭으로, **첫 실체결 확인 전까지는 컨텍스트만
+            # 저장**하고 진입 관련 side effect를 지연시킵니다.
             self.state.last_order_id_by_symbol[symbol] = result.order_id
-            self._last_buy_signal_at[symbol] = datetime.now()
+            self._pending_buy_side_effects[symbol] = {
+                "order_id": result.order_id,
+                "current_price": current_price,
+                "quantity": quantity,
+                "regime": regime,
+                "signal_reason": signal.reason if signal else "",
+            }
 
             # ── _sold_today 플래그 즉시 해제 (2026-07-21 긴급수정) ──────
             # _sold_today는 "매도 접수 직후 브로커 API 잔고 미반영으로 인한
@@ -2650,23 +2677,14 @@ class TradingService:
                         f"[BB_WARN] {symbol} | 볼린저 상단 근처 매수 "
                         f"(%B={_bb.percent_b:.2f})"
                     )
-            # 1일 1회 진입 제한용 카운터
-            self.state.symbol_entry_count_today[symbol] = (
-                self.state.symbol_entry_count_today.get(symbol, 0) + 1
-            )
-
-            # 주문 성공 후 잔고 캐시 무효화
+            # 2026-08-13 (1P0.7.2): 진입횟수 카운터·매수 알림은 첫 실체결이
+            # 확인된 뒤 _apply_first_fill_buy_side_effects()에서 실행합니다.
+            # accepted 시점에는 잔고 캐시 무효화와 접수 로그만 남깁니다.
             self.cached_balance = None
             self.cached_balance_loaded_at = None
 
             self.app_logger.info(
-                f"[ORDER] {symbol} | 매수 주문 접수 완료 | 수량 {quantity}주 | 주문번호 {result.order_id}"
-            )
-            self._notifier.send(
-                f"🟢 [매수] {symbol}\n"
-                f"가격: {current_price:,}원 | 수량: {quantity}주\n"
-                f"금액: {current_price * quantity:,}원\n"
-                f"장세: {regime.value if regime else '-'} | 점수: {signal.reason[:30]}"
+                f"[ORDER] {symbol} | 매수 주문 접수 완료(미확정) | 수량 {quantity}주 | 주문번호 {result.order_id}"
             )
         else:
             self.app_logger.warning(
@@ -2883,6 +2901,53 @@ class TradingService:
                 f"[FAIL ] {symbol} | 매도 주문 실패 | 사유: {result.message}"
             )
 
+
+
+    def _apply_first_fill_buy_side_effects(self, symbol: str) -> None:
+        """BUY의 첫 실체결이 확인됐을 때만 실행되는 진입 처리.
+
+        2026-08-13 (1P0.7.2, GPT 코드리뷰 P0, 재현 근거 — 8/12 103590):
+        ```
+        11:47:17 BUY accepted
+        11:47:27 4주만 체결       ← 여기서 entry_time을 잡아야 함(first_fill_at)
+        11:50:42 83주 전량 확인
+        ```
+        accepted 시각(11:47:17)에 `entry_time_by_symbol`을 기록하면
+        "5분 최소수익 미달" 같은 보유시간 판정이 실제 보유 1분 37초
+        만에 발동합니다. 여기서는 **첫 실체결(quantity가 진입 전보다
+        늘어난 시점)**을 entry_time으로 기록합니다(first_fill_at 정책).
+        "전체 포지션 완전 체결" 기준(full_fill_at)이 필요한 규칙이
+        생기면 별도 필드로 분리하십시오 — 이번 수정 범위에는 없습니다.
+
+        0주 체결로 끝난(취소/미체결) BUY는 이 메서드가 호출되지 않으므로
+        진입횟수·쿨다운·알림을 전혀 소모하지 않습니다.
+        """
+        ctx = self._pending_buy_side_effects.pop(symbol, None)
+        if ctx is None:
+            return
+        current_price = ctx["current_price"]
+        quantity = ctx["quantity"]
+        regime = ctx["regime"]
+        signal_reason = ctx["signal_reason"]
+        order_id = ctx["order_id"]
+
+        # 매수 시각 기록(first_fill_at) → entry_watch·보유시간 판정에 사용
+        self.state.entry_time_by_symbol[symbol] = datetime.now().isoformat()
+        self.state.bought_symbols_today.add(symbol)
+        self._last_buy_signal_at[symbol] = datetime.now()
+        self.state.symbol_entry_count_today[symbol] = (
+            self.state.symbol_entry_count_today.get(symbol, 0) + 1
+        )
+
+        self.app_logger.info(
+            f"[ORDER] {symbol} | 매수 첫 체결 확인 | 수량 {quantity}주 | 주문번호 {order_id}"
+        )
+        self._notifier.send(
+            f"🟢 [매수] {symbol}\n"
+            f"가격: {current_price:,}원 | 수량: {quantity}주\n"
+            f"금액: {current_price * quantity:,}원\n"
+            f"장세: {regime.value if regime else '-'} | 점수: {signal_reason[:30]}"
+        )
 
     def _apply_deferred_sell_side_effects(self, symbol: str) -> None:
         """SELL이 완전 청산으로 확정됐을 때만 실행되는 후속 처리.
