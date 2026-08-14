@@ -7021,3 +7021,78 @@ only, TradingService/PSM 미접촉). **다음 세션에서 필요한 것은 민�
 
 ---
 
+## 1P0.8-B.1 재검토 — 실측 캡처 전 보강 2건 (2026-08-14)
+
+민우님이 실제 모의계좌 캡처를 시작하기 전, B.2의 근거 데이터 신뢰성과
+직결되는 구멍 2개를 GPT가 지적했습니다. 둘 다 read-only 원칙과
+Broker 인터페이스 미변경 원칙은 그대로 유지한 채 보강했습니다.
+
+1. **mock-domain fail-closed 강화 + defense-in-depth**: 기존
+   `assert_mock_domain()`은 host만 확인해서 `http://mockapi.kiwoom.
+   com`(평문 전송, 토큰이 암호화 없이 나갈 위험)도 통과했고, `main()`
+   에서만 호출돼서 누군가 `call_kiwoom_api()`를 직접 다른 base_url로
+   호출하면(예: 실전 URL 하드코딩 실수) 우회가 가능했습니다.
+   → `assert_mock_domain()`이 이제 scheme(`https` 고정)·host(정확히
+   `mockapi.kiwoom.com`)·port(명시 안 됨 또는 443만 허용) 세 가지를
+   모두 검증합니다. 그리고 `call_kiwoom_api()` 맨 앞에서도 다시
+   호출해, 호출부가 이 검증을 우회해도 실제 네트워크 계층에서 한 번
+   더 막히도록 했습니다.
+
+2. **연속조회(pagination) 처리 누락**: ka10075/ka10076은 `--order-id`
+   로 특정 주문 하나만 필터링하는 게 아니라 종목 기준 목록을
+   반환하는데, 기존 코드는 매번 `cont-yn=N`/`next-key=""`로만 요청하고
+   응답의 `cont-yn=Y`(다음 페이지 존재)를 그냥 JSONL에 기록만 하고
+   끝냈습니다. 목표 주문이 두 번째 페이지 이후에 있으면 "이 주문이
+   미체결 목록에 없었다"가 아니라 "첫 페이지만 봤다"를 "없었다"로
+   오인하는 위험한 데이터가 만들어질 수 있었습니다.
+   → `call_kiwoom_api()`가 `cont_yn`/`next_key` 파라미터를 받도록
+   확장하고, 새 함수 `fetch_paginated()`가 응답의 `cont-yn=Y`를
+   따라가며 `next-key`를 다음 요청에 그대로 실어 모든 페이지를
+   순서대로 조회합니다. 상태 해석은 여전히 하지 않고, 각 페이지를
+   그대로 JSONL 한 줄씩으로 남기되 `page_index`/`request_cont_yn`/
+   `request_next_key` protocol metadata를 추가해 어떤 요청의 응답인지
+   JSONL만 보고 알 수 있게 했습니다. 무한 루프 방지용
+   `MAX_CONTINUATION_PAGES`(기본 20, `--max-pages`로 조정 가능) hard
+   cap을 두고, cap에 도달했는데도 더 볼 데이터가 있다면(`cont-yn=Y`)
+   추가 네트워크 호출 없이 `probe_page_cap_exceeded=True`를 명시하는
+   synthetic 레코드를 하나 더 남기고 멈춥니다 — 침묵 없이 중단.
+
+### 테스트: `test_order_reconciliation_probe.py` 50건 → **78건** (28건 신규)
+
+- 14절(6건): scheme=http, 비표준 포트(8443/80), 잘못된 scheme(ftp)
+  거부, 정상 URL(포트 없음/443)은 통과.
+- 15절(2건): `call_kiwoom_api()`에 직접 실전 URL/http URL을 넘겨도
+  거부되고 네트워크 호출이 0회임을 확인(main()의 검증 우회 시나리오).
+- 16절(8건): `fetch_paginated()`가 cont-yn=Y,Y,N 3페이지를 순서대로
+  조회, 각 요청이 직전 응답의 next-key를 정확히 실어 보내는지, 실제
+  HTTP 요청 헤더까지 확인.
+- 17절(6건): 항상 cont-yn=Y를 반환하는 fake session으로 무한
+  continuation을 흉내내 `max_pages=3`에서 실제 호출이 정확히 3회로
+  제한되고, synthetic cap 레코드(http_status=None,
+  `probe_page_cap_exceeded=True`, page_index=4)가 남는지 확인.
+- 18절(6건): `main()` 통합 테스트로 ka10075가 2페이지(Y→N),
+  ka10076이 1페이지인 시나리오에서 JSONL에 정확히 3줄이 만들어지고,
+  각 페이지의 request_cont_yn/request_next_key/response_body가
+  올바르게 분리·보존되는지 확인.
+
+기존 1~13절(50건)은 시그니처 변경(`call_kiwoom_api`에 `cont_yn`/
+`next_key` 키워드 인자 추가, `build_record`에 `page_index`/
+`request_cont_yn`/`request_next_key` 필드 추가)에도 전부 하위 호환
+방식으로 유지되어 수정 없이 그대로 통과합니다.
+
+**전체 회귀**: 19개 파일 중 18개 통과. `test_replay_time_axis.py`만
+기존 pre-existing failure(이번 변경과 무관). `compileall` 정상.
+
+### 범위는 그대로 지켰습니다
+
+`BrokerOrder`/`OrderStatus`/`get_order_status()` 등은 여전히 만들지
+않았습니다 — 이번 보강은 read-only 프로브 자체의 안전성과 데이터
+완전성(pagination 누락 방지)에 대한 것이지, 도메인 모델 설계를
+앞당긴 것이 아닙니다. GPT도 이 두 건 외에는 "현재 구조를 유지"라고
+확인했습니다.
+
+이걸로 1P0.8-B.1은 실측 캡처를 시작해도 되는 상태입니다. 다음은
+민우님이 실제 모의계좌로 프로브를 실행해 JSONL을 확보하는 것입니다.
+
+---
+

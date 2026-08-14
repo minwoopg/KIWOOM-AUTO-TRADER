@@ -19,6 +19,12 @@
 11. run_id / elapsed_ms 유지
 12. 조회 실패가 다음 캡처를 조용히 정상값으로 위장하지 않음
 
+2026-08-14 GPT 재검토(2건) 반영 후 추가된 절(14~18):
+- mock-domain fail-closed 강화(scheme=https + host + port까지 검증,
+  `call_kiwoom_api()` 자체에서도 defense-in-depth 재검증)
+- 연속조회(pagination) — cont-yn=Y/next-key를 따라가며 모든 페이지를
+  조회, page cap 초과 시 침묵 없이 명시적 레코드로 중단
+
 네트워크 호출은 전혀 하지 않습니다 — fake session/broker로 대체합니다.
 """
 from __future__ import annotations
@@ -46,6 +52,7 @@ from tools.order_reconciliation_probe import (
     build_ka10076_payload,
     build_record,
     call_kiwoom_api,
+    fetch_paginated,
     main as probe_main,
     parse_intervals,
     redact_sensitive,
@@ -122,6 +129,43 @@ class _FakeSession:
             raise self._raise_exc
         api_id = (headers or {}).get("api-id")
         return self._response_by_api_id[api_id]
+
+
+class _FakeSequenceSession:
+    """api_id별로 미리 정해둔 응답을 순서대로 하나씩 돌려주는 fake session.
+
+    pagination(cont-yn/next-key) 검증용 — 매 호출의 요청 헤더까지 기록해
+    두 번째 페이지 요청이 첫 응답의 next-key를 실제로 그대로 실었는지
+    확인할 수 있게 합니다.
+    """
+
+    def __init__(self, sequence_by_api_id):
+        self.calls = []
+        self._queues = {k: list(v) for k, v in sequence_by_api_id.items()}
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.calls.append({"url": url, "headers": dict(headers or {}), "json": json, "timeout": timeout})
+        api_id = (headers or {}).get("api-id")
+        queue = self._queues.get(api_id, [])
+        if not queue:
+            raise AssertionError(f"테스트 설정보다 많은 호출이 발생함: api_id={api_id}")
+        return queue.pop(0)
+
+
+class _FakeInfiniteContinuationSession:
+    """항상 cont-yn=Y를 돌려주는(끝나지 않는) fake session — page cap 검증용."""
+
+    def __init__(self):
+        self.calls = []
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.calls.append({"url": url, "headers": dict(headers or {}), "json": json, "timeout": timeout})
+        api_id = (headers or {}).get("api-id")
+        return _FakeResponse(
+            200,
+            {"api-id": api_id, "cont-yn": "Y", "next-key": f"KEY{len(self.calls)}"},
+            {"oso": [], "return_code": 0, "return_msg": "완료"},
+        )
 
 
 _ok_body_ka10075 = {
@@ -430,6 +474,193 @@ check("12-3) 예외 메시지 원문('connection refused')이 그대로 노출�
       and _body12["probe_transport_error"] == "ConnectionError")
 check("12-4) 실패해도 예외를 다시 던지지 않고 값으로 반환(호출부가 다음 캡처를 계속할 수 있음)",
       isinstance(_body12, dict))
+
+
+# ══════════════════════════════════════════════════════════════
+# 14. mock-domain fail-closed 강화 (2026-08-14 GPT 재검토 #1)
+# ══════════════════════════════════════════════════════════════
+for bad_url in (
+    "http://mockapi.kiwoom.com",        # scheme이 http — 토큰 평문 전송 위험
+    "https://mockapi.kiwoom.com:8443",  # 비표준 포트
+    "ftp://mockapi.kiwoom.com",         # 엉뚱한 scheme
+    "https://mockapi.kiwoom.com:80",    # https인데 80포트(비표준)
+):
+    try:
+        assert_mock_domain(bad_url)
+        check(f"14-1) 강화된 검증이 거부: {bad_url}", False)
+    except NonMockDomainRejected:
+        check(f"14-1) 강화된 검증이 거부: {bad_url}", True)
+
+for good_url in ("https://mockapi.kiwoom.com", "https://mockapi.kiwoom.com:443"):
+    try:
+        assert_mock_domain(good_url)
+        check(f"14-2) 정상 URL은 통과: {good_url}", True)
+    except ProbeConfigError:
+        check(f"14-2) 정상 URL은 통과: {good_url}", False)
+
+
+# ══════════════════════════════════════════════════════════════
+# 15. call_kiwoom_api() 자체의 defense-in-depth (2026-08-14 GPT 재검토 #1)
+# ══════════════════════════════════════════════════════════════
+_session15a = _FakeSession(
+    response_by_api_id={
+        "ka10075": _FakeResponse(200, {"api-id": "ka10075", "cont-yn": "N", "next-key": ""}, _ok_body_ka10075),
+    }
+)
+try:
+    call_kiwoom_api(_session15a, "https://api.kiwoom.com", "TOKEN", "ka10075",
+                     build_ka10075_payload("005930"))
+    check("15-1) call_kiwoom_api()에 실전 URL을 직접 넘겨도 거부됨(main()의 검증을 우회해도 안전)", False)
+except NonMockDomainRejected:
+    check("15-1) call_kiwoom_api()에 실전 URL을 직접 넘겨도 거부됨(main()의 검증을 우회해도 안전)",
+          len(_session15a.calls) == 0)
+
+_session15b = _FakeSession(
+    response_by_api_id={
+        "ka10075": _FakeResponse(200, {"api-id": "ka10075", "cont-yn": "N", "next-key": ""}, _ok_body_ka10075),
+    }
+)
+try:
+    call_kiwoom_api(_session15b, "http://mockapi.kiwoom.com", "TOKEN", "ka10075",
+                     build_ka10075_payload("005930"))
+    check("15-2) call_kiwoom_api()에 http(평문) URL을 직접 넘겨도 거부됨", False)
+except NonMockDomainRejected:
+    check("15-2) call_kiwoom_api()에 http(평문) URL을 직접 넘겨도 거부됨",
+          len(_session15b.calls) == 0)
+
+
+# ══════════════════════════════════════════════════════════════
+# 16. 연속조회(pagination) — cont-yn/next-key 따라가기 (2026-08-14 GPT 재검토 #2)
+# ══════════════════════════════════════════════════════════════
+_pages16 = []
+
+
+def _capture16(page_index, request_cont_yn, request_next_key, http_status, response_headers, response_body):
+    _pages16.append({
+        "page_index": page_index,
+        "request_cont_yn": request_cont_yn,
+        "request_next_key": request_next_key,
+        "http_status": http_status,
+        "response_headers": response_headers,
+        "response_body": response_body,
+    })
+
+
+_session16 = _FakeSequenceSession({
+    "ka10075": [
+        _FakeResponse(200, {"api-id": "ka10075", "cont-yn": "Y", "next-key": "PAGE2KEY"},
+                      {"oso": [{"ord_no": "AAA"}], "return_code": 0}),
+        _FakeResponse(200, {"api-id": "ka10075", "cont-yn": "Y", "next-key": "PAGE3KEY"},
+                      {"oso": [{"ord_no": "BBB"}], "return_code": 0}),
+        _FakeResponse(200, {"api-id": "ka10075", "cont-yn": "N", "next-key": ""},
+                      {"oso": [{"ord_no": "CCC"}], "return_code": 0}),
+    ]
+})
+fetch_paginated(_session16, "https://mockapi.kiwoom.com", "TOKEN", "ka10075",
+                 build_ka10075_payload("005930"), _capture16)
+
+check("16-1) cont-yn=Y,Y,N 응답 3개를 전부 페이지로 조회함", len(_pages16) == 3)
+check("16-2) page_index가 1,2,3 순서로 증가", [p["page_index"] for p in _pages16] == [1, 2, 3])
+check("16-3) 첫 요청은 cont-yn=N/next-key=''(첫 페이지 기본값)",
+      _pages16[0]["request_cont_yn"] == "N" and _pages16[0]["request_next_key"] == "")
+check("16-4) 두 번째 요청은 첫 응답의 next-key(PAGE2KEY)를 그대로 사용",
+      _pages16[1]["request_cont_yn"] == "Y" and _pages16[1]["request_next_key"] == "PAGE2KEY")
+check("16-5) 세 번째 요청은 두 번째 응답의 next-key(PAGE3KEY)를 그대로 사용",
+      _pages16[2]["request_cont_yn"] == "Y" and _pages16[2]["request_next_key"] == "PAGE3KEY")
+check("16-6) 실제 HTTP 요청 헤더에도 cont-yn/next-key가 정확히 실림(2번째 호출)",
+      _session16.calls[1]["headers"]["cont-yn"] == "Y"
+      and _session16.calls[1]["headers"]["next-key"] == "PAGE2KEY")
+check("16-7) cont-yn=N인 마지막 페이지에서 정상 종료(추가 호출 없음, 총 3회)",
+      len(_session16.calls) == 3)
+check("16-8) 각 페이지의 response_body가 서로 다른 원본 그대로 보존됨(첫 페이지에 없어도 끊지 않음)",
+      [p["response_body"]["oso"][0]["ord_no"] for p in _pages16] == ["AAA", "BBB", "CCC"])
+
+
+# ══════════════════════════════════════════════════════════════
+# 17. page cap 초과 시 명시적 오류/중단 (2026-08-14 GPT 재검토 #2)
+# ══════════════════════════════════════════════════════════════
+_pages17 = []
+
+
+def _capture17(page_index, request_cont_yn, request_next_key, http_status, response_headers, response_body):
+    _pages17.append((page_index, request_cont_yn, request_next_key, http_status, response_headers, response_body))
+
+
+_session17 = _FakeInfiniteContinuationSession()
+fetch_paginated(_session17, "https://mockapi.kiwoom.com", "TOKEN", "ka10075",
+                 build_ka10075_payload("005930"), _capture17, max_pages=3)
+
+check("17-1) 실제 네트워크 호출은 max_pages(3)회로 제한됨(무한 루프 방지)",
+      len(_session17.calls) == 3)
+check("17-2) on_page는 실제 페이지 3개 + synthetic cap 레코드 1개 = 4번 호출됨",
+      len(_pages17) == 4)
+_last17 = _pages17[-1]
+check("17-3) synthetic 레코드는 추가 네트워크 호출 없이 http_status=None",
+      _last17[3] is None)
+check("17-4) synthetic 레코드가 cap 초과 사실과 max_pages 값을 명시함",
+      isinstance(_last17[5], dict)
+      and _last17[5].get("probe_page_cap_exceeded") is True
+      and _last17[5].get("max_continuation_pages") == 3)
+check("17-5) synthetic 레코드의 page_index는 max_pages+1(4) — 어느 페이지에서 끊겼는지 알 수 있음",
+      _last17[0] == 4)
+check("17-6) 실제 페이지 1~3의 http_status는 정상(200)으로 남아있음(cap 자체가 실패로 오인되지 않음)",
+      all(p[3] == 200 for p in _pages17[:3]))
+
+
+# ══════════════════════════════════════════════════════════════
+# 18. main() 통합 — pagination이 실제로 여러 JSONL 레코드를 만듦
+# ══════════════════════════════════════════════════════════════
+class _FakeKiwoomBrokerPaginated:
+    """ka10075는 2페이지(Y→N), ka10076은 1페이지만 있는 시나리오."""
+
+    def __init__(self, config):
+        self.config = config
+        self.access_token = None
+        self.session = _FakeSequenceSession({
+            "ka10075": [
+                _FakeResponse(200, {"api-id": "ka10075", "cont-yn": "Y", "next-key": "P2"},
+                              {"oso": [{"ord_no": "X1"}], "return_code": 0}),
+                _FakeResponse(200, {"api-id": "ka10075", "cont-yn": "N", "next-key": ""},
+                              {"oso": [{"ord_no": "X2"}], "return_code": 0}),
+            ],
+            "ka10076": [
+                _FakeResponse(200, {"api-id": "ka10076", "cont-yn": "N", "next-key": ""},
+                              {"cntr": [], "return_code": 0}),
+            ],
+        })
+
+    def authenticate(self):
+        self.access_token = "FAKE-TOKEN-FOR-TEST"
+
+
+with tempfile.TemporaryDirectory() as _tmp18:
+    _out_path18 = Path(_tmp18) / "probe18.jsonl"
+    with patch("config.settings.load_settings", lambda path: _FakeSettings("https://mockapi.kiwoom.com")), \
+         patch("infra.broker.kiwoom_broker.KiwoomBroker", _FakeKiwoomBrokerPaginated):
+        _rc18 = probe_main([
+            "--symbol", "005930", "--order-id", "0000069",
+            "--intervals", "0",
+            "--out", str(_out_path18),
+        ])
+
+    check("18-1) main()이 성공 종료", _rc18 == 0)
+    _records18 = [json.loads(line) for line in _out_path18.read_text(encoding="utf-8").strip().splitlines()]
+    check("18-2) ka10075 2페이지 + ka10076 1페이지 = 총 3줄",
+          len(_records18) == 3)
+    _ka10075_records18 = sorted(
+        (r for r in _records18 if r["api_id"] == "ka10075"), key=lambda r: r["page_index"],
+    )
+    check("18-3) ka10075 레코드가 정확히 2개, page_index=1,2",
+          [r["page_index"] for r in _ka10075_records18] == [1, 2])
+    check("18-4) 두 번째 페이지 레코드의 request_cont_yn/request_next_key가 첫 응답 값과 일치",
+          _ka10075_records18[1]["request_cont_yn"] == "Y"
+          and _ka10075_records18[1]["request_next_key"] == "P2")
+    check("18-5) 각 페이지의 response_body가 서로 다름(X1, X2 — 뭉개지지 않음)",
+          _ka10075_records18[0]["response_body"]["oso"][0]["ord_no"] == "X1"
+          and _ka10075_records18[1]["response_body"]["oso"][0]["ord_no"] == "X2")
+    _ka10076_records18 = [r for r in _records18 if r["api_id"] == "ka10076"]
+    check("18-6) ka10076은 1페이지만(cont-yn=N이라 정상 종료)", len(_ka10076_records18) == 1
+          and _ka10076_records18[0]["page_index"] == 1)
 
 
 # ══════════════════════════════════════════════════════════════

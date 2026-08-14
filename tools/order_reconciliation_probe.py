@@ -25,8 +25,15 @@ from __future__ import annotations
         --scenario market_buy_full_fill
 
 안전장치 (fail-closed):
-1. `settings.broker.base_url`의 host가 정확히 `mockapi.kiwoom.com`이
-   아니면 즉시 거부합니다 — 실전 계좌 조회를 원천 차단합니다.
+1. `settings.broker.base_url`이 정확히 `https://mockapi.kiwoom.com`
+   (포트 없음 또는 443)이 아니면 즉시 거부합니다 — 실전 계좌 조회와
+   평문(HTTP) 전송(토큰이 암호화 없이 나갈 수 있음)을 함께 막습니다.
+   이 검증은 `main()` 진입 시점뿐 아니라 실제 HTTP 호출을 수행하는
+   `call_kiwoom_api()` 맨 앞에서도 다시 한번 수행합니다(defense-in-
+   depth) — 나중에 누군가 `call_kiwoom_api()`를 다른 base_url로 직접
+   호출해도(예: 실전 URL을 실수로 하드코딩) 네트워크 호출 자체가
+   나가지 않습니다. 우회 옵션(플래그로 이 검증을 끄는 기능)은 의도적
+   으로 제공하지 않습니다.
 2. 호출 가능한 api-id는 `ka10075`/`ka10076` 두 개로 하드코딩되어
    있습니다. 다른 값이 들어오면(코드 수정 실수 포함) 즉시 예외.
 3. `order_id`가 None/빈 문자열/공백뿐/`"pending"`/`"UNKNOWN_ORDER_ID"`
@@ -41,6 +48,17 @@ from __future__ import annotations
    `api-id`/`cont-yn`/`next-key`만 allow-list로 뽑습니다. 응답 바디는
    원본을 그대로 저장하되, `acnt_no` 등 계좌번호로 보이는 키는 값만
    `"[REDACTED]"`로 치환합니다(구조/다른 필드는 그대로 보존).
+5. 연속조회(pagination)를 명시적으로 따라갑니다. 키움 REST는 응답에
+   `cont-yn=Y`가 오면 다음 페이지가 더 있다는 뜻이고, 그 `next-key`를
+   다음 요청 헤더에 그대로 넣어야 조회를 이어갈 수 있습니다(공식
+   가이드). 첫 페이지에 우리가 찾는 주문이 없다고 해서 조회를 끊으면
+   "이 주문이 미체결/체결 목록에 없었다"가 아니라 "첫 페이지만
+   봤다"를 "없었다"로 오인하는 위험한 데이터가 만들어집니다. 이
+   프로브는 상태를 해석하지 않으므로, 각 페이지를 그대로 JSONL
+   한 줄씩으로 남기고(`page_index`/`request_cont_yn`/
+   `request_next_key` 메타데이터 포함) `MAX_CONTINUATION_PAGES`
+   (기본 20)에 도달하면 계속 진행하는 대신 그 사실 자체를 명시하는
+   레코드를 하나 더 남기고 멈춥니다(무한 루프 방지 + 침묵 없는 중단).
 """
 
 import argparse
@@ -58,8 +76,11 @@ import requests
 # ── 안전장치 상수 ────────────────────────────────────────────────
 ALLOWED_API_IDS = frozenset({"ka10075", "ka10076"})
 ALLOWED_BASE_URL_HOST = "mockapi.kiwoom.com"
+ALLOWED_BASE_URL_SCHEME = "https"
+ALLOWED_BASE_URL_PORTS = (None, 443)  # None = URL에 포트가 명시 안 됨(기본 443)
 ALLOWED_RESPONSE_HEADER_KEYS = ("api-id", "cont-yn", "next-key")
 FORBIDDEN_ORDER_IDS = {"pending", "UNKNOWN_ORDER_ID"}
+MAX_CONTINUATION_PAGES = 20
 
 # 응답 바디에서 값만 redact할 키(대소문자 무시, 부분일치).
 # ka10075 실측 예시 응답에 "acnt_no"가 실제로 포함되어 있음을 확인했음
@@ -120,18 +141,33 @@ def validate_order_id(raw: Any) -> str:
 
 
 def assert_mock_domain(base_url: str) -> None:
-    """base_url이 정확히 모의투자 도메인인지 확인합니다.
+    """base_url이 정확히 `https://mockapi.kiwoom.com`(포트 없음/443)인지 확인합니다.
 
-    호스트 부분 문자열 포함이 아니라 정확히 일치해야 통과합니다
-    (예: "notmockapi.kiwoom.com.evil.example" 같은 우회 방지).
+    세 가지를 모두 요구합니다(2026-08-14, GPT 재검토 반영 — 강화):
+    - scheme이 정확히 "https"(http는 거부 — 토큰이 평문으로 나가는 것을 방지)
+    - host가 정확히 "mockapi.kiwoom.com"(부분 문자열 포함이 아니라 정확히
+      일치. 예: "mockapi.kiwoom.com.evil.example" 같은 우회 방지)
+    - port가 명시 안 됐거나(None, https 기본값) 443(비표준 포트 차단)
+
+    `main()` 진입 시점뿐 아니라 `call_kiwoom_api()` 맨 앞에서도 다시
+    호출됩니다 — 호출부 하나가 이 검증을 우회해도 실제 네트워크 계층
+    에서 다시 막히도록 하기 위함(defense-in-depth).
     """
-    host = (urlparse(base_url).hostname or "").lower()
-    if host != ALLOWED_BASE_URL_HOST:
+    parsed = urlparse(base_url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    if (
+        scheme != ALLOWED_BASE_URL_SCHEME
+        or host != ALLOWED_BASE_URL_HOST
+        or port not in ALLOWED_BASE_URL_PORTS
+    ):
         raise NonMockDomainRejected(
-            f"이 진단 스크립트는 모의투자 도메인({ALLOWED_BASE_URL_HOST})에서만 "
-            f"실행할 수 있습니다. 현재 settings.broker.base_url의 host={host!r} "
-            f"(base_url={base_url!r}). 실전 계좌 조회를 막기 위한 안전장치이며, "
-            f"우회 옵션은 의도적으로 제공하지 않습니다."
+            f"이 진단 스크립트는 https://{ALLOWED_BASE_URL_HOST}(포트 없음 또는 "
+            f"443)에서만 실행할 수 있습니다. 현재 base_url={base_url!r} "
+            f"(scheme={scheme!r}, host={host!r}, port={port!r}). 실전 계좌 조회와 "
+            f"평문 전송을 막기 위한 안전장치이며, 우회 옵션은 의도적으로 제공하지 "
+            f"않습니다."
         )
 
 
@@ -209,16 +245,25 @@ def call_kiwoom_api(
     access_token: str,
     api_id: str,
     payload: dict[str, Any],
+    cont_yn: str = "N",
+    next_key: str = "",
     timeout: int = 10,
 ) -> tuple[int | None, dict[str, str], Any]:
     """ka10075/ka10076을 호출하고 (http_status, response_headers, response_body)를 반환합니다.
 
-    - api_id가 허용 목록 밖이면 네트워크 호출 자체를 하지 않고 예외.
+    - base_url이 모의투자 도메인이 아니면(defense-in-depth, `main()`의
+      검증과 별개로 여기서도 다시 확인) 네트워크 호출 자체를 하지 않고 예외.
+    - api_id가 허용 목록 밖이면 마찬가지로 네트워크 호출 자체를 하지 않고 예외.
+    - cont_yn/next_key는 연속조회(pagination) 요청 헤더입니다. 첫 페이지는
+      "N"/""(기본값), 다음 페이지부터는 직전 응답의 cont-yn/next-key를
+      그대로 넘겨받아 씁니다(공식 가이드 규정).
     - 네트워크 계층 예외(타임아웃/연결 실패 등)는 삼키지 않고 http_status=None,
       토큰이 노출되지 않는 안전한 메시지만 담아 반환합니다 — 실패를 조용히
       정상값으로 위장하지 않기 위함.
     - return_code가 0이 아닌 업무 오류 응답도 그대로 반환합니다(버리지 않음).
     """
+    assert_mock_domain(base_url)
+
     if api_id not in ALLOWED_API_IDS:
         raise DisallowedApiId(
             f"probe는 다음 TR만 허용합니다: {sorted(ALLOWED_API_IDS)} "
@@ -228,8 +273,8 @@ def call_kiwoom_api(
     headers = {
         "Content-Type": "application/json;charset=UTF-8",
         "authorization": f"Bearer {access_token}",
-        "cont-yn": "N",
-        "next-key": "",
+        "cont-yn": cont_yn,
+        "next-key": next_key,
         "api-id": api_id,
     }
 
@@ -258,6 +303,70 @@ def call_kiwoom_api(
     return response.status_code, response_headers, body
 
 
+def fetch_paginated(
+    session: Any,
+    base_url: str,
+    access_token: str,
+    api_id: str,
+    payload: dict[str, Any],
+    on_page: Any,
+    max_pages: int = MAX_CONTINUATION_PAGES,
+) -> None:
+    """cont-yn/next-key를 따라가며 모든 페이지를 원시 그대로, 순서대로 조회합니다.
+
+    페이지마다 `on_page(page_index, request_cont_yn, request_next_key,
+    http_status, response_headers, response_body)`를 정확히 1회씩
+    호출합니다 — 상태를 해석하지 않고 그대로 전달만 합니다.
+
+    - 응답 `cont-yn`이 "Y"이고 `next-key`가 있으면 다음 페이지를 이어서
+      조회합니다. `cont-yn != "Y"`거나 `next-key`가 비어있으면 정상
+      종료(더 이상 페이지 없음)입니다.
+    - 전송 실패(http_status=None)면 그 페이지를 마지막으로 멈춥니다 —
+      실패 이후 페이지를 계속 시도해도 신뢰할 수 있는 데이터가 아니고,
+      실패 사실 자체는 이미 그 페이지의 레코드에 명시돼 있습니다.
+    - `max_pages`에 도달했는데 마지막 응답이 아직 `cont-yn=Y`라면(더
+      볼 데이터가 있다는 뜻), 추가 HTTP 호출 없이 `on_page`를 한 번 더
+      호출해 "여기서 캡 때문에 멈췄다"는 사실을 명시하는 synthetic
+      레코드(http_status=None, response_body에
+      `probe_page_cap_exceeded=True`)를 남깁니다 — 조용히 끊지 않고
+      침묵 없이 중단하기 위함입니다. 무한 루프 방지가 목적이며 실제
+      네트워크 호출 횟수는 항상 max_pages 이하입니다.
+    """
+    cont_yn = "N"
+    next_key = ""
+    page_index = 1
+
+    while True:
+        http_status, response_headers, response_body = call_kiwoom_api(
+            session, base_url, access_token, api_id, payload,
+            cont_yn=cont_yn, next_key=next_key,
+        )
+        on_page(page_index, cont_yn, next_key, http_status, response_headers, response_body)
+
+        if http_status is None:
+            break  # 전송 실패 — 이미 이 레코드로 명시됐으므로 더 진행하지 않음
+
+        resp_cont_yn = response_headers.get("cont-yn", "")
+        resp_next_key = response_headers.get("next-key", "")
+        if resp_cont_yn != "Y" or not resp_next_key:
+            break  # 정상 종료 — 다음 페이지 없음
+
+        if page_index >= max_pages:
+            on_page(
+                page_index + 1, resp_cont_yn, resp_next_key,
+                None, {},
+                {
+                    "probe_page_cap_exceeded": True,
+                    "max_continuation_pages": max_pages,
+                },
+            )
+            break
+
+        page_index += 1
+        cont_yn = resp_cont_yn
+        next_key = resp_next_key
+
+
 @dataclass
 class ProbeContext:
     symbol: str
@@ -272,6 +381,9 @@ def build_record(
     ctx: ProbeContext,
     run_id: str,
     api_id: str,
+    page_index: int,
+    request_cont_yn: str,
+    request_next_key: str,
     payload: dict[str, Any],
     elapsed_ms: int,
     http_status: int | None,
@@ -279,7 +391,12 @@ def build_record(
     response_body: Any,
     captured_at: datetime,
 ) -> dict[str, Any]:
-    """스펙에 정의된 JSONL 레코드 하나를 만듭니다(민우님 확정 사양 그대로)."""
+    """JSONL 레코드 하나를 만듭니다(민우님 확정 사양 + pagination 메타데이터).
+
+    `page_index`/`request_cont_yn`/`request_next_key`는 GPT 재검토
+    (2026-08-14)에서 추가된 연속조회(pagination) protocol metadata —
+    이 레코드가 어떤 페이지 요청이었는지 JSONL만 보고 알 수 있게 합니다.
+    """
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -292,6 +409,9 @@ def build_record(
         "order_id": ctx.order_id,
         "requested_quantity": ctx.requested_quantity,
         "api_id": api_id,
+        "page_index": page_index,
+        "request_cont_yn": request_cont_yn,
+        "request_next_key": request_next_key,
         "request_body": payload,
         "http_status": http_status,
         "response_headers": response_headers,
@@ -335,6 +455,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--settings", default="config/settings.yaml", help="settings.yaml 경로",
+    )
+    parser.add_argument(
+        "--max-pages", type=int, default=MAX_CONTINUATION_PAGES,
+        help=f"연속조회(cont-yn=Y) 최대 페이지 수(무한 루프 방지, 기본 {MAX_CONTINUATION_PAGES})",
     )
     return parser
 
@@ -391,6 +515,31 @@ def main(argv: list[str] | None = None) -> int:
     monotonic_start = time.monotonic()
 
     with out_path.open("a", encoding="utf-8") as fp:
+        def _write_page(api_id, payload):
+            def _on_page(page_index, request_cont_yn, request_next_key,
+                         http_status, response_headers, response_body):
+                captured_at = datetime.now(KST)
+                elapsed_ms = int(round((time.monotonic() - monotonic_start) * 1000))
+                record = build_record(
+                    ctx, run_id, api_id, page_index, request_cont_yn, request_next_key,
+                    payload, elapsed_ms, http_status, response_headers, response_body,
+                    captured_at,
+                )
+                fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fp.flush()
+                if response_body.get("probe_page_cap_exceeded") if isinstance(response_body, dict) else False:
+                    print(
+                        f"[{elapsed_ms:>6}ms] {api_id} page={page_index} "
+                        f"[경고] max_pages({args.max_pages}) 도달 — 추가 페이지 조회를 중단합니다"
+                    )
+                else:
+                    return_code = response_body.get("return_code") if isinstance(response_body, dict) else "?"
+                    print(
+                        f"[{elapsed_ms:>6}ms] {api_id} page={page_index} "
+                        f"cont-yn={request_cont_yn} http={http_status} return_code={return_code}"
+                    )
+            return _on_page
+
         for interval_sec in intervals:
             target = monotonic_start + interval_sec
             now = time.monotonic()
@@ -401,21 +550,10 @@ def main(argv: list[str] | None = None) -> int:
                 ("ka10075", build_ka10075_payload(args.symbol)),
                 ("ka10076", build_ka10076_payload(args.symbol)),
             ):
-                captured_at = datetime.now(KST)
-                elapsed_ms = int(round((time.monotonic() - monotonic_start) * 1000))
-                http_status, response_headers, response_body = call_kiwoom_api(
+                fetch_paginated(
                     broker.session, broker.config.base_url, broker.access_token,
-                    api_id, payload,
-                )
-                record = build_record(
-                    ctx, run_id, api_id, payload, elapsed_ms,
-                    http_status, response_headers, response_body, captured_at,
-                )
-                fp.write(json.dumps(record, ensure_ascii=False) + "\n")
-                fp.flush()
-                print(
-                    f"[{elapsed_ms:>6}ms] {api_id} http={http_status} "
-                    f"return_code={response_body.get('return_code') if isinstance(response_body, dict) else '?'}"
+                    api_id, payload, _write_page(api_id, payload),
+                    max_pages=args.max_pages,
                 )
 
     print(f"[완료] {out_path}")
