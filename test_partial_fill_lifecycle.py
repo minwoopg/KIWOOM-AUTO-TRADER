@@ -1870,6 +1870,219 @@ check("27-12) 모듈 docstring의 stale 'order_id 연결 예정(미착수)' 문�
       "1P0.8-A.1에서 완료" in _lc_src)
 
 
+# ══════════════════════════════════════════════════════════════════
+# 28~29. 1P0.8-P0.1/P0.2: place_order() 실패 시맨틱 분리
+#     (319400 실측 P0 사고 대응 — 2026-08-14, SELL이 kt10001 HTTP 429로
+#     실패했는데 예외가 종목별 최상위 except에서 조용히 삼켜지면서
+#     PSM이 109분간 phantom pending으로 방치됨 → 손실이 -1.37%에서
+#     -6.4%까지 확대됨. 저수준 429/timeout 분류 자체는
+#     test_kiwoom_broker_placement_failure.py에서 검증 — 여기서는
+#     PSM/TradingService 레벨 동작만 검증한다.)
+# ══════════════════════════════════════════════════════════════════
+
+# ── PSM 단위: on_placement_ambiguous()는 PENDING을 ERROR로 전이 ────
+m28a = M()
+m28a.on_sell_requested("S1", 202, "pending")
+m28a.on_placement_ambiguous("S1", "SELL", "connection timed out")
+st28a = m28a.get("S1")
+check("28-1) SELL ambiguous 시 lifecycle이 ERROR로 전이됨", st28a.lifecycle == L.ERROR)
+check("28-2) last_error에 SELL_PLACEMENT_AMBIGUOUS 기록",
+      st28a.last_error == "SELL_PLACEMENT_AMBIGUOUS")
+check("28-3) pending_order_id는 지우지 않음(사람 확인용 흔적 보존)",
+      st28a.pending_order_id == "pending")
+check("28-4) error_since가 기록됨", st28a.error_since is not None)
+
+m28b = M()
+m28b.on_buy_requested("S2", 100, "pending")
+m28b.on_placement_ambiguous("S2", "BUY", "timeout")
+st28b = m28b.get("S2")
+check("28-5) BUY ambiguous 시 lifecycle이 ERROR로 전이됨", st28b.lifecycle == L.ERROR)
+check("28-6) last_error에 BUY_PLACEMENT_AMBIGUOUS 기록",
+      st28b.last_error == "BUY_PLACEMENT_AMBIGUOUS")
+
+# ── ERROR 전이 후 기존 guard가 BUY/SELL을 모두 HARD block함(재사용 검증) ──
+sell_block_28 = m28a.would_block_sell("S1")
+buy_block_28 = m28a.would_block_buy("S1")
+check("28-7) ERROR 상태는 기존 SELL guard(BLOCK_SELL_ERROR_STATE)로 차단됨",
+      sell_block_28 is not None and "BLOCK_SELL_ERROR_STATE" in sell_block_28)
+check("28-8) ERROR 상태는 기존 BUY guard(BLOCK_BUY_IN_ERROR)로도 차단됨",
+      buy_block_28 is not None and "BLOCK_BUY_IN_ERROR" in buy_block_28)
+
+# ── 기존 acknowledge_error()로만 해제 가능(새 상태를 만들지 않고 재사용) ──
+m28a.acknowledge_error("S1", 202, "HTS 직접 확인 — 실제로는 미체결이었음, 수동 취소")
+st28a_after = m28a.get("S1")
+check("28-9) acknowledge_error() 호출 후 ERROR 해제됨(재사용 확인)",
+      st28a_after.lifecycle != L.ERROR)
+check("28-10) 해제 후 SELL guard도 풀림", m28a.would_block_sell("S1") is None)
+
+# ── TradingService 통합: 4개 축(BUY/SELL x definite-reject/ambiguous) ──
+from domain.models import OrderResult as _OrderResult
+
+# 29-1~3: SELL + 429(definite reject) → OPEN 복귀, HARD block 없음
+with _tf2.TemporaryDirectory() as _tmp29a:
+    svc29a = _build_real_service(_tmp29a)
+    sym29a = "319400"
+    svc29a.broker._positions[sym29a] = _Position(symbol=sym29a, quantity=202,
+                                                  average_price=29700)
+    svc29a.broker._prices[sym29a] = 27800
+    svc29a._sync_position_state_machine_shadow(svc29a.broker.get_account_balance())
+
+    def _place_order_429_29a(order):
+        return _OrderResult(
+            order_id="", symbol=order.symbol, side=order.side,
+            requested_quantity=order.quantity, accepted=False,
+            message="HTTP 429: {'return_code': 5, 'return_msg': "
+                    "'허용된 요청 개수를 초과하였습니다'}",
+            timestamp=_dt2(2026, 8, 14, 9, 43, 8), is_ambiguous=False,
+        )
+    svc29a.broker.place_order = _place_order_429_29a
+
+    svc29a._try_sell(sym29a, 202, current_price=27800,
+                      exit_reason="손절 — 평균단가 대비 -5.8%", avg_buy_price=29700)
+
+    st29a = svc29a._position_state_machine.get(sym29a)
+    check("29-1) SELL+429(definite reject, 319400 실측 재현): ERROR로 빠지지 않고 OPEN 복귀",
+          st29a.lifecycle == L.OPEN)
+    check("29-2) SELL+429: orphan이 생기지 않음(접수 안 됐다고 안전하게 확정)",
+          st29a.orphan_order_id is None)
+    check("29-3) SELL+429: HARD block(ERROR/orphan) 없음 — 109분 방치 사고 재현 안 됨",
+          st29a.lifecycle != L.ERROR and st29a.orphan_order_id is None)
+
+# 29-4~6: BUY + 429(definite reject) → FLAT 복귀, side-effect 없음
+with _tf2.TemporaryDirectory() as _tmp29b:
+    svc29b = _build_real_service(_tmp29b)
+    svc29b.broker._cash = 100_000_000
+    sym29b = "319400"
+    svc29b.broker._positions.pop(sym29b, None)
+    svc29b.broker._prices[sym29b] = 29700
+    svc29b._sync_position_state_machine_shadow(svc29b.broker.get_account_balance())
+
+    def _place_order_429_29b(order):
+        return _OrderResult(
+            order_id="", symbol=order.symbol, side=order.side,
+            requested_quantity=order.quantity, accepted=False,
+            message="HTTP 429: rate limited", timestamp=_dt2(2026, 8, 14, 9, 43, 8),
+            is_ambiguous=False,
+        )
+    svc29b.broker.place_order = _place_order_429_29b
+
+    balance29b = svc29b.broker.get_account_balance()
+    buy_signal29b = _Signal(type=_SignalType.BUY, reason="테스트 매수(429)")
+    with _patch2("domain.service.trading_service.now_kst",
+                return_value=_dt2(2026, 8, 12, 11, 47, 17)):
+        svc29b._try_buy(sym29b, 29700, balance29b, signal=buy_signal29b,
+                        regime=_MarketRegime.BULLISH, minute_analysis=None)
+
+    st29b = svc29b._position_state_machine.get(sym29b)
+    check("29-4) BUY+429(definite reject): ERROR로 빠지지 않고 FLAT 복귀",
+          st29b.lifecycle == L.FLAT)
+    check("29-5) BUY+429: deferred BUY side-effect가 만들어지지 않음",
+          sym29b not in svc29b._pending_buy_side_effects)
+    check("29-6) BUY+429: HARD block 없이 즉시 재시도 가능(would_block_buy=None)",
+          svc29b._position_state_machine.would_block_buy(sym29b) is None)
+
+# 29-7~10: SELL + timeout(ambiguous, 319400 실측 그대로) → ERROR, 중복매도 차단
+with _tf2.TemporaryDirectory() as _tmp29c:
+    svc29c = _build_real_service(_tmp29c)
+    sym29c = "319400"
+    svc29c.broker._positions[sym29c] = _Position(symbol=sym29c, quantity=202,
+                                                  average_price=29700)
+    svc29c.broker._prices[sym29c] = 27800
+    svc29c._sync_position_state_machine_shadow(svc29c.broker.get_account_balance())
+
+    _critical_calls_29c = []
+    svc29c.app_logger.critical = lambda msg: _critical_calls_29c.append(msg)
+
+    def _place_order_timeout_29c(order):
+        return _OrderResult(
+            order_id="", symbol=order.symbol, side=order.side,
+            requested_quantity=order.quantity, accepted=False,
+            message="kiwoom transport failed: api_id=kt10001: Timeout: connection timed out",
+            timestamp=_dt2(2026, 8, 14, 9, 43, 8), is_ambiguous=True,
+        )
+    svc29c.broker.place_order = _place_order_timeout_29c
+
+    svc29c._try_sell(sym29c, 202, current_price=27800,
+                      exit_reason="손절 — 평균단가 대비 -5.8%", avg_buy_price=29700)
+
+    st29c = svc29c._position_state_machine.get(sym29c)
+    check("29-7) SELL+timeout(ambiguous, 319400 실측 재현): ERROR로 전이됨"
+          "(109분 phantom pending 방지)",
+          st29c.lifecycle == L.ERROR)
+    check("29-8) SELL+timeout: last_error가 SELL_PLACEMENT_AMBIGUOUS",
+          st29c.last_error == "SELL_PLACEMENT_AMBIGUOUS")
+    check("29-9) SELL+timeout: CRITICAL 로그가 즉시 남음(사람이 인지 가능)",
+          any("ORDER_PLACEMENT_AMBIGUOUS" in m and "side=SELL" in m
+              for m in _critical_calls_29c))
+
+    svc29c._try_sell(sym29c, 202, current_price=27800,
+                      exit_reason="손절 재시도", avg_buy_price=29700)
+    check("29-10) SELL+timeout 직후 재시도해도 여전히 ERROR 유지(중복매도 방지)",
+          svc29c._position_state_machine.get(sym29c).lifecycle == L.ERROR)
+
+    # 29-16: acknowledge_error()로 사람이 확인 후 해제하면 정상 거래 재개(탈출구 확인)
+    svc29c._position_state_machine.acknowledge_error(
+        sym29c, 202, "HTS 직접 확인 — 원 주문 미체결, 수동 취소 완료"
+    )
+    check("29-16) ERROR는 acknowledge_error()로 정상 해제됨(319400을 다시 겪어도 탈출구가 있음)",
+          svc29c._position_state_machine.get(sym29c).lifecycle != L.ERROR)
+
+# 29-11~15: BUY + timeout(ambiguous) → ERROR, 중복매수 차단
+with _tf2.TemporaryDirectory() as _tmp29d:
+    svc29d = _build_real_service(_tmp29d)
+    svc29d.broker._cash = 100_000_000
+    sym29d = "319400"
+    svc29d.broker._positions.pop(sym29d, None)
+    svc29d.broker._prices[sym29d] = 29700
+    svc29d._sync_position_state_machine_shadow(svc29d.broker.get_account_balance())
+
+    _critical_calls_29d = []
+    svc29d.app_logger.critical = lambda msg: _critical_calls_29d.append(msg)
+
+    def _place_order_timeout_29d(order):
+        return _OrderResult(
+            order_id="", symbol=order.symbol, side=order.side,
+            requested_quantity=order.quantity, accepted=False,
+            message="kiwoom transport failed: api_id=kt10000: Timeout: connection timed out",
+            timestamp=_dt2(2026, 8, 14, 9, 43, 8), is_ambiguous=True,
+        )
+    svc29d.broker.place_order = _place_order_timeout_29d
+
+    balance29d = svc29d.broker.get_account_balance()
+    buy_signal29d = _Signal(type=_SignalType.BUY, reason="테스트 매수(timeout)")
+    with _patch2("domain.service.trading_service.now_kst",
+                return_value=_dt2(2026, 8, 12, 11, 47, 17)):
+        svc29d._try_buy(sym29d, 29700, balance29d, signal=buy_signal29d,
+                        regime=_MarketRegime.BULLISH, minute_analysis=None)
+
+    st29d = svc29d._position_state_machine.get(sym29d)
+    check("29-11) BUY+timeout(ambiguous): ERROR로 전이됨", st29d.lifecycle == L.ERROR)
+    check("29-12) BUY+timeout: last_error가 BUY_PLACEMENT_AMBIGUOUS",
+          st29d.last_error == "BUY_PLACEMENT_AMBIGUOUS")
+    check("29-13) BUY+timeout: deferred BUY side-effect가 만들어지지 않음",
+          sym29d not in svc29d._pending_buy_side_effects)
+    check("29-14) BUY+timeout: CRITICAL 로그가 즉시 남음",
+          any("ORDER_PLACEMENT_AMBIGUOUS" in m and "side=BUY" in m
+              for m in _critical_calls_29d))
+
+    with _patch2("domain.service.trading_service.now_kst",
+                return_value=_dt2(2026, 8, 12, 11, 47, 20)):
+        _block29d = svc29d._try_buy(sym29d, 29700, balance29d, signal=buy_signal29d,
+                                     regime=_MarketRegime.BULLISH, minute_analysis=None)
+    check("29-15) BUY+timeout 직후 재시도는 즉시 차단됨(BLOCK_BUY_IN_ERROR, 중복매수 방지)",
+          _block29d == "BLOCK_BUY_IN_ERROR")
+
+# 29-17~20: 소스 검증
+check("29-17) trading_service.py의 BUY 경로가 is_ambiguous를 확인함",
+      "if result.is_ambiguous:" in ts_src)
+check("29-18) trading_service.py의 SELL 경로도 is_ambiguous를 확인함(BUY/SELL 두 곳)",
+      ts_src.count("if result.is_ambiguous:") >= 2)
+check("29-19) trading_service.py가 on_placement_ambiguous를 호출함(BUY/SELL 두 곳)",
+      ts_src.count("on_placement_ambiguous(") >= 2)
+check("29-20) lifecycle.py에 on_placement_ambiguous 정의 존재",
+      "def on_placement_ambiguous(self, symbol: str, side: str" in _lc_src)
+
+
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
 if failed:

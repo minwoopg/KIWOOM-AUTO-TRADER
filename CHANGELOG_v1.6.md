@@ -7168,3 +7168,403 @@ order_reconciliation_probe ...`로 실행).
 
 ---
 
+
+## 1P0.8-B.1 실측 캡처 결과 분석 (2026-08-14, 2차)
+
+`.env` 수정 반영 후 민우님이 실제 모의계좌에서 프로브를 2회 실행,
+JSONL 결과물 2건을 전달받아 분석했습니다.
+
+### 실행 성공 확인
+
+- 1차: `symbol=005930`(삼성전자), `order_id=157897`(이미 체결된
+  기존 주문), 5주, `market_buy_full_fill` — T+0/1/3/10초 4회 캡처,
+  총 8개 레코드(ka10075 4 + ka10076 4).
+- 2차: `symbol=009150`(삼성전기), `order_id=163276`(신규 주문),
+  1주, 동일 시나리오 — 동일하게 8개 레코드.
+- 두 실행 모두 전 구간 `http_status: 200`, `return_code: 0`,
+  트랜스포트 에러 없음. `.env` 수정으로 인증 문제는 완전히
+  해결됐음을 실측으로 확인.
+
+### 필드 시맨틱스 발견 사항
+
+- **`ord_no` 0-padding**: 요청 시 넘긴 `order_id`(`"157897"`,
+  `"163276"`)와 달리 `ka10076` 응답의 `cntr[].ord_no`는 7자리
+  0-padding(`"0157897"`, `"0163276"`)으로 내려옵니다. 향후
+  `order_id` 매칭 로직(B.2)은 문자열 그대로 비교하면 안 되고
+  정규화(0-padding 제거 또는 추가)가 필요합니다.
+- **`io_tp_nm` 부호 컨벤션**: `"+매수"` / (1차 캡처의 다른 체결
+  건들에서) `"-매도"` 형태로 매수/매도가 부호 접두사로 구분됩니다.
+- **`ka10076`가 설계대로 무필터 당일 체결 이력을 반환**: 요청
+  payload에서 `ord_no`를 항상 공백으로 보내는 설계(특정 주문으로
+  필터링하지 않음)가 의도대로 동작 — 1차 캡처에서는 대상 주문 외에
+  같은 종목의 그날 다른 매수/매도 체결 5건이 함께 반환됨을 확인.
+  클라이언트 측에서 `ord_no`(0-padding 정규화 후) 매칭이 반드시
+  필요하다는 근거.
+- **미검증 상태로 남은 것**:
+  - Pagination(`cont-yn=Y`) 경로 — 두 실측 모두 당일 체결 건수가
+    적어 트리거되지 않음. 코드 자체는 mock 기반 유닛테스트로만
+    검증된 상태, 실거래 트래픽으로는 아직 미검증(차단 사유는
+    아님, 다만 알려진 gap으로 기록).
+  - Redaction 로직의 실계좌번호 처리 — 두 실측 모두 응답에
+    `acnt_no` 필드 자체가 없어(원 공식 샘플과 동일하게 `cntr`
+    항목에 계좌번호가 안 실림), redaction이 실 데이터의 계좌번호를
+    실제로 가리는지는 여전히 synthetic fixture 테스트로만 검증됨.
+  - 신규 미해석 필드 `stop_pric`(값 `"0"`)이 실측 `cntr` 항목에
+    존재 — 기존에 참고한 공식 샘플에는 없던 필드. 현재 프로브는
+    원본 그대로 보존하므로 데이터 손실은 없음, 의미 해석은 보류.
+
+### 시나리오 커버리지 — 아직 미확보
+
+두 실측 모두 **T+0 시점부터 이미 완전 체결 완료 상태**였습니다
+(`oso`는 전 구간 빈 배열, `cntr`에는 대상 주문이 처음부터 `ord_stt:
+"체결"`로 존재). 즉 이번 캡처는 "미체결→체결 전환"이 아니라
+"이미 체결된 주문을 사후 조회"한 것에 가깝습니다.
+
+민우님이 애초에 설계하신 3개 시나리오 기준:
+
+- ✅ 전량체결(market_buy_full_fill) — 2회 실측 확보.
+- ❌ 미체결 + HTS 수동취소 — 미확보. `oso`에 실제로 주문이 잡히는
+  모습, 그리고 취소 후 `ka10075`/`ka10076` 각각의 시그니처는 아직
+  한 번도 관측되지 않음.
+- ❌ 부분체결 자연발생 — 미확보.
+
+"ka10075에 없으면 체결로 간주하지 말고 반드시 ka10076과
+교차검증"이라는 원 설계 원칙의 핵심 근거가 되는 것이 바로 미체결
+상태의 실제 관측인데, 아직 이 부분 증거가 없습니다. 따라서
+1P0.8-B.2(BrokerOrder/OrderStatus 모델 설계)는 미체결+취소
+시나리오를 최소 1건 확보한 뒤 시작하는 것이 맞다고 판단합니다.
+
+### 코드 변경 없음
+
+이번 라운드는 실측 데이터 분석 결과이며 프로브 자체에서 새로 발견된
+버그는 없습니다. 새 diff는 없습니다.
+
+---
+
+## 1P0.8-P0.1/P0.2 — place_order() 실패 시맨틱 분리 (2026-08-14, P0)
+
+### 배경
+
+실측 중 발견된 319400 사고(위 "실측 캡처 결과 분석" 섹션 참고)의
+근본 원인을 수정합니다. 09:43:08 SELL 시도 중 kt10001 호출이 HTTP
+429("허용된 API 요청 개수를 초과")로 거부됐는데, 당시 코드는:
+
+```
+SELL 신호
+→ PSM: OPEN → SELL_PENDING (on_sell_requested, place_order() 호출 전)
+→ kt10001 호출 → HTTP 429
+→ _post()가 RuntimeError를 던짐
+→ place_order()가 그대로 전파
+→ 종목별 최상위 except가 [ERROR]로만 로그하고 다음 종목으로 이동
+→ SELL_PENDING이 롤백 없이 그대로 방치
+→ 60초 뒤 timeout → orphan → RECONCILIATION_REQUIRED (사람 확인 필요)
+→ 실제로 주문이 전달된 적이 없어 잔고가 절대 안 바뀜
+→ balance-check 기반 orphan 자동 해소가 영원히 발생하지 않음
+→ 109분간 청산 불가 → -1.37%였을 손절이 -6.4%까지 확대
+→ 11:30 우연한 프로세스 재시작으로 메모리 orphan 소실 → 해소
+```
+
+### 수정 방향
+
+place_order() 실패를 두 종류로 명확히 분리했습니다.
+
+- **DEFINITIVE_REJECT** (예: HTTP 429, 다른 명시적 HTTP 오류): 서버가
+  실제로 응답했으므로 "이 시도는 접수되지 않았다"고 안전하게 판단
+  가능. 기존 `on_buy_result(accepted=False)`/`on_sell_result(accepted=False)`
+  경로가 이미 OPEN/FLAT으로 정확히 롤백하고 재시도를 허용합니다 —
+  이 경로는 손대지 않았습니다(원래도 맞았음, 문제는 여기 도달하지
+  못하고 예외로 새는 것이었음).
+- **AMBIGUOUS** (타임아웃, connection 오류 등): 응답 자체를 못 받았으므로
+  브로커가 실제로 주문을 접수했을 수도 있습니다. 함부로 롤백해
+  재주문을 허용하면 원 주문이 실제로 살아있을 때 중복 주문 사고로
+  이어집니다 — 그래서 절대 자동 롤백/재시도하지 않고, 기존 `ERROR`
+  상태(이미 `BLOCK_SELL_ERROR_STATE`/`BLOCK_BUY_IN_ERROR`로 BUY/SELL을
+  모두 HARD block하고 `acknowledge_error()`로만 사람이 명시적으로
+  해제 가능)로 전이시킵니다. 새 상태를 만들지 않고 기존 메커니즘을
+  재사용했습니다.
+
+`except Exception: rollback` 같은 단순 일괄 처리는 하지 않았습니다.
+429처럼 명확한 미접수와, timeout처럼 접수 여부가 불명확한 경우를
+구분하지 않고 전부 롤백하면, timeout인데 실제로는 접수된 주문 위에
+재주문을 허용해 더 위험한 중복 주문 사고로 이어질 수 있습니다.
+
+### 변경 파일
+
+- `infra/broker/kiwoom_broker.py`: `KiwoomHttpError`(HTTP 응답은
+  받았지만 status_code != 200)/`KiwoomTransportError`(응답 자체를
+  못 받음) 신설, 둘 다 `RuntimeError` 상속(기존에 `RuntimeError`/
+  `Exception`으로 넓게 잡던 다른 모든 `_post()` 호출부는 동작 변경
+  없음). `place_order()`는 이제 이 두 예외를 각각 처리해 **절대
+  예외를 던지지 않고** `OrderResult`로 항상 분류해 반환합니다.
+- `domain/models.py`: `OrderResult`에 `is_ambiguous: bool = False`
+  필드 추가(기본값으로 기존 모든 브로커 구현체와 하위호환).
+- `domain/position/lifecycle.py`: `on_placement_ambiguous(symbol, side,
+  detail)` 신설 — PENDING을 ERROR로 전이시키고 기존 guard/
+  `acknowledge_error()` 탈출구를 그대로 재사용.
+- `domain/service/trading_service.py`: `_try_buy()`/
+  `_try_sell_unchecked()`의 `place_order()` 호출 직후 `result.is_ambiguous`
+  를 확인해 ERROR 전이 + CRITICAL 로그 + trade log 기록 후 조기
+  반환하는 분기 추가(BUY/SELL 대칭).
+
+### 테스트
+
+- `test_kiwoom_broker_placement_failure.py` (신규, 24건): 429 →
+  `is_ambiguous=False`(definite reject), timeout/connection error →
+  `is_ambiguous=True`(ambiguous), 정상 200 회귀 방지, `_post()` 레벨
+  예외 타입과 `RuntimeError` 상속 관계, place_order()가 두 예외를
+  모두 처리하는지 소스 검증.
+- `test_partial_fill_lifecycle.py` (306건 → **336건**, 30건 추가):
+  - PSM 단위(28절, 10건): `on_placement_ambiguous()`가 BUY/SELL 모두
+    ERROR로 전이, `pending_order_id` 보존, 기존 guard로 HARD block,
+    `acknowledge_error()`로 해제 가능(재사용 확인).
+  - TradingService 통합(29절, 20건) — 사용자가 요구한 4개 축 전부:
+    SELL+429(OPEN 복귀, orphan 없음, HARD block 없음) / BUY+429(FLAT
+    복귀, side-effect 없음, 즉시 재시도 가능) / SELL+timeout(319400
+    실측 그대로 재현 — ERROR 전이, CRITICAL 로그, 재시도해도 중복매도
+    안 됨, acknowledge_error 탈출구 확인) / BUY+timeout(ERROR 전이,
+    side-effect 없음, 재시도 즉시 BLOCK_BUY_IN_ERROR로 차단) + 소스
+    검증 4건.
+
+**전체 회귀**: 20개 파일 중 19개 통과(`test_kiwoom_broker_placement_failure.py`
+신규 포함). `test_replay_time_axis.py`만 기존 pre-existing failure(무관).
+`compileall` 정상.
+
+### 남은 작업 (1P0.8-P0.3, 다음 라운드)
+
+이번 라운드는 429를 "안전하게 롤백"하는 것까지만 다뤘습니다. 429
+자체가 재발하지 않도록 하는 두 가지는 아직 남아있습니다.
+
+1. **429 전용 bounded retry**: 429는 서버가 "이 요청은 처리하지
+   않았다"고 명시적으로 응답한 경우라 재시도가 비교적 안전합니다
+   (timeout에는 적용 금지 — 접수 여부가 불명확하므로). 짧고
+   bounded한 횟수(무한 재시도 금지)로 짧게 대기 후 재시도, 그래도
+   실패하면 지금처럼 definite reject로 확정.
+2. **장기적으로 더 중요함 — Broker-level request scheduler/rate
+   limiter + 우선순위**: 오늘 사고는 일봉 조회(`ka10081`)가 429를
+   맞은 지 22ms 뒤에 긴급 SELL(`kt10001`)도 같은 이유로 429를
+   맞았습니다. 청산 주문과 저우선순위 분석 조회가 동일한 API
+   한도를 놓고 경쟁하면 안 됩니다. 호출 우선순위를 (1) 긴급
+   SELL/손절 (2) 기존 주문 reconciliation/취소 (3) 일반 SELL (4)
+   BUY (5) 잔고/체결 조회 (6) 분봉/현재가 (7) 일봉 등 저우선 분석
+   조회 순으로 두는 것이 근본적인 해결입니다.
+
+이 두 항목은 1P0.8-B(ka10075/ka10076 실측)를 계속 진행하면서 별도
+라운드로 다룰 예정입니다 — 프로젝트를 바꿀 필요 없이 원래
+1P0.8 순서 안에서 계속됩니다.
+
+---
+
+## 1P0.8-P0.1/P0.2 재검토 — DEFINITIVE_REJECT 판정 범위 축소 (2026-08-14, P0)
+
+### 배경
+
+위 라운드에서 `KiwoomHttpError`(HTTP 응답은 받았지만 status_code
+!= 200) 전체를 DEFINITIVE_REJECT로 취급했습니다. 코드 리뷰에서
+이것이 과하게 넓다는 지적이 나왔습니다: "HTTP 응답을 받았다"는
+사실만으로는 "이 시도가 접수되지 않았다"를 보장하지 않습니다.
+408/500/502/503/504 같은 코드나, 오늘 실측과 형태가 다른 429는
+Kiwoom 서버가 요청을 내부적으로 처리하다가 응답 단계에서
+실패했을 가능성을 배제하지 못합니다. 이런 경우까지 definite
+reject로 판정해 롤백+재시도를 허용하면, 원래 이번 수정으로
+막으려던 사고(phantom pending 방치)보다 더 위험한 **중복 주문**
+사고를 새로 만들 수 있습니다. Kiwoom 공식 문서도 kt10000/kt10001의
+URL/TR-ID 계약만 확인해줄 뿐, "모든 non-200은 미접수"라는 보장은
+하지 않습니다.
+
+### 수정 방향
+
+DEFINITIVE_REJECT 판정을 오늘(8/14) 319400 실측으로 안전성이
+직접 확인된 단 하나의 형태로 whitelist했습니다:
+
+> HTTP 429 **+** `return_code == 5` **+** `return_msg`에 `"1700"`
+> (허용된 API 요청 개수 초과 코드) 포함
+
+이 세 조건을 모두 만족할 때만 DEFINITIVE_REJECT이고, 그 외
+(408/5xx 전체, `return_code`가 다른 429, `return_msg`에 "1700"이
+없는 429 등)는 timeout/connection error와 동일하게
+`is_ambiguous=True`로 fail-close합니다 — 즉 `ERROR` 상태로 전이해
+사람이 `acknowledge_error()`로 확인하기 전까지 자동 롤백도
+재시도도 하지 않습니다.
+
+수정된 판정 테이블:
+
+| 상황 | 판정 |
+|---|---|
+| HTTP 200 + `return_code != 0` (명시적 business reject) | DEFINITIVE_REJECT |
+| HTTP 429 + `return_code == 5` + `return_msg`에 "1700" 포함 (8/14 실측 확인) | DEFINITIVE_REJECT |
+| timeout / connection reset (응답 자체 없음) | AMBIGUOUS |
+| HTTP 408 / 5xx | AMBIGUOUS |
+| 그 외 형태가 다른 non-200 (예: 429이지만 조건 불일치) | AMBIGUOUS |
+
+또한 `place_order()` 직전 주석에 있던 "이제 절대 예외를 던지지
+않습니다"라는 표현이 부정확하다는 지적도 반영했습니다.
+`access_token`이 없을 때 `_post()`/`_headers()`가 던지는
+`RuntimeError`(프로그래밍 오류에 가까운 사전조건 실패)는 여전히
+그대로 전파됩니다 — 이런 것까지 조용히 삼켜 `OrderResult`로
+위장하면 오히려 원인 파악이 어려워지므로 의도적으로 그대로
+뒀습니다. 주석을 "주문 전송 과정에서 분류 가능한 HTTP/transport
+failure를 예외로 전파하지 않고 OrderResult로 반환한다"로
+정정했습니다.
+
+### 변경 파일
+
+- `infra/broker/kiwoom_broker.py`: `_is_confirmed_rate_limit_reject(status_code, body)`
+  whitelist 함수 신설. `place_order()`의 `except KiwoomHttpError`
+  분기가 이 함수를 거쳐 판정하도록 수정(무조건 DEFINITIVE_REJECT →
+  whitelist 매칭만 DEFINITIVE_REJECT, 나머지는 `is_ambiguous=True`).
+  `KiwoomHttpError` 클래스 docstring과 `place_order()` 직전 주석
+  정정.
+- `domain/models.py` / `domain/position/lifecycle.py` /
+  `domain/service/trading_service.py`: 변경 없음(이번 라운드는
+  분류 로직만 좁혔고, PSM/TradingService의 `is_ambiguous` 소비
+  로직은 그대로 유효).
+
+### 테스트
+
+- `test_kiwoom_broker_placement_failure.py` (24건 → **55건**, 31건
+  추가): 7절 신설 — HTTP 408/500/502/503/504와 "형태가 다른 429"
+  (return_code 불일치, "1700" 미포함) 각각에 대해 BUY(kt10000)와
+  SELL(kt10001) 양쪽 모두 `accepted=False`, `is_ambiguous=True`를
+  확인(7종 × 2방향 × 2건 = 28건), whitelist 함수 소스 존재 확인
+  1건, 기존 429+1700 whitelist 케이스가 여전히
+  `is_ambiguous=False`로 유지되는지 재확인 2건.
+- `test_partial_fill_lifecycle.py`: 336건 그대로 재통과(이 파일의
+  28/29절은 `OrderResult(is_ambiguous=...)`를 직접 구성해
+  PSM/TradingService 소비 측을 테스트하므로, 분류 로직이 좁혀져도
+  영향받지 않음 — 회귀 없음을 재확인).
+
+**전체 회귀**: `python3 run_regression_tests.py` 20개 파일 중 19개
+통과(`test_replay_time_axis.py`만 기존 pre-existing failure, 무관).
+`python3 -m compileall -q domain infra config app tools .` 정상.
+
+### 다음 (1P0.8-P0.3, 이 라운드 이후에만 시작)
+
+이 좁히기 수정이 끝났으므로, 다음 라운드에서 **429/1700 whitelist
+전용** bounded retry(최대 약 2회, 짧은 대기, timeout/connection
+reset/408/5xx/그 외 ambiguous 케이스에는 절대 적용 금지)를
+별도 커밋으로 구현합니다. Broker-level API 우선순위 스케줄러는
+이 라운드와도, P0.3과도 섞지 않고 더 뒤의 독립된 단계로
+남겨둡니다.
+
+---
+
+## 1P0.8-P0.1/P0.2 문서 정합성 정리 (2026-08-14, GPT 리뷰 반영)
+
+기능 승인 이후 발견된 stale 주석 2곳을 정리했습니다(기능 변경
+없음, docstring/주석만 수정).
+
+- `domain/position/lifecycle.py`의 `on_placement_ambiguous()`
+  docstring이 `DEFINITIVE_REJECT (예: HTTP 429, 다른 명시적 HTTP
+  오류)`라고 적혀 있어 실제 구현(429+1700 whitelist만 definitive)
+  과 어긋났습니다 → "현재는 8/14 실측으로 확인된 HTTP 429 +
+  return_code=5 + 1700만"으로 정정하고
+  `_is_confirmed_rate_limit_reject()` 참조를 추가했습니다.
+- `infra/broker/kiwoom_broker.py`의 `_post()`에 남아있던
+  "서버가 명시적으로 응답했으므로 ... → definite reject"라는
+  옛 설명(전체 non-200을 definitive로 보던 1차 구현 당시 문구)을
+  "non-200을 KiwoomHttpError로 분류해 전달할 뿐, definitive/
+  ambiguous 최종 판정은 `place_order()`의 whitelist 정책이
+  담당한다"로 정정했습니다.
+
+회귀: `test_kiwoom_broker_placement_failure.py` 55/55,
+`test_partial_fill_lifecycle.py` 336/336, `run_regression_tests.py`
+20개 중 19개(기존 무관 실패만), `compileall` 정상.
+
+---
+
+## 1P0.8-P0.3: 429/1700 whitelist 전용 bounded retry (2026-08-14)
+
+### 배경
+
+P0.1/P0.2가 "429가 왔을 때 상태를 안전하게 복구"하는 것까지
+다뤘다면, 이번 라운드는 "같은 429 자체를 되도록 주문 실패로 끝내지
+않게" 합니다. 429는 서버가 "이 요청은 처리하지 않았다"고 명시적으로
+응답한 경우라 재시도가 비교적 안전합니다 — 단, 오늘 실측으로
+안전성이 확인된 정확히 그 shape(429 + `return_code=5` +
+`return_msg`에 "1700" 포함)에 대해서만입니다.
+
+### 범위 (민우님 확정, 좁게 유지)
+
+```
+kt10000 / kt10001
+    ↓
+정확히 429 + code=5 + 1700
+    ↓
+짧은 backoff(1.5초) 후 최대 2회 재시도
+    ↓
+성공 → 정상 처리 (accepted=True)
+계속 429/1700 → definitive reject → 기존 롤백 경로(P0.1/P0.2, 무변경)
+
+timeout / connection reset / 408 / 5xx / 형태 불명 429
+    ↓
+재시도 절대 금지 → 즉시 is_ambiguous=True (P0.1/P0.2 그대로)
+```
+
+재시도 도중에 다른 형태의 실패(예: 첫 시도는 429/1700인데 재시도
+응답이 500이거나 timeout)를 만나면, 그 즉시 재시도를 멈추고
+`is_ambiguous=True`로 fail-close합니다 — "429/1700이라고 확인된
+경우에만" 재시도가 안전하다는 원칙을 재시도 루프 내부에서도 그대로
+지킵니다. 재시도 자체도 무한이 아니라 최대 2회로 고정해, 429가
+계속되면 결국 기존 P0.1/P0.2의 definitive reject 경로로 확정
+빠집니다.
+
+API 우선순위 스케줄러(청산/reconciliation 호출을 저우선 분석
+조회보다 먼저 처리)는 이번 라운드에 섞지 않았습니다 — 오늘 사고를
+직접 막는 재시도를 먼저 독립적으로 검증하고, 그다음 전체 호출
+우선순위를 건드리는 게 더 안전하다는 민우님 판단에 따랐습니다.
+
+### 변경 파일
+
+- `infra/broker/kiwoom_broker.py`:
+  - `PLACE_ORDER_RATE_LIMIT_MAX_RETRIES = 2`,
+    `PLACE_ORDER_RATE_LIMIT_RETRY_BACKOFF_SECONDS = 1.5` 모듈
+    상수 신설.
+  - `KiwoomBroker.__init__()`에 `self._retry_sleep = time.sleep`
+    추가 — 테스트에서 실제 대기 없이 재시도 횟수/조건만 검증할 수
+    있도록 인스턴스 속성으로 분리(실 운영에서는 `time.sleep`
+    그대로 사용).
+  - `place_order()`의 `_post()` 호출을 `while True` 루프로 감싸,
+    `KiwoomHttpError`가 whitelist(429/1700)에 해당하고 재시도
+    여력이 남아있을 때만 `self._retry_sleep(...)` 후 재전송.
+    whitelist가 아니거나 재시도 도중 다른 실패를 만나면 즉시
+    반환(재시도 없음). 재시도를 모두 소진해도 여전히 429/1700이면
+    기존과 동일하게 definitive reject로 확정.
+- `domain/models.py` / `domain/position/lifecycle.py` /
+  `domain/service/trading_service.py`: 변경 없음(재시도는 브로커
+  레벨에서만 일어나고, PSM/TradingService가 받는 `OrderResult`의
+  의미는 그대로 — accepted/is_ambiguous 계약이 안 바뀌었으므로).
+
+### 테스트
+
+`test_kiwoom_broker_placement_failure.py` (55건 → **86건**, 8절
+31건 추가): 재시도 1회 후 성공(accepted=True, session.post() 정확히
+2번 호출), 재시도 2회 모두 소진 시 definitive reject 확정
+(session.post() 정확히 3번), 재시도 도중 다른 HTTP 형태(500)나
+timeout을 만나면 즉시 ambiguous로 중단(재시도 계속 안 함, 정확히
+2번만 호출), whitelist에 해당하지 않는 케이스(408/500/429-wrong-code/
+timeout/connection-error)는 애초에 재시도 자체가 시도되지 않음
+(session.post() 정확히 1번, BUY/SELL 양쪽 확인), 정상 200 회귀
+방지, `_retry_sleep`이 재시도 횟수만큼 정확한 backoff 값으로
+호출되는지, 관련 상수·재시도 호출부 소스 검증.
+
+`test_partial_fill_lifecycle.py`: 336건 그대로 재통과(재시도는
+브로커 내부에서만 일어나고 PSM/TradingService가 받는 `OrderResult`
+계약은 바뀌지 않았으므로 영향 없음).
+
+**전체 회귀**: `run_regression_tests.py` 20개 파일 중 19개 통과
+(`test_replay_time_axis.py`만 기존 pre-existing failure, 무관).
+`compileall` 정상.
+
+### 남은 작업 (다음 라운드, 아직 미착수)
+
+**Broker-level API request scheduler/rate limiter + 우선순위**:
+오늘 사고는 일봉 조회(`ka10081`)가 429를 맞은 지 22ms 뒤 긴급
+SELL(`kt10001`)도 같은 이유로 429를 맞았습니다. 청산 주문과
+저우선순위 분석 조회가 동일한 API 한도를 놓고 경쟁하면 안
+됩니다. 호출 우선순위를 (1) 긴급 SELL/손절 (2) 기존 주문
+reconciliation/취소 (3) 일반 SELL (4) BUY (5) 잔고/체결 조회 (6)
+분봉/현재가 (7) 일봉 등 저우선 분석 조회 순으로 두는 것이 근본적인
+해결입니다. 이번 P0.3(재시도)과는 독립된, 더 큰 범위의 작업이라
+별도 라운드로 진행합니다.
+
+---

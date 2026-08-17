@@ -2702,6 +2702,41 @@ class TradingService:
         # 대칭 구조, GPT 제안 반영).
         self._position_state_machine.on_buy_requested(symbol, order.quantity, "pending")
         result = self.broker.place_order(order)
+
+        # 2026-08-14 (1P0.8-P0.1/P0.2, 319400 실측 P0 사고 대응):
+        # place_order() 응답 자체를 받지 못한 경우(타임아웃/connection
+        # 오류 등)는 실제 접수 여부를 알 수 없습니다.
+        # on_buy_result(accepted=False)로 그냥 롤백하면 "혹시 이미
+        # 접수된 주문" 위에 재매수를 허용해 중복 매수 위험이 생기므로,
+        # 별도로 ERROR 상태로 전이시켜 사람이 실제 계좌를 확인할
+        # 때까지 이 종목의 BUY/SELL을 모두 막습니다. (서버가 명시적으로
+        # 거부한 경우, 예: HTTP 429는 result.accepted=False로만
+        # 내려오고 is_ambiguous는 False이므로 아래 기존 정상 롤백
+        # 경로를 그대로 탑니다 — 서버 응답을 받았다는 것 자체가
+        # "이번 시도는 접수되지 않았다"는 강한 증거이기 때문입니다.)
+        if result.is_ambiguous:
+            self._position_state_machine.on_placement_ambiguous(symbol, "BUY", result.message)
+            self.app_logger.critical(
+                f"[ORDER_PLACEMENT_AMBIGUOUS] {symbol} | side=BUY | "
+                f"주문 접수 여부 불명(응답 없음) — 사람 확인 후 "
+                f"acknowledge_error() 필요: {result.message}"
+            )
+            self._last_order_attempt_by_symbol[symbol] = result
+            self._write_trade_log(
+                order.symbol,
+                order.side.value,
+                quantity,
+                False,
+                f"AMBIGUOUS: {result.message}",
+                result.order_id,
+                price=current_price,
+                context=self._build_trade_context(
+                    side="BUY", signal=signal, regime=regime,
+                    minute_analysis=minute_analysis, current_price=current_price,
+                ),
+            )
+            return "ORDER_PLACEMENT_AMBIGUOUS"
+
         self._position_state_machine.on_buy_result(symbol, result.accepted)
         # 2026-08-14 (1P0.8-A.1, GPT 코드리뷰 제안): 브로커가 이미
         # 반환한 실제 주문번호(result.order_id)를 "pending" placeholder
@@ -2931,6 +2966,43 @@ class TradingService:
         # 다음 폴링에서 처리하도록 SELL_PENDING만 표시.
         self._position_state_machine.on_sell_requested(symbol, quantity, "pending")
         result = self.broker.place_order(order)
+
+        # 2026-08-14 (1P0.8-P0.1/P0.2, 319400 실측 P0 사고 대응): BUY와
+        # 동일한 이유로, 응답을 못 받은 경우는 롤백하지 않고 ERROR로
+        # 전이시켜 사람 확인 전까지 이 종목의 매도/매수를 모두
+        # 막습니다. 특히 SELL은 여기서 함부로 OPEN으로 되돌려 재시도를
+        # 허용하면, 원 주문이 실제로는 접수돼 있었을 경우 중복 매도로
+        # 이어질 수 있습니다 — 8/14 319400 실측에서 정확히 이 경로
+        # (당시엔 예외로 방치됨)가 손실을 -1.37%에서 -6.4%까지
+        # 키운 원인이었습니다.
+        if result.is_ambiguous:
+            self._position_state_machine.on_placement_ambiguous(symbol, "SELL", result.message)
+            if self._is_forced_exit_reason(exit_reason):
+                self._forced_sell_failures[symbol] = (
+                    self._forced_sell_failures.get(symbol, 0) + 1
+                )
+            self.app_logger.critical(
+                f"[ORDER_PLACEMENT_AMBIGUOUS] {symbol} | side=SELL | "
+                f"주문 접수 여부 불명(응답 없음) — 사람 확인 후 "
+                f"acknowledge_error() 필요: {result.message} | 사유={exit_reason}"
+            )
+            self._write_trade_log(
+                order.symbol,
+                order.side.value,
+                quantity,
+                False,
+                f"AMBIGUOUS: {result.message}",
+                result.order_id,
+                price=current_price,
+                context={
+                    "exit_reason": exit_reason,
+                    "hold_minutes": "",
+                    "avg_buy_price": avg_buy_price,
+                    "condition_name": self._representative_condition_name(symbol),
+                },
+            )
+            return
+
         if not result.accepted:
             self._position_state_machine.on_sell_result(
                 symbol, accepted=False, broker_quantity=0,

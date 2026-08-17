@@ -93,6 +93,15 @@ class OrderResult:
     accepted: bool
     message: str
     timestamp: datetime
+    # 2026-08-14 (1P0.8-P0.1, 319400 실측 P0 사고 대응): place_order()가
+    # 브로커 응답 자체를 받지 못한 경우(타임아웃/connection 오류 등)
+    # True. 이때 accepted는 항상 False이지만, "서버가 명시적으로
+    # 거부함"(예: HTTP 429)과는 성격이 다릅니다 — 실제로는 주문이
+    # 브로커에 접수됐을 수도 있으므로, 호출부가 즉시 이전 상태로
+    # 롤백하고 재시도를 허용하면 중복 주문 사고로 이어질 위험이
+    # 있습니다. 기본값 False는 기존 accepted=True/False 두 값만
+    # 쓰던 모든 브로커 구현체(MockBroker 등)와 100% 하위호환됩니다.
+    is_ambiguous: bool = False
 
 
 @dataclass(frozen=True)

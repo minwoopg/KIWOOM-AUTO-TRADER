@@ -19,6 +19,7 @@ from __future__ import annotations
 - 실전투자로 바꿀 때는 base_url, 앱키/시크릿키, 주문 시간대를 다시 확인하세요.
 """
 
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -28,6 +29,93 @@ import requests
 from config.settings import BrokerConfig
 from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, OrderSide, Position, PriceBar, WeeklyBar, MinuteBar
 from infra.broker.base import Broker
+
+
+class KiwoomTransportError(RuntimeError):
+    """`session.post()` 자체가 실패(타임아웃, connection 오류 등)해
+    브로커 응답을 아예 받지 못한 경우입니다.
+
+    2026-08-14 (1P0.8-P0.1, 319400 실측 P0 사고 대응): 요청이 실제로
+    처리됐는지 알 수 없습니다(응답이 없으므로). `place_order()`는 이
+    예외를 받으면 주문 접수 여부를 "불명(ambiguous)"으로 취급해야
+    합니다 — 아래 `KiwoomHttpError`(서버가 명시적으로 응답한 거부)와
+    달리, 실제로는 브로커에 주문이 들어갔을 수도 있으므로 함부로
+    롤백하고 재주문하면 중복 주문 위험이 있습니다. 이 클래스는
+    `RuntimeError`를 상속하므로, 기존에 `_post()` 실패를 `RuntimeError`/
+    `Exception`으로 넓게 잡던 다른 모든 호출부(일봉/분봉 조회 등)의
+    동작은 전혀 바뀌지 않습니다 — `place_order()`만 이 타입을 구분해
+    별도로 처리합니다.
+    """
+
+
+class KiwoomHttpError(RuntimeError):
+    """HTTP 응답은 정상적으로 받았지만 `status_code != 200`인 경우입니다.
+
+    2026-08-14 (1P0.8-P0.1, 319400 실측 P0 사고 대응): 8/14 319400
+    종목의 SELL 주문(kt10001)이 HTTP 429("허용된 API 요청 개수를
+    초과")로 거부됐는데, 당시 코드는 이를 구분 없이 일반
+    `RuntimeError`로 던져서 `place_order()` 호출부(TradingService)가
+    이미 `SELL_PENDING`으로 바꿔놓은 상태를 롤백할 방법이 없었습니다.
+
+    2026-08-14 (1P0.8-P0.1 재검토, GPT 코드리뷰 지적 — P0): **이
+    예외 자체가 "주문이 미접수됐다"는 증거는 아닙니다.** 최초
+    구현은 `status_code != 200`이면 전부 `accepted=False`(definitive
+    reject)로 취급했는데, 이는 과분류입니다. 키움 공식 문서는
+    kt10000/kt10001이 `/api/dostk/ordr` POST 주문 API라는 것만
+    명시할 뿐, "모든 HTTP 오류 코드에 대해 주문이 미접수임을
+    보장한다"는 계약까지 제공하지 않습니다 — 예를 들어 408/5xx는
+    "키움 내부에서는 이미 주문을 처리했는데 응답 단계에서
+    gateway/internal error가 났다"는 시나리오를 배제할 수 없습니다.
+    이런 경우까지 definitive reject로 취급해 OPEN/FLAT으로 롤백하고
+    재주문을 허용하면, 오늘 막으려던 바로 그 중복 주문 사고로
+    이어집니다.
+
+    그래서 `place_order()`는 이 예외를 받아도 곧바로 definitive
+    reject로 확정하지 않고, `_is_confirmed_rate_limit_reject()`로
+    실제 관찰·확인된 shape(HTTP 429 + `return_code=5` +
+    `return_msg`에 "1700" 포함)인지 먼저 확인합니다. 그 shape과
+    정확히 일치할 때만 `accepted=False`(안전하게 롤백/재시도
+    가능)로 반환하고, 그 외 모든 non-200(408/5xx 포함, 형태가 다른
+    429 포함)은 `is_ambiguous=True`로 fail-close합니다 — "모르면
+    재주문하지 않는다"는 원칙을 HTTP 레벨에서도 지키기 위함입니다.
+    """
+
+    def __init__(self, message: str, status_code: int, body: Any) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+
+
+def _is_confirmed_rate_limit_reject(status_code: int, body: Any) -> bool:
+    """오늘(8/14) 319400 실측으로 안전성이 확인된 단 하나의 케이스만
+    definitive reject로 whitelist합니다: HTTP 429 + `return_code=5` +
+    `return_msg`에 "1700"(허용된 API 요청 개수 초과) 포함.
+
+    2026-08-14 (1P0.8-P0.1 재검토, GPT 코드리뷰 지적 — P0): 이 함수가
+    `False`를 반환하는 모든 경우(408/5xx, 형태가 다른 429, 다른
+    return_code 등)는 `place_order()`가 `is_ambiguous=True`로
+    처리합니다 — 즉 "definitive reject로 넓힐지"를 결정하는 게
+    아니라 "이것만 확실하니 이것만 예외로 인정한다"는 whitelist
+    입니다. 401/403 등 다른 코드도 실제 응답이나 공식 계약을
+    확보하면 여기 추가하면 되지만, 지금은 추측으로 넓히지 않습니다.
+    """
+    if status_code != 429:
+        return False
+    if not isinstance(body, dict):
+        return False
+    if body.get("return_code") != 5:
+        return False
+    return "1700" in str(body.get("return_msg", ""))
+
+
+# 2026-08-14 (1P0.8-P0.3, 민우님 확정 범위): _is_confirmed_rate_limit_reject()
+# whitelist에 해당하는 429/1700만 대상으로 하는 짧은 bounded retry입니다.
+# timeout/connection reset/408/5xx/형태가 다른 429에는 절대 적용하지
+# 않습니다(place_order()에서 이 케이스들은 첫 시도든 재시도 도중이든
+# 즉시 is_ambiguous=True로 fail-close되고, 재시도 루프에 들어오지
+# 않습니다). 무한 재시도를 막기 위해 최대 횟수를 상수로 고정합니다.
+PLACE_ORDER_RATE_LIMIT_MAX_RETRIES = 2
+PLACE_ORDER_RATE_LIMIT_RETRY_BACKOFF_SECONDS = 1.5
 
 
 @dataclass(frozen=True)
@@ -73,6 +161,11 @@ class KiwoomBroker(Broker):
         # 로그 기록이 실제로 성공한 뒤에만 키를 추가 — 로그 자체가
         # 실패해도 다음 호출에서 재시도할 수 있게 함.
         self._minute_diagnostic_keys: set[tuple[str, str, str, int, str]] = set()
+        # 2026-08-14 (1P0.8-P0.3): place_order()의 429/1700 bounded
+        # retry가 재시도 사이에 대기하는 데 쓰는 sleep 함수입니다.
+        # 테스트에서 실제로 몇 초씩 기다리지 않도록 broker._retry_sleep
+        # 을 no-op으로 바꿔치기할 수 있게 인스턴스 속성으로 뒀습니다.
+        self._retry_sleep = time.sleep
 
     def authenticate(self) -> None:
         """키움 OAuth 토큰을 발급받아 저장합니다.
@@ -525,14 +618,100 @@ class KiwoomBroker(Broker):
             "cond_uv": "",
         }
 
-        response = self._post(
-            endpoint="/api/dostk/ordr",
-            api_id=api_id,
-            payload=payload,
-            cont_yn="N",
-            next_key="",
-            raise_on_business_error=False,
-        )
+        # 2026-08-14 (1P0.8-P0.1/P0.2, 319400 실측 P0 사고 대응): 이전엔
+        # _post()가 던진 예외가 여기서 그대로 place_order() 밖으로
+        # 전파돼, 호출부(TradingService)가 이미 SELL_PENDING/BUY_PENDING
+        # 으로 바꿔놓은 상태를 롤백할 방법이 없었습니다(8/14 319400
+        # 종목 SELL이 kt10001 HTTP 429로 실패 → 109분간 청산 불가 →
+        # -1.37%였을 손절이 -6.4%까지 확대). place_order()는 이제
+        # 주문 전송 과정에서 분류 가능한 HTTP/transport failure를
+        # 예외로 전파하지 않고 OrderResult로 반환합니다(access token
+        # 누락처럼 프로그래밍 오류에 가까운 사전조건 실패는 여전히
+        # 예외로 남습니다 — 이런 것까지 조용히 삼켜 OrderResult로
+        # 위장하면 오히려 원인 파악이 어려워집니다).
+        # 2026-08-14 (1P0.8-P0.3, 민우님 확정 범위): 429/1700
+        # whitelist에 해당하는 경우에만, 짧은 bounded retry(최대
+        # PLACE_ORDER_RATE_LIMIT_MAX_RETRIES회)를 허용합니다. 그 외
+        # 모든 실패(timeout/connection reset/408/5xx/형태가 다른
+        # 429)는 재시도 없이 즉시 반환합니다 — retry는 "서버가
+        # 명시적으로 처리하지 않았다고 응답한" 케이스에만 안전하고,
+        # 응답이 불명확한 케이스에 재시도를 걸면 원 주문이 실제로는
+        # 살아있을 때 중복 주문을 만들 위험이 있기 때문입니다.
+        rate_limit_retries_used = 0
+        while True:
+            try:
+                response = self._post(
+                    endpoint="/api/dostk/ordr",
+                    api_id=api_id,
+                    payload=payload,
+                    cont_yn="N",
+                    next_key="",
+                    raise_on_business_error=False,
+                )
+                break
+            except KiwoomHttpError as exc:
+                # 2026-08-14 (1P0.8-P0.1 재검토, GPT 코드리뷰 지적 — P0):
+                # "HTTP 응답을 받았다"는 사실만으로는 definitive reject를
+                # 보장하지 않습니다(KiwoomHttpError 클래스 docstring
+                # 참고). 오늘 실측으로 확인된 429+1700 shape만 whitelist
+                # 하고, 그 외(408/5xx 및 형태가 다른 429 포함)는
+                # is_ambiguous=True로 fail-close합니다 — 재시도도
+                # 하지 않고 즉시 반환합니다(이 shape은 재시도해도
+                # "미접수가 확정됐다"는 근거가 없어 안전성이 없음).
+                if not _is_confirmed_rate_limit_reject(exc.status_code, exc.body):
+                    return OrderResult(
+                        order_id="",
+                        symbol=order.symbol,
+                        side=order.side,
+                        requested_quantity=order.quantity,
+                        accepted=False,
+                        message=f"HTTP {exc.status_code}: {exc.body}",
+                        timestamp=datetime.now(),
+                        is_ambiguous=True,
+                    )
+
+                # whitelist(429+1700) 케이스 — 재시도 여력이 남아
+                # 있으면 짧게 대기 후 재시도합니다. 소진됐으면 지금까지
+                # 해오던 대로 definitive reject로 확정합니다.
+                if rate_limit_retries_used >= PLACE_ORDER_RATE_LIMIT_MAX_RETRIES:
+                    return OrderResult(
+                        order_id="",
+                        symbol=order.symbol,
+                        side=order.side,
+                        requested_quantity=order.quantity,
+                        accepted=False,
+                        message=(
+                            f"HTTP {exc.status_code}: {exc.body} "
+                            f"(429/1700 재시도 {rate_limit_retries_used}회 모두 실패)"
+                        ),
+                        timestamp=datetime.now(),
+                    )
+
+                rate_limit_retries_used += 1
+                import logging
+
+                logging.getLogger("app").warning(
+                    f"[ORDER_RATE_LIMIT_RETRY] {order.symbol} | side={order.side.value} | "
+                    f"api_id={api_id} | {rate_limit_retries_used}/{PLACE_ORDER_RATE_LIMIT_MAX_RETRIES}"
+                    f"번째 429(1700) 재시도 — {PLACE_ORDER_RATE_LIMIT_RETRY_BACKOFF_SECONDS}초 대기 후 재전송"
+                )
+                self._retry_sleep(PLACE_ORDER_RATE_LIMIT_RETRY_BACKOFF_SECONDS)
+                continue
+            except KiwoomTransportError as exc:
+                # 응답 자체를 못 받음 — 실제 접수 여부 불명. 재시도
+                # 대상이 아닙니다(whitelist는 "명시적으로 응답받은
+                # 429/1700"만 다룸). is_ambiguous=True로 표시해
+                # 호출부가 절대 자동 롤백/재주문하지 않도록 합니다.
+                return OrderResult(
+                    order_id="",
+                    symbol=order.symbol,
+                    side=order.side,
+                    requested_quantity=order.quantity,
+                    accepted=False,
+                    message=str(exc),
+                    timestamp=datetime.now(),
+                    is_ambiguous=True,
+                )
 
         accepted = response.body.get("return_code") == 0
         message = str(response.body.get("return_msg", ""))
@@ -570,17 +749,37 @@ class KiwoomBroker(Broker):
         if not self.access_token:
             raise RuntimeError("access token is missing. call authenticate() first.")
 
-        response = self.session.post(
-            f"{self.config.base_url}{endpoint}",
-            headers=self._headers(api_id=api_id, cont_yn=cont_yn, next_key=next_key),
-            json=payload,
-            timeout=10,
-        )
+        try:
+            response = self.session.post(
+                f"{self.config.base_url}{endpoint}",
+                headers=self._headers(api_id=api_id, cont_yn=cont_yn, next_key=next_key),
+                json=payload,
+                timeout=10,
+            )
+        except requests.exceptions.RequestException as exc:
+            # 2026-08-14 (1P0.8-P0.1): 응답 자체를 못 받은 전송 실패 —
+            # KiwoomHttpError(아래)와 구분되는 KiwoomTransportError로
+            # 던집니다. 둘 다 RuntimeError를 상속하므로 기존 호출부의
+            # 동작(넓게 RuntimeError/Exception으로 잡는 코드)은 그대로
+            # 유지됩니다.
+            raise KiwoomTransportError(
+                f"kiwoom transport failed: api_id={api_id}: {type(exc).__name__}: {exc}"
+            ) from exc
         api_response = self._to_api_response(response)
 
         if api_response.status_code != 200:
-            raise RuntimeError(
-                f"kiwoom request failed: api_id={api_id}, http={api_response.status_code}, body={api_response.body}"
+            # 2026-08-14 (1P0.8-P0.1, 319400 실측 P0 사고 대응,
+            # P0 재검토로 문구 정정): non-200 응답을 KiwoomHttpError로
+            # 분류해 상위 호출부로 전달합니다. 이 응답이
+            # DEFINITIVE_REJECT인지 AMBIGUOUS인지의 최종 판정은
+            # 여기서 하지 않습니다 — place_order()가
+            # _is_confirmed_rate_limit_reject() whitelist 정책으로
+            # 판단합니다(자세한 근거는 KiwoomHttpError 클래스
+            # docstring 참고).
+            raise KiwoomHttpError(
+                f"kiwoom request failed: api_id={api_id}, http={api_response.status_code}, body={api_response.body}",
+                status_code=api_response.status_code,
+                body=api_response.body,
             )
 
         if raise_on_business_error and api_response.body.get("return_code") != 0:

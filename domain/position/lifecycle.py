@@ -579,6 +579,61 @@ class PositionStateMachine:
             detail=f"order_id={order_id}",
         )
 
+    def on_placement_ambiguous(self, symbol: str, side: str, detail: str = "") -> None:
+        """place_order() 응답 자체를 받지 못해(타임아웃/connection 오류 등)
+        실제 접수 여부를 알 수 없을 때 호출합니다.
+
+        2026-08-14 (1P0.8-P0.1/P0.2, 319400 실측 P0 사고 대응): 8/14
+        319400 종목에서 SELL 시도 중 kt10001 호출이 HTTP 429로
+        실패했는데(허용된 요청 개수 초과), 당시 place_order()가
+        예외를 던지면서 이미 on_sell_requested()가 SELL_PENDING으로
+        바꿔놓은 상태가 그대로 방치됐습니다. 실제 브로커 잔고는
+        전혀 바뀐 적이 없었으므로(원 주문이 브로커에 전달되지
+        않음) balance-check 기반 orphan 자동 해소도 영원히
+        발생하지 않았고, 결국 사람의 확인 없이는 절대 풀리지 않는
+        HARD block(RECONCILIATION_REQUIRED) 상태로 109분간 청산이
+        막혀 손실이 -1.37%에서 -6.4%까지 확대됐습니다(우연한
+        프로세스 재시작으로만 해소됨).
+
+        이 사고를 분석하며 place_order() 실패를 두 종류로 나눴습니다.
+
+        - DEFINITIVE_REJECT (2026-08-14 P0 재검토로 범위 확정:
+          현재는 8/14 319400 실측으로 안전성이 확인된 HTTP 429 +
+          return_code=5 + return_msg에 "1700" 포함 — 이 한 형태만.
+          infra/broker/kiwoom_broker.py의
+          _is_confirmed_rate_limit_reject() whitelist 참고. 그 외
+          408/5xx 및 형태가 다른 429는 전부 아래 AMBIGUOUS로
+          fail-close됩니다): 서버가 실제로 응답했고 그 응답이
+          안전하게 확인된 형태이므로 "이 시도는 접수되지 않았다"고
+          판단 가능 — 기존 on_buy_result(accepted=False)/
+          on_sell_result(accepted=False) 경로가 이미 OPEN/FLAT으로
+          정확히 롤백하고 재시도를 허용합니다(이 메서드와 무관,
+          변경 없음).
+        - AMBIGUOUS (타임아웃, connection 오류 등): 응답 자체를
+          못 받았으므로 브로커가 실제로 주문을 접수했을 수도
+          있습니다. 이 경우 함부로 롤백해 재주문을 허용하면 원
+          주문이 실제로 살아있을 때 중복 주문 사고로 이어집니다.
+          이 메서드는 이 케이스 전용입니다.
+
+        AMBIGUOUS는 기존 ERROR 상태를 재사용합니다 — ERROR는 이미
+        BLOCK_SELL_ERROR_STATE/BLOCK_BUY_IN_ERROR로 이 종목의 BUY/
+        SELL을 모두 HARD block하고, acknowledge_error()로만 사람이
+        명시적으로(실제 계좌 확인 후) 해제할 수 있습니다 — 정확히
+        이 상황에 필요한 시맨틱이라 새 상태를 만들지 않았습니다.
+
+        pending_order_id는 일부러 지우지 않습니다 — "무엇을 시도하다가
+        불명확해졌는지" 흔적을 사람이 확인할 때 볼 수 있어야 합니다.
+        """
+        state = self.get(symbol)
+        prev = state.lifecycle
+        state.lifecycle = PositionLifecycle.ERROR
+        state.last_error = f"{side.upper()}_PLACEMENT_AMBIGUOUS"
+        state.error_since = datetime.now()
+        self._log_event(
+            symbol, "PLACEMENT_AMBIGUOUS", prev, state.lifecycle,
+            detail=(f"side={side} pending_order={state.pending_order_id} | {detail}")[:300],
+        )
+
     # ── 주문 전 guard (1P0.2에서 enforce로 전환) ────────────────
     # 2026-08-10: 1P0.1에서는 shadow(경고만)였습니다. 그러나 8/10
     # 실서버에서 "매도가능수량 부족" 11회가 실제로 발생했고, 이는
