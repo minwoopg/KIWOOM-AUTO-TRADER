@@ -7568,3 +7568,367 @@ reconciliation/취소 (3) 일반 SELL (4) BUY (5) 잔고/체결 조회 (6)
 별도 라운드로 진행합니다.
 
 ---
+
+## 1P0.8-B.1 실측 3차: 미체결 + HTS 수동취소 시나리오 캡처 성공 (2026-08-18)
+
+민우님이 `order_reconciliation_probe.py`로 4개 JSONL을 캡처해
+전달. 이 중 2개는 8/14에 이미 분석한 전량체결 캡처(005930/157897,
+009150/163276)의 재업로드로 신규 정보 없음. **나머지 2개가 지금까지
+미확보였던 미체결+취소 시나리오를 정확히 캡처**했습니다 — 코드
+변경 없이 분석만 수행.
+
+### 캡처 개요
+- `20260818_090527_005930` (`scenario=limit_buy_unfilled`): 005930
+  BUY 1주, 지정가 270,000원(당시 시장가 283,000원대 — 절대 안
+  닿게 의도적으로 낮게 설정), order_id 13557. T+0/1/3/10초 4회
+  폴링.
+- `20260818_090621_005930` (`scenario=limit_buy_after_cancel`): 같은
+  order_id 13557, 위 캡처 종료 약 1분 뒤(09:05:27→09:06:21) 재실행
+  — 그 사이 HTS에서 수동 취소. T+0/1/3/10초 4회 폴링.
+
+### 발견 1 — 진짜 미체결 상태의 ka10075/ka10076 시그니처 (최초 확보)
+`limit_buy_unfilled` 4회 폴링 내내 동일하게 유지됨:
+- `ka10075`(미체결) `oso` 배열에 항목 1개 유지: `ord_stt: "접수"`,
+  `ord_qty: "1"`, `oso_qty: "1"`(미체결 잔량 = 전체 수량, 안 줄어듦),
+  `cntr_qty: "0"`, `cntr_pric: "0"`, `cntr_tot_amt: "0"`,
+  `trde_tp: "보통"`(지정가 — 기존 전량체결 캡처는 전부
+  `trde_tp: "시장가"`였음, 이번에 처음으로 지정가 값 확인).
+- `ka10076`(체결) `cntr` 배열은 **4회 내내 완전히 빈 배열** — 진짜
+  미체결 주문은 체결이력에 전혀 나타나지 않음이 처음으로 실측
+  확인됨(기존엔 추론/설계 원칙이었을 뿐, 실측 근거가 없었음).
+
+→ **원 설계 원칙("ka10075에 없다고 체결로 단정 금지, 반드시
+ka10076과 교차검증")의 반대 방향 근거도 이제 확보**: `ka10075`에
+있고 `ord_stt: "접수"`이며 `ka10076`에 전혀 없으면 안전하게
+"미체결"로 판단할 수 있다는 것이 실측으로 뒷받침됨.
+
+### 발견 2 — 취소 후 시그니처: 두 API 모두에서 흔적 없이 사라짐
+`limit_buy_after_cancel`(취소 후 재실행) 4회 폴링 내내:
+- `ka10075` `oso`: **빈 배열** — 취소된 주문은 미체결 목록에서
+  완전히 빠짐(당연히 예상됨).
+- `ka10076` `cntr`: **역시 빈 배열** — 취소된 주문은 체결이력에도
+  전혀 나타나지 않음(한 번도 체결된 적이 없으므로).
+
+→ **중요한 설계 함의**: 이 두 read-only API만으로는 "취소됨"을
+가리키는 양성 신호(예: `ord_stt: "취소"` 같은 상태값)를 전혀 받을
+수 없습니다. 취소된 주문은 두 API 모두에서 **그냥 없었던 것처럼
+사라집니다.** 즉 클라이언트가 자신이 추적 중이던 `order_id`가
+`oso`에서 사라졌는데 `cntr`에도 전혀 없다면, 그 판정은 오직
+"이 주문번호를 우리가 걸었다는 걸 기억하고 있다"는 클라이언트
+측 상태에 의존합니다 — 서버 응답만 봐서는 "취소된 주문"과
+"애초에 존재한 적 없는 주문번호를 조회함"을 구분할 수 없습니다.
+1P0.8-B.2/C/D의 reconciliation 설계에서 이 지점을 반드시 반영해야
+합니다: "oso에도 없고 cntr에도 없음"은 (a) 취소됨 (b) 오래전에
+체결됐는데 `ka10076` 조회 범위(당일자 등) 밖으로 벗어남 (c) 애초에
+잘못된 order_id 등 여러 원인이 있을 수 있어, 이 응답 자체가
+"취소 확정"을 증명하지는 않습니다 — 클라이언트가 걸어둔
+"이 order_id로 주문을 냈다"는 사전 지식과 결합해야만 "취소(또는
+소실)"로 해석할 수 있습니다.
+
+### 시나리오 커버리지 갱신
+민우님이 설계한 3개 시나리오 기준:
+- ✅ 전량체결(2회 확보, 8/14)
+- ✅ **미체결 + HTS 수동취소(이번에 확보) — `ord_stt` 필드값,
+  `trde_tp` 지정가 값, 취소 후 양쪽 API 모두 공백이 되는 시그니처
+  전부 최초 실측 확인**
+- ❌ 부분체결(아직 미확보 — 남은 유일한 gap)
+
+### 남은 것
+`test_order_reconciliation_probe.py`의 mock fixture는 이미 이
+시나리오들을 가정하고 있었지만, 이번 캡처로 실측 근거가 처음
+생겼습니다. 이 2개 JSONL(과 8/14 전량체결 2건)을
+`tools/order_reconciliation_probe.py` 산출물 그대로 fixture로
+고정해 1P0.8-B.2(BrokerOrder/OrderStatus 모델 설계)의 입력으로
+쓸 수 있습니다. 부분체결은 모의계좌 특성상 캡처가 더 어려울 수
+있어(체결이 보통 즉시/전량으로 일어남), 민우님 판단에 따라
+부분체결을 계속 시도할지, 지금 확보한 2개 시나리오만으로
+1P0.8-B.2를 먼저 시작할지 결정 필요.
+
+---
+
+## 1P0.8-B.2: BrokerOrder/BrokerOrderStatus 모델 + fixture 고정 (2026-08-18)
+
+민우님이 "지금 확보분(전량체결 2건 + 미체결/취소 2건)으로 B.2
+바로 시작"을 확정해 진행했습니다. `Broker` 인터페이스는 아직
+건드리지 않았습니다(1P0.8-C에서 `get_order_status()`/
+`get_open_orders()`로 연결 예정) — 이번 라운드는 순수 모델 설계 +
+그 모델을 만드는 파싱 함수 + 실측 fixture 검증까지만입니다.
+
+### fixture 고정
+`tests/fixtures/order_reconciliation/`에 실측 JSONL 4건을 그대로
+커밋(계좌번호는 프로브가 이미 `[REDACTED]` 처리, appkey/secretkey/
+토큰은 원래 응답에 없음 — 1P0.8-B.1의 안전장치 그대로 유효):
+- `20260814_151548_005930_market_buy_full_fill.jsonl`(005930/157897)
+- `20260814_151909_009150_market_buy_full_fill.jsonl`(009150/163276)
+- `20260818_090527_005930_limit_buy_unfilled.jsonl`(005930/13557,
+  진짜 미체결)
+- `20260818_090621_005930_limit_buy_after_cancel.jsonl`(같은
+  주문, HTS 수동취소 후 재조회)
+
+`diagnostics/`(gitignore 대상, 프로브의 일반 실행 산출물)와는
+다른 디렉토리입니다 — 이 4개는 의도적으로 "얼려서" 회귀 테스트가
+항상 참조하는 고정 fixture로 커밋합니다.
+
+### 신설 모델 (`domain/models.py`)
+- `BrokerOrderStatus` enum: `OPEN`/`FILLED`/`UNKNOWN` 세 값만.
+  실측으로 확인된 시그니처만 반영하고, 확인 안 된 조합(대표적으로
+  부분체결)은 의도적으로 `UNKNOWN`으로 fail-close — 이름 자체를
+  `PARTIALLY_FILLED`로 만들어두고 추측으로 채우지 않았습니다.
+- `BrokerOrder` dataclass: `place_order()`가 반환하는 `OrderResult`
+  (주문 "제출" 시점 응답)와는 별개로, "이미 낸 주문을 나중에 다시
+  조회한 결과"를 표현합니다. 수량/가격 필드는 판정 불가능하면
+  `None`(0으로 채우면 "실제로 0"과 "몰라서 못 채움"을 구분 못 함).
+
+### 신설 파싱 로직 (`infra/broker/kiwoom_order_status.py`, 신규 파일)
+`derive_broker_order_status(order_id, symbol, oso_entries, cntr_entries)`
+— ka10075 `oso` 배열 + ka10076 `cntr` 배열을 받아 `BrokerOrder`를
+반환하는 순수 함수(실제 API 호출 없음). 판정 순서:
+1. `cntr`에 매칭 → `FILLED`(가장 강한 증거 — 실제 체결이력이므로
+   `oso`에 남아있는지와 무관하게 우선).
+2. `cntr`엔 없고 `oso`에 매칭 + `ord_stt == "접수"` → `OPEN`.
+3. `oso`에 매칭되지만 `ord_stt`가 그 외 값 → `UNKNOWN`(부분체결/
+   정정 등으로 추정되나 미실측, fail-close).
+4. 둘 다에 없음 → `UNKNOWN`("취소됨"을 확정하지 않음 — 8/18 실측
+   3차에서 확인했듯 이 상태는 취소 외에도 여러 원인 가능. 이
+   함수만으로는 구분 불가하다는 걸 반환값 자체가 명시).
+
+`order_id` 비교는 `normalize_order_id()`로 양쪽 다 앞자리 0을
+제거해서 비교(원 설계 가이드 그대로 — `zfill()`로 자릿수를
+가정하지 않음, 1P0.8-B.1 실측 2차에서 확립된 원칙 재사용).
+수량/가격 파싱은 기존 `KiwoomBroker._parse_abs_int()`
+(`@staticmethod`)를 그대로 재사용해 부호 접두사(`"+283500"` 등)
+처리 로직을 중복 구현하지 않았습니다.
+
+### 테스트
+`test_broker_order_status.py`(신규, **101건**):
+- 1절(실측 fixture 4건, 폴링 라운드마다 검증): 전량체결 2건은
+  모든 라운드에서 `FILLED` + 정확한 수량/가격/방향, 미체결 fixture는
+  모든 라운드에서 `OPEN` + `open_quantity=1`/`filled_quantity=0`/
+  `order_type_raw="보통"`, 취소 후 fixture는 원본 `oso`/`cntr`가
+  정말로 빈 배열인지부터 확인한 뒤 `UNKNOWN` 검증.
+- 2절(order_id 정규화, 6건): 0-padding 무시 비교, 전부 0/빈
+  문자열 엣지케이스, 실제 fixture에서 0-padding 다른 order_id로도
+  매칭되는지 확인.
+- 3절(fail-closed/방어적 입력, 8건): 미실측 `ord_stt`는 `UNKNOWN`
+  으로 떨어지되 `raw_oso_entry`는 보존(디버깅 가능), 매칭 안 되는
+  order_id, `oso`/`cntr`가 `None`, 둘 다 매칭될 때 `cntr` 우선,
+  빈 `dict` 항목 — 전부 예외 없이 처리.
+
+`test_partial_fill_lifecycle.py`(336건)/`test_kiwoom_broker_placement_failure.py`
+(86건) 재통과(무관한 신규 모듈이라 영향 없음). **전체 회귀**:
+`run_regression_tests.py`가 신규 테스트 파일을 자동 발견해 21개
+파일 중 20개 통과(`test_replay_time_axis.py`만 기존 무관 실패).
+`compileall` 정상.
+
+### 남은 것
+`Broker`/`KiwoomBroker`에는 아직 연결 안 함 — 다음은 **1P0.8-C**
+(`get_order_status()`/`get_open_orders()`를 `Broker` 인터페이스에
+추가하고 `KiwoomBroker`가 실제 ka10075/ka10076 호출 + 이번에 만든
+`derive_broker_order_status()`로 응답을 파싱해 반환하도록 연결).
+그다음 **1P0.8-D**(PSM reconciliation — `UNKNOWN` 상태를 실제로
+어떻게 다룰지, 특히 `RECONCILIATION_REQUIRED`/`acknowledge_error()`
+경로와 어떻게 엮을지가 핵심 설계 포인트). 부분체결 실측은 여전히
+미확보 — 확보되면 `BrokerOrderStatus.PARTIALLY_FILLED`를 실측
+근거로 추가.
+
+---
+
+## 1P0.8-B.2 보강: FILLED/OPEN 판정에 수량 signature 강제 (2026-08-18, GPT 리뷰 반영)
+
+배치 전 GPT 리뷰에서 B.2의 `derive_broker_order_status()`가 스스로
+선언한 "부분체결은 미실측이라 UNKNOWN으로 fail-close" 원칙과
+실제로는 어긋난다는 지적을 받았습니다 — `cntr`에 매칭되면
+`ord_stt`만 보고 무조건 `FILLED`, `oso`에서 `ord_stt == "접수"`이면
+무조건 `OPEN`으로 판정하고 있어서, 미래에 부분체결이 같은
+`ord_stt`를 유지한 채 수량만 다르게(예: `ord_stt="체결"`인데
+`cntr_qty < ord_qty`) 내려온다면 잘못 `FILLED`/`OPEN`으로 새는
+구조였습니다. 커밋을 보류하고 다음과 같이 강화했습니다.
+
+### 코드 변경 (`infra/broker/kiwoom_order_status.py`)
+- **FILLED 조건 강화**: `cntr` 매칭 + `ord_stt == "체결"`뿐 아니라
+  실측 fixture 2건에서 공통 확인된 `ord_qty == cntr_qty` **그리고**
+  `oso_qty == 0`까지 정확히 일치해야 `FILLED`. 하나라도 다르면
+  `UNKNOWN`(수량/가격 자체는 참고용으로 계속 보존, `filled_price`만
+  `FILLED` 확정 시에만 채움).
+- **OPEN 조건 강화**: `oso` 매칭 + `ord_stt == "접수"`뿐 아니라
+  실측 fixture(005930/13557)에서 확인된 `cntr_qty == 0` **그리고**
+  `oso_qty == ord_qty`까지 정확히 일치해야 `OPEN`. 마찬가지로
+  하나라도 다르면 `UNKNOWN`.
+- **빈/무효 order_id 방어**: `normalize_order_id()`가 빈 문자열/
+  전부-0 입력을 더 이상 `"0"` 하나로 합치지 않고 빈 문자열
+  그대로 반환하도록 변경 — 예전엔 `ord_no` 필드가 아예 없는
+  항목(`entry.get("ord_no", "")` → 정규화하면 `""`)이 `"0"`으로
+  정규화된 빈/무효 `order_id`와 우연히 매칭될 위험이 있었습니다.
+  `derive_broker_order_status()`는 이제 정규화 결과가 빈 문자열이면
+  매칭 자체를 시도하지 않고 즉시 `UNKNOWN`을 반환합니다.
+
+### 문서 변경 (`domain/models.py`)
+`BrokerOrderStatus`/`BrokerOrder`의 docstring을 위 강화된 판정
+조건과 일치하도록 재작성. `BrokerOrder`의 수량 필드(`requested_
+quantity`/`open_quantity`/`filled_quantity`)는 매칭된 원본 항목의
+값을 status와 무관하게(UNKNOWN이어도) 참고용으로 담고, `filled_
+price`만 `FILLED`로 확정됐을 때만 채운다는 점을 명시.
+
+### 테스트 (`test_broker_order_status.py`, 101건 → **106건**)
+- **3-1b/3-1c 신규**: 예전 구현이라면 잘못 판정했을 "그럴듯한
+  부분체결" 두 케이스 — `oso`에서 `ord_stt="접수"`인데 수량이
+  `ord_qty=10/oso_qty=4/cntr_qty=6`(부분체결 모양) → `UNKNOWN`(OPEN
+  아님), `cntr`에서 `ord_stt="체결"`인데 수량이 같은 모양 →
+  `UNKNOWN`(FILLED 아님). 강화 전 코드로 되돌리면 이 두 테스트가
+  실패하는 것으로 확인.
+- **2-4/2-5 수정**: `normalize_order_id("0000000")`/`("")`의 기대값을
+  `"0"`에서 `""`(빈 문자열)로 변경.
+- **2-7/2-8 신규**: `order_id=""`/`"0000000"`이 `ord_no` 필드 없는
+  항목과 오매칭되지 않고 즉시 `UNKNOWN`으로 fail-close되는지 확인.
+- **3-4 수정**: cntr 우선 검증용 synthetic 데이터에 `oso_qty="0"`을
+  추가(강화된 FILLED signature를 만족시키도록) — 테스트 의도(cntr가
+  oso보다 우선)는 그대로 유지.
+- 1절(실측 fixture 4건) 테스트는 전부 그대로 통과 — 실측 데이터
+  자체가 강화된 signature를 정확히 만족하기 때문(재확인 완료).
+
+전체 회귀 재실행: `run_regression_tests.py` 21개 파일 중 20개
+통과(`test_replay_time_axis.py`만 기존 무관 실패), `test_kiwoom_
+broker_placement_failure.py`(86건)/`test_partial_fill_lifecycle.py`
+(336건) 무영향 확인. `compileall` 정상.
+
+### 남은 것
+위 보강으로 B.2는 이제 "부분체결 미실측 → fail-close" 원칙과
+코드가 정확히 일치합니다. 다음은 여전히 **1P0.8-C**
+(`Broker`/`KiwoomBroker`에 실제 연결). 부분체결이 실측되면
+`ord_stt`/수량 조합을 이 fixture 세트에 추가하고 그때 비로소
+`BrokerOrderStatus.PARTIALLY_FILLED`를 실측 근거로 신설.
+
+---
+
+## 1P0.8-B.2 closure: KiwoomBroker 의존 제거 + malformed 수량 fail-close (2026-08-18, GPT 리뷰 반영)
+
+B.2 판정 로직(수량 signature 강제) 자체는 승인받았으나, 1P0.8-C
+착수 직전 GPT 리뷰에서 구조적 문제 하나를 추가로 지적받았습니다.
+
+### 문제
+`infra/broker/kiwoom_order_status.py`가 숫자 파싱 재사용을 위해
+`from infra.broker.kiwoom_broker import KiwoomBroker`를 하고 있었는데,
+다음 1P0.8-C에서 `KiwoomBroker`가 자연스럽게
+`from infra.broker.kiwoom_order_status import derive_broker_order_status`를
+하게 되면(`get_order_status()` 구현을 위해) 아래처럼 순환 import가
+됩니다.
+```
+kiwoom_broker.py → kiwoom_order_status.py → kiwoom_broker.py
+```
+더 본질적으로, `kiwoom_order_status.py`는 스스로 "raw dict를
+BrokerOrder로 바꾸는 순수 함수" 모듈이라고 선언했는데, 구체적인
+HTTP Broker 구현 클래스에 의존하는 건 그 선언과 어긋났습니다.
+
+### 수정 — 숫자 파싱을 의존성 없는 공용 모듈로 분리
+- **`infra/broker/kiwoom_parsing.py`(신규 파일)**: `parse_abs_int(value)`
+  — 기존 `KiwoomBroker._parse_abs_int()`의 파싱 로직을 그대로
+  옮김(부호 접두사/0-padding/빈 문자열 등 규칙 무변경). 어떤
+  `infra/broker` 모듈에도 의존하지 않는 순수 함수.
+- **`infra/broker/kiwoom_broker.py`**: `_parse_abs_int()`(정적
+  메서드)는 하위 호환을 위해 시그니처 그대로 남기고, 내부에서
+  `kiwoom_parsing.parse_abs_int()`로 위임만 함(로직 중복 없음,
+  기존 호출부 20여 곳 전부 무변경 동작).
+- **`infra/broker/kiwoom_order_status.py`**: `KiwoomBroker` import를
+  완전히 제거하고 `kiwoom_parsing.parse_abs_int()`만 사용. 이제
+  `infra.broker.kiwoom_broker`에 전혀 의존하지 않음 — 1P0.8-C에서
+  `KiwoomBroker`가 이 모듈을 import해도 순환이 생기지 않음.
+
+### 수정 — malformed 수량 필드도 진짜로 fail-close
+`_parse_optional_qty()`가 `parse_abs_int()`에만 의존할 때는
+"파싱 불가 → 0"과 "실제로 0"을 구분할 수 없었습니다(둘 다 정수
+`0`으로 동일하게 나옴 — `parse_abs_int()`는 범용 helper라 파싱
+불가 입력도 예외 없이 `0`으로 떨어뜨리도록 설계돼 있음, 이건 이
+파일 밖의 기존 호출부 동작이라 바꾸지 않음). 이 구분이 없으면
+malformed 수량이 우연히 수량 signature(`open_qty == 0` 등)를
+통과시켜 잘못된 OPEN/FILLED로 이어질 위험이 있습니다. 그래서
+`_parse_optional_qty()`는 먼저 `float()`로 숫자 해석 가능 여부만
+직접 확인하고, 해석 가능할 때만 `parse_abs_int()`로 최종 절대값
+변환을 위임하도록 고쳤습니다. 해석 불가능하면 `None`을 반환해
+수량 signature 비교가 항상 불일치하게 만들고, 결과적으로
+`UNKNOWN`으로 fail-close됩니다 — 예외로 죽지 않습니다.
+
+### 테스트 (`test_broker_order_status.py`, 106건 → **119건**)
+- 4절(dependency cleanup, 신규 4건): AST 파싱으로 `kiwoom_order_status.py`
+  소스에 `KiwoomBroker`를 이름으로 참조하는 실제 코드가 없는지
+  확인(docstring 설명 문구는 문자열 substring 검사가 아니라 AST
+  `Name` 노드 검사로 걸러내 오탐 방지), `kiwoom_broker` import
+  부재, `kiwoom_parsing.parse_abs_int` 사용 확인, 모듈이 실제로
+  정상 import되는지(순환 import였다면 여기까지 오지 못했을 것).
+- 5절(malformed 수량 fail-close, 신규 9건): `oso`/`cntr` 매칭
+  항목의 수량 필드가 숫자로 해석 불가능한 문자열이거나(`"???"`,
+  `"not-a-number"`) 아예 리스트 같은 엉뚱한 타입이어도 예외 없이
+  `UNKNOWN`으로 fail-close되는지, `requested_quantity`가 파싱
+  실패 시 `0`이 아니라 `None`으로 떨어지는지(0으로 위장하지
+  않음), malformed 방어 로직 추가 후에도 정상 fixture(전량체결/
+  미체결) 판정이 그대로 유지되는지 재확인.
+
+`test_minute_bar_diagnostics.py`(158건, `_parse_abs_int()` 규칙을
+독립적으로 재구현해 대조 검증하는 파일)도 그대로 재통과 — 파싱
+규칙 자체는 무변경(위치만 이동)이므로 영향 없음.
+`test_kiwoom_broker_placement_failure.py`(86건)/
+`test_partial_fill_lifecycle.py`(336건) 재통과(무관). **전체
+회귀**: 21개 파일 중 20개 통과(`test_replay_time_axis.py`만 기존
+무관 실패). `compileall` 정상.
+
+### 남은 것
+B.2는 이제 판정 로직(수량 signature)과 구조(의존성 방향, malformed
+입력 처리) 양쪽 모두 정리됐습니다. 다음은 **1P0.8-C** —
+`Broker`(`infra/broker/base.py`)에 `get_order_status()`/
+`get_open_orders()`를 추가하고 `KiwoomBroker`가 실제 ka10075/
+ka10076을 호출해 `derive_broker_order_status()`로 파싱한 결과를
+반환하도록 연결(민우님 권고: TradingService/PSM에는 아직 연결하지
+말고, `KiwoomBroker` 구현 + `MockBroker` 구현 + 단독 테스트까지만
+하는 read-only wiring 단계로 먼저 자르고, 실제 lifecycle
+reconciliation은 그다음 1P0.8-D에서 별도로 진행).
+
+---
+
+## 1P0.8-B.2 closure 2차: non-finite(nan/inf) 수량 fail-close (2026-08-18, GPT 리뷰 반영, B.2 최종 종료)
+
+1P0.8-C 착수 직전 마지막 리뷰에서 아주 작은 fail-close 구멍 하나를
+추가로 지적받았습니다.
+
+### 문제
+`_parse_optional_qty()`는 `float(text)`가 예외 없이 성공하면 숫자로
+해석 가능하다고 판단했는데, Python의 `float()`은 `"nan"`/`"inf"`/
+`"-inf"`뿐 아니라 `"1e309"`처럼 float 표현 범위를 넘어서는 값도
+예외 없이 `inf`로 통과시킵니다. 이런 값을 그대로
+`parse_abs_int()`에 넘기면 정수로 변환할 수 없어 범용 helper
+규칙대로 `0`을 반환하는데, 이 `0`은 "실제로 0"과 구분되지
+않습니다. 예를 들어 `cntr_qty="nan"`인 미체결 응답
+(`ord_qty=1, oso_qty=1, ord_stt="접수"`)이 오면 `cntr_qty`가
+`0`으로 위장되어 실측 완전미체결 signature(`cntr_qty==0 &&
+oso_qty==ord_qty`)를 우연히 만족시켜 잘못 `OPEN`으로 판정될 수
+있었습니다.
+
+### 수정
+`infra/broker/kiwoom_order_status.py`의 `_parse_optional_qty()`가
+`float()` 성공 여부만이 아니라 `math.isfinite()`로 유한한 값인지도
+확인하도록 강화했습니다. `nan`/`inf`/`-inf`/overflow-to-inf는 전부
+`None`을 반환해(파싱 실패와 동일하게 취급) 수량 signature 비교가
+자연히 불일치하게 만들고, 결과적으로 `UNKNOWN`으로 fail-close됩니다.
+
+### 테스트 (`test_broker_order_status.py`, 119건 → **133건**)
+`cntr_qty`가 `"nan"`/`"inf"`/`"1e309"`인 3가지 케이스 모두 예외
+없이 `UNKNOWN`으로 fail-close되는지(9건, 필드별 라벨 포함),
+`oso_qty="nan"`이 OPEN 판정 경로(1건)와 FILLED 판정 경로(1건)
+양쪽에서 모두 signature를 우연히 통과시키지 않는지 확인. 강화 전
+코드로 되돌리면 이 케이스들이 실패하는 것으로 확인. 정상 fixture 4건
+판정은 그대로 유지(재확인). 전체 회귀 21개 파일 중 20개 통과(기존
+무관 실패만), `compileall` 정상.
+
+### 결론
+**1P0.8-B.2는 이 보강으로 완전히 종료됩니다.** 판정 로직(수량
+signature 강제), 구조(의존성 방향), 입력 방어(malformed 문자열 +
+non-finite 값) 세 축 모두 GPT 리뷰를 거쳐 정리되었습니다. 다음은
+**1P0.8-C** — 범위는 좁게 유지: `Broker`에 `get_open_orders()`/
+`get_order_status()` 추가 → `KiwoomBroker`가 실제 ka10075/ka10076을
+호출해 `derive_broker_order_status()`로 파싱 → `MockBroker`에도
+동일 계약 구현 + 단독 테스트. **TradingService 자동 호출 없음,
+PSM 상태 변경 없음, orphan 자동 해제 없음, ERROR 자동 복구 없음,
+cancel 주문 추가 없음, BUY/SELL 판정 변경 없음, restart
+reconciliation 없음** — `UNKNOWN`이 나와도 내부에서 추가 추론하거나
+재조회해서 상태를 바꾸지 않는다. C는 조회 배관만 완성하고, 그
+결과로 lifecycle을 어떻게 복구할지는 1P0.8-D의 책임으로 남긴다.
+
+---

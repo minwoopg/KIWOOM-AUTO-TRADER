@@ -104,6 +104,88 @@ class OrderResult:
     is_ambiguous: bool = False
 
 
+class BrokerOrderStatus(str, Enum):
+    """ka10075(미체결조회)/ka10076(체결조회)를 종합해 판정한, 한
+    주문의 read-only 상태입니다.
+
+    2026-08-14/08-18 (1P0.8-B.1 실측, 1P0.8-B.2 모델 설계, 08-18 GPT
+    리뷰 반영 강화): 이 값은 "실측으로 확인된 시그니처"만 반영합니다
+    — 추측으로 상태를 넓히지 않습니다(프로젝트 전반의 fail-closed
+    원칙과 동일). `ord_stt` 문자열 하나만으로 판정하지 않고, 실측
+    fixture에서 함께 관찰된 수량 조합까지 정확히 일치해야만
+    OPEN/FILLED를 반환합니다 — 그래야 미실측 부분체결이 `ord_stt`만
+    같다는 이유로 잘못 OPEN/FILLED로 새는 것을 막을 수 있습니다.
+
+    - OPEN   : ka10075 `oso`에 있고 `ord_stt == "접수"` **그리고**
+      `cntr_qty == 0` **그리고** `oso_qty == ord_qty`(세 조건 모두
+      실측 signature와 정확히 일치)이며 ka10076 `cntr`엔 전혀 없음.
+      8/18 실측(005930/13557, 지정가 미체결: ord_qty=1/oso_qty=1/
+      cntr_qty=0)으로 확인. 이 수량 조합이 아니면(예: `ord_stt`는
+      "접수"지만 `cntr_qty > 0`인 경우) UNKNOWN.
+    - FILLED : ka10076 `cntr`에 해당 주문번호가 있고 `ord_stt ==
+      "체결"` **그리고** `ord_qty == cntr_qty` **그리고**
+      `oso_qty == 0`(세 조건 모두 실측 signature와 정확히 일치).
+      8/14 실측(005930/157897, 009150/163276, 전량체결: 각각
+      ord_qty==cntr_qty, oso_qty=0)으로 확인. 이 수량 조합이
+      아니면(예: `ord_stt`는 "체결"이지만 `cntr_qty < ord_qty`인
+      경우) UNKNOWN.
+    - UNKNOWN: 위 두 경우에 해당하지 않는 전부 — (a) `oso`/`cntr`
+      둘 다에 흔적이 없음(8/18 실측: 취소 후 시그니처. 단, "취소됨"
+      하나만을 의미하지 않음 — 오래된 체결이 조회 범위 밖으로
+      벗어났거나 애초에 잘못된 order_id일 수도 있음. 이 상태에서
+      "취소 확정"으로 해석하려면 클라이언트가 보유한 "이 order_id로
+      주문을 냈다"는 사전 지식과 결합해야 함 — CHANGELOG의 "1P0.8-B.1
+      실측 3차" 참고), (b) `oso`/`cntr`에는 매칭되지만 `ord_stt`나
+      수량 조합이 위 실측 signature와 다른 값(부분체결/정정 등으로
+      추정되나 아직 실측 확인된 바 없어 의도적으로 fail-close),
+      (c) order_id 자체가 빈 값/전부 0이라 애초에 매칭을 시도하지
+      않은 경우.
+    """
+
+    OPEN = "OPEN"
+    FILLED = "FILLED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class BrokerOrder:
+    """한 주문에 대해 "지금 다시 물어본" read-only 조회 스냅샷입니다.
+
+    `OrderResult`(place_order() 호출 직후의 "제출 응답")와는 다른
+    객체입니다 — 이건 이미 제출된 주문번호를 ka10075/ka10076으로
+    나중에 다시 조회한 결과입니다. 1P0.8-B.2에서 신설, 아직
+    `Broker` 인터페이스에는 연결되지 않았습니다(1P0.8-C에서
+    `get_order_status()`/`get_open_orders()` 추가 예정 — 그 전까지는
+    `infra/broker/kiwoom_order_status.py`의 순수 함수로만 존재).
+
+    수량/가격 필드는 판정 불가능하거나 원본에 없으면 `None`입니다 —
+    0으로 채우면 "실제로 0이었다"와 "몰라서 못 채웠다"를 구분할 수
+    없어 의도적으로 `Optional`로 뒀습니다.
+    """
+
+    order_id: str
+    symbol: str
+    status: BrokerOrderStatus
+    side: OrderSide | None = None
+    # 2026-08-18 (GPT 리뷰 반영): requested_quantity/open_quantity/
+    # filled_quantity는 oso/cntr 중 매칭된 항목의 원본 수량을 status와
+    # 무관하게(UNKNOWN이어도) 그대로 담습니다 — 디버깅/로그 목적의
+    # 참고값입니다. 오직 filled_price만 status가 실제로 FILLED로
+    # "확정"됐을 때만 채웁니다(가격은 체결이 확정됐다는 의미를
+    # 내포하므로 더 보수적으로 취급). status 필드 자체가 최종 판정을
+    # 나타내므로, 호출부는 이 수치 필드들이 아니라 반드시 status를
+    # 보고 분기해야 합니다.
+    requested_quantity: int | None = None   # ord_qty
+    open_quantity: int | None = None        # oso_qty (매칭된 항목의 원본값, status 무관)
+    filled_quantity: int | None = None      # cntr_qty (매칭된 항목의 원본값, status 무관)
+    filled_price: int | None = None         # cntr_pric — status가 FILLED로 확정됐을 때만 채워짐
+    order_type_raw: str | None = None       # trde_tp 원문("보통"/"시장가" 등), 정규화하지 않고 그대로 보존
+    # 디버깅/미확인 상태(UNKNOWN) 재현용 — 매칭된 원본 레코드를
+    # 그대로 보존합니다(매칭 안 되면 둘 다 None).
+    raw_oso_entry: dict | None = None
+    raw_cntr_entry: dict | None = None
+
+
 @dataclass(frozen=True)
 class Signal:
     """전략 판단의 결과와 이유를 함께 담습니다."""

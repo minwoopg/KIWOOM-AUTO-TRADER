@@ -28,6 +28,7 @@ import requests
 
 from config.settings import BrokerConfig
 from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, OrderSide, Position, PriceBar, WeeklyBar, MinuteBar
+from infra.broker.kiwoom_parsing import parse_abs_int
 from infra.broker.base import Broker
 
 
@@ -827,24 +828,15 @@ class KiwoomBroker(Broker):
     def _parse_abs_int(value: Any) -> int:
         """키움 숫자 문자열을 안전하게 정수로 바꿉니다.
 
-        키움 응답은 종종 아래처럼 옵니다.
-        - '000000000437250'
-        - '-218750'
-        - '+225000'
-        - ''
-
-        현재가/기준가/수량처럼 '크기'가 중요한 값은 절대값으로 써야 하므로
-        여기서는 abs(int(...)) 형태로 처리합니다.
+        2026-08-18 (GPT 리뷰 반영, 1P0.8-B.2 dependency cleanup): 실제
+        파싱 로직은 `infra/broker/kiwoom_parsing.parse_abs_int()`로
+        옮겼습니다 — `infra/broker/kiwoom_order_status.py`가 이
+        규칙을 재사용하는데, 거기서 `KiwoomBroker`를 직접 import하면
+        다음 1P0.8-C에서 `KiwoomBroker`가 `kiwoom_order_status.py`를
+        import할 때 순환 import가 됩니다. 이 메서드는 기존 호출부
+        (`self._parse_abs_int(...)`, 이 파일 안에서 다수 사용)와의
+        하위 호환을 위해 그대로 남겨두고 내부에서 위임만 합니다 —
+        로직 중복 없음, 동작 무변경.
         """
 
-        if value is None:
-            return 0
-
-        text = str(value).strip()
-        if not text:
-            return 0
-
-        try:
-            return abs(int(float(text)))
-        except ValueError:
-            return 0
+        return parse_abs_int(value)
