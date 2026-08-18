@@ -27,7 +27,8 @@ from typing import Any
 import requests
 
 from config.settings import BrokerConfig
-from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, OrderSide, Position, PriceBar, WeeklyBar, MinuteBar
+from domain.models import AccountBalance, BrokerOrder, MarketPrice, OrderRequest, OrderResult, OrderSide, Position, PriceBar, WeeklyBar, MinuteBar
+from infra.broker.kiwoom_order_status import derive_broker_order_status, normalize_order_id
 from infra.broker.kiwoom_parsing import parse_abs_int
 from infra.broker.base import Broker
 
@@ -117,6 +118,41 @@ def _is_confirmed_rate_limit_reject(status_code: int, body: Any) -> bool:
 # 않습니다). 무한 재시도를 막기 위해 최대 횟수를 상수로 고정합니다.
 PLACE_ORDER_RATE_LIMIT_MAX_RETRIES = 2
 PLACE_ORDER_RATE_LIMIT_RETRY_BACKOFF_SECONDS = 1.5
+
+
+class KiwoomPaginationIncompleteError(RuntimeError):
+    """ka10075/ka10076 연속조회 결과의 완결성을 보장할 수 없는 상태입니다.
+
+    2026-08-18 (1P0.8-C.1, GPT 리뷰 반영): 처음에는 "page cap까지
+    갔는데도 cont-yn=Y가 계속됨" 한 가지 경우만 다뤘습니다. 이 경로는
+    실제 Broker read-only 조회 API(`get_order_status()`/
+    `get_open_orders()`)이므로, 지금까지 모은 rows를 "완결된 목록"인
+    것처럼 반환하면 안 됩니다 — 호출부가 "이 order_id는 여기 없다"를
+    "정말 없다"로 오해해 잘못된 UNKNOWN/빈 목록 판정으로 이어질 수
+    있습니다(특히 1P0.8-D에서 이 결과로 PSM lifecycle을 복구하기
+    시작하면 위험이 커짐).
+
+    2026-08-18 (1P0.8-C.1 closure, GPT 리뷰 반영 2차): "완결성을
+    보장할 수 없는 상태"는 page cap 초과 말고도 더 있다는 지적을
+    받아 이 예외의 의미를 넓혔습니다. 지금 이 예외가 던져지는 경우:
+    1. page cap까지 갔는데도 `cont-yn=Y`가 계속됨(원래 케이스).
+    2. `cont-yn=Y`인데 `next-key`가 비어있음 — "뒤에 페이지가 더
+       있다"는 신호인데 그 다음 페이지로 갈 방법(next-key)이 없는
+       모순 상태. 이걸 "더 볼 페이지 없음"으로 오판하면 안 됩니다.
+    3. `cont-yn`이 `"N"`도 `"Y"`도 아닌 값(빈 문자열 포함) — 완결
+       여부를 서버가 명확히 알려주지 않은 상태.
+    4. 응답의 `oso`/`cntr` 배열 자체가 리스트가 아니거나(예: `{}`),
+       리스트 안에 dict가 아닌 원소가 섞여 있음 — 응답 구조 자체를
+       신뢰할 수 없는 상태.
+    모든 경우 공통 원칙은 동일합니다: **불확실하면 완결된 결과인
+    척 조용히 반환하지 않고, 예외로 명시적으로 fail-close한다.**
+    """
+
+
+# 2026-08-18 (1P0.8-C.1): B.1 진단 프로브의 MAX_CONTINUATION_PAGES와
+# 동일한 값을 사용합니다 — 실측으로 검증된 상한이며, 굳이 다른 값을
+# 추측으로 도입하지 않습니다.
+ORDER_QUERY_MAX_CONTINUATION_PAGES = 20
 
 
 @dataclass(frozen=True)
@@ -586,6 +622,227 @@ class KiwoomBroker(Broker):
 
         # 요청한 days 수만큼만 잘라서 반환
         return bars[-days:] if len(bars) > days else bars
+
+    # ══════════════════════════════════════════════════════════════
+    # 1P0.8-C / 1P0.8-C.1: read-only 주문조회 wiring
+    #
+    # 여기서부터 두 개의 public 메서드(get_open_orders/get_order_status)와
+    # 그것들이 쓰는 raw-fetch 헬퍼들은 순수하게 "조회 배관"입니다.
+    # TradingService 자동 호출, PSM 상태 변경, orphan 자동 해제, ERROR
+    # 자동 복구, cancel_order 추가, BUY/SELL 판정 변경, restart
+    # reconciliation은 이 라운드 범위 밖입니다(민우님 승인 범위,
+    # CHANGELOG_v1.6.md "1P0.8-C"/"1P0.8-C.1" 참고).
+    #
+    # get_order_status()가 BrokerOrderStatus.UNKNOWN을 반환하더라도
+    # 여기서 추가로 재조회하거나 다른 방식으로 추론해 상태를 바꾸지
+    # 않습니다 — UNKNOWN을 어떻게 다룰지는 1P0.8-D의 책임으로 남겨둡니다.
+    # ══════════════════════════════════════════════════════════════
+
+    def _fetch_paginated_rows(
+        self, api_id: str, payload: dict[str, Any], response_key: str
+    ) -> list[dict[str, Any]]:
+        """cont-yn/next-key를 따라가며 `api_id` 응답의 `response_key`
+        배열을 전부 모아 반환합니다.
+
+        2026-08-18 (1P0.8-C.1, GPT 리뷰 반영): B.1에서 이미 검증한
+        연속조회 패턴(`tools/order_reconciliation_probe.py`의
+        `fetch_paginated()`)을 production Broker 조회 경로용으로
+        재사용합니다. 첫 페이지는 `cont_yn="N"`/`next_key=""`로
+        시작하고, 응답 헤더의 `cont-yn`이 `"Y"`이면 `next-key`를
+        그대로 다음 요청에 실어 계속 따라갑니다.
+
+        2026-08-18 (1P0.8-C.1 closure, GPT 리뷰 반영 2차): 최초
+        구현은 `cont-yn != "Y"` 이면 전부 "정상 종료"로 취급했는데,
+        이건 `cont-yn=Y`인데 `next-key`가 비어있는 모순 상태(뒤에
+        페이지가 더 있다는데 갈 방법이 없음)나 `cont-yn`이 애초에
+        `"N"`/`"Y"` 어느 쪽도 아닌 값(빈 문자열 포함)인 상태까지
+        "완결"로 오판할 위험이 있었습니다. 그래서 **명시적으로
+        `cont-yn == "N"`일 때만 정상 종료**하도록 좁혔습니다 —
+        그 외(`cont-yn=Y`인데 next-key 없음 / `cont-yn`이 알 수 없는
+        값)는 전부 완결 여부를 보장할 수 없는 상태로 보고
+        `KiwoomPaginationIncompleteError`를 던집니다. 응답의
+        `response_key` 배열이 `list`가 아니거나(예: `{}`) 내부에
+        `dict`가 아닌 원소가 섞여 있는 경우도 마찬가지로 응답
+        구조를 신뢰할 수 없는 상태이므로 같은 예외로 fail-close합니다
+        (조용히 빈 리스트나 부분 데이터로 흘려보내지 않습니다).
+
+        차이점(B.1 프로브 대비): 프로브는 diagnostic 용도라 page cap
+        (`ORDER_QUERY_MAX_CONTINUATION_PAGES`)에 도달하면 synthetic
+        record를 남기고 조용히 멈췄지만, 여기는 실제 Broker 조회
+        결과이므로 완결성을 보장할 수 없는 모든 경우에 지금까지
+        모은 rows를 "전체 목록"인 것처럼 반환하지 않고 예외를
+        던집니다 — 호출부가 불완전한 결과를 완결된 것으로 오해하면
+        안 되기 때문입니다.
+        """
+
+        rows: list[dict[str, Any]] = []
+        cont_yn = "N"
+        next_key = ""
+        page_index = 1
+
+        while True:
+            api_response = self._post(
+                endpoint="/api/dostk/acnt",
+                api_id=api_id,
+                payload=payload,
+                cont_yn=cont_yn,
+                next_key=next_key,
+            )
+
+            page_rows = api_response.body.get(response_key)
+            if not isinstance(page_rows, list):
+                raise KiwoomPaginationIncompleteError(
+                    f"api_id={api_id}: 응답의 {response_key!r}가 list가 아님"
+                    f"({type(page_rows).__name__}) — 응답 구조를 신뢰할 수 "
+                    "없어 fail-close"
+                )
+            if not all(isinstance(row, dict) for row in page_rows):
+                raise KiwoomPaginationIncompleteError(
+                    f"api_id={api_id}: 응답의 {response_key!r} 내부에 "
+                    "dict가 아닌 항목이 섞여 있음 — 응답 구조를 신뢰할 수 "
+                    "없어 fail-close"
+                )
+            rows.extend(page_rows)
+
+            resp_cont_yn = str(api_response.headers.get("cont-yn", "")).strip().upper()
+            resp_next_key = str(api_response.headers.get("next-key", "")).strip()
+
+            if resp_cont_yn == "N":
+                return rows  # 정상 종료 — 더 볼 페이지 없음
+
+            if resp_cont_yn != "Y":
+                raise KiwoomPaginationIncompleteError(
+                    f"api_id={api_id}: 알 수 없는 cont-yn={resp_cont_yn!r} "
+                    "— pagination 완결 여부를 확인할 수 없어 fail-close"
+                )
+
+            if not resp_next_key:
+                raise KiwoomPaginationIncompleteError(
+                    f"api_id={api_id}: cont-yn=Y인데 next-key가 비어 있음 "
+                    "— 다음 페이지로 이어갈 방법이 없어 fail-close"
+                )
+
+            if page_index >= ORDER_QUERY_MAX_CONTINUATION_PAGES:
+                raise KiwoomPaginationIncompleteError(
+                    f"api_id={api_id}: {ORDER_QUERY_MAX_CONTINUATION_PAGES}"
+                    f"페이지까지 조회했지만 cont-yn=Y가 계속됨 — 지금까지 모은 "
+                    f"{len(rows)}건은 전체 목록이 아닐 수 있음(fail-close)"
+                )
+
+            page_index += 1
+            cont_yn = resp_cont_yn
+            next_key = resp_next_key
+
+    def _fetch_open_orders_raw(self, symbol: str) -> list[dict[str, Any]]:
+        """ka10075(미체결요청)를 연속조회까지 따라가며 원시 `oso` 리스트를 반환합니다.
+
+        요청 필드는 `tools/order_reconciliation_probe.py`의
+        `build_ka10075_payload()`와 동일합니다(민우님이 제공한 공식
+        샘플 그대로, 1P0.8-B.1에서 이미 실측 검증됨).
+
+        2026-08-18 (1P0.8-C.1): 이전(1P0.8-C)에는 단일 페이지만
+        조회했으나, cont-yn=Y로 이어지는 다음 페이지에 대상
+        주문번호가 있는데 첫 페이지만 보고 "없다"고 오판할 위험이
+        있어(GPT 리뷰 지적) `_fetch_paginated_rows()`로 전체 페이지를
+        따라가도록 보강했습니다. 페이지 cap에 도달하면 조용히
+        일부만 반환하지 않고 `KiwoomPaginationIncompleteError`를
+        던집니다.
+        """
+
+        return self._fetch_paginated_rows(
+            api_id="ka10075",
+            payload={
+                "all_stk_tp": "1",  # 0:전체, 1:종목
+                "trde_tp": "0",     # 0:전체, 1:매도, 2:매수
+                "stk_cd": symbol,
+                "stex_tp": "0",     # 0:통합, 1:KRX, 2:NXT
+            },
+            response_key="oso",
+        )
+
+    def _fetch_fill_history_raw(self, symbol: str) -> list[dict[str, Any]]:
+        """ka10076(체결요청)을 연속조회까지 따라가며 원시 `cntr` 리스트를 반환합니다.
+
+        요청 필드는 `tools/order_reconciliation_probe.py`의
+        `build_ka10076_payload()`와 동일합니다. `ord_no`는 일부러 빈
+        문자열로 둡니다(특정 주문 하나만 골라내는 필터가 아니라
+        "이 주문번호 이전 체결 내역"을 걸러내는 필터라, 종목 전체
+        체결이력을 그대로 받아 `derive_broker_order_status()`가
+        판단하게 합니다).
+
+        2026-08-18 (1P0.8-C.1): `_fetch_open_orders_raw()`와 동일하게
+        이제 연속조회를 전부 따라갑니다(이전엔 단일 페이지만 조회).
+        """
+
+        return self._fetch_paginated_rows(
+            api_id="ka10076",
+            payload={
+                "stk_cd": symbol,
+                "qry_tp": "1",   # 0:전체, 1:종목
+                "sell_tp": "0",  # 0:전체, 1:매도, 2:매수
+                "ord_no": "",
+                "stex_tp": "0",
+            },
+            response_key="cntr",
+        )
+
+    def get_open_orders(self, symbol: str) -> list[BrokerOrder]:
+        """symbol의 미체결 주문을 조회합니다 (1P0.8-C/-C.1, read-only).
+
+        ka10075(oso) 응답에 등장하는 각 주문번호에 대해, ka10076(cntr)
+        응답과 함께 `derive_broker_order_status()`로 최종 판정합니다 —
+        oso 목록에 있다는 사실만으로 곧바로 OPEN이라 단정하지 않고
+        수량 signature까지 확인하는, B.2에서 정한 fail-close 원칙을
+        그대로 따릅니다. 판정이 애매하면 OPEN이 아니라 UNKNOWN이
+        섞여서 반환될 수 있습니다 — 이 목록을 가지고 추가 추론이나
+        재조회는 하지 않습니다.
+
+        2026-08-18 (1P0.8-C.1, GPT 리뷰 반영, API 호출 절약): oso가
+        (전체 페이지를 다 봤는데도) 비어있으면 ka10076 호출 자체를
+        생략하고 곧바로 빈 리스트를 반환합니다 — 미체결이 없으면
+        어차피 판정할 대상이 없으므로, 불필요한 API 호출로 429
+        한도를 소모하지 않기 위함입니다(319400 사고 이후 API 호출
+        절약이 우선순위임을 재확인). 이 최적화는 `get_order_status()`
+        에는 적용하지 않습니다 — 특정 주문이 이미 FILLED라면
+        oso=[]이어도 cntr을 반드시 봐야 정확히 판정할 수 있기
+        때문입니다.
+        """
+
+        oso_entries = self._fetch_open_orders_raw(symbol)
+        if not oso_entries:
+            return []
+
+        cntr_entries = self._fetch_fill_history_raw(symbol)
+
+        seen: set[str] = set()
+        orders: list[BrokerOrder] = []
+        for entry in oso_entries:
+            raw_order_id = str(entry.get("ord_no", ""))
+            normalized = normalize_order_id(raw_order_id)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            orders.append(
+                derive_broker_order_status(raw_order_id, symbol, oso_entries, cntr_entries)
+            )
+        return orders
+
+    def get_order_status(self, order_id: str, symbol: str) -> BrokerOrder:
+        """단일 주문(order_id)의 현재 상태를 조회합니다 (1P0.8-C/-C.1, read-only).
+
+        ka10075/ka10076을 각각 (연속조회까지 포함해) 호출해
+        `derive_broker_order_status()`에 그대로 넘깁니다. UNKNOWN이
+        반환되더라도 여기서 추가로 재조회하거나 다른 방식으로
+        추론해 상태를 바꾸지 않습니다.
+
+        `get_open_orders()`와 달리 oso가 비어있어도 ka10076 호출을
+        생략하지 않습니다 — 이미 전량체결된 주문은 oso에 없는 게
+        정상이므로, cntr을 보지 않으면 FILLED를 놓치게 됩니다.
+        """
+
+        oso_entries = self._fetch_open_orders_raw(symbol)
+        cntr_entries = self._fetch_fill_history_raw(symbol)
+        return derive_broker_order_status(order_id, symbol, oso_entries, cntr_entries)
 
     def place_order(self, order: OrderRequest) -> OrderResult:
         """매수 또는 매도 주문을 키움 REST API로 전송합니다.

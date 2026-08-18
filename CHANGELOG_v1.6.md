@@ -7932,3 +7932,272 @@ reconciliation 없음** — `UNKNOWN`이 나와도 내부에서 추가 추론하
 결과로 lifecycle을 어떻게 복구할지는 1P0.8-D의 책임으로 남긴다.
 
 ---
+
+## 1P0.8-C: Broker read-only 주문조회 wiring (2026-08-18, 민우님 승인 범위대로 좁게 완료)
+
+B.2 종료 직후 민우님이 승인한 범위 그대로 진행했습니다: `Broker`
+인터페이스에 조회 메서드를 추가하고, `KiwoomBroker`/`MockBroker`
+양쪽에 동일 계약으로 구현한 뒤 단독 테스트만 작성. **TradingService/
+PSM/orphan 자동 해제/ERROR 자동 복구/cancel_order/BUY-SELL 판정
+변경/restart reconciliation은 이번 라운드에서 전혀 건드리지
+않았습니다.**
+
+### 변경 사항
+
+1. `infra/broker/base.py` — `Broker`에 abstractmethod 2개 추가:
+   - `get_open_orders(symbol: str) -> list[BrokerOrder]`
+   - `get_order_status(order_id: str, symbol: str) -> BrokerOrder`
+   두 메서드 모두 docstring에 "UNKNOWN이 나와도 여기서 추가 추론/
+   재조회로 상태를 바꾸지 않는다"는 제약을 명시했습니다.
+
+2. `infra/broker/kiwoom_broker.py`:
+   - `_fetch_open_orders_raw(symbol)` / `_fetch_fill_history_raw(symbol)`
+     (신규, private) — 각각 ka10075(`/api/dostk/acnt`, oso)/
+     ka10076(같은 엔드포인트, cntr)을 단일 페이지 조회합니다. 요청
+     필드는 `tools/order_reconciliation_probe.py`의
+     `build_ka10075_payload()`/`build_ka10076_payload()`와 동일(민우님이
+     제공한 공식 샘플, 1P0.8-B.1에서 이미 실측 검증됨).
+     **알려진 제한**: cont-yn/next-key 연속조회(페이지네이션)는 이
+     라운드 범위 밖이라 다루지 않습니다 — 한 종목의 미체결/체결
+     이력이 한 페이지를 넘기면 일부만 반환됩니다. 필요해지면 별도
+     라운드에서 `fetch_paginated()` 패턴을 재사용해 보강할 것.
+   - `get_order_status(order_id, symbol)` — 위 두 raw fetch를 각각
+     정확히 한 번씩 호출하고, 그 결과를 그대로
+     `infra/broker/kiwoom_order_status.py`의
+     `derive_broker_order_status()`에 넘겨 반환합니다. UNKNOWN이
+     나와도 추가 호출 없음(테스트로 호출 횟수까지 확정 검증).
+   - `get_open_orders(symbol)` — 같은 두 raw fetch를 한 번씩 호출한
+     뒤, ka10075 `oso` 목록에 등장하는 각 주문번호(정규화 후 중복
+     제거)에 대해 `derive_broker_order_status()`를 적용해
+     `list[BrokerOrder]`로 반환합니다. oso 목록에 있다고 곧바로
+     OPEN이라 단정하지 않고 수량 signature까지 확인하는 B.2의
+     fail-close 원칙을 그대로 따릅니다 — 부분체결 모양이면 OPEN이
+     아니라 UNKNOWN이 섞여 나올 수 있습니다.
+   - `import`는 `from infra.broker.kiwoom_order_status import
+     derive_broker_order_status, normalize_order_id` 한 방향으로만
+     추가했습니다 — B.2 closure에서 정리한 의존성 방향(order_status가
+     broker를 import하지 않음)은 그대로 유지됩니다.
+
+3. `infra/broker/mock_broker.py`:
+   - `place_order()`는 accept/reject 판단과 체결가 계산 로직을 전혀
+     바꾸지 않았습니다 — 각 분기에서 이미 계산돼 있던 체결가를
+     `fill_price` 지역변수로 잡아, 최종 accepted 경로 직전에
+     `self._orders[order_id]`로 기록만 추가했습니다(순수 부기,
+     BUY/SELL 판단 로직 무변경).
+   - `get_order_status(order_id, symbol)` — 기록된 정보가 있고
+     symbol이 일치하면 `FILLED`(MockBroker는 accept 즉시 전량체결을
+     시뮬레이션하므로), 없거나 symbol이 다르면 추측하지 않고
+     `UNKNOWN`을 반환합니다.
+   - `get_open_orders(symbol)` — MockBroker는 accept된 주문을 즉시
+     전량체결 처리해 실제로 미체결 상태가 존재하지 않으므로 항상 빈
+     리스트를 반환합니다. `KiwoomBroker`와 동일한 반환 타입 계약만
+     지킵니다.
+
+### 테스트 (`test_broker_read_only_wiring.py`, 신규, 32건)
+- `KiwoomBroker`: 전량체결 실측 shape → FILLED(0절), 미체결 실측
+  shape → OPEN(1절), 매칭 없음 → UNKNOWN(2절), 부분체결 모양이 섞인
+  `get_open_orders()` 응답에서 정상 미체결은 OPEN·부분체결 모양은
+  UNKNOWN으로 갈리는지(3절), 빈 oso → 빈 리스트(4절) — **모든
+  케이스에서 ka10075/ka10076이 정확히 한 번씩만 호출되는지
+  fake session의 호출 로그로 확정 검증**(UNKNOWN이 나와도 추가
+  재조회가 없다는 민우님의 명시적 요구사항을 직접 테스트로 고정).
+- `MockBroker`: BUY 접수 후 조회하면 FILLED로 일관되게 응답하는지,
+  존재하지 않는 order_id·symbol 불일치는 UNKNOWN으로 fail-close
+  되는지, 거절된 주문(현금 부족)은 애초에 기록되지 않아 조회 시
+  UNKNOWN인지, `get_open_orders()`는 주문 개수와 무관하게 항상 빈
+  리스트인지.
+- `Broker` 서브클래스 계약: `KiwoomBroker`/`MockBroker` 둘 다 새
+  abstractmethod 2개를 구현하지 않으면 인스턴스화 자체가
+  `TypeError`로 즉시 드러나므로, 정상 인스턴스화 자체가 계약 검증의
+  일부입니다.
+- 전체 회귀 22개 파일 중 21개 통과(기존 무관 실패
+  `test_replay_time_axis.py`만 그대로 유지, 이번 변경과 무관),
+  `compileall` 정상.
+
+### 결론
+1P0.8-C는 승인된 범위(read-only 조회 wiring)만 정확히 구현하고
+종료합니다. `get_order_status()`/`get_open_orders()`는 아직 어디서도
+자동으로 호출되지 않습니다(TradingService/PSM 연결 없음) — 이
+메서드들을 실제로 언제/어떻게 불러서 lifecycle을 복구할지는
+**1P0.8-D**의 책임입니다.
+
+---
+
+## 1P0.8-C.1: 주문조회 pagination 완성 + get_open_orders() API 호출 절약 (2026-08-18, GPT 리뷰 반영, D 착수 전 필수 보강)
+
+C 커밋 직후, D 착수 전 리뷰에서 C가 남긴 위험 하나를 지적받았습니다.
+
+### 문제 1 — ka10075/ka10076이 다시 단일 페이지만 조회
+1P0.8-C의 `_fetch_open_orders_raw()`/`_fetch_fill_history_raw()`는
+`cont_yn="N"`/`next_key=""`로 단일 페이지만 조회했습니다. 그런데
+1P0.8-B.1에서 이미 "cont-yn=Y/next-key 연속조회를 반드시 따라가야
+한다"고 검증하고 프로브에 구현해 뒀던 원칙이, 이 production
+Broker 조회 경로에는 반영되지 않은 채 남아 있었습니다. 결과적으로
+다음 시나리오가 가능했습니다:
+
+```
+ka10076 page 1 → 대상 order_id 없음 → cont-yn=Y
+실제 대상 주문 → page 2에 존재
+현재 get_order_status() → page 1만 조회 → UNKNOWN (오판)
+```
+
+C가 아직 어디에도 자동 연결되지 않은 단독 조회 API인 지금은 큰
+사고가 아니지만, 다음 1P0.8-D에서 이 값을 PSM 복구에 쓰기
+시작하면 "주문을 못 찾았다"가 아니라 "첫 페이지만 봤다"인 상태를
+UNKNOWN으로 잘못 받아들이게 됩니다.
+
+### 수정 1 — B.1 프로브의 연속조회 패턴을 production 경로로 이식
+`infra/broker/kiwoom_broker.py`에 `_fetch_paginated_rows(api_id,
+payload, response_key)`(신규 private)를 추가해
+`_fetch_open_orders_raw()`/`_fetch_fill_history_raw()`가 이걸
+공유하도록 리팩터링했습니다. `cont-yn`/`next-key`를 응답 헤더에서
+그대로 읽어 다음 요청에 실어 보내며, `cont-yn != "Y"`이거나
+`next-key`가 비어있으면 정상 종료합니다.
+
+**B.1 프로브와의 중요한 차이**: 프로브는 diagnostic 용도라 page
+cap(`ORDER_QUERY_MAX_CONTINUATION_PAGES = 20`, B.1과 동일 값)에
+도달하면 synthetic record를 남기고 조용히 멈췄습니다. 하지만 이
+경로는 실제 Broker 조회 API이므로, cap에 도달했는데 아직
+`cont-yn=Y`라면 지금까지 모은 rows를 "완결된 목록"인 것처럼
+반환하지 않고 신설 예외 `KiwoomPaginationIncompleteError`(신설,
+`RuntimeError` 상속)를 던져 명시적으로 fail-close합니다 —
+호출부가 불완전한 결과를 완전한 결과로 오해하면 안 되기 때문입니다.
+
+### 문제 2 — get_open_orders()가 미체결이 없어도 항상 ka10076까지 호출
+319400 사고(429로 SELL 실패) 이후 API 호출 절약이 우선순위인데,
+`get_open_orders()`는 `oso`가 빈 배열이어도 항상 `ka10076`까지
+호출하고 있었습니다.
+
+### 수정 2 — oso가 비어있으면 ka10076 호출 생략
+`get_open_orders()`가 (전체 페이지를 다 확인한 뒤) `oso`가 비어
+있으면 `ka10076` 호출 자체를 생략하고 곧바로 빈 리스트를
+반환하도록 수정했습니다 — 미체결이 없으면 판정할 대상 자체가
+없으므로 안전합니다. **이 최적화는 `get_order_status()`에는
+적용하지 않습니다** — 특정 주문이 이미 FILLED라면 `oso=[]`가
+정상이므로, `cntr`을 반드시 봐야 FILLED를 놓치지 않습니다.
+
+### 테스트 (`test_broker_order_query_pagination.py`, 신규, 16건)
+ka10075/ka10076이 2페이지에 걸친 항목을 모두 합쳐 반환하는지,
+요청이 이전 응답의 `cont-yn`/`next-key`를 그대로 이어받는지, **대상
+주문이 cntr 2페이지에만 있어도 FILLED로 정확히 판정되는지(원래
+버그 시나리오를 그대로 재현해 고정)**, page cap을 넘겨 `cont-yn=Y`가
+끝없이 이어지면 `KiwoomPaginationIncompleteError`가 발생하고
+정확히 cap만큼만 호출한 뒤 멈추는지, `get_order_status()`도 이
+예외를 삼키지 않고 그대로 전파하는지, oso가 여러 빈 페이지를
+거쳐도 결국 비어있으면 `get_open_orders()`가 ka10076을 호출하지
+않는지(반대로 `get_order_status()`는 oso가 비어있어도 ka10076을
+반드시 호출하는지).
+
+기존 `test_broker_read_only_wiring.py`(32건)의 5-2 테스트도 새
+동작(oso 비어있으면 ka10076 생략)에 맞춰 갱신했고, 나머지 31건은
+전부 그대로 재통과했습니다(단일 페이지 fake response는 헤더에
+`cont-yn`이 없으면 `""`로 읽혀 자동으로 "더 볼 페이지 없음"으로
+처리되므로 기존 fake session들이 수정 없이 그대로 유효합니다).
+
+전체 회귀 23개 파일 중 22개 통과(`test_replay_time_axis.py`만 기존
+무관 실패), `compileall` 정상.
+
+### 결론
+1P0.8-C.1로 B.1에서 이미 검증했던 연속조회 원칙을 production
+Broker 조회 경로에도 동일하게 적용했고, 429 재발 방지 원칙에 맞춰
+불필요한 API 호출도 줄였습니다. **이제 1P0.8-D(PSM reconciliation
+설계) 착수 전 필수 보강이 끝났습니다.** D 설계 시 반드시 고려할
+것(민우님 지적):
+- `get_order_status()`가 `UNKNOWN`을 반환해도 "취소됨"으로 자동
+  해석하지 않는다(클라이언트 측 추적 정보와 결합 필요).
+- D의 폴링 대상은 `BUY_PENDING`/`SELL_PENDING`/`ERROR(ambiguous
+  placement)`/orphan 존재 + startup reconciliation 필요 주문으로
+  좁힌다 — 일반 `OPEN`/`FLAT` 종목에 매 polling마다 주문조회를
+  붙이지 않는다(429 재발 방지).
+- 현재 확실히 구분 가능한 상태는 `OPEN`/`FILLED`/`UNKNOWN`뿐이다.
+  `FILLED`만 확실한 reconciliation 가능, `OPEN`은 pending 유지
+  가능, `UNKNOWN`은 자동 상태 해제·자동 재주문 모두 금지(관측만).
+
+---
+
+## 1P0.8-C.1 closure: cont-yn 프로토콜 fail-close 보강 (2026-08-18, GPT 리뷰 반영 2차, D 착수 전 마지막 보강)
+
+C.1 커밋 직후 마지막 리뷰에서 pagination fail-close에 남아 있던
+허점 하나를 추가로 지적받았습니다. "C.1 기능 방향은 승인, D 진입
+전 protocol fail-close closure 1회만 추가"가 결론이었습니다.
+
+### 문제 1 — `cont-yn != "Y"`를 전부 정상 종료로 취급
+`_fetch_paginated_rows()`가 다음 조건으로 종료를 판단했습니다:
+
+```python
+if resp_cont_yn != "Y" or not resp_next_key:
+    return rows
+```
+
+이 조건은 `cont-yn=Y`인데 `next-key`가 비어있는 모순 상태(뒤에
+페이지가 더 있다는데 다음 페이지로 갈 방법이 없음)와, `cont-yn`이
+`"N"`도 `"Y"`도 아닌 값(빈 문자열 포함, 완결 여부를 서버가 명확히
+알려주지 않은 상태)까지 전부 "정상 종료"로 오판했습니다. 1P0.8-D가
+이 결과로 PSM lifecycle을 복구하기 시작하면 "주문이 없다"가 아니라
+"뒤 페이지를 확인할 방법을 잃었다"인 상황을 완결된 결과로 쓰게 될
+위험이 있었습니다.
+
+### 문제 2 — 응답 배열 형식을 방어하지 않음
+`page_rows = api_response.body.get(response_key, [])`가 `oso`/`cntr`
+필드가 예상과 다른 형태(예: `{}`처럼 list가 아니거나, 리스트 안에
+dict가 아닌 원소가 섞인 경우)로 와도 `isinstance(page_rows, list)`
+검사만 통과하면 조용히 빈 리스트나 부분 데이터로 흘려보냈습니다.
+
+### 수정
+`_fetch_paginated_rows()`를 명시적 상태 기계로 다시 짰습니다 —
+**`cont-yn == "N"`일 때만 정상 종료**하고, 그 외(`Y`인데 next-key
+없음, 알 수 없는 값)는 전부 `KiwoomPaginationIncompleteError`로
+fail-close합니다. 응답 배열도 `response_key`가 `list`가 아니거나
+내부에 `dict`가 아닌 원소가 섞여 있으면 같은 예외로 fail-close합니다.
+새 예외 클래스를 추가하지 않고, 기존 `KiwoomPaginationIncompleteError`
+의 의미를 "주문조회 결과의 완결성을 보장할 수 없음"으로 넓혀
+재사용했습니다(docstring도 갱신). 최종 상태 규칙:
+
+```
+cont-yn = N              → 정상 종료
+cont-yn = Y + next-key 있음  → 다음 페이지로 계속
+cont-yn = Y + next-key 없음  → fail-close
+cont-yn 이 그 외 값(빈 문자열 포함) → fail-close
+oso/cntr 이 list가 아님        → fail-close
+oso/cntr 내부에 dict 아닌 원소  → fail-close
+page cap 초과              → fail-close (기존 그대로)
+```
+
+### 테스트 (`test_broker_order_query_pagination.py`, 16건 → **22건**)
+`cont-yn=Y`+`next-key=""` → 예외, `cont-yn=""` → 예외, `cont-yn="X"`
+(알 수 없는 값) → 예외, `oso={}`(list 아님) → 예외, `cntr` 내부에
+dict 아닌 원소 섞임 → 예외(6절, 신규 5건) + 기존 정상 프로토콜
+(`N` 종료 / `Y`+next-key로 계속)이 회귀 없이 그대로 동작하는지
+재확인(1건). 기존 테스트가 사용하던 `test_broker_read_only_wiring.py`
+의 단일 페이지 fake response들은 실제로는 항상 `cont-yn` 헤더를
+명시하는 실제 API 응답 형태를 반영해, 헤더 미지정 시 기본값을
+`{"cont-yn": "N", "next-key": ""}`로 바꿨습니다(이전엔 빈 `{}`라
+이번 강화로 "알 수 없는 cont-yn"이 되어 깨졌던 것을 실제 응답
+형태에 맞게 수정 — 기존 32건 전부 재통과).
+
+전체 회귀 23개 파일 중 22개 통과(`test_replay_time_axis.py`만 기존
+무관 실패), `compileall` 정상.
+
+### 결론
+**1P0.8-C.1은 이 closure로 완전히 종료됩니다.** 더 이상 C를
+늘리지 않고, 다음 세션에서 곧바로 1P0.8-D 범위를 좁게 확정하는
+것으로 넘어갑니다. 민우님이 제시한 D 첫 단계 원칙을 그대로
+따릅니다:
+
+```
+SELL_PENDING / BUY_PENDING / orphan
+        ↓
+get_order_status()
+        ↓
+FILLED  → 관측/안전한 reconcile
+OPEN    → 기존 pending 유지
+UNKNOWN → 아무것도 해제하지 않음
+조회 자체 예외(KiwoomPaginationIncompleteError 포함)
+        → 아무것도 해제하지 않음
+```
+
+**UNKNOWN이나 pagination 오류를 근거로 pending/orphan을 자동
+해제하는 기능은 D.1에 절대 넣지 않는다** — 이번 라운드에서 만든
+protocol fail-close가 바로 그 안전장치의 기반이다.
+
+---
