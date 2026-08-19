@@ -24,8 +24,8 @@ from config.settings import Settings
 from domain.market_regime.classifier import MarketRegimeClassifier
 from domain.market_regime.minute_analyzer import MinuteAnalyzer, MinuteAnalysis, MinuteDataResult
 from domain.market_regime.session_metrics import merge_session_bars, build_session_metrics, format_session_metrics_log_line
-from domain.models import AccountBalance, MarketRegime, OrderRequest, OrderResult, OrderSide, Signal, SignalType
-from domain.position.lifecycle import PositionLifecycle, PositionStateMachine
+from domain.models import AccountBalance, BrokerOrderStatus, MarketRegime, OrderRequest, OrderResult, OrderSide, Signal, SignalType
+from domain.position.lifecycle import PositionLifecycle, PositionStateMachine, is_trackable_order_id
 from domain.risk.risk_manager import RiskManager
 from domain.strategy.strategy_router import StrategyRouter
 from domain.strategy.entry_quality_shadow import evaluate_vwap_shadow
@@ -219,6 +219,10 @@ class TradingService:
         self._pending_sell_side_effects: dict[str, dict] = {}
         # 1P0.7.2: BUY accepted~첫 실체결 확인 사이 대기 중인 side-effect 컨텍스트
         self._pending_buy_side_effects: dict[str, dict] = {}
+        # 2026-08-18 (1P0.8-D.1): 종목별 마지막 order status(get_order_status())
+        # 조회 시각 — 조회 빈도 제한용(429 재발 방지). 아래
+        # _reconcile_tracked_order_status() docstring 참고.
+        self._last_order_status_query_at: dict[str, datetime] = {}
 
         # 일일 리포트 생성기
         self._reporter = DailyReporter(
@@ -2009,6 +2013,18 @@ class TradingService:
         # (targets에서 빠졌어도 이전에 보유했던 종목은 계속 추적해야 함)
         symbols_to_check = set(self.targets) | set(psm._states.keys()) | set(broker_qty_by_symbol.keys())
 
+        # 2026-08-19 (1P0.8-D.1.1, 민우님 GPT 리뷰 반영): order-status
+        # 조회의 global query budget. 기존 종목별 30초 throttle
+        # (ORDER_STATUS_QUERY_MIN_INTERVAL_SEC)만으로는, 같은 폴링에
+        # BUY_PENDING/SELL_PENDING/orphan이 동시에 여러 종목 쌓이면
+        # (예: A/B/C 모두 조회 대상) get_order_status()가 종목 수만큼
+        # 거의 연속으로 호출될 수 있습니다 — 8/14 319400 사고가 API
+        # 호출 폭주 직후 kt10001 SELL까지 429를 맞은 사례였으므로,
+        # 종목별 throttle과 별개로 "이번 폴링 전체에서 order-status
+        # 조회는 최대 1건"이라는 상한을 둡니다. 자세한 사유는
+        # _select_order_status_query_target() docstring 참고.
+        _order_status_query_target = self._select_order_status_query_target(symbols_to_check)
+
         for symbol in symbols_to_check:
             broker_qty = broker_qty_by_symbol.get(symbol, 0)
             state = psm.get(symbol)
@@ -2049,6 +2065,30 @@ class TradingService:
             # 처음 FLAT이 됐고 대기 중인 컨텍스트가 있는 경우"에만
             # 한 곳에서 실행합니다(중복 실행 방지).
             _lifecycle_before_sync = state.lifecycle
+
+            # 2026-08-18 (1P0.8-D.1): 실제 order_id로 추적 가능한
+            # BUY_PENDING/SELL_PENDING/orphan에 한해 read-only order
+            # status를 교차 확인합니다. FILLED + 잔고 일치가 모두
+            # 확인됐을 때만 아래 공식 전이 메서드(confirm_buy_from_broker/
+            # on_sell_result/observe_for_orphan)를 이 시점에 앞당겨
+            # 호출합니다 — 그 결과로 state.lifecycle이 이미
+            # SELL_PENDING/BUY_PENDING을 벗어났다면, 바로 아래
+            # if/elif는 (현재 lifecycle 기준으로 분기하므로) 자연히
+            # 건너뛰어 중복 호출을 만들지 않습니다. 조회가 실패하거나
+            # OPEN/UNKNOWN이거나 잔고가 아직 안 맞으면 아무것도
+            # 바꾸지 않고, 기존 잔고 기반 흐름(아래 if/elif)이 지금까지와
+            # 동일하게 그대로 진행됩니다 — 즉 이 조회는 기존 흐름을
+            # 대체하지 않고 "확실할 때만 더 일찍 확정"하는 보강일
+            # 뿐입니다. 자세한 사유는 _reconcile_tracked_order_status()
+            # docstring 참고.
+            # 2026-08-19 (1P0.8-D.1.1): 이번 폴링의 global query budget
+            # (위에서 미리 뽑아 둔 단 하나의 대상)에 해당할 때만 호출.
+            # 나머지 종목은 이번 폴링에서 조회를 건너뛰고 다음 폴링에서
+            # 다시 후보가 됩니다 — 기존 잔고 기반 if/elif는 아래에서
+            # 그대로 진행되므로 상태 자체가 멈추는 것은 아닙니다.
+            if symbol == _order_status_query_target:
+                self._reconcile_tracked_order_status(symbol, broker_qty)
+
             if state.lifecycle == PositionLifecycle.SELL_PENDING:
                 # 매도 요청 다음 폴링 — 브로커 잔고를 다시 조회해 실제로
                 # 전량/부분/미체결인지 판정 (on_sell_result 내부 로직)
@@ -2114,6 +2154,286 @@ class TradingService:
                     f"[POSITION_STATE_ERROR][SHADOW] {symbol} | "
                     f"{psm.get(symbol).last_error} | broker_qty={broker_qty} — "
                     f"실제 계좌 상태를 확인하세요"
+                )
+
+    # 2026-08-18 (1P0.8-D.1): 조회 빈도 제한 상수.
+    # - ORDER_STATUS_QUERY_MIN_PENDING_AGE_SEC: 방금 시작된 BUY_PENDING/
+    #   SELL_PENDING은 기존 잔고 기반 확인이 이미 대부분 빠르게(보통
+    #   폴링 1~2회 이내) 처리합니다. 여기서 굳이 order status까지
+    #   조회할 필요는 없어, pending_since 경과가 이 값 미만이면 조회
+    #   자체를 하지 않습니다. SELL_PENDING_TIMEOUT_SEC(60s)의 절반,
+    #   BUY_PENDING_TIMEOUT_SEC(120s)의 1/4 정도로 잡아 "정말 오래
+    #   걸리는" 케이스만 조회 대상이 되도록 합니다. orphan은 이미
+    #   타임아웃을 넘겨 전이된 상태이므로 이 나이 제한을 적용하지
+    #   않습니다(항상 조회 대상).
+    # - ORDER_STATUS_QUERY_MIN_INTERVAL_SEC: 조회 대상이 된 뒤에도 매
+    #   폴링(보통 10초)마다 재조회하지 않고, 종목당 이 간격으로만
+    #   조회합니다 — 429 재발 방지가 최우선 원칙이므로 보수적으로 둡니다.
+    ORDER_STATUS_QUERY_MIN_PENDING_AGE_SEC = 30
+    ORDER_STATUS_QUERY_MIN_INTERVAL_SEC = 30
+
+    def _select_order_status_query_target(self, symbols) -> str | None:
+        """1P0.8-D.1.1: order-status 조회의 global query budget.
+
+        민우님 GPT 리뷰(2026-08-19, D.1 커밋 승인과 함께 전달)의
+        핵심 지적: `ORDER_STATUS_QUERY_MIN_INTERVAL_SEC`(종목별 30초
+        throttle)만으로는 **동일한 폴링에서 여러 종목이 동시에 조회
+        대상**이 되는 경우를 막지 못합니다 — 예를 들어 BUY_PENDING/
+        SELL_PENDING/orphan이 A/B/C 세 종목에서 동시에 발생하면,
+        `_sync_position_state_machine_shadow()`의 한 폴링 루프
+        안에서 `get_order_status()`(ka10075+ka10076 조합)가 세 번
+        거의 연속으로 호출될 수 있습니다. 8/14 319400 사고가 API
+        호출 폭주 직후 `kt10001` SELL까지 HTTP 429를 맞은 사례였던
+        만큼, "폴링 1회당 order-status 조회는 최대 1건"이라는 상한을
+        종목별 throttle과 별개로 둡니다.
+
+        선정 규칙: 이번 폴링에서 실제로 조회 자격이 있는(즉
+        `_reconcile_tracked_order_status()`가 조회를 시도했을) 후보
+        전체 중, **가장 오래 대기 중인 것 하나만** 고릅니다 —
+        BUY_PENDING/SELL_PENDING은 `pending_since`, orphan은
+        `orphan_since` 기준으로 가장 오래된 것을 우선합니다. 자격
+        판정(`is_trackable_order_id()`, 나이 게이트, 종목별 최소
+        조회 간격)은 `_reconcile_tracked_order_status()`와 동일한
+        규칙을 그대로 따라 하며(단, 실제로 상태를 바꾸지는 않고
+        "이번 폴링에 조회해도 되는가"만 판정), 최종적으로 고른 대상만
+        호출부(`_sync_position_state_machine_shadow()`)에서
+        `_reconcile_tracked_order_status()`를 실제로 호출합니다.
+        선택되지 못한 나머지 후보는 이번 폴링에서 조용히 건너뛰고
+        다음 폴링에서 다시 후보가 됩니다 — pending/orphan 상태
+        자체는 계속 유지되고(D.1의 기존 잔고 기반 흐름은 아래에서
+        평소와 동일하게 그대로 진행), 단지 order-status "확인"만
+        한 폴링 늦춰질 뿐입니다.
+
+        후보가 전혀 없으면 `None`을 반환하고, 이번 폴링에서는
+        `get_order_status()`가 한 번도 호출되지 않습니다.
+        """
+        psm = self._position_state_machine
+        now = datetime.now()
+        best_symbol: str | None = None
+        best_since: datetime | None = None
+
+        for symbol in symbols:
+            state = psm.get(symbol)
+            lifecycle = state.lifecycle
+
+            order_id: str | None = None
+            since: datetime | None = None
+            if lifecycle in (PositionLifecycle.BUY_PENDING, PositionLifecycle.SELL_PENDING):
+                order_id = state.pending_order_id
+                # _reconcile_tracked_order_status()와 동일한 나이 게이트.
+                age_sec = (
+                    (now - state.pending_since).total_seconds()
+                    if state.pending_since else 0.0
+                )
+                if age_sec < self.ORDER_STATUS_QUERY_MIN_PENDING_AGE_SEC:
+                    continue
+                since = state.pending_since or now
+            elif psm.has_orphan_order(symbol):
+                order_id = state.orphan_order_id
+                since = state.orphan_since or now
+            else:
+                continue
+
+            if not is_trackable_order_id(order_id):
+                continue
+
+            last_at = self._last_order_status_query_at.get(symbol)
+            if last_at is not None and (
+                (now - last_at).total_seconds() < self.ORDER_STATUS_QUERY_MIN_INTERVAL_SEC
+            ):
+                continue
+
+            if best_since is None or since < best_since:
+                best_since = since
+                best_symbol = symbol
+
+        return best_symbol
+
+    def _reconcile_tracked_order_status(self, symbol: str, broker_qty: int) -> None:
+        """1P0.8-D.1: Tracked Order Reconciliation (read-only).
+
+        2026-08-19 (1P0.8-D.1.1): 이 메서드 자체는 여러 종목에 대해
+        반복 호출돼도 안전하지만(각자 독립적으로 자격을 재판정함),
+        실제 운영 호출부(`_sync_position_state_machine_shadow()`)는
+        `_select_order_status_query_target()`이 이번 폴링에서 고른
+        단 하나의 종목에 대해서만 이 메서드를 호출합니다 — 폴링 1회당
+        `get_order_status()` 호출을 최대 1건으로 제한하는 global
+        query budget입니다(종목별 30초 throttle과는 별개 상한). 이
+        메서드 자체의 동작(조회 대상 판정, 결과별 행동)은 D.1과
+        동일하게 무변경입니다 — 이 docstring이 설명하는 아래 내용은
+        여전히 유효합니다.
+
+        조회 대상은 오직 실제 추적 가능한 order_id가 있는 세 경우로
+        한정합니다 — BUY_PENDING + 실제 pending_order_id, SELL_PENDING +
+        실제 pending_order_id, orphan_order_id 존재 + 실제 order_id.
+        `None`/빈 문자열/`"pending"`/`"UNKNOWN_ORDER_ID"`,
+        `ERROR(ambiguous placement)`, 일반 OPEN/FLAT은 전부 제외합니다
+        (`is_trackable_order_id()`가 sentinel/placeholder를 걸러내고,
+        ERROR/OPEN/FLAT은 이 메서드 자체가 애초에 조회 대상으로 선택하지
+        않습니다 — 아래 분기 참고).
+
+        조회 결과별 행동(민우님 확정):
+        - `BrokerOrderStatus.OPEN`: 주문이 아직 살아있다는 증거일 뿐 —
+          상태 변경/자동 재주문/자동 orphan 해제 전부 하지 않습니다.
+        - `BrokerOrderStatus.UNKNOWN`: 아무것도 확정할 수 없습니다 —
+          상태 변경/pending 해제/orphan 해제/재주문 전부 하지 않습니다.
+        - 조회 자체가 예외(`KiwoomPaginationIncompleteError`/HTTP/
+          transport 오류 등 무엇이든)를 던져도 동일합니다 — 기존
+          lifecycle을 그대로 두고 로그만 남깁니다.
+        - `BrokerOrderStatus.FILLED`: 이것만으로는 확정하지 않습니다.
+          **계좌 잔고(이번 폴링에서 이미 조회된 broker_qty)와 동시에
+          일치해야만** 기존 공식 전이 메서드를 호출합니다 — BUY는
+          `broker_qty == expected_final_quantity`일 때만
+          `confirm_buy_from_broker()`, SELL은 `broker_qty == 0`일
+          때만 `on_sell_result(accepted=True, broker_quantity=0)`,
+          orphan은 목표(SELL은 0, BUY는 expected_final_quantity)에
+          정확히 일치할 때만 `observe_for_orphan()` — 전부 기존에
+          이미 검증된 메서드를 그대로 재사용합니다(새 전이 로직을
+          만들지 않음). 일치하지 않으면 `ORDER_STATUS_BALANCE_MISMATCH`
+          로그만 남기고 아무것도 바꾸지 않습니다 — 잔고 API 반영
+          지연일 수 있기 때문입니다. `BrokerOrder.filled_quantity`로
+          `known_quantity`를 직접 덮어쓰지 않습니다 — 포지션의 실제
+          수량은 계속 계좌 잔고 API가 source of truth입니다.
+
+        side-effect(`_apply_first_fill_buy_side_effects()`/
+        `_apply_deferred_sell_side_effects()`)는 이 메서드가 직접
+        호출하지 않습니다 — 이 메서드가 공식 전이 메서드를 호출해
+        lifecycle이 바뀌면, `_sync_position_state_machine_shadow()`의
+        기존 중앙화된 실행 지점(호출부 바로 아래, `_lifecycle_before_
+        sync` 비교 + `known_quantity > base_quantity_before_order`
+        비교)이 그 전이를 그대로 감지해 정확히 1회 실행합니다 — 이
+        메서드는 PSM을 공식 전이 메서드로만 움직일 뿐입니다.
+
+        1P0.8-D.1에서 하지 않는 것: `ERROR(ambiguous placement)` 자동
+        복구, `"pending"`/`"UNKNOWN_ORDER_ID"` 조회, UNKNOWN → CANCELLED
+        추론, CANCELLED/REJECTED 상태 신설, 부분체결 추론, 자동 재주문,
+        cancel_order(), restart reconciliation, PSM state persistence,
+        BUY/SELL 전략 조건 변경, API priority scheduler.
+
+        forward fail-close: OPEN/UNKNOWN을 먼저 걸러낸 뒤에도
+        `status != FILLED`이면 무조건 return합니다(미지원 상태를
+        `[ORDER_STATUS_UNSUPPORTED]`로 로그만 남김) — 이후
+        `BrokerOrderStatus`에 PARTIALLY_FILLED/CANCELLED/REJECTED 등이
+        추가되어도 이 메서드가 그걸 FILLED처럼 처리하지 않도록 하는
+        안전장치입니다.
+        """
+        state = self._position_state_machine.get(symbol)
+        lifecycle = state.lifecycle
+
+        kind: str | None = None
+        order_id: str | None = None
+        if lifecycle == PositionLifecycle.BUY_PENDING:
+            kind = "BUY_PENDING"
+            order_id = state.pending_order_id
+            age_sec = (
+                (datetime.now() - state.pending_since).total_seconds()
+                if state.pending_since else 0.0
+            )
+            if age_sec < self.ORDER_STATUS_QUERY_MIN_PENDING_AGE_SEC:
+                return
+        elif lifecycle == PositionLifecycle.SELL_PENDING:
+            kind = "SELL_PENDING"
+            order_id = state.pending_order_id
+            age_sec = (
+                (datetime.now() - state.pending_since).total_seconds()
+                if state.pending_since else 0.0
+            )
+            if age_sec < self.ORDER_STATUS_QUERY_MIN_PENDING_AGE_SEC:
+                return
+        elif self._position_state_machine.has_orphan_order(symbol):
+            kind = "ORPHAN"
+            order_id = state.orphan_order_id
+        else:
+            return  # BUY_PENDING/SELL_PENDING/orphan 아님 — 추적 대상 아님
+            # (ERROR(ambiguous placement)/일반 OPEN/FLAT은 여기서 이미 제외됨)
+
+        if not is_trackable_order_id(order_id):
+            return  # 실제 브로커 주문번호가 아님 — 조회하지 않음(429 절약)
+
+        now = datetime.now()
+        last_at = self._last_order_status_query_at.get(symbol)
+        if last_at is not None and (
+            (now - last_at).total_seconds() < self.ORDER_STATUS_QUERY_MIN_INTERVAL_SEC
+        ):
+            return
+        self._last_order_status_query_at[symbol] = now
+
+        try:
+            broker_order = self.broker.get_order_status(order_id, symbol)
+        except Exception as exc:
+            self.app_logger.warning(
+                f"[ORDER_STATUS_QUERY_FAILED] {symbol} | kind={kind} | "
+                f"order_id={order_id} | {type(exc).__name__}: {exc} — "
+                f"기존 lifecycle 그대로 유지, 아무것도 해제하지 않음"
+            )
+            return
+
+        if broker_order.status == BrokerOrderStatus.OPEN:
+            return  # 살아있다는 증거일 뿐 — 상태 변경 없음
+        if broker_order.status == BrokerOrderStatus.UNKNOWN:
+            return  # 아무것도 확정할 수 없음 — 상태 변경 없음
+
+        # 2026-08-19 (1P0.8-D.1 커밋 전 보강, 민우님 GPT 리뷰 반영):
+        # 위 두 분기는 "OPEN/UNKNOWN이면 return"이지 "FILLED가 아니면
+        # return"이 아니었습니다 — 지금은 BrokerOrderStatus가
+        # OPEN/FILLED/UNKNOWN 셋뿐이라 동치이지만, 이후 실측으로
+        # PARTIALLY_FILLED/CANCELLED/REJECTED 등을 enum에 추가하면 이
+        # 주석에만 의존한 암묵적 동치가 깨져 이 코드가 새 상태를
+        # 아무 안전장치 없이 FILLED처럼(잔고 일치 시 confirm/orphan
+        # 해제까지) 처리해버릴 위험이 있습니다. 그런 미래 회귀를
+        # 막기 위해 "FILLED가 아니면 무조건 return"을 명시적으로
+        # 검사합니다(forward fail-close) — 주석이 아니라 코드로 막습니다.
+        if broker_order.status != BrokerOrderStatus.FILLED:
+            self.app_logger.warning(
+                f"[ORDER_STATUS_UNSUPPORTED] {symbol} | kind={kind} | "
+                f"order_id={order_id} | status={broker_order.status} — "
+                f"미지원 주문 상태이므로 lifecycle 유지"
+            )
+            return
+
+        # 여기부터만 broker_order.status == FILLED — 잔고와 동시에 일치할 때만 확정.
+        if kind == "BUY_PENDING":
+            expected = state.expected_final_quantity
+            if broker_qty == expected:
+                self._position_state_machine.confirm_buy_from_broker(symbol, broker_qty)
+            else:
+                self.app_logger.warning(
+                    f"[ORDER_STATUS_BALANCE_MISMATCH] {symbol} | kind=BUY_PENDING | "
+                    f"order_id={order_id} | order_status=FILLED | "
+                    f"broker_qty={broker_qty} | expected={expected} — "
+                    f"잔고 API 반영 지연일 수 있음, 상태 유지"
+                )
+        elif kind == "SELL_PENDING":
+            if broker_qty == 0:
+                self._position_state_machine.on_sell_result(
+                    symbol, accepted=True, broker_quantity=0)
+            else:
+                self.app_logger.warning(
+                    f"[ORDER_STATUS_BALANCE_MISMATCH] {symbol} | kind=SELL_PENDING | "
+                    f"order_id={order_id} | order_status=FILLED | "
+                    f"broker_qty={broker_qty} | expected=0 — "
+                    f"잔고 API 반영 지연일 수 있음, 상태 유지"
+                )
+        elif kind == "ORPHAN":
+            target = (0 if state.orphan_expected_delta < 0
+                      else state.expected_final_quantity)
+            matched = (
+                (state.orphan_expected_delta < 0 and broker_qty == 0)
+                or (state.orphan_expected_delta > 0
+                    and broker_qty == state.expected_final_quantity)
+            )
+            if matched:
+                note = self._position_state_machine.observe_for_orphan(symbol, broker_qty)
+                if note:
+                    self.app_logger.warning(
+                        f"[LIFECYCLE_ORPHAN][ORDER_STATUS_CONFIRMED] {symbol} | {note}"
+                    )
+            else:
+                self.app_logger.warning(
+                    f"[ORDER_STATUS_BALANCE_MISMATCH] {symbol} | kind=ORPHAN | "
+                    f"order_id={order_id} | order_status=FILLED | "
+                    f"broker_qty={broker_qty} | target={target} — "
+                    f"잔고 API 반영 지연일 수 있음, orphan 유지"
                 )
 
     def _process_pending_ack_error_commands(self) -> None:

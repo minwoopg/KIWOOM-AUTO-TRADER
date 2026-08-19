@@ -70,6 +70,46 @@ class PositionLifecycle(str, Enum):
     ERROR = "ERROR"
 
 
+# 2026-08-18 (1P0.8-D.1): pending_order_id/orphan_order_id에 남아있는
+# "실제 브로커 주문번호가 아닌" placeholder/sentinel 값들. on_buy_requested()/
+# on_sell_requested()는 place_order() 호출 "전"에 이 리터럴을 먼저 기록하고
+# (아직 실제 번호를 모르므로), confirm_pending_order_id()는 accepted인데
+# 브로커가 order_id를 비워 반환하면 UNKNOWN_ORDER_ID_SENTINEL로 남깁니다.
+PENDING_ORDER_ID_PLACEHOLDER = "pending"
+UNKNOWN_ORDER_ID_SENTINEL = "UNKNOWN_ORDER_ID"
+
+
+def is_trackable_order_id(order_id: str | None) -> bool:
+    """이 order_id로 `Broker.get_order_status()`를 안전하게 호출할 수 있는가.
+
+    2026-08-18 (1P0.8-D.1, 민우님 확정 범위): order status 조회 대상은
+    "실제 추적 가능한 order_id가 있는" 세 경우(BUY_PENDING/SELL_PENDING/
+    orphan)로 한정합니다. 다음은 명시적으로 제외합니다 — 조회해봐야
+    의미 없는 API 호출만 늘어나고(429 재발 위험), 브로커가 이 값들을
+    실제 주문번호로 해석할 수 없어 잘못된 매칭으로 이어질 수도 있습니다.
+
+    - `None`/빈 문자열(공백만 있는 경우 포함)
+    - `PENDING_ORDER_ID_PLACEHOLDER`("pending") — place_order() 호출
+      *전*에 기록되는 placeholder. 이 값이 아직 남아있다는 것은
+      confirm_pending_order_id()가 호출되지 않았거나(비정상 흐름),
+      또는 이 주문이 `ERROR(ambiguous placement)`로 전이돼(응답
+      자체를 못 받아 order_id를 영영 모르는 상태) 실제 번호로 교체될
+      기회가 없었다는 뜻입니다. 이런 주문은 조회할 방법 자체가
+      없습니다 — 추측 매칭은 하지 않습니다(D.1에서 하지 않을 것).
+    - `UNKNOWN_ORDER_ID_SENTINEL`("UNKNOWN_ORDER_ID") — accepted인데
+      브로커 응답에 order_id가 없었던 경우. 역시 조회할 실제 번호가
+      없습니다.
+    """
+    if order_id is None:
+        return False
+    order_id = order_id.strip()
+    if not order_id:
+        return False
+    if order_id in (PENDING_ORDER_ID_PLACEHOLDER, UNKNOWN_ORDER_ID_SENTINEL):
+        return False
+    return True
+
+
 
 # ══════════════════════════════════════════════════════════════
 # 매도 결정 — 단일 진입점 (1P0.5)

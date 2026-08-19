@@ -8201,3 +8201,239 @@ UNKNOWN → 아무것도 해제하지 않음
 protocol fail-close가 바로 그 안전장치의 기반이다.
 
 ---
+
+## 1P0.8-D.1 (2026-08-18, Tracked Order Reconciliation — read-only)
+
+C.1 closure를 승인받은 뒤, 민우님이 범위를 정밀하게 좁혀 확정한
+D.1을 그대로 구현했습니다. C에서 만든 `get_order_status()`가 처음
+실제 lifecycle에 영향을 주는 라운드입니다.
+
+### 범위 (민우님 확정)
+조회 대상은 오직 실제 추적 가능한 order_id가 있는 세 경우로 한정:
+```
+1. BUY_PENDING  + 실제 pending_order_id
+2. SELL_PENDING + 실제 pending_order_id
+3. orphan_order_id 존재 + 실제 order_id
+```
+다음은 명시적으로 제외:
+```
+None / "" / "pending" / "UNKNOWN_ORDER_ID"
+ERROR(ambiguous placement)
+일반 OPEN
+일반 FLAT
+```
+`ERROR(ambiguous placement)`를 제외한 이유: timeout/connection
+오류로 `on_placement_ambiguous()`에 들어간 경우 실제 주문 응답을
+못 받아 `pending_order_id`가 대개 `"pending"` placeholder로 남아
+있습니다 — 조회할 실제 주문번호 자체가 없으므로, 조회를 시도해도
+의미 없는 API 호출만 늘고 429 위험만 커집니다.
+
+### 신설 — `is_trackable_order_id()` (`domain/position/lifecycle.py`)
+`None`/빈 문자열(공백만 포함)/`"pending"`(place_order() 호출 전
+placeholder)/`"UNKNOWN_ORDER_ID"`(accepted인데 브로커가 order_id를
+비워 반환했을 때의 sentinel)를 걸러내는 명시적 helper. 두 sentinel
+상수(`PENDING_ORDER_ID_PLACEHOLDER`, `UNKNOWN_ORDER_ID_SENTINEL`)도
+함께 신설.
+
+### 신설 — `TradingService._reconcile_tracked_order_status()`
+`_sync_position_state_machine_shadow()`의 폴링 루프 안, 기존
+`_lifecycle_before_sync` 캡처 직후·if/elif 분기 직전에 삽입했습니다.
+조회 결과별 행동은 전부 민우님이 확정한 그대로:
+- `OPEN`: 유지. 상태 변경/자동 재주문/자동 orphan 해제 전부 없음.
+- `UNKNOWN`: 유지. 아무것도 확정하지 않음.
+- 조회 자체가 예외(`KiwoomPaginationIncompleteError` 포함 무엇이든)
+  를 던져도 동일: 기존 lifecycle 그대로, 로그만 남기고 흡수(호출부로
+  전파하지 않음).
+- `FILLED`: 이것만으로 확정하지 않음. **계좌 잔고(이번 폴링에서 이미
+  조회된 broker_qty)와 동시에 일치해야만** 기존 공식 전이 메서드를
+  호출: BUY는 `broker_qty == expected_final_quantity`일 때만
+  `confirm_buy_from_broker()`, SELL은 `broker_qty == 0`일 때만
+  `on_sell_result(accepted=True, broker_quantity=0)`, orphan은
+  목표(SELL은 0, BUY는 expected_final_quantity)에 정확히 일치할
+  때만 `observe_for_orphan()` — 전부 기존에 이미 검증된 메서드를
+  그대로 재사용(새 전이 로직 없음). 불일치면
+  `ORDER_STATUS_BALANCE_MISMATCH` 로그만 남기고 유지 — 잔고 API
+  반영 지연일 수 있기 때문. `BrokerOrder.filled_quantity`로
+  `known_quantity`를 직접 덮어쓰지 않음 — 포지션의 실제 수량은
+  계속 계좌 잔고 API가 source of truth.
+
+이 메서드가 확정을 위해 공식 전이 메서드를 호출하면(예:
+`on_sell_result()`가 SELL_PENDING→FLAT으로 이미 전이), 바로 아래의
+기존 if/elif(`state.lifecycle == SELL_PENDING`/`BUY_PENDING`)는
+**현재 lifecycle 기준으로 분기하므로** 자연히 건너뛰어 중복 호출이
+생기지 않습니다 — 새 코드가 "확실할 때만 더 일찍 확정"하는 보강일
+뿐, 기존 잔고 기반 흐름을 대체하지 않습니다. 조회 실패/OPEN/
+UNKNOWN/잔고 불일치면 기존 if/elif가 지금까지와 동일하게 그대로
+진행되어 100% 하위호환됩니다.
+
+side-effect(`_apply_first_fill_buy_side_effects()`/
+`_apply_deferred_sell_side_effects()`)는 이 메서드가 직접 호출하지
+않습니다 — lifecycle이 바뀌면 `_sync_position_state_machine_shadow()`
+의 기존 중앙화된 실행 지점(`_lifecycle_before_sync` 비교 +
+`known_quantity > base_quantity_before_order` 비교)이 그 전이를
+그대로 감지해 정확히 1회 실행합니다. D.1은 PSM을 공식 전이 메서드로만
+움직일 뿐입니다.
+
+### API 호출량 제한 (429 재발 방지 우선)
+- `ORDER_STATUS_QUERY_MIN_PENDING_AGE_SEC = 30`: 방금 시작된
+  BUY_PENDING/SELL_PENDING은 기존 잔고 기반 확인이 이미 대부분
+  빠르게 처리하므로, `pending_since` 경과가 이 값 미만이면 조회
+  자체를 하지 않습니다. orphan은 이미 타임아웃을 넘겨 전이된
+  상태이므로 이 나이 제한을 적용하지 않습니다(항상 조회 대상).
+- `ORDER_STATUS_QUERY_MIN_INTERVAL_SEC = 30`: 조회 대상이 된 뒤에도
+  종목당 이 간격으로만 재조회합니다(`_last_order_status_query_at`
+  로 추적) — 매 폴링(보통 10초)마다 재조회하지 않습니다.
+
+### 1P0.8-D.1에서 하지 않은 것 (민우님 확정, 명시적 제외)
+`ERROR(ambiguous placement)` 자동복구, `"pending"`/
+`"UNKNOWN_ORDER_ID"` 조회, UNKNOWN → CANCELLED 추론,
+CANCELLED/REJECTED 상태 신설, 부분체결 추론, 자동 재주문,
+`cancel_order()`, restart reconciliation, PSM state persistence,
+BUY/SELL 전략 조건 변경, API priority scheduler.
+
+### 테스트 (`test_order_status_reconciliation.py`, 신규, 44건)
+민우님이 제시한 테스트 핵심표를 그대로 구현: BUY_PENDING/
+SELL_PENDING/orphan × OPEN/FILLED-일치/FILLED-불일치/UNKNOWN 조합,
+조회 예외(KiwoomPaginationIncompleteError 포함 임의 예외) 시 유지,
+`"pending"`/`"UNKNOWN_ORDER_ID"`는 `get_order_status()` 호출 자체가
+0회임을 확인, ERROR(ambiguous placement)는 추적 대상에서 완전히
+제외됨을 확인, 나이 게이트(방금 시작된 PENDING은 아직 조회 안 함,
+orphan은 즉시 대상)와 최소 조회 간격(재호출 억제 + 간격 경과 후
+재조회)을 각각 검증. 마지막 절은 `_sync_position_state_machine_shadow()`
+전체 폴링 경로를 실제로 돌려, order-status 확정이 기존 중앙화된
+side-effect 실행 지점을 통해 **정확히 1회만** 실행되고(재진입
+쿨다운 기록으로 확인) `get_order_status()` 중복 호출이 없음을
+통합적으로 확인.
+
+`test_partial_fill_lifecycle.py`(336건, PSM/BUY-SELL 판정 로직
+전부 무변경 확인) 재통과. 전체 회귀 24개 파일 중 23개 통과
+(`test_replay_time_axis.py`만 기존 무관 실패), `compileall` 정상.
+
+### 결론
+D.1로 처음으로 read-only 주문조회가 실제 PSM lifecycle에 안전하게
+연결됐습니다. UNKNOWN·조회 예외는 절대 pending/orphan을 자동
+해제하지 않는다는 안전장치(C.1 closure의 protocol fail-close 위에
+쌓음)가 그대로 지켜졌고, FILLED도 계좌 잔고와 동시에 일치할 때만
+확정한다는 이중 확인 원칙이 코드와 테스트 양쪽에 반영됐습니다.
+다음은 D.2 이후 범위(예: 부분체결 실측 확보 후 PARTIALLY_FILLED
+도입, API 우선순위 스케줄러, restart reconciliation, cancel_order)
+를 민우님과 다시 좁혀 확정할 차례입니다.
+
+---
+
+## 1P0.8-D.1 커밋 전 보강 (2026-08-19, GPT 리뷰 반영)
+
+민우님이 위 1P0.8-D.1 diff를 실제 코드까지 검토한 뒤 "핵심 설계는
+승인, 다만 커밋 전에 forward fail-close 하나만 추가하자"는 리뷰를
+전달했습니다. 코드 변경 없이 커밋해도 지금은 정확했지만(현재
+`BrokerOrderStatus`가 OPEN/FILLED/UNKNOWN 셋뿐이므로 "UNKNOWN이
+아니면 FILLED"라는 암묵적 동치가 우연히 성립), 이후 실측으로
+`PARTIALLY_FILLED`/`CANCELLED`/`REJECTED` 등을 enum에 추가하는 순간
+이 암묵적 동치가 깨져 `_reconcile_tracked_order_status()`가 새 상태를
+아무 안전장치 없이 FILLED처럼(잔고 일치 시 confirm/orphan 해제까지)
+처리해버릴 위험이 지적됐습니다.
+
+**변경 내용**:
+- `_reconcile_tracked_order_status()`(`domain/service/trading_service.py`)에서
+  기존 `OPEN → return` / `UNKNOWN → return` 두 분기 뒤에, FILLED 분기로
+  진입하기 직전에 `if broker_order.status != BrokerOrderStatus.FILLED: return`을
+  명시적으로 추가했습니다(그냥 `return`이 아니라
+  `[ORDER_STATUS_UNSUPPORTED]` 경고 로그를 남기고 return — 관측
+  가능성을 위해). 이제 "FILLED가 아니면 무조건 유지"가 주석이 아니라
+  코드로 강제됩니다 — enum이 나중에 확장돼도 이 메서드가 자동으로
+  위험해지지 않습니다.
+- OPEN/UNKNOWN 분기는 그대로 남겨뒀습니다 — 흔한 두 경우는 여전히
+  조용히(로그 없이) 유지되고, 새로 추가될 미지원 상태만 별도로 눈에
+  띄게 경고합니다.
+
+**테스트 보강** (`test_order_status_reconciliation.py`, 44건 → **56건**):
+- 신규 `_unsupported()` 헬퍼 — `BrokerOrder`가 `frozen=True`이지만
+  런타임 타입 강제는 없다는 점을 이용해, enum에 없는 문자열 status를
+  synthetic하게 주입.
+- 섹션 10 (3건): BUY_PENDING/SELL_PENDING/orphan 각각에서 "미지원
+  status + 잔고는 목표와 이미 일치"라는, 버그가 있었다면 잘못
+  확정됐을 최악의 조건을 구성 → 전부 기존 lifecycle 유지·조회 1회만
+  확인.
+- 섹션 11 (BUY 쪽 통합 테스트, 6건 신규): 기존 섹션 9(SELL 쪽)와
+  대칭으로, `_sync_position_state_machine_shadow()` 전체 폴링
+  경로에서 BUY_PENDING → order-status(FILLED) + 잔고(목표) 일치 →
+  OPEN 확정 → `_apply_first_fill_buy_side_effects()`가 중앙화된
+  지점에서 정확히 1회만 실행(entry_time 기록, entry_count 정확히
+  1회 증가, 다음 폴링에서 재실행 없음, get_order_status 중복 호출
+  없음)까지 확인. 기존엔 SELL 쪽만 전체 경로 통합 테스트가 있었는데
+  이제 BUY 쪽도 동일한 수준으로 커버됩니다.
+
+**회귀 검증**: `python3 -m compileall` 정상. 전체 회귀 24개 파일 중
+23개 통과(무관한 기존 `test_replay_time_axis.py` 실패만, HEAD와
+동일). `test_partial_fill_lifecycle.py` 336건 전부 무변경 재통과 —
+BUY/SELL 판단 로직은 이번에도 전혀 건드리지 않았습니다.
+
+**결론**: 이 보강까지 반영해 **1P0.8-D.1을 완전히 닫습니다**. 다음은
+민우님이 제안한 순서(D.1 운영 관측 → E.1 restart reconciliation →
+D.2 → API priority scheduler → 수익성 개선)를 따르며, 다음 라운드는
+**restart reconciliation(E.1)** 범위를 좁혀 확정하는 것부터
+시작합니다.
+
+## 1P0.8-D.1.1 (2026-08-19, order-status global query budget — 429 재발 방지 최소 안전장치)
+
+민우님이 D.1 커밋 승인과 함께, 운영 관점에서 남은 위험 하나를 지적했습니다.
+
+**문제**: `_reconcile_tracked_order_status()`의 `ORDER_STATUS_QUERY_MIN_INTERVAL_SEC`(30초)는
+종목별 throttle입니다. `_sync_position_state_machine_shadow()`는
+여러 종목을 한 폴링에서 연속 처리하므로, BUY_PENDING/SELL_PENDING/
+orphan이 동시에 여러 종목에서 발생하면(예: A/B/C) `get_order_status()`
+(ka10075+ka10076 조합)가 같은 폴링 안에서 종목 수만큼 거의 연속으로
+호출될 수 있습니다. 8/14 319400 사고가 API 호출 폭주 직후 `kt10001`
+SELL까지 HTTP 429를 맞은 사례였던 만큼, 종목별 throttle만으로는
+전체 호출 burst를 막지 못한다는 지적이었습니다.
+
+**해결**: 풀 API 우선순위 스케줄러(예정된 별도 라운드)를 만들기 전,
+아주 작은 운영 안전장치만 추가했습니다 — **폴링 1회당 order-status
+조회는 최대 1건**.
+
+- `TradingService._select_order_status_query_target(symbols)`(신규):
+  이번 폴링에서 실제로 조회 자격이 있는 후보(BUY_PENDING/SELL_PENDING
+  + 나이 게이트 통과 + 추적 가능한 order_id + 종목별 30초 interval
+  통과, 또는 동일 조건의 orphan) 중 **가장 오래 대기 중인 것 하나만**
+  선택합니다. BUY_PENDING/SELL_PENDING은 `pending_since`, orphan은
+  `orphan_since` 기준으로 비교합니다. 후보가 없으면 `None`.
+- `_sync_position_state_machine_shadow()`는 폴링 시작 시 이 대상을
+  한 번만 계산해 두고, 루프 안에서는 그 대상 종목에 대해서만
+  `_reconcile_tracked_order_status()`를 호출합니다. 선택되지 못한
+  나머지 후보는 이번 폴링에서 조용히 건너뛰고 다음 폴링에서 다시
+  후보가 됩니다 — pending/orphan 상태 자체는 그대로 유지되고, 기존
+  잔고 기반 if/elif/observe_for_orphan()은 평소와 동일하게 계속
+  진행되므로(D.1이 잔고 기반 흐름을 대체하지 않는다는 원칙 그대로),
+  "조회"만 한 폴링 늦춰질 뿐입니다.
+- `_reconcile_tracked_order_status()` 자체는 무변경입니다 — 여전히
+  단독으로 호출해도 안전하고(기존 44/56건 테스트 전부 그대로
+  유효), global budget은 오직 호출부(`_sync_position_state_machine_shadow()`)
+  에서만 강제됩니다.
+
+**테스트** (`test_order_status_reconciliation.py`, 56건 → **64건**):
+세 후보(대기시간 500/300/100초)를 만들어 `_select_order_status_query_target()`이
+가장 오래된 것을 정확히 고르는지, 그 종목이 방금 조회돼 종목별
+throttle에 걸리면 다음 선택은 두 번째로 오래된 것으로 넘어가는지,
+후보가 없으면 `None`을 반환하는지 확인. 마지막 절은 세 종목
+(BUY_PENDING 2개 + orphan 1개)이 동시에 후보인 상태로
+`_sync_position_state_machine_shadow()`를 실제로 한 번 돌려,
+`get_order_status()` 호출이 정확히 1건(가장 오래 대기 중인 종목)만
+발생하고 나머지 종목은 lifecycle이 그대로 유지됨을 통합 확인.
+
+**회귀**: `python3 -m compileall` 정상. 전체 회귀 24개 파일 중 23개
+통과(무관한 기존 `test_replay_time_axis.py` 실패만), `test_partial_fill_
+lifecycle.py` 336건 전부 무변경 재통과 — BUY/SELL 판단 로직은 여전히
+건드리지 않았습니다.
+
+**이번에 하지 않은 것**: 풀 API 우선순위 스케줄러(긴급 SELL > SELL >
+주문조회 > BUY > 시세/분석 순 전체 설계)는 여전히 별도 라운드로
+남겨둡니다 — 이번은 429 재발 방지를 위한 최소한의 운영 안전장치일
+뿐입니다. `trading_service.py`에 남아있는 "포지션 5단계 상태머신
+(shadow 모드), 아직 실제 매매 판정에는 쓰이지 않음" 같은 stale
+문서 정리도 이번 범위가 아닙니다 — 민우님 권고대로 E.1 착수 전
+문서 cleanup에 함께 정리할 예정입니다.
+
+**결론**: 1P0.8-D.1이 커밋된 뒤, D.1.1로 429 재발 방지 최소
+안전장치까지 마무리합니다. 다음은 D.1 운영 관측(`ORDER_STATUS_
+BALANCE_MISMATCH` 빈도 확인) 후 **1P0.8-E.1(restart reconciliation)**
+착수입니다.
