@@ -2206,6 +2206,15 @@ class TradingService:
 
         후보가 전혀 없으면 `None`을 반환하고, 이번 폴링에서는
         `get_order_status()`가 한 번도 호출되지 않습니다.
+
+        2026-08-19 (민우님 GPT 리뷰, 커밋 전 표현 정정): 이 budget이
+        제한하는 것은 폴링당 `get_order_status()` **논리적 호출
+        1건**입니다. `get_order_status()` 한 번 안에서도 ka10075/
+        ka10076 두 TR을 조회하고, pagination(cont-yn/next-key)이
+        걸리면 실제 HTTP 요청은 2회 이상 나갈 수 있습니다 — 즉 이
+        budget은 여러 종목의 order-status 조회가 한 폴링에 몰리는
+        burst를 크게 줄여 429 재발 위험을 낮추는 안전장치이지, 429를
+        구조적으로 완전히 막는 scheduler는 아닙니다.
         """
         psm = self._position_state_machine
         now = datetime.now()

@@ -8374,7 +8374,7 @@ D.2 → API priority scheduler → 수익성 개선)를 따르며, 다음 라운
 **restart reconciliation(E.1)** 범위를 좁혀 확정하는 것부터
 시작합니다.
 
-## 1P0.8-D.1.1 (2026-08-19, order-status global query budget — 429 재발 방지 최소 안전장치)
+## 1P0.8-D.1.1 (2026-08-19, order-status global query budget — 다종목 조회 burst 완화 최소 안전장치)
 
 민우님이 D.1 커밋 승인과 함께, 운영 관점에서 남은 위험 하나를 지적했습니다.
 
@@ -8410,6 +8410,16 @@ SELL까지 HTTP 429를 맞은 사례였던 만큼, 종목별 throttle만으로�
   유효), global budget은 오직 호출부(`_sync_position_state_machine_shadow()`)
   에서만 강제됩니다.
 
+**정확한 범위 — 논리적 호출 1건 제한이지 실제 HTTP 요청 1회 제한이
+아님**: 이 budget이 제한하는 것은 폴링당 `get_order_status()` **호출
+횟수**(1건)입니다. `get_order_status()` 한 번 안에서도 ka10075(미체결)/
+ka10076(체결) 두 TR을 순서대로 조회하고, `_fetch_paginated_rows()`의
+cont-yn/next-key 연속조회가 걸리면 실제 HTTP 요청은 2회 이상 나갈 수
+있습니다. 즉 이번 변경은 여러 종목의 order-status 조회가 한 폴링에
+한꺼번에 몰리는 **burst를 크게 줄이는 안전장치**이지, 429를 구조적으로
+완전히 막는 scheduler는 아닙니다 — 아래 "이번에 하지 않은 것"과 결론도
+이 표현으로 통일합니다.
+
 **테스트** (`test_order_status_reconciliation.py`, 56건 → **64건**):
 세 후보(대기시간 500/300/100초)를 만들어 `_select_order_status_query_target()`이
 가장 오래된 것을 정확히 고르는지, 그 종목이 방금 조회돼 종목별
@@ -8427,13 +8437,28 @@ lifecycle.py` 336건 전부 무변경 재통과 — BUY/SELL 판단 로직은 �
 
 **이번에 하지 않은 것**: 풀 API 우선순위 스케줄러(긴급 SELL > SELL >
 주문조회 > BUY > 시세/분석 순 전체 설계)는 여전히 별도 라운드로
-남겨둡니다 — 이번은 429 재발 방지를 위한 최소한의 운영 안전장치일
-뿐입니다. `trading_service.py`에 남아있는 "포지션 5단계 상태머신
-(shadow 모드), 아직 실제 매매 판정에는 쓰이지 않음" 같은 stale
-문서 정리도 이번 범위가 아닙니다 — 민우님 권고대로 E.1 착수 전
-문서 cleanup에 함께 정리할 예정입니다.
+남겨둡니다 — 이번은 order-status 다종목 조회 burst를 완화해 429
+재발 위험을 낮추는 최소한의 운영 안전장치일 뿐, 429를 구조적으로
+완전히 막지는 못합니다(위 "정확한 범위" 참고). `trading_service.py`에
+남아있는 "포지션 5단계 상태머신(shadow 모드), 아직 실제 매매 판정에는
+쓰이지 않음" 같은 stale 문서 정리도 이번 범위가 아닙니다 — 민우님
+권고대로 E.1 착수 전 문서 cleanup에 함께 정리할 예정입니다.
 
-**결론**: 1P0.8-D.1이 커밋된 뒤, D.1.1로 429 재발 방지 최소
-안전장치까지 마무리합니다. 다음은 D.1 운영 관측(`ORDER_STATUS_
-BALANCE_MISMATCH` 빈도 확인) 후 **1P0.8-E.1(restart reconciliation)**
-착수입니다.
+**결론**: 1P0.8-D.1이 커밋된 뒤, D.1.1로 order-status 다종목 조회
+burst 완화 최소 안전장치까지 마무리합니다. 다음은 D.1 운영 관측
+(`ORDER_STATUS_BALANCE_MISMATCH`/`ORDER_STATUS_QUERY_FAILED` 빈도
+확인 등, 1~2거래일) 후 **1P0.8-E.1(restart reconciliation)** 착수입니다.
+
+### 1P0.8-D.1.1 커밋 전 표현 정정 (2026-08-19, 민우님 GPT 리뷰 반영)
+
+민우님이 위 D.1.1 diff를 코드까지 검토한 뒤 "기능은 승인, 다만
+표현 하나만 정확히 해두자"는 리뷰를 전달했습니다: 이 global query
+budget은 폴링당 **논리적** `get_order_status()` 호출 1건 제한이지,
+실제 **HTTP 요청** 1회 제한이 아닙니다 — pagination이 걸리면 한 번의
+`get_order_status()` 호출 안에서도 HTTP 요청이 2회 이상 나갈 수
+있습니다. 따라서 "429 재발 방지"라고 단정하는 것보다 "order-status
+다종목 burst 완화 / 429 재발 위험 감소"로 표현하는 것이 더 정확하다는
+지적이었습니다. 기능 변경은 없고(코드 로직은 승인 그대로), 위 섹션의
+표현만 이 리뷰에 맞춰 정정했습니다 — 헤더, "정확한 범위" 문단(신규),
+"이번에 하지 않은 것", "결론" 네 곳. `test_order_status_reconciliation.py`
+64건은 순수 로직 무변경이라 그대로 유효합니다.
