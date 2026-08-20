@@ -8462,3 +8462,95 @@ budget은 폴링당 **논리적** `get_order_status()` 호출 1건 제한이지,
 표현만 이 리뷰에 맞춰 정정했습니다 — 헤더, "정확한 범위" 문단(신규),
 "이번에 하지 않은 것", "결론" 네 곳. `test_order_status_reconciliation.py`
 64건은 순수 로직 무변경이라 그대로 유효합니다.
+
+## 1P0.8-D.1/D.1.1 운영 관측 observability fix: daily bundle 로그 allowlist 갱신 (2026-08-20, 민우님 GPT 리뷰 지시, 매매 로직 무변경)
+
+### 문제 — D.1/D.1.1 로그가 export_daily_bundle.py의 allowlist에 없어서 daily bundle에서 전부 누락됨
+
+민우님이 D.1/D.1.1 승인과 함께 확정한 다음 순서는 **1~2거래일 운영
+관측**이었고, 확인할 로그 태그로 `[ORDER_STATUS_QUERY_FAILED]`/
+`[ORDER_STATUS_BALANCE_MISMATCH]`/`[ORDER_STATUS_UNSUPPORTED]`/
+`[LIFECYCLE_ORPHAN][ORDER_STATUS_CONFIRMED]`를 지목했습니다. 실제로
+민우님이 공유한 첫 실거래 번들(2026-08-20)을 분석하며
+`raw/app_analysis_20260820.log`를 이 네 태그로 grep했더니 전부
+0건이었습니다.
+
+**이 0건을 "오늘 이벤트가 없었다"로 해석하면 안 됩니다.**
+`export_daily_bundle.py`의 `LOG_TAGS`(1I.1, 2026-08-06 신설)는 D.1/
+D.1.1(2026-08-18/19 신설)보다 오래된 allowlist라 애초에 이 태그들을
+포함하지 않았습니다 — `raw/app_analysis_*.log`는 allowlist를 통과한
+줄만 남기는 필터링된 로그이므로, allowlist에 없는 태그는 실제
+발생 여부와 무관하게 항상 0건으로 나옵니다. 즉 이번 발견은 매매
+로직/lifecycle 판정 문제가 아니라 **관측 파이프라인 누락**이었습니다.
+
+### 수정 — LOG_TAGS에 5개 태그 추가(그 외 전부 무변경)
+
+`domain/service/trading_service.py`의
+`_reconcile_tracked_order_status()`/`observe_for_orphan()` 호출
+경로에서 실제로 쓰이는 태그를 grep으로 확인한 뒤(2374/2397/2410/
+2421/2438/2442/2048행), `export_daily_bundle.py`의 `LOG_TAGS`에
+다음 5개를 추가했습니다:
+```
+[ORDER_STATUS_QUERY_FAILED]
+[ORDER_STATUS_BALANCE_MISMATCH]
+[ORDER_STATUS_UNSUPPORTED]
+[ORDER_STATUS_CONFIRMED]
+[LIFECYCLE_ORPHAN]
+```
+`[LIFECYCLE_ORPHAN]`은 D.1 전용 태그는 아니지만(1P0.7 orphan 로직
+때부터 존재), order-status 조회와 orphan 생성/해제가 시간상 어떻게
+연결되는지 보려면 함께 있어야 한다는 민우님 지적을 반영해 포함했습니다.
+`[LIFECYCLE_ORPHAN][ORDER_STATUS_CONFIRMED]`는 한 로그 줄에 두 태그가
+붙어 나오는 형태(`_reconcile_tracked_order_status()`의 ORPHAN 분기,
+2438행)라 `[LIFECYCLE_ORPHAN]`과 `[ORDER_STATUS_CONFIRMED]`를 각각
+allowlist에 넣으면(둘 다 substring 매칭) 자동으로 이 결합 줄도
+포함됩니다.
+
+이 5개 태그가 담는 로그 줄에는 `order_id`/`symbol`/수량(`broker_qty`
+등)만 있고, `SENSITIVE_KEYS`(계좌번호/토큰/appkey 등) 대상 필드는
+전혀 포함하지 않음을 확인했습니다(위 6곳 소스 직접 확인) — 마스킹
+정책과 충돌 없음.
+
+**범위 제한(민우님 지시 그대로 준수)**: `TradingService`/lifecycle/
+Broker 로직, BUY/SELL 판단, 주문조회 호출 빈도, 로그 생성 자체는
+전혀 건드리지 않았습니다. `export_daily_bundle.py`의 `LOG_TAGS`
+튜플 값 확장과 관련 주석/docstring, 그리고 아래 테스트만 변경했습니다.
+
+### 테스트 (`test_shadow_analysis.py`, 170건 → **170건**, 신규 8건 추가 + 기존 1건 조정)
+
+- **B-11 조정**: 기존 "allowlist에 잔고/인증 관련 태그가 없어야 함"
+  가드가 `[ORDER_STATUS_BALANCE_MISMATCH]`의 `BALANCE` substring과
+  충돌해 그대로 두면 깨짐 — 이 태그는 원본 잔고 값이 아니라
+  "수량 불일치가 감지됐다"는 이벤트 플래그일 뿐이므로(SENSITIVE_KEYS
+  필드 없음, 위에서 확인) 가드에서 이 태그만 명시적으로 제외하고
+  나머지 가드는 그대로 유지.
+- **B-14** (신규): 5개 태그가 `LOG_TAGS`에 전부 존재하는지 확인.
+- **B-15~B-19** (신규): 실제 `slice_log()` 경로(`_run_export()`)를
+  태워, 5개 태그가 붙은 샘플 로그 6줄(단독 `[ORDER_STATUS_QUERY_FAILED]`/
+  `[ORDER_STATUS_BALANCE_MISMATCH]`/`[ORDER_STATUS_UNSUPPORTED]`/
+  결합 `[LIFECYCLE_ORPHAN][ORDER_STATUS_CONFIRMED]`/단독
+  `[LIFECYCLE_ORPHAN]`)이 실제로 번들 로그 파일(`raw/app_analysis_*.log`)에
+  담기는지 확인 — allowlist 튜플에 있는 것과 실제 추출 동작은 다른
+  문제이므로 반드시 end-to-end로 검증.
+- **B-20**: 기존 `[COND_STATUS]` 같은 이전 태그도 이번 변경과
+  무관하게 여전히 정상 추출되는지 회귀 확인.
+- **B-21**: 새 태그를 추가해도 추출 줄 수가 정확히 입력 그대로(6줄)인지
+  — 누락도 중복도 없는지 확인.
+
+전체 170건 통과. `test_order_status_reconciliation.py`(64건)/
+`test_partial_fill_lifecycle.py`(336건)는 이 변경과 무관하므로
+재검증 없이도 영향 없음(이번 diff에 포함하지 않음) — 실제로도
+`export_daily_bundle.py`/`test_shadow_analysis.py`만 수정했습니다.
+전체 회귀 24개 파일 중 23개 통과(기존 무관 `test_replay_time_axis.py`
+실패만), `python3 -m compileall .` 정상.
+
+### 다음 단계 — 8/20 bundle 재생성
+
+민우님 로컬에 8/20 원본 `logs/app.log`(및 회전된 `app.log.N`)가
+아직 남아있다면, 이 수정을 적용한 뒤 `python export_daily_bundle.py
+2026-08-20`을 다시 실행해 8/20 bundle을 재생성할 수 있습니다 —
+재생성한 bundle을 전달해 주시면 오늘 실제로 있었던 005935/005690
+부분체결·orphan 상황에서 D.1이 어떤 order-status 응답을 봤는지까지
+포함해 운영 관측 분석을 다시 진행합니다. 원본 로그가 이미 로테이션
+되어 없어졌다면, 로컬 `app.log`에서 직접 grep한 결과를 대안으로
+받아 분석하겠습니다.

@@ -27,6 +27,16 @@
    shadow-실매수 연결률 등을 collection_quality.txt로 기록.
 6) **원자적 ZIP 생성 + 동시 실행 보호** — 고유 임시 디렉터리,
    .tmp 작성 후 무결성 확인, os.replace로 교체, 락 파일.
+
+2026-08-20 observability-only fix
+----------------------------------
+LOG_TAGS allowlist에 1P0.8-D.1/D.1.1의 order-status reconciliation
+로그 태그 5종을 추가(`[ORDER_STATUS_QUERY_FAILED]`,
+`[ORDER_STATUS_BALANCE_MISMATCH]`, `[ORDER_STATUS_UNSUPPORTED]`,
+`[ORDER_STATUS_CONFIRMED]`, `[LIFECYCLE_ORPHAN]`) — allowlist가
+D.1/D.1.1(8/18~19 신설)보다 오래돼서 운영 관측에 필요한 로그가
+계속 걸러지고 있었음(8/20 bundle 분석 중 발견). 매매 로직·조회
+호출·로그 생성 자체는 무변경, LOG_TAGS 튜플만 확장.
 """
 from __future__ import annotations
 
@@ -65,10 +75,26 @@ CSV_SOURCES: list[tuple[str, tuple[str, ...]]] = [
 # allowlist에 없는 인증·계좌·주문응답 로그가 WARNING이라는 이유로
 # 번들에 실릴 수 있었기 때문. 1F에서 스윙을 폐기했으므로
 # [COND_SWING]도 제거.
+#
+# 2026-08-20 (observability-only fix, 민우님 GPT 리뷰 반영):
+# 1P0.8-D.1(2026-08-18)/D.1.1(2026-08-19)이 새로 남기는 order-status
+# reconciliation 로그 태그가 이 allowlist 신설 당시(1I.1, 2026-08-06)
+# 존재하지 않았던 태그라 계속 누락되고 있었음 — D.1/D.1.1 운영 관측
+# 1~2거래일을 하기로 확정했는데 정작 관련 로그가 daily bundle에서
+# 전부 걸러지고 있었던 것(8/20 bundle 분석 중 발견, 0건으로 나온 건
+# "이벤트가 없었다"가 아니라 "번들이 안 담았다"는 뜻이었음). 아래
+# 5개 태그를 추가 — 전부 domain/service/trading_service.py의
+# _reconcile_tracked_order_status()/observe_for_orphan() 경로에서만
+# 쓰이고, order_id/symbol/수량(broker_qty 등)만 포함할 뿐 SENSITIVE_KEYS
+# 대상 필드(계좌번호/토큰 등)는 담지 않음 — 매매 로직/조회 호출/로그
+# 생성 자체는 전혀 건드리지 않은 **수집 대상 확장만**.
 LOG_TAGS: tuple[str, ...] = (
     "[COND_STATUS]", "[COND_TRUNCATE]", "[COND]",
     "[WS]", "[SESSION_SHADOW]", "[EXPERIMENTAL]",
     "[REPORT]", "[ANALYSIS]", "[RECONCILE]", "[MIN_STALE]",
+    "[ORDER_STATUS_QUERY_FAILED]", "[ORDER_STATUS_BALANCE_MISMATCH]",
+    "[ORDER_STATUS_UNSUPPORTED]", "[ORDER_STATUS_CONFIRMED]",
+    "[LIFECYCLE_ORPHAN]",
 )
 
 # ── 민감정보 마스킹 ─────────────────────────────────────────────

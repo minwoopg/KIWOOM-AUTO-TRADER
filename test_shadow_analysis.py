@@ -254,12 +254,61 @@ check("B-9) mask()가 Bearer 토큰을 직접 가림",
       "SECRET_TOKEN_123" not in B.mask("authorization=Bearer SECRET_TOKEN_123"))
 check("B-10) mask()가 10자리 계좌번호를 가림",
       "1234567890" not in B.mask("account_no=1234567890"))
-check("B-11) allowlist에 인증·잔고 태그가 없음",
+check("B-11) allowlist에 인증·원본 잔고조회 태그가 없음",
+      # 2026-08-20: [ORDER_STATUS_BALANCE_MISMATCH]는 "잔고 수량이
+      # order-status 응답과 다르다"는 이벤트 플래그일 뿐(SENSITIVE_KEYS
+      # 대상 필드인 계좌번호/토큰은 안 담음) — 의도적으로 허용된
+      # 예외이므로 이 가드에서 제외하고 별도로 B-14에서 검증.
       not any(k in t.upper() for t in B.LOG_TAGS
+              if t != "[ORDER_STATUS_BALANCE_MISMATCH]"
               for k in ("TOKEN", "BALANCE", "AUTH", "ORDER_RESP")))
 check("B-12) 1F 폐기된 [COND_SWING]이 allowlist에서 제거됨",
       "[COND_SWING]" not in B.LOG_TAGS)
 check("B-13) [MIN_STALE]이 allowlist에 추가됨", "[MIN_STALE]" in B.LOG_TAGS)
+
+# 2026-08-20 (observability-only fix): 1P0.8-D.1/D.1.1의 order-status
+# reconciliation 로그가 allowlist 신설(1I.1, 8/6) 당시엔 존재하지
+# 않아 계속 daily bundle에서 누락되고 있었음 — 8/20 bundle 분석 중
+# 발견(4개 태그 전부 0건으로 나왔는데, 실제로는 "이벤트가 없었다"가
+# 아니라 "번들이 담지 않았다"였음). 아래 태그 5종을 추가.
+check("B-14) D.1/D.1.1 order-status 태그 5종이 allowlist에 모두 존재",
+      all(tag in B.LOG_TAGS for tag in (
+          "[ORDER_STATUS_QUERY_FAILED]", "[ORDER_STATUS_BALANCE_MISMATCH]",
+          "[ORDER_STATUS_UNSUPPORTED]", "[ORDER_STATUS_CONFIRMED]",
+          "[LIFECYCLE_ORPHAN]",
+      )))
+
+# 실제로 슬라이싱 경로를 태워서 이 5개 태그가 번들 로그 파일에
+# 그대로 담기는지(단순히 튜플에 있는 것과 실제 추출은 다른 문제)와,
+# 기존 태그([COND_STATUS] 등)가 여전히 정상 동작하는지 함께 검증.
+order_status_log_lines = [
+    "2026-08-06 09:01:01 | WARNING | [ORDER_STATUS_QUERY_FAILED] 005930 | kind=BUY_PENDING | order_id=0012345 | TimeoutError: timed out — 기존 lifecycle 그대로 유지",
+    "2026-08-06 09:01:02 | WARNING | [ORDER_STATUS_BALANCE_MISMATCH] 005930 | kind=BUY_PENDING | order_id=0012345 | order_status=FILLED | broker_qty=5 | expected=10 — 잔고 API 반영 지연일 수 있음",
+    "2026-08-06 09:01:03 | WARNING | [ORDER_STATUS_UNSUPPORTED] 005930 | kind=SELL_PENDING | order_id=0012345 | status=BrokerOrderStatus.OPEN — 미지원 주문 상태이므로 lifecycle 유지",
+    "2026-08-06 09:01:04 | WARNING | [LIFECYCLE_ORPHAN][ORDER_STATUS_CONFIRMED] 005930 | order=0012345 목표수량(10) 도달",
+    "2026-08-06 09:01:05 | WARNING | [LIFECYCLE_ORPHAN] 005930 해소 | orphan cleared",
+    "2026-08-06 09:01:06 | INFO | [COND_STATUS] seq1=1종목 | final=5종목",
+]
+root6 = Path(tempfile.mkdtemp())
+(root6 / "logs").mkdir(parents=True, exist_ok=True)
+(root6 / "logs" / "app.log").write_text("\n".join(order_status_log_lines) + "\n", encoding="utf-8")
+z6 = _run_export(root6, "2026-08-06")
+texts6 = _zip_texts(z6)
+applog6 = texts6["raw/app_analysis_20260806.log"]
+check("B-15) [ORDER_STATUS_QUERY_FAILED] 줄이 번들 로그에 포함됨",
+      "[ORDER_STATUS_QUERY_FAILED]" in applog6 and "005930" in applog6)
+check("B-16) [ORDER_STATUS_BALANCE_MISMATCH] 줄이 번들 로그에 포함됨",
+      "[ORDER_STATUS_BALANCE_MISMATCH]" in applog6 and "broker_qty=5" in applog6)
+check("B-17) [ORDER_STATUS_UNSUPPORTED] 줄이 번들 로그에 포함됨",
+      "[ORDER_STATUS_UNSUPPORTED]" in applog6)
+check("B-18) [LIFECYCLE_ORPHAN][ORDER_STATUS_CONFIRMED] 결합 태그 줄이 포함됨",
+      "[LIFECYCLE_ORPHAN][ORDER_STATUS_CONFIRMED]" in applog6)
+check("B-19) 단독 [LIFECYCLE_ORPHAN] 줄도 포함됨(D.1 이전부터 있던 태그)",
+      "[LIFECYCLE_ORPHAN] 005930 해소" in applog6)
+check("B-20) 기존 [COND_STATUS] 태그는 이번 변경과 무관하게 여전히 포함됨",
+      "[COND_STATUS]" in applog6)
+check("B-21) 새 태그 추가가 회귀 없이 정확히 6줄만 추출함(줄 누락/중복 없음)",
+      len([l for l in applog6.splitlines() if l.strip()]) == 6)
 
 
 # ── C. 중복 판정 ───────────────────────────────────────────────
