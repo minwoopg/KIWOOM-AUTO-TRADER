@@ -114,6 +114,13 @@ def build_minimal_settings(tmpdir: str) -> Settings:
             entry_watch_shadow_log_file=f"{tmpdir}/entry_watch_shadow.csv",
             position_lifecycle_log_file=f"{tmpdir}/position_lifecycle.csv",
             entry_quality_shadow_log_file=f"{tmpdir}/entry_quality_shadow.csv",
+            # 2026-08-20 (1P0.8-E.1-A): 위 세 필드와 동일한 이유로
+            # 반드시 tmpdir 기준 경로 명시 — 그렇지 않으면 StorageConfig
+            # 기본값("data/tracked_order_journal.json")이 그대로 쓰여서
+            # 이 헬퍼를 재사용하는 모든 테스트가 프로젝트 루트의 실제
+            # data/ 디렉터리에 journal 파일을 새게 됩니다(0.5단계에서
+            # 발견된 CSV 누출 사고와 동일한 클래스의 버그 재발 방지).
+            tracked_order_journal_file=f"{tmpdir}/tracked_order_journal.json",
         ),
         websocket=WebSocketConfig(
             enabled=False, url="", condition_seqs=[], max_symbols=10,

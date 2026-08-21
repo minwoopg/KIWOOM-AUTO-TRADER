@@ -719,8 +719,27 @@ class PositionStateMachine:
         """
         return bool(self.get(symbol).orphan_order_id)
 
-    def clear_orphan(self, symbol: str, note: str = "") -> None:
-        """orphan 주문이 해소됐다고 표시합니다."""
+    def clear_orphan(
+        self, symbol: str, note: str = "", *, terminal_quantity: int | None = None,
+    ) -> None:
+        """orphan 주문이 해소됐다고 표시합니다.
+
+        2026-08-21 (1P0.8-OBS.2-D, 8/21 실측 재현): 이벤트 로그의
+        broker_quantity 컬럼에는 원래 `state.known_quantity`(이 호출
+        시점의 stale 값 — 아직 `sync_from_broker()`가 최신 관측치로
+        갱신하기 전)를 그대로 찍었습니다. 그래서 `observe_for_orphan()`
+        이 "잔고 0 도달"을 직접 확인해 이 메서드를 부른 순간에도
+        ORPHAN_CLEARED 행에는 해소 직전의 잔여수량(예: 1051)이 남고,
+        바로 다음 SYNC 행에서야 0이 찍혀 혼란스러웠습니다(064260/
+        017670 실측). `terminal_quantity`를 명시하면 이 값을 그대로
+        broker_quantity 컬럼에 기록합니다 — 해제를 실제로 발생시킨
+        관측 terminal 수량(SELL orphan은 언제나 0, BUY orphan은
+        expected_final_quantity)입니다. `state.known_quantity` 자체는
+        건드리지 않습니다(PSM state 변경 아님 — `sync_from_broker()`가
+        평소처럼 갱신). 호출부에서 terminal_quantity를 명시하지 않으면
+        (예: acknowledge_orphan()처럼 "방금 관측된 값"이 따로 없는
+        경우) 기존과 동일하게 state.known_quantity를 씁니다.
+        """
         state = self.get(symbol)
         if not state.orphan_order_id:
             return
@@ -728,8 +747,11 @@ class PositionStateMachine:
         state.orphan_order_id = None
         state.orphan_since = None
         state.orphan_expected_delta = 0
+        logged_quantity = (
+            terminal_quantity if terminal_quantity is not None else state.known_quantity
+        )
         self._log_event(symbol, "ORPHAN_CLEARED", state.lifecycle, state.lifecycle,
-                        state.known_quantity, f"order={prev_id} {note}")
+                        logged_quantity, f"order={prev_id} {note}")
 
     def acknowledge_orphan(self, symbol: str, note: str) -> None:
         """사람이 브로커에서 원 주문 상태를 직접 확인한 뒤 해제합니다.
@@ -762,11 +784,13 @@ class PositionStateMachine:
             return None
         if state.orphan_expected_delta < 0 and broker_quantity == 0:
             note = "잔고 0 도달 (SELL orphan 완전 체결 확인)"
-            self.clear_orphan(symbol, note)
+            self.clear_orphan(symbol, note, terminal_quantity=0)
             return note
         if state.orphan_expected_delta > 0 and broker_quantity == state.expected_final_quantity:
             note = f"목표수량({state.expected_final_quantity}) 도달 (BUY orphan 완전 체결 확인)"
-            self.clear_orphan(symbol, note)
+            self.clear_orphan(
+                symbol, note, terminal_quantity=state.expected_final_quantity,
+            )
             return note
         if broker_quantity != state.known_quantity:
             self._log_event(

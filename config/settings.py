@@ -255,6 +255,12 @@ class StorageConfig:
     # — legacy BUY 후보에만 기록, signal_log.csv와 별도로 관리해
     # 53MB급 signal_log.csv를 더 이상 키우지 않음.
     entry_quality_shadow_log_file: str = "logs/entry_quality_shadow.csv"
+    # 1P0.8-E.1-A: durable tracked order journal (2026-08-20) — 실제
+    # order_id가 확보된 BUY/SELL accepted 주문의 사실을 재시작 후에도
+    # 잃지 않기 위한 원자적 JSON 저장소. state.json과 별개 파일(같은
+    # data/ 디렉터리 관례를 따름) — infra/storage/tracked_order_journal.py
+    # 참고. 이 라운드는 저장만 하고 startup 자동 복구는 하지 않음.
+    tracked_order_journal_file: str = "data/tracked_order_journal.json"
 
 
 @dataclass(frozen=True)

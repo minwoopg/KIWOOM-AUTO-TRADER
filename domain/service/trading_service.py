@@ -40,6 +40,9 @@ from infra.storage.skip_reason import classify_skip_reason, SkipReason
 from infra.notify.kakao_notifier import KakaoNotifier, build_notifier
 from domain.indicator.indicators import calc_atr, calc_bollinger, ATRResult, BollingerResult
 from infra.storage.state_store import JsonStateStore
+from infra.storage.tracked_order_journal import (
+    TrackedOrderJournalStore, TrackedOrderRecord, TrackedOrderJournalCorruptError,
+)
 from utils.time_utils import is_market_open, now_kst, parse_kst_bar_timestamp
 
 
@@ -60,6 +63,7 @@ class TradingService:
         entry_watch_shadow_logger: "EntryWatchShadowLogger | None" = None,
         position_lifecycle_logger: "PositionLifecycleLogger | None" = None,
         entry_quality_shadow_logger: "EntryQualityShadowLogger | None" = None,
+        tracked_order_journal: "TrackedOrderJournalStore | None" = None,
     ) -> None:
         self.settings = settings
         self.broker = broker
@@ -84,6 +88,15 @@ class TradingService:
         # 자체가 mode를 먼저 확인) 파일이 새로 만들어지지 않음.
         self.entry_quality_shadow_logger = entry_quality_shadow_logger or EntryQualityShadowLogger(
             settings.storage.entry_quality_shadow_log_file
+        )
+        # 2026-08-20 (1P0.8-E.1-A): 동일 패턴 — None이면 storage 설정에서
+        # 자동 생성. 생성 시점에는 파일을 전혀 읽지 않습니다(저장소
+        # 객체를 만들 뿐) — startup에 journal을 읽어 자동으로 뭔가
+        # 판단하는 로직은 이번 라운드에 의도적으로 넣지 않았습니다
+        # (E.1-B 범위). 손상된 journal 파일이 있어도 이 생성자 호출
+        # 자체는 절대 실패하지 않습니다.
+        self._tracked_order_journal = tracked_order_journal or TrackedOrderJournalStore(
+            settings.storage.tracked_order_journal_file
         )
 
         self.state, loaded_highest = self.state_store.load()
@@ -1825,9 +1838,10 @@ class TradingService:
 
         # 1) 급락 즉시 청산
         if pnl_pct <= ew.fail_cut_pct:
-            self._start_entry_watch_shadow_tracking(
-                symbol, position, avg, current_price, ew, "급락청산",
-            )
+            # 2026-08-21 (1P0.8-OBS.2-A): shadow 추적 시작 지점을
+            # _try_sell_unchecked 메서드의 accepted 분기로 옮겼습니다 —
+            # 이유는 아래 _start_entry_watch_shadow_tracking() docstring
+            # 참고. 여기서는 더 이상 호출하지 않습니다.
             return Signal(
                 type=SignalType.SELL,
                 reason=(
@@ -1862,9 +1876,6 @@ class TradingService:
                 self.state.vwap_break_streak_by_symbol[symbol] = streak
                 confirm_count = getattr(ew, "vwap_break_confirm_count", 1)
                 if streak >= confirm_count:
-                    self._start_entry_watch_shadow_tracking(
-                        symbol, position, avg, current_price, ew, "VWAP이탈청산",
-                    )
                     return Signal(
                         type=SignalType.SELL,
                         reason=(
@@ -1884,9 +1895,6 @@ class TradingService:
 
         # 3) watch_minutes 경과 시점에 최소수익 미달 청산
         if elapsed_min >= ew.watch_minutes and pnl_pct < ew.min_profit_pct:
-            self._start_entry_watch_shadow_tracking(
-                symbol, position, avg, current_price, ew, "최소수익미달청산",
-            )
             return Signal(
                 type=SignalType.SELL,
                 reason=(
@@ -1898,8 +1906,7 @@ class TradingService:
         return None
 
     def _start_entry_watch_shadow_tracking(
-        self, symbol: str, position, entry_price: int, trigger_price: int,
-        ew, trigger_type: str,
+        self, symbol: str, entry_price: int, trigger_price: int, trigger_type: str,
     ) -> None:
         """entry_watch가 청산한 종목의 counterfactual 추적을 시작합니다.
 
@@ -1907,6 +1914,30 @@ class TradingService:
         관찰해서 5/10/20분 체크포인트마다 기록합니다. 같은 종목이 이미
         추적 중이면(예: 짧은 시간 내 재진입 후 다시 청산) 기존 추적을
         덮어씁니다 — 가장 최근 개입의 효과를 보는 게 목적이므로.
+
+        2026-08-21 (1P0.8-OBS.2-A, 8/21 실측 재현): 이전에는
+        `_check_entry_watch()`가 SELL Signal을 만드는 시점(=판단
+        시점)에 바로 이 메서드를 불렀습니다. 문제는 accepted=True로
+        실제 주문이 접수된 뒤에도 balance API가 늦게 따라오는 동안
+        (SELL_PENDING/orphan) `position`이 여전히 non-None으로 보여
+        `_check_entry_watch()`가 매 폴링마다 다시 판단을 냈다는
+        것입니다(064260 8/21 실측: 10:49:43 VWAP 최초 접수 이후에도
+        10:49:59~10:52:35까지 판단이 반복됨). 그때마다 이 메서드가
+        다시 불려 최초 트리거(10:49:43 VWAP)가 나중 판단(10:52:35
+        최소수익미달)으로 덮어써졌습니다 — counterfactual 데이터가
+        실제 청산 시점을 기준으로 하지 않게 되는 오염이었습니다.
+
+        지금은 이 메서드를 `_try_sell_unchecked` 메서드의 accepted 분기
+        에서만 호출합니다(정규 SELL 판단·PSM 차단 로직은 무변경).
+        같은 종목에 대한 후속 SELL 시도는 `_try_sell()`의 단일 관문
+        (`decide_sell()`)이 SELL_PENDING/orphan 동안 HARD block으로
+        전부 막으므로, 이 메서드가 다시 불리는 시점은 항상 "그
+        직전의 pending/orphan이 완전히 풀리고 난 뒤의 새 접수"뿐입니다
+        — 별도의 lock 상태 없이도 "여기 도달 = 이 포지션의 최초
+        accepted 시점"이 그대로 성립합니다. 주문이 거부되거나
+        (accepted=False) 응답 자체가 불명확한 경우(is_ambiguous)는
+        애초에 이 메서드를 호출하는 분기에 들어오지 않으므로 잘못된
+        lock도 생기지 않습니다.
         """
         if entry_price <= 0:
             return
@@ -2155,6 +2186,100 @@ class TradingService:
                     f"{psm.get(symbol).last_error} | broker_qty={broker_qty} — "
                     f"실제 계좌 상태를 확인하세요"
                 )
+
+            # 2026-08-20 (1P0.8-E.1-A): 이번 폴링의 모든 lifecycle
+            # 변화가 끝난 뒤, 이 종목의 journal record를 최신 상태로
+            # 유지(orphaned_at/first_fill_at 갱신, 안전한 terminal
+            # 확정 시 삭제). 새 레코드를 만들지는 않음 — 생성은
+            # 오직 _create_tracked_order_journal_entry()(accepted
+            # 직후)에서만.
+            self._maintain_tracked_order_journal(symbol)
+
+    # ── 1P0.8-E.1-A: Durable Tracked Order Journal ──────────────────
+    # 아래 두 메서드가 이번 라운드의 전체 범위입니다 — journal에
+    # 쓰고, 갱신하고, 안전할 때만 지웁니다. journal을 읽어 자동으로
+    # lifecycle을 복구하는 로직은 여기 없습니다(E.1-B 범위, 아직
+    # 미승인). journal I/O 실패는 절대 매매 로직을 막지 않습니다 —
+    # 항상 CRITICAL 로그만 남기고 계속 진행합니다.
+
+    def _create_tracked_order_journal_entry(self, symbol: str, side: str) -> None:
+        """accepted + 실제 order_id 확정 직후 호출됩니다(BUY는 _try_buy,
+        SELL은 매도 접수 처리 메서드 안에서). `state.pending_order_id`가 추적
+        불가능한 값(빈 값/"pending"/"UNKNOWN_ORDER_ID")이면 아무 것도
+        쓰지 않습니다 — 조회할 방법이 없는 order_id를 journal에 남기지
+        않기 위함(is_trackable_order_id()가 이미 D.1에서 같은 기준으로
+        검증된 판정 함수).
+        """
+        state = self._position_state_machine.get(symbol)
+        order_id = state.pending_order_id
+        if not is_trackable_order_id(order_id):
+            return
+        try:
+            record = TrackedOrderRecord(
+                symbol=symbol,
+                side=side,
+                order_id=str(order_id).strip(),
+                base_quantity_before_order=state.base_quantity_before_order,
+                target_quantity_after_order=(
+                    # D.1의 _reconcile_tracked_order_status()와 동일한
+                    # "expected" 정의를 그대로 재사용합니다: BUY는
+                    # expected_final_quantity, SELL은 항상 0(이 시스템은
+                    # 전량매도만 함) — 두 곳이 서로 다른 "기대 수량"
+                    # 정의를 쓰면 혼란스러워집니다.
+                    state.expected_final_quantity if side == "BUY" else 0
+                ),
+                accepted_at=datetime.now(),
+                lifecycle_kind="BUY_PENDING" if side == "BUY" else "SELL_PENDING",
+            )
+            self._tracked_order_journal.upsert(record)
+        except Exception as exc:
+            self.app_logger.critical(
+                f"[TRACKED_ORDER_JOURNAL_ERROR] {symbol} | journal 기록 실패"
+                f"(매매 로직에는 영향 없음, 재시작 후 이 주문의 흔적이 없을 "
+                f"수 있음) | side={side} | {type(exc).__name__}: {exc}"
+            )
+
+    def _maintain_tracked_order_journal(self, symbol: str) -> None:
+        """이번 폴링에서 이 종목에 대한 journal record가 있으면 최신
+        상태로 유지합니다. 새 레코드는 만들지 않습니다(그건
+        _create_tracked_order_journal_entry()만의 책임) — 이 메서드는
+        갱신과 "안전할 때만" 삭제만 담당합니다.
+
+        삭제 조건(전부 동시에 참이어야 함): lifecycle이 OPEN 또는
+        FLAT이고(안정적으로 정착), pending_order_id가 더 이상 추적
+        가능한 값이 아니며(추적 중인 주문이 없다는 뜻), orphan_order_id도
+        없음(orphan도 없다는 뜻). 이 세 조건은 PSM이 이 심볼에 대해
+        "지금 추적 중인 주문이 전혀 없다"고 말하는 것과 정확히
+        동치입니다 — ERROR 상태는 이 조건을 만족하지 않으므로(사람이
+        acknowledge_error()로 해소하기 전까지) 레코드가 절대 삭제되지
+        않습니다.
+        """
+        try:
+            record = self._tracked_order_journal.get(symbol)
+            if record is None:
+                return
+            state = self._position_state_machine.get(symbol)
+            changed = False
+            if state.orphan_order_id and record.orphaned_at is None:
+                record.orphaned_at = state.orphan_since or datetime.now()
+                changed = True
+            if state.partial_fill_since and record.first_fill_at is None:
+                record.first_fill_at = state.partial_fill_since
+                changed = True
+            if (
+                state.lifecycle in (PositionLifecycle.OPEN, PositionLifecycle.FLAT)
+                and not is_trackable_order_id(state.pending_order_id)
+                and not state.orphan_order_id
+            ):
+                self._tracked_order_journal.remove(symbol)
+                return
+            if changed:
+                self._tracked_order_journal.upsert(record)
+        except Exception as exc:
+            self.app_logger.critical(
+                f"[TRACKED_ORDER_JOURNAL_ERROR] {symbol} | journal 유지 실패"
+                f"(매매 로직에는 영향 없음): {type(exc).__name__}: {exc}"
+            )
 
     # 2026-08-18 (1P0.8-D.1): 조회 빈도 제한 상수.
     # - ORDER_STATUS_QUERY_MIN_PENDING_AGE_SEC: 방금 시작된 BUY_PENDING/
@@ -3086,6 +3211,11 @@ class TradingService:
                     f"주문 accepted=True지만 order_id가 비어 있음 | "
                     f"side=BUY"
                 )
+            # 2026-08-20 (1P0.8-E.1-A): 실제 order_id가 확보된 직후
+            # durable journal에 기록 — 재시작 시 이 사실을 잃지
+            # 않기 위함. 추적 불가능한 order_id(빈 값/sentinel)면
+            # 아래 헬퍼가 조용히 아무 것도 쓰지 않음.
+            self._create_tracked_order_journal_entry(symbol, "BUY")
         # 2026-08-05 (3차 GPT 코드리뷰 지적 P1): 브로커 응답을
         # 즉시 저장 — _write_signal_log()가 이 시점의 실제 접수
         # 여부(result.accepted)를 order_accepted로 정확히 반영할
@@ -3367,6 +3497,9 @@ class TradingService:
                     f"주문 accepted=True지만 order_id가 비어 있음 | "
                     f"side=SELL"
                 )
+            # 2026-08-20 (1P0.8-E.1-A): BUY와 대칭 — 실제 order_id
+            # 확보 직후 durable journal에 기록.
+            self._create_tracked_order_journal_entry(symbol, "SELL")
 
         # 보유 시간 계산
         hold_minutes = ""
@@ -3443,6 +3576,19 @@ class TradingService:
             self.app_logger.info(
                 f"[ORDER] {symbol} | 매도 주문 접수 완료 | 수량 {quantity}주 | 주문번호 {result.order_id}"
             )
+
+            # 2026-08-21 (1P0.8-OBS.2-A): entry_watch counterfactual
+            # 추적은 "실제 SELL 주문이 accepted된 최초 시점"에만
+            # 시작합니다 — 이유는 _start_entry_watch_shadow_tracking()
+            # docstring 참고. exit_reason이 "entry_watch "로 시작하는
+            # 경우만 대상(정규 전략 SELL은 이 shadow 추적 대상이 아님).
+            if exit_reason.startswith("entry_watch "):
+                _ew_trigger_type = (
+                    exit_reason[len("entry_watch "):].split(" —", 1)[0].strip()
+                )
+                self._start_entry_watch_shadow_tracking(
+                    symbol, avg_buy_price, current_price, _ew_trigger_type,
+                )
         else:
             self.app_logger.warning(
                 f"[FAIL ] {symbol} | 매도 주문 실패 | 사유: {result.message}"

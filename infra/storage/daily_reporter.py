@@ -14,6 +14,15 @@ from collections import defaultdict, Counter
 from datetime import date, datetime
 from pathlib import Path
 
+# 2026-08-21 (1P0.8-OBS.2-C): analyze_trades.py와 승/무/패 정의를
+# 공유하는 공통 helper. 이 모듈이 임포트될 때 repo root(app/main.py가
+# `python -m app.main`으로 실행되며 이미 sys.path에 올려둔 경로)가
+# 아직 없는 실행 컨텍스트(예: 이 파일을 단독 스크립트로 직접 실행)
+# 대비 방어적으로 추가 — 이미 있으면 중복 삽입되지 않도록 확인.
+if "." not in sys.path:
+    sys.path.insert(0, ".")
+from utils.trade_outcome import classify_outcome, format_win_rate, WIN, LOSS, BREAKEVEN  # noqa: E402
+
 
 DAYS_KO = ["월", "화", "수", "목", "금", "토", "일"]
 
@@ -192,7 +201,7 @@ class DailyReporter:
         estimated_cost = 0   # 추정 비용 (별도 표기용)
         total_buy_amount  = 0
         total_sell_amount = 0
-        wins = losses = 0
+        wins = losses = breakevens = 0
 
         symbol_matches: dict[str, list[dict]] = {}
         for sym, sell_list in today_sells.items():
@@ -214,17 +223,25 @@ class DailyReporter:
                 estimated_cost += cost
                 total_buy_amount  += m["buy_price"] * m["qty"]
                 total_sell_amount += m["sell_price"] * m["qty"]
-                if m["sell_price"] >= m["buy_price"]:
+                # 2026-08-21 (1P0.8-OBS.2-C, 8/21 실측 재현): 기존에는
+                # 여기가 sell_price >= buy_price(동률도 승)였고,
+                # analyze_trades.py는 pnl_pct > 0(동률은 승 아님)이라
+                # 서로 달랐습니다(017670 pnl=0 때문에 같은 5건을 두고
+                # "3승 2패"/"2승 3패"로 갈림). 이제 두 파일 모두
+                # utils/trade_outcome.classify_outcome() 하나만 씁니다.
+                outcome = classify_outcome(m["sell_price"] - m["buy_price"])
+                if outcome == WIN:
                     wins += 1
-                else:
+                elif outcome == LOSS:
                     losses += 1
+                else:
+                    breakevens += 1
 
         realized_pnl      = int(round(realized_pnl))
         total_buy_amount  = int(round(total_buy_amount))
         net_realized_pnl  = realized_pnl - estimated_cost
 
-        total_match = wins + losses
-        win_rate = f"{wins}승 {losses}패 ({wins/total_match*100:.0f}%)" if total_match > 0 else "해당없음"
+        win_rate = format_win_rate(wins, losses, breakevens)
 
         # ── 이월 청산 손익 계산 ───────────────────────────────────
         # 전일 이월 포지션의 매도 손익을 별도 집계 (avg_buy_price=전일 평균단가 사용)
@@ -314,7 +331,11 @@ class DailyReporter:
                     matched_avg_buy = sum(m["buy_price"] * m["qty"] for m in matches) / matched_qty
                     pnl = gross
                     pnl_pct = gross / (matched_avg_buy * matched_qty) * 100
-                    result_tag = "✅" if pnl >= 0 else "❌"
+                    # 2026-08-21 (1P0.8-OBS.2-C): 위 [손익 요약]의
+                    # 승/무/패 집계와 동일한 classify_outcome() 기준 —
+                    # 동률(pnl==0)을 ✅로 잘못 표시하지 않음.
+                    _outcome = classify_outcome(pnl)
+                    result_tag = "✅" if _outcome == WIN else ("➖" if _outcome == BREAKEVEN else "❌")
                     sell_qty_note = f" x{matched_qty}주" if matched_qty != total_buy_qty else ""
                     sell_str = (
                         f"매도 {avg_sell:,.0f}원{sell_qty_note}  "
@@ -515,6 +536,14 @@ class DailyReporter:
                     "symbol":      sym,
                     "pnl_pct":     pnl_pct,
                     "pnl_amount":  (sp - bp) * qty,
+                    # 2026-08-21 (1P0.8-OBS.2-C → closure): "win"
+                    # (pnl_pct>0) 필드는 하위호환을 위해 남겨뒀지만,
+                    # 이 파일 안에서는 더 이상 쓰이지 않습니다 —
+                    # exit_reason별 breakdown도 outcome(wins/(wins+
+                    # losses), breakeven 제외) 기준으로 통일했습니다
+                    # (세부 breakdown이 여전히 win/len(grp)라 헤드라인과
+                    # 다른 승률이 날 수 있었던 문제를 닫음).
+                    "outcome":     classify_outcome(pnl_pct),
                     "win":         pnl_pct > 0,
                     "exit_reason": sell.get("exit_reason",""),
                     "hold_min":    self._safe_float(sell.get("hold_minutes")),
@@ -528,8 +557,16 @@ class DailyReporter:
             lines.append(sep)
             return "\n".join(lines)
 
-        wins = [p for p in pairs if p["win"]]
-        lines.append(f"  승률: {len(wins)}/{len(pairs)} ({self._pct(len(wins),len(pairs))})")
+        wins       = [p for p in pairs if p["outcome"] == WIN]
+        losses     = [p for p in pairs if p["outcome"] == LOSS]
+        breakevens = [p for p in pairs if p["outcome"] == BREAKEVEN]
+        # 2026-08-21 (1P0.8-OBS.2-C, 8/21 실측 재현): 위 [손익 요약]
+        # 섹션과 반드시 같은 승/무/패 숫자가 나오도록 동일한
+        # classify_outcome()/format_win_rate()를 씁니다 — 이전에는
+        # 여기가 pnl_pct>0/len(pairs) 기준이라 위 섹션(sell_price>=
+        # buy_price 기준)과 동률 매매가 있을 때 서로 다른 승률을
+        # 냈습니다(8/21 017670: "3승 2패" vs "2/5(40.0%)").
+        lines.append(f"  승률: {format_win_rate(len(wins), len(losses), len(breakevens))}")
         lines.append(f"  평균 수익률: {sum(p['pnl_pct'] for p in pairs)/len(pairs):+.2f}%")
         holds = [p["hold_min"] for p in pairs if p["hold_min"]]
         if holds:
@@ -542,15 +579,33 @@ class DailyReporter:
         for p in pairs:
             er_grp.setdefault(p["exit_reason"] or "(없음)", []).append(p)
         for er, grp in sorted(er_grp.items(), key=lambda x: -len(x[1])):
-            w   = sum(1 for p in grp if p["win"])
+            # 2026-08-21 (1P0.8-OBS.2-C closure):
+            # 헤드라인 승률(위)은 outcome 3분류로 이미 통일했지만, 이
+            # exit_reason별 세부 breakdown은 여전히 "win"(pnl_pct>0)
+            # 개수를 len(grp)(=BREAKEVEN 포함 전체 건수)로 나누고
+            # 있었습니다 — 동률이 섞이면 분모가 달라 헤드라인과 다른
+            # 승률이 나옵니다. wins/(wins+losses)로 통일.
+            #
+            # 2026-08-21 (1P0.8-OBS.2 최종 리뷰): 분모(w+l)가 0인
+            # 경우(그룹 전체가 BREAKEVEN) `self._pct(w, w+l)`을 그대로
+            # 쓰면 "0.0%"가 나와 정의 불가 상태를 승률 0%로 잘못
+            # 표시합니다. `_pct()` 자체는 다른 일반 백분율 계산에도
+            # 쓰이므로 전역 의미를 바꾸지 않고, 이 승률 표시 경로만
+            # 분모 0일 때 "해당없음"으로 분기합니다.
+            w = sum(1 for p in grp if p["outcome"] == WIN)
+            l = sum(1 for p in grp if p["outcome"] == LOSS)
+            decided = w + l
+            win_rate = self._pct(w, decided) if decided > 0 else "해당없음"
             avg = sum(p["pnl_pct"] for p in grp) / len(grp)
-            lines.append(f"    {er[:36]:<38} {len(grp)}건  승률 {self._pct(w,len(grp))}  {avg:+.2f}%")
+            lines.append(f"    {er[:36]:<38} {len(grp)}건  승률 {win_rate}  {avg:+.2f}%")
 
         # 거래 목록
         lines.append("")
         lines.append("  [ 거래 목록 ]")
         for p in pairs:
-            mark = "✅" if p["win"] else "❌"
+            # 2026-08-21 (1P0.8-OBS.2-C): 위 헤드라인 승률과 동일한
+            # outcome 기준(동률은 ➖).
+            mark = "✅" if p["outcome"] == WIN else ("➖" if p["outcome"] == BREAKEVEN else "❌")
             hold = f"{p['hold_min']:.0f}분" if p["hold_min"] else "?"
             v    = "V" if p["is_v"] else "-"
             lines.append(f"    {mark} {p['symbol']}  {p['pnl_pct']:+.1f}%  {p['pnl_amount']:+,.0f}원  {hold}  [{v}]  {p['exit_reason'][:25]}")

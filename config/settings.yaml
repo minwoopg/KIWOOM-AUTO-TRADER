@@ -214,6 +214,7 @@ storage:
   app_log_file: logs/app.log
   save_minute_bars: true              # 1분봉 원본 저장 여부
   minute_bars_dir: data/minute_bars   # 저장 경로
+  tracked_order_journal_file: data/tracked_order_journal.json  # 1P0.8-E.1-A
 
 # ── 카카오톡 알림 ──────────────────────────────────────────
 # .env 파일에 아래 키를 입력하세요 (.gitignore로 보호됨)
@@ -235,4 +236,4 @@ experimental:
   reward_risk_guard_mode: "off"     # 4단계: 상승여력·손익비 하드 게이트
   candidate_ranking_mode: "off"     # 5단계: 후보 순위화
   trailing_breakeven_mode: "off"    # 6단계: 순본전 트레일링
-  entry_quality_guard_mode: "shadow"   # 1E.5단계: MACD/VWAP 진입 품질 shadow 관측 (off/shadow만 지원)
+  entry_quality_guard_mode: "off"   # 1E.5단계: MACD/VWAP 진입 품질 shadow 관측 (off/shadow만 지원)

@@ -8554,3 +8554,595 @@ Broker 로직, BUY/SELL 판단, 주문조회 호출 빈도, 로그 생성 자체
 포함해 운영 관측 분석을 다시 진행합니다. 원본 로그가 이미 로테이션
 되어 없어졌다면, 로컬 `app.log`에서 직접 grep한 결과를 대안으로
 받아 분석하겠습니다.
+
+## 1P0.8-E.1-A: Durable Tracked Order Journal (2026-08-20, 민우님 GPT 리뷰 지시, write/read 전용, startup 자동 복구 없음)
+
+### 배경 — E.1을 왜 E.1-A/E.1-B로 쪼갰는가
+
+8/20 D.1/D.1.1 재분석(위 섹션)으로 오늘 필요했던 두 가지 질문은
+이미 충분히 답이 나왔습니다(BALANCE_MISMATCH 지속 2분26초~2분42초,
+D.1 order-status 조회는 balance-only 폴링보다 먼저 도는 구조라
+오늘 데이터에서는 확정 가속 효과 0초 — 다만 FILLED를 약 2.5분
+더 일찍 감지하는 조기경보 효과는 확인됨). 하루 더 관측 표본을
+늘려도 restart 설계 방향이 바뀔 가능성은 낮다는 민우님 판단에 따라,
+entry_quality_guard=shadow·D.1/D.1.1 운영 관측은 그대로 병행하면서
+개발은 E.1로 넘어갔습니다.
+
+민우님이 제 표현("재시작 직후에는 order-status 조회가 유일한
+근거가 될 수 있다")을 정정: 더 근본적인 문제는 재시작하면 order_id
+자체가 메모리에서 사라진다는 것입니다. 즉 E.1의 첫 문제는
+"재시작 → 주문번호를 어떻게 찾지?"가 아니라 "주문 접수 순간부터
+실제 order_id + side + 기대수량을 어떻게 안전하게 영속화해 둘
+것인가?"입니다. 그래서 E.1을 둘로 쪼갰습니다:
+
+- **E.1-A (이번 라운드)**: 순수 증거 영속화 계층. accepted+order_id
+  확정 직후 최소 사실을 파일에 기록하고, 안전하게 확인된 terminal
+  상태에서만 지웁니다. **읽어서 뭘 하는 로직은 전혀 없습니다.**
+- **E.1-B (다음 라운드, 별도 승인 필요)**: 이 journal을 startup에서
+  읽어 실제로 무엇을 할지(ka10075/ka10076 재조회 등) 결정하는
+  복구 로직. 이번 diff에는 포함하지 않았습니다.
+
+D.2(주문 접수 자체가 타임아웃 등으로 결과를 못 받아 order_id를
+"한 번도 받은 적이 없는" 경우)와도 명확히 구분합니다 — E.1은
+"order_id를 알고 있었는데 재시작으로 잃어버린" 경우, D.2는 애초에
+증거 수준 자체가 다릅니다. 이번 라운드는 E.1만 다루고 D.2는
+건드리지 않았습니다.
+
+### 구현 — `infra/storage/tracked_order_journal.py` (신규)
+
+`TrackedOrderRecord`(dataclass) 필드: `schema_version`, `symbol`,
+`side`, `order_id`, `base_quantity_before_order`,
+`target_quantity_after_order`, `accepted_at`, `lifecycle_kind`,
+`first_fill_at`(optional), `orphaned_at`(optional). `__post_init__`이
+side("BUY"/"SELL")·lifecycle_kind("BUY_PENDING"/"SELL_PENDING")·
+symbol/order_id 비어있음을 검증(`ValueError`).
+
+`TrackedOrderJournalStore`:
+- `upsert()`/`remove()`는 항상 `load_all()`로 전체 상태를 먼저 읽은
+  뒤 갱신 — 파일이 손상돼 있으면 그 위에 그냥 덮어쓰지 않고 예외를
+  올립니다(조용한 데이터 유실 방지).
+- 원자적 쓰기: 같은 디렉터리의 `.tmp` 파일에 쓰고 `flush()`+
+  `os.fsync()`(일부 환경에서 특정 핸들에 fsync를 거부하는 문제가
+  있어 `OSError`는 try/except로 흡수, `export_daily_bundle.py`
+  1I.5 선례와 동일) 후 `os.replace()`로 교체. 예외 발생 시 `.tmp`
+  정리. `state_store.py`의 `JsonStateStore`(비-원자적 `write_text()`)를
+  참고하지 않고, 프로젝트의 실제 원자적 쓰기 관례(`logger.py` CSV
+  마이그레이션, `export_daily_bundle.py` ZIP export)를 그대로 따름.
+- 손상/스키마 불일치 fail-close: JSON 파싱 실패, top-level이 dict가
+  아님, `records` 키 없음/dict가 아님, 레코드별 파싱 실패,
+  `schema_version` 불일치 — 전부 `TrackedOrderJournalCorruptError`로
+  올립니다(조용히 무시하거나 빈 상태로 취급하지 않음).
+- 추적 불가능한 order_id(`None`/공백/`"pending"`/`"UNKNOWN_ORDER_ID"`)는
+  애초에 저장 시도조차 하지 않음 — `lifecycle.py`의
+  `is_trackable_order_id()`를 그대로 재사용.
+- 계좌번호/토큰/appkey 등 민감정보는 필드에 아예 없음 — 저장되는
+  값은 order_id/symbol/side/수량/시각뿐.
+
+### 연결 — `domain/service/trading_service.py`
+
+- `TradingService.__init__`에 `tracked_order_journal` optional 파라미터
+  추가(주입 안 하면 `settings.storage.tracked_order_journal_file`로
+  자동 생성) — `entry_watch_shadow_logger` 등 기존 optional-dependency
+  자가생성 패턴 그대로 재사용.
+- `_try_buy()`의 accepted 분기, `_try_sell_unchecked()`의 accepted
+  분기에서 order_id 확정 직후 `_create_tracked_order_journal_entry()`
+  호출 — 추적 불가능한 order_id면 아무 것도 쓰지 않고 조용히 반환.
+- `_sync_position_state_machine_shadow()`의 심볼별 폴링 루프 끝에서
+  `_maintain_tracked_order_journal()` 호출 — 매 폴링마다 딱 한 번,
+  다음을 한 곳에서 판단:
+  - orphan 전환되면 같은 레코드에 `orphaned_at`만 채움(새 레코드
+    생성 아님 — order_id는 그대로).
+  - 첫 부분체결 시각이 잡히면 `first_fill_at` 채움.
+  - **삭제 조건(전부 동시에 참이어야 함)**: lifecycle이 OPEN 또는
+    FLAT이고, `pending_order_id`가 더 이상 추적 가능한 값이 아니며,
+    `orphan_order_id`도 없음. 이 조건은 `acknowledge_error()`로
+    ERROR에서 복귀한 이후에는 자연히 만족되지만, **ERROR 상태 자체에서는
+    만족되지 않으므로** 사람이 확인하기 전까지 증거가 보존됩니다
+    (민우님 명시 요구사항).
+  - 삭제 판단을 `confirm_buy_from_broker`/`on_sell_result`/
+    `observe_for_orphan`/`acknowledge_error` 등 여러 lifecycle
+    전이 지점에 흩어놓지 않고 이 한 곳으로 모아, `lifecycle.py`는
+    journal의 존재 자체를 전혀 모르게(계층 분리) 유지.
+  - **프로세스 종료(정상 종료 포함)만으로는 절대 지우지 않음** —
+    삭제는 오직 위 조건을 폴링 중 실제로 관측했을 때만 일어남. 즉
+    SELL 접수 후 clean shutdown이 일어나도 journal은 그대로 남아
+    다음 기동에서 "이 주문이 아직 브로커에 살아있을 수 있다"는
+    증거를 보존합니다.
+- journal I/O 실패(디스크 오류 등)는 두 헬퍼 모두
+  `[TRACKED_ORDER_JOURNAL_ERROR]` CRITICAL 로그만 남기고 예외를
+  삼켜 매매 로직에는 전혀 영향을 주지 않음 — journal은 어디까지나
+  "있으면 좋은" 증거 계층이지, 매매 흐름의 필수 경로가 아님.
+
+### 이번 라운드에서 명시적으로 하지 않은 것 (민우님 지시 그대로)
+
+- startup에서 journal을 읽어 뭔가 판단/조회/재주문하는 로직 없음
+  (`__init__`은 저장소 객체만 만들 뿐, `load_all()`/`get()` 호출 없음).
+- 새로운 자동 `get_order_status()` 호출 없음(D.1/D.1.1이 만든
+  호출부 개수 그대로 — 테스트로 카운트 확인).
+- 자동 BUY/SELL/재주문/`cancel_order()` 없음.
+- `PositionLifecycle`에 새 상태(`RECOVERING` 등) 추가 없음 — 여전히
+  FLAT/BUY_PENDING/OPEN/SELL_PENDING/ERROR 5개.
+- D.2(주문 접수 자체가 불확실한 경우) 처리 없음.
+
+### 설정 — `config/settings.py` / `config/settings.yaml`
+
+`StorageConfig`에 `tracked_order_journal_file: str =
+"data/tracked_order_journal.json"` 추가, `settings.yaml`의
+`storage:` 블록에도 동일 항목 추가.
+
+### 테스트 (`test_tracked_order_journal.py`, 신규, 67건) + 기존 헬퍼 보강
+
+12개 섹션으로 구성 — 요구된 테스트 목록을 전부 포함:
+
+1. `TrackedOrderRecord` 생성자 검증(빈/공백 order_id, 잘못된 side/
+   lifecycle_kind, schema_version 기본값).
+2. 저장소 write/read 왕복 — "재시작 시뮬레이션"(같은 경로로 새
+   `TrackedOrderJournalStore` 객체 생성)까지 포함.
+3. 원자적 쓰기 견고성 — fsync 실패 허용(monkeypatch로 `os.fsync`가
+   `OSError`), `os.replace()` 실패해도 원본 파일이 바이트 단위로
+   보존되고 `.tmp` 정리됨.
+4. 손상 파일/스키마 불일치 fail-close(잘못된 JSON, 스키마 버전
+   불일치, `records`가 dict 아님, 레코드 필드 누락) — 전부
+   `TrackedOrderJournalCorruptError`.
+5. 민감정보 없음 확인(직렬화된 JSON 텍스트 + dataclass 필드명 양쪽
+   스캔).
+6. BUY accepted(`_try_buy()` 실호출) → journal 생성, PSM과 일치,
+   재로드 확인.
+7. SELL accepted(`_try_sell()` 실호출) → journal 생성,
+   `target_quantity_after_order == 0`(D.1과 동일한 전량매도 관례).
+8. sentinel/placeholder order_id(`UNKNOWN_ORDER_ID`, `"pending"`) →
+   journal 미생성.
+9. 부분체결 지연 + `BUY_PENDING_TIMEOUT_SEC` 단축 monkeypatch로
+   PENDING_TIMEOUT→orphan 유도 → **같은** order_id의 레코드가
+   갱신됨(새로 생기지 않음), `orphaned_at` 채워짐.
+10. terminal OPEN 확정 → 레코드 안전 삭제. 별도로 ERROR 전이
+    시나리오(`confirm_buy_from_broker()`에 예상 밖 초과 수량) →
+    ERROR 동안에는 삭제되지 않음 확인.
+11. journal I/O 장애 내성 — `upsert()`/`remove()`가 항상 `OSError`를
+    던지는 더블로 교체 후 `_try_buy()` 호출 → 매매는 정상 진행
+    (BUY_PENDING 도달, `_pending_buy_side_effects` 정상 채워짐),
+    `_sync_position_state_machine_shadow()`(→
+    `_maintain_tracked_order_journal` 트리거)도 예외 없이 생존.
+12. 소스 레벨 범위 가드(디버깅 중 일부러 fragile하게 유지) —
+    `__init__` 자가생성 확인, `__init__`~`_maintain_tracked_order_journal`
+    사이에 `load_all()`/`get()` 호출 없음(startup 자동 읽기 없음),
+    `get_order_status(` 호출부 개수가 여전히 1(D.1 그대로), journal
+    훅 코드 영역에 `place_order`/`cancel_order` 없음,
+    `PositionLifecycle` 멤버 5개 그대로, 두 헬퍼 모두
+    `[TRACKED_ORDER_JOURNAL_ERROR]` try/except 존재.
+
+**디버깅 중 발견/수정한 테스트 자체의 문제 2건(매매 로직과 무관,
+전부 테스트 코드 문제)**:
+- 11번 섹션 초기 작성 시 `MockBroker` 기본 현금(100만원)이
+  `order_cash_per_trade`(100만원)와 정확히 같아 `min_cash_buffer`
+  (10만원) 게이트에 막혀 `_try_buy()`가 `place_order()`까지 가지
+  못하는 실수가 있었음 — 6번 섹션과 동일하게 `broker._cash =
+  100_000_000`으로 미리 올려두는 것을 빠뜨렸던 것. 9/10/11번
+  섹션에 동일하게 보강.
+- `_try_buy()`의 실제 반환 계약은 문서(`"차단 사유 문자열(차단
+  없으면 빈 문자열)"`)와 달리, accepted(비차단) 경로에서는 명시적
+  `return ""` 없이 함수 끝까지 흘러 **암묵적으로 `None`을 반환**함 —
+  이는 이번 E.1-A 변경과 무관한 기존 동작(실제 호출부 `_process_symbol`
+  1625행도 `if block:` truthy 검사라 `""`/`None`을 동일하게
+  "차단 없음"으로 취급해 원래부터 문제가 없었음). 테스트 11-1의
+  `block11 == ""` 단정을 `not block11`로 정정(운영 로직은 무변경).
+- 12-6 테스트의 `PositionLifecycle` enum 멤버 개수 판별 heuristic이
+  "class PositionLifecycle" ~ 다음 "class " 등장 전까지"를 통째로
+  훑던 방식이라, enum 정의 직후 이어지는 D.1의 기존 모듈 상수
+  (`PENDING_ORDER_ID_PLACEHOLDER`, `UNKNOWN_ORDER_ID_SENTINEL` —
+  이번 라운드와 무관, 이미 존재하던 코드)도 "대문자 이름 = 값"
+  패턴에 걸려 5개가 아닌 7개로 잘못 집계됨. enum 클래스 선언 다음
+  줄부터 들여쓰기가 끊기는 첫 줄 전까지로 범위를 좁혀 정정 — 실제
+  `PositionLifecycle`은 여전히 5개 그대로이며 이번 라운드에서
+  건드리지 않음.
+
+**`test_run_once_integration.py`의 `build_minimal_settings()` 보강**:
+새 `StorageConfig.tracked_order_journal_file` 필드를 tmpdir 기준
+경로로 명시하지 않으면, 이 헬퍼를 재사용하는 모든 테스트가
+프로젝트 실제 `data/` 디렉터리에 journal 파일을 새는 사고가 남
+— 0.5단계에서 있었던 CSV 누출 사고와 동일한 클래스의 문제라 미리
+동일한 방식으로 방지(tmpdir 경로 명시).
+
+### 회귀 결과
+
+`test_tracked_order_journal.py` 67건 전부 통과. 전체 회귀
+25개 파일(신규 1개 포함) 중 24개 통과, 실패 1개는 이번 변경과
+무관한 기존 `test_replay_time_axis.py`(baseline과 동일 — 168/178,
+10건 실패는 이번 diff 이전부터 있던 별개 이슈). `python3 -m
+compileall .` 정상.
+
+### 다음 단계
+
+E.1-B(startup에서 journal을 읽어 실제로 무엇을 할지 결정하는
+복구 로직)는 이번 diff에 포함하지 않았습니다 — 민우님 별도 승인
+후 착수합니다. 그 사이 entry_quality_guard=shadow·D.1/D.1.1 운영
+관측은 계속 병행합니다.
+
+---
+
+## 1P0.8-OBS.2: Analytics/Observability Integrity (2026-08-21, 민우님 8/21 번들 직접 대조로 발견, GPT 리뷰 지시)
+
+### 사실관계 정정 (이번 라운드 착수 전 필수)
+
+이전 8/21 번들 분석 문서(`2026-08-21-bundle-analysis.md`)에 "E.1-A
+journal error = 0 → 운영 정상"이라는 취지의 서술이 있었습니다.
+**철회합니다.** E.1-A는 8/21 시점까지 민우님 로컬/운영 환경에
+적용된 적이 없습니다 — 그러므로 8/21에는 E.1-A journal이 애초에
+동작하지 않았고, "8/21 journal error=0"은 "E.1-A가 정상 운영됐다"는
+증거가 될 수 없습니다(관측 대상 자체가 없었을 뿐). 정확한 서술:
+D.1/D.1.1은 8/20·8/21 이틀 연속 실운영에서 직접 관측·검증됐지만,
+E.1-A는 이 시점까지 실운영 검증 0일입니다 — E.1-A의 운영 검증은
+최종(E.1-A.1 하드닝 포함) diff가 실제로 적용된 이후부터 시작됩니다.
+해당 문서와 `handoff.md`를 이 서술로 정정했습니다.
+
+### 배경 — 왜 "새 코드 변경 불필요"가 아니었는가
+
+8/21 번들 최초 분석에서 저는 "오늘 데이터로 코드를 바꿔야 할 새
+발견은 없다"고 결론 내렸습니다. 민우님이 같은 번들을 직접
+재대조해 이 결론에 동의하지 않는다며 정정: 주문 안전성 쪽에는
+새 P0가 없다는 뜻이라면 맞지만, **앞으로의 수익성 연구(Low Upside
+임계값 재검토, 5-Min Exit 타이밍 연구)에 쓰일 분석 데이터 자체가
+잘못 기록되는 P1 문제 4건**이 실측으로 확인됐습니다. 이 4건을
+먼저 닫지 않으면 이후 연구가 오염된 데이터 위에 세워집니다.
+BUY/SELL 조건, 점수 계산, upside 임계값, entry_watch 5분 기준,
+VWAP 청산 정책, PENDING/orphan 타임아웃, Broker API 호출, 주문상태
+폴링 주기, D.1/D.1.1 재조정 정책, `entry_quality_guard` enforce
+스위치, E.1 시작복구는 이번 라운드에서 전혀 건드리지 않았습니다 —
+전부 순수 관측성(기록/집계) 수정입니다.
+
+### A. entry_watch_shadow 오염 (064260 8/21 실측)
+
+**증상**: 10:49:43 VWAP이탈청산으로 SELL이 실제 accepted됐는데,
+잔고 API 반영 지연(balance lag)이 이어지는 동안 `position`이 여전히
+non-None으로 보여 `_check_entry_watch()`가 10:49:59~10:52:35까지
+매 폴링마다 다시 판단을 냈습니다. 그때마다
+`_start_entry_watch_shadow_tracking()`이 호출돼 최초 트리거
+(VWAP/10:49:43)가 나중 판단(최소수익미달/10:52:35)으로 덮어써졌습니다
+— "entry_watch가 개입 안 했다면?"이라는 counterfactual의 기준
+시점 자체가 실제 청산 시점과 어긋나는 오염이었습니다.
+
+**수정**: 판단 시점(`_check_entry_watch()`)이 아니라 **실제 SELL이
+accepted된 시점**(`_try_sell_unchecked()`의 accepted 분기, exit_reason이
+"entry_watch "로 시작할 때만)으로 추적 시작 지점을 옮겼습니다.
+새 lock 상태를 추가하지 않았습니다 — `_try_sell()`의 단일 관문
+(`decide_sell()`)이 SELL_PENDING/orphan 동안 이미 모든 후속 SELL
+시도를 HARD block으로 막아주므로(1P0.5부터 있던 기존 보장,
+forced로도 우회 불가), 이 메서드가 다시 호출되는 시점은 항상
+"그 직전 pending/orphan이 완전히 풀리고 난 뒤의 새 accepted"뿐이라는
+사실이 그대로 성립합니다. 거부(accepted=False)/응답 불명확
+(is_ambiguous)한 SELL은 애초에 이 분기에 들어오지 않으므로 잘못된
+lock도 생기지 않습니다. `_start_entry_watch_shadow_tracking()`의
+시그니처를 `(symbol, entry_price, trigger_price, trigger_type)`으로
+단순화(미사용 `position`/`ew` 인자 제거).
+
+### B. Low Upside 0.0 결측 처리 (017670 8/21 실측)
+
+**증상**: `analyze_trades.py`의 기존 `safe_float()`는
+`f if f != 0.0 else None` — `v_drop_pct`/`v_rise_pct`(0.0 = V자
+패턴 아님, 의도된 sentinel)에는 맞지만, `upside_to_recent_high_pct`
+(상승 여력)처럼 0.0 자체가 유효한 측정값인 필드에 그대로 쓰면
+정확히 0.0인 매매가 통계에서 통째로 빠집니다. 8/21 017670이
+정확히 이 경계(upside=0.00)에 걸려 "< 1%" 구간이 실제 4건인데
+3건으로 집계됐습니다.
+
+**수정**: `safe_float()`는 그대로 두고(다른 필드의 의도된 sentinel
+동작 보존), `upside_to_recent_high_pct` 전용으로
+`safe_float_zero_valid()`를 신설 — 결측은 오직 None/빈 문자열/파싱
+실패로만 판정, 0.0은 유효값으로 반환. `pair_trades()`의 `"upside"`
+필드만 이 함수로 교체(`change_rate_pct`/`hold_minutes` 등 확정
+버그 목록에 없는 필드는 건드리지 않음).
+
+### C. WIN/LOSS/BREAKEVEN 정의 불일치 (017670 8/21 실측)
+
+**증상**: `daily_reporter.py`는 `sell_price >= buy_price`(동률도
+승)로, `analyze_trades.py`는 `pnl_pct > 0`(동률은 승 아님)으로
+서로 다르게 판정 — 017670(매수 100,300원/매도 100,300원, pnl=0)이
+정확히 이 경계에 걸려 같은 5건의 매매를 두고 두 리포트가 각각
+"3승 2패"/"2승 3패"를 동시에 출력했습니다.
+
+**수정**: `utils/trade_outcome.py` 신설 — `classify_outcome(pnl)`
+(pnl>0→WIN, pnl<0→LOSS, pnl==0→BREAKEVEN)과
+`format_win_rate(wins, losses, breakevens=0)`(승률 분모는 wins+losses만,
+breakeven 제외 — 민우님 확정 선호. breakeven=0이면 기존과 동일한
+"N승 K패" 형식만 출력해 무변화 케이스의 기존 리포트 가독성 유지).
+`daily_reporter.py`/`analyze_trades.py` 양쪽의 "헤드라인" 승률
+계산(각 파일의 "손익 요약"/"1. 전체 손익 요약" 및
+`_build_trade_analysis()`의 "매매 분석" 승률)만 이 공유 모듈로
+교체 — 기존 `pnl_pct > 0` 기준의 `"win"` 불리언은 그대로 유지해,
+이미 WIN-only로 정확했던 exit_reason별/entry_score별 등 수십 개의
+세부 breakdown 섹션은 건드리지 않았습니다.
+
+### D. ORPHAN_CLEARED 수량 stale 기록 (064260/017670 8/21 실측)
+
+**증상**: `clear_orphan()`이 이벤트 로그의 `broker_quantity` 컬럼에
+`state.known_quantity`(호출 시점의 stale 값 — `sync_from_broker()`가
+최신 관측치로 갱신하기 전)를 그대로 찍었습니다. `observe_for_orphan()`
+이 "잔고 0 도달"을 직접 확인해 이 메서드를 부른 순간에도
+ORPHAN_CLEARED 행에는 해소 직전의 잔여수량이 남고, 바로 다음
+SYNC 행에서야 실제 값이 찍혀 사후 분석 시 혼란스러웠습니다.
+
+**수정**: `clear_orphan()`에 키워드 전용 `terminal_quantity: int |
+None = None` 인자 추가 — 명시되면 이 값을 그대로 `broker_quantity`
+컬럼에 기록(SELL orphan은 항상 0, BUY orphan은
+`expected_final_quantity`). `state.known_quantity` 자체는 건드리지
+않음(PSM state 변경 아님 — `sync_from_broker()`가 평소처럼 갱신).
+`observe_for_orphan()`의 두 호출부(SELL/BUY orphan 해소)만
+`terminal_quantity`를 명시하도록 갱신. `acknowledge_orphan()`(사람이
+수동 확인하는 경로, "방금 관측된 값"이 따로 없음)은 인자를 생략해
+기존과 동일하게 `state.known_quantity`를 씀 — 완전히 하위호환.
+orphan-clear 조건, lifecycle 전이, PSM state, 주문 재시도/타임아웃은
+전혀 건드리지 않음.
+
+### 테스트 (`test_obs2_analytics_observability_integrity.py`, 신규, 45건)
+
+4개 섹션으로 구성:
+
+- **A (18건)**: 064260 8/21 케이스를 그대로 재현 — 최초 VWAP SELL
+  accepted(trigger_type/trigger_price/시각 정확성) → balance lag
+  동안 최소수익미달 판단 반복(원본 불변, `place_order` 재호출 없음
+  — 실제 호출 횟수로 검증) → 40회 반복 판단에도 여전히 1건 →
+  FLAT 확정 후 재진입한 새 포지션의 청산은 새 trigger로 정상 등록
+  → 거부된(accepted=False, "no position") SELL은 shadow를 전혀
+  생성하지 않음.
+- **B (9건)**: `safe_float_zero_valid()`의 None/빈문자열/0.0/유효값/
+  파싱실패 5가지 경계 + 기존 `safe_float()` 무변경 확인 + 8/21
+  017670 재현 픽스처(5건 매매쌍, upside=0.00 포함 4건이 "< 1%"로
+  정확히 집계됨, 0.0 누락 시 3건으로 오집계됐을 것).
+- **C (9건)**: `classify_outcome()` 3개 경계값(+1/0/-1) +
+  `format_win_rate()` breakeven 포함/제외 표시 형식 + 017670과
+  동형인 5건 픽스처(2승 1무 2패)를 `daily_reporter._build_report()`
+  와 `analyze_trades.pair_trades()` 양쪽에 동일하게 먹여 완전히
+  같은 승/무/패 숫자·문자열이 나오는지 직접 대조.
+- **D (9건)**: SELL orphan(잔고 0 도달, stale known_quantity=1051
+  vs 실제 기록 0) / BUY orphan(목표수량 도달, stale 150 vs 실제
+  기록 200) / 목표 미달 시 미해소(회귀 없음) / `acknowledge_orphan()`
+  기존 동작 무변경(known_quantity=77 그대로 기록) — `_EventRecorder`
+  더블로 `PositionLifecycleLogger.append()` 호출을 그대로 캡처해
+  실제 로그 행의 `broker_quantity` 컬럼 값을 직접 검증.
+
+### 디버깅 중 발견/수정한 테스트 자체의 문제 1건 (매매 로직과 무관)
+
+OBS.2-A 구현 중 `_check_entry_watch()`/`_start_entry_watch_shadow_tracking()`
+docstring에 "`_try_sell_unchecked()`의 accepted 분기로 옮겼다"는
+설명을 추가했는데, `test_partial_fill_lifecycle.py`의 기존 테스트
+11-4가 `ts_src.index("LIFECYCLE_FORCE_THROTTLE") <
+ts_src.index("_try_sell_unchecked(")`(파일 내 최초 등장 위치 비교)로
+"THROTTLED면 실제 주문 발행 전에 return하는가"를 검증하는 fragile
+heuristic이었습니다. 제가 추가한 docstring 문구가 실제 호출부
+(3406행)보다 앞선 1842/1930행에서 먼저 "_try_sell_unchecked("
+문자열을 만들어 이 heuristic을 우연히 깨뜨렸습니다 — 실제 코드
+순서(THROTTLED 로그가 실제 주문 발행보다 먼저 나옴)는 전혀
+바뀌지 않았습니다. docstring 문구에서 함수명 뒤 괄호를 제거
+("_try_sell_unchecked 메서드"로 수정)해 문자열 매칭만 정정,
+로직은 무변경.
+
+### 회귀 결과
+
+`test_obs2_analytics_observability_integrity.py` 45건 전부 통과.
+민우님이 명시 요구한 `test_shadow_analysis.py`(170건)/
+`test_partial_fill_lifecycle.py`(336건)/`test_order_status_reconciliation.py`
+(64건) 전부 통과. 전체 회귀 26개 파일 중 25개 통과, 실패 1개는
+이번 변경과 무관한 기존 `test_replay_time_axis.py`(168/178 —
+baseline과 동일, 이번 diff 이전부터 있던 별개 이슈). `python3 -m
+compileall .` 정상.
+
+### 다음 단계
+
+이번 라운드(OBS.2)는 여기서 종료 — 민우님 검토·확인 후에만
+1P0.8-E.1-A.1(Durable Tracked Order Journal 하드닝: 레코드 자체의
+sentinel order_id 거부, journal 키/symbol 불일치 fail-close,
+레코드별 schema_version 검증, 기존 손상 파일 fail-close 유지·보강)
+로 넘어갑니다. E.1-B(startup 복구)는 이 세션에서 절대 착수하지
+않습니다 — E.1-A.1 하드닝이 완료되고 최종 diff가 민우님 로컬에
+실제로 적용돼 최소 1~2일 실운영에서 journal 생성/갱신/terminal
+삭제가 직접 관측된 뒤에만 검토 대상입니다.
+
+---
+
+## 1P0.8-OBS.2 closure: 전제 정정(E.1-A 적용 완료) + 세부 breakdown 승률 통일 + non-finite 방어 (2026-08-21, 민우님 GPT 리뷰 지적)
+
+### 전제 정정 — E.1-A contamination 우려 철회
+
+민우님이 이전 지시("OBS.2 zip에 E.1-A journal 코드가 섞여 있으면
+안 된다")를 철회했습니다. **민우님이 E.1-A를 이미 본 프로그램에
+적용**했으므로, OBS.2가 건드리는 `trading_service.py`에 E.1-A의
+journal import/훅 코드가 함께 들어있는 것은 packaging contamination이
+아니라 현재 실제 baseline을 그대로 반영한 것입니다. 이번 closure는
+E.1-A 코드를 일부러 제거한 별도 패키지를 만들지 않고, **E.1-A가
+포함된 현재 baseline 위에서** 검증했습니다.
+
+다만 시간축 구분은 그대로 유지합니다: 2026-08-21 장중에는 E.1-A가
+아직 미적용 상태였으므로, 8/21 로그의 `TRACKED_ORDER_JOURNAL_ERROR=0`
+을 "E.1-A가 8/21에 정상 운영됐다"는 증거로 해석하지 않습니다.
+E.1-A의 실제 운영 검증은 **다음 실제 운용일부터** 시작됩니다(위
+"사실관계 정정" 문구는 이 구분을 그대로 유지 — 철회된 것은 zip
+packaging 우려뿐입니다).
+
+### 문제 — OBS.2-C가 headline만 고치고 세부 breakdown을 놓침
+
+최초 OBS.2-C는 "1. 전체 손익 요약"(`analyze_trades.py`)과 "[손익
+요약]"(`daily_reporter.py`)의 헤드라인 승률만 `classify_outcome()`/
+`format_win_rate()` 기준으로 통일했습니다. 민우님이 코드를 직접
+지적: exit_reason/전략/entry_score/V-PR/volume_spike/Low Upside/
+당일 등락률/종목별/추세꺾임/트레일링/조건검색식별 등 나머지 세부
+구간 breakdown들은 여전히
+
+```python
+w = sum(1 for p in grp if p["win"])
+win_rate = w / len(grp)
+```
+
+형태였습니다 — `len(grp)`가 BREAKEVEN까지 포함한 전체 건수라
+분모가 잘못됐습니다. 예를 들어 WIN1/BREAKEVEN1/LOSS2 조합이면
+우리가 정한 정의로는 승률 = 1/(1+2) = 33.3%인데, 이 buggy 코드는
+1/4 = 25.0%를 출력합니다. Low Upside Study 등 앞으로 실제 사용할
+연구 수치에 직접 영향을 미치므로 OBS.2 안에서 닫기로 했습니다.
+
+### 수정 1 — 세부 breakdown 전체를 breakeven 제외 분모로 통일
+
+`analyze_trades.py`에 `win_rate_pct(grp, ndigits=1)`/`win_rate_frac(grp)`
+헬퍼 신설 — 둘 다 `w = wins`, `l = losses`(둘 다 `outcome` 기준),
+분모는 `w+l`만(breakeven 제외), 분모 0이면 0%로 안전 처리(0으로
+나누기 방지). `pct(n, total)`을 그대로 두고(범용 유틸이라 다른
+곳에서도 쓰임) 이 두 헬퍼가 승률 계산 시 항상 올바른 분모를
+넘기도록 감쌉니다. 다음 12곳(2/3/4/5/6/7/7-1/8/10/10-1/트레일링
+밴드별/11/11의 패턴별 세부)의 `w = sum(1 for p in grp if p["win"])`
++ `len(grp)` 분모 조합을 전부 `win_rate_pct()`/`win_rate_frac()`
+호출로 교체했습니다. "7-1. 당일 등락률 구간별 손익"의 `[손실 거래]`
+목록 필터도 `not p["win"]`(BREAKEVEN까지 손실로 분류)에서
+`p["outcome"] == LOSS`로 정정 — 동률 매매가 손실 거래 목록에
+잘못 끼는 것을 막습니다.
+
+`daily_reporter.py`의 `_build_trade_analysis()` "exit_reason별"
+breakdown도 동일하게 `w = sum(..outcome==WIN)`, `l = sum(..outcome
+==LOSS)`, 분모 `w+l`로 교체(이 파일에서 breakeven 분모 문제가 있던
+유일한 세부 breakdown이었습니다 — 다른 세부 섹션은 없음).
+
+`"win"` 필드(`pnl_pct > 0`) 자체는 두 파일 모두 그대로 남겨뒀습니다
+(하위호환, 의미는 무변경) — 다만 이제 두 파일 안에서는 더 이상
+참조되지 않습니다(관련 주석도 갱신).
+
+### 수정 2 — `safe_float_zero_valid()` non-finite 방어
+
+민우님 지적: 0.0을 살리는 것과 별개로 `float("nan")`/`float("inf")`/
+`float("-inf")`/`float("1e309")`(오버플로 → inf)는 예외 없이
+파싱에 "성공"해버려 상승 여력 구간에 잘못 집계될 수 있습니다.
+`math.isfinite()` 체크를 추가해 이런 값도 결측으로 fail-close —
+`kiwoom_order_status.py`의 `_parse_optional_qty()`가 이미 같은
+이유로 non-finite 값을 fail-close하는 전례(1P0.8-B.2 closure 2차)를
+그대로 따랐습니다.
+
+### 이번에 변경하지 않은 것 (OBS.2-A/B/D 동작 무변경 확인)
+
+entry_watch_shadow 최초 accepted 기준 lock(A), upside=0.0 통계
+포함(B), ORPHAN_CLEARED terminal quantity 기록(D)은 이번 closure에서
+전혀 건드리지 않았습니다 — 기존 테스트가 그대로 재통과합니다.
+BUY/SELL 전략, lifecycle 전이, Broker 호출량, D.1/D.1.1, E.1-A
+journal 동작 자체, E.1-B, threshold, entry_watch 5분 기준도 무변경.
+
+### 테스트 (`test_obs2_analytics_observability_integrity.py`, 45건 → **60건**)
+
+C 섹션에 15건 추가:
+- `win_rate_pct()`/`win_rate_frac()` 순수 함수 단위 테스트
+  (WIN1/BREAKEVEN1/LOSS2 → 33.3%/`"1/3 (33%)"`, ndigits=0 반올림,
+  전부 BREAKEVEN이면 0%로 안전 처리).
+- `analyze_trades.py`의 "2. exit_reason별 손익"과
+  `daily_reporter.py`의 `_build_trade_analysis()` exit_reason별
+  둘 다, 같은 4건(WIN1/BREAKEVEN1/LOSS2) 픽스처를 실제 리포트
+  생성 파이프라인에 통째로 태워 "33.3%"가 나오고 buggy 값
+  "25.0%"는 나오지 않는지 직접 검증(단위 테스트가 아니라 실제
+  출력 문자열 검증).
+- "[손실 거래] 목록"에 BREAKEVEN 종목이 섞이지 않고 실제 LOSS
+  종목만 들어가는지 검증.
+- `safe_float_zero_valid()`의 nan/inf/-inf/1e309 → 결측 처리 4건 +
+  기존 유효값(0.0/0.18/-0.5) 무변경 확인.
+
+### 회귀 결과
+
+`test_obs2_analytics_observability_integrity.py` 60건 전부 통과.
+`test_shadow_analysis.py`(170건)/`test_partial_fill_lifecycle.py`
+(336건)/`test_order_status_reconciliation.py`(64건)/E.1-A journal
+테스트인 `test_tracked_order_journal.py`(67건) 전부 재통과. 전체
+회귀 26개 파일 중 25개 통과(무관한 기존 `test_replay_time_axis.py`
+168/178만), `compileall` 정상.
+
+### 다음 단계 — 순서 재조정 (민우님 확정)
+
+E.1-A.1(journal 하드닝)로 바로 넘어가지 않습니다. E.1-A가 이미
+본 프로그램에 적용됐으므로, **먼저 다음 실제 운용일에서 journal
+자체를 실측 관측**합니다:
+
+```
+BUY accepted        → journal record 생성
+부분체결             → first_fill_at / 관측값 갱신
+PENDING_TIMEOUT      → orphaned_at 갱신
+terminal             → active record 제거
+TRACKED_ORDER_JOURNAL_ERROR → 0인지
+장 종료 후 tracked_order_journal.json → terminal 완료 주문이
+  찌꺼기로 남아있지 않는지
+```
+
+그 관측 결과에 따라 E.1-A.1(sentinel/schema/key-symbol 하드닝)
+착수 여부를 판단합니다 — 문제가 발견되면 당연히 하드닝, 문제가
+없어도 이미 파악된 하드닝 후보들은 검토합니다. 이후 순서:
+OBS.3(raw order-status 증거 캡처) → E.1-B(startup 복구, 별도 승인
+필요). **이번 라운드에서도 E.1-A.1/E.1-B는 착수하지 않았습니다.**
+
+## 1P0.8-OBS.2 최종 리뷰 반영: all-BREAKEVEN 그룹의 승률 0% 오표시 수정 (2026-08-21, 코드 재검토 지적)
+
+### 문제 — all-BREAKEVEN 그룹을 "승률 0%"로 표시
+
+OBS.2 closure 최종본을 실제 코드로 재확인한 결과, A/B/D와 C의
+대부분(세부 breakdown 12곳의 `p["win"]` 기반 승률 제거, non-finite
+방어)은 정확히 닫혔지만 딱 1개의 의미상 불일치가 남아있었습니다.
+
+`analyze_trades.py`의 `win_rate_pct()`/`win_rate_frac()`가
+분모(`wins+losses`)가 0인 경우(그룹 전체가 BREAKEVEN, 즉 승패가
+전혀 없는 경우) `"0.0%"`/`"0/0 (0%)"`를 반환하고 있었습니다.
+`daily_reporter.py`의 exit_reason별 breakdown(`self._pct(w, w+l)`)도
+동일하게 `w+l==0`이면 `"0.0%"`가 나왔습니다.
+
+그러나 승률의 정의는 `wins/(wins+losses)`이므로 0승 0패(전부
+BREAKEVEN)는 승률 0%가 아니라 **정의 불가**입니다. headline의
+`format_win_rate()`는 이미 이 경우를 정확히 `"해당없음"`으로
+처리하고 있었으므로, OBS.2-C가 목표로 한 "headline과 세부
+breakdown의 outcome semantics 통일"이 이 극단적인 all-breakeven
+케이스에서만 아직 완전히 닫히지 않은 상태였습니다.
+
+### 수정
+
+- `analyze_trades.py`의 `win_rate_pct()`: 분모 0이면 `"해당없음"`
+  반환(기존 `"0.0%"`에서 변경).
+- `analyze_trades.py`의 `win_rate_frac()`: 분모 0이면
+  `"0/0 (해당없음)"` 반환(기존 `"0/0 (0%)"`에서 변경).
+- `daily_reporter.py`의 exit_reason별 breakdown: `_pct()` 자체의
+  전역 의미는 바꾸지 않고(다른 일반 백분율 계산에도 쓰이므로),
+  이 승률 표시 경로만 `decided = w + l; win_rate = self._pct(w,
+  decided) if decided > 0 else "해당없음"`으로 분기.
+
+### 소규모 문서 정리 (blocker 아님, 함께 반영)
+
+- `utils/trade_outcome.py`의 `format_win_rate()` docstring 첫 줄에
+  있던 중복 따옴표(````""""N승````) 정정.
+- 코드 주석/docstring에 남아있던 특정 개인명 언급을 객관적인 규칙
+  설명으로 교체(예: "breakeven을 분모에 넣으면 해석이 왜곡되므로
+  분모에서 제외한다"). 이번에 수정한 세 파일
+  (`analyze_trades.py`/`infra/storage/daily_reporter.py`/
+  `utils/trade_outcome.py`)에 적용.
+- `safe_float_zero_valid()` docstring의 "결측은 오직 None/빈
+  문자열/파싱 실패"를 "결측은 None/빈 문자열/파싱 실패/non-finite
+  (nan/inf/-inf)"로 갱신 — OBS.2-C closure에서 non-finite 방어를
+  추가했는데 docstring이 갱신되지 않았던 부분 반영.
+
+### 이번에 변경하지 않은 것
+
+OBS.2-A/B/D 로직, headline 승률 정의(`classify_outcome()`/
+`format_win_rate()` 자체), BUY/SELL 전략, lifecycle, D.1/D.1.1,
+E.1-A journal 로직, E.1-B, 임계값, entry-watch 5분 규칙 — 전부
+무변경. `_pct()`의 전역 시그니처/기본 동작도 무변경(0.0%를
+반환하는 다른 호출부에는 영향 없음).
+
+### 테스트 (60건 → 62건)
+
+- 기존 C-13("승패가 전혀 없으면 0%를 반환")을 반대 기대값으로
+  교체 — `win_rate_pct([BREAKEVEN, BREAKEVEN]) == "해당없음"`,
+  `win_rate_frac([BREAKEVEN]) == "0/0 (해당없음)"`.
+- 신규 C-25/C-26: `daily_reporter.py`에 all-BREAKEVEN
+  exit_reason 픽스처(2건, 둘 다 동률청산)를 실제 리포트 생성
+  파이프라인에 태워 `"2건  승률 해당없음"`이 나오고
+  `"2건  승률 0.0%"`는 나오지 않는지 직접 검증.
+
+### 회귀 결과
+
+`test_obs2_analytics_observability_integrity.py` 62건 전부 통과.
+`test_shadow_analysis.py`(170건)/`test_partial_fill_lifecycle.py`
+(336건)/`test_order_status_reconciliation.py`(64건)/
+`test_tracked_order_journal.py`(67건) 전부 재통과. 전체 회귀 26개
+파일 중 25개 통과(무관한 기존 `test_replay_time_axis.py` 168/178만),
+`compileall` 정상.
+
+### 다음 단계
+
+변경 없음 — 위 "다음 단계 — 순서 재조정" 그대로 유지. 이번
+라운드에서도 E.1-A.1/E.1-B는 착수하지 않았습니다. OBS.2는 이
+라운드로 최종 승인 대상입니다.
