@@ -37,6 +37,23 @@ LOG_TAGS allowlist에 1P0.8-D.1/D.1.1의 order-status reconciliation
 D.1/D.1.1(8/18~19 신설)보다 오래돼서 운영 관측에 필요한 로그가
 계속 걸러지고 있었음(8/20 bundle 분석 중 발견). 매매 로직·조회
 호출·로그 생성 자체는 무변경, LOG_TAGS 튜플만 확장.
+
+2026-08-24 observability-only closure (E.1-A 운영 검증용)
+-----------------------------------------------------------
+같은 유형의 gap을 8/24 bundle 분석 중 또 발견: E.1-A(durable
+tracked order journal, 8/20 도입)와 1P0.8-A.1(order_id 연결,
+8/14 도입)의 CRITICAL 로그 태그 3종이 이 allowlist에 없어서
+daily bundle에 전혀 실리지 않고 있었음 — `[TRACKED_ORDER_JOURNAL_ERROR]`
+(journal 기록/유지 실패), `[ORDER_ID_MISSING]`(accepted=True인데
+order_id가 비어 있음), `[ORDER_PLACEMENT_AMBIGUOUS]`(주문 접수
+여부 불명, 사람 확인 필요). 이번에도 "0건"이 "정상"인지 "번들이
+안 담았다"인지 구분이 안 되는 문제였음. 세 태그 모두 symbol/
+order_id/side만 포함하고 SENSITIVE_KEYS 대상 필드는 담지 않음.
+이번 라운드에서 존재하는지 확인했으나 별도로 성공 시점(journal
+create/update/orphan/terminal remove)을 남기는 로그 태그는 코드베이스에
+아직 없음 — 새로 만들지 않음(범위를 exporter allowlist 확장으로만
+좁힘, 민우님 지시). 매매 로직·journal 동작·로그 생성 호출 자체는
+전혀 건드리지 않음, LOG_TAGS 튜플만 확장.
 """
 from __future__ import annotations
 
@@ -97,6 +114,13 @@ CSV_SOURCES: list[tuple[str, tuple[str, ...]]] = [
 # 쓰이고, order_id/symbol/수량(broker_qty 등)만 포함할 뿐 SENSITIVE_KEYS
 # 대상 필드(계좌번호/토큰 등)는 담지 않음 — 매매 로직/조회 호출/로그
 # 생성 자체는 전혀 건드리지 않은 **수집 대상 확장만**.
+#
+# 2026-08-24 (observability-only closure, E.1-A 운영 검증용): 아래
+# 3개 태그 추가. 전부 domain/service/trading_service.py의 기존
+# CRITICAL 로그 경로(_create_tracked_order_journal_entry()/
+# _maintain_tracked_order_journal()/_try_buy()/SELL accepted 분기)
+# 에서만 쓰이고, symbol/order_id/side만 포함할 뿐 SENSITIVE_KEYS
+# 대상 필드(계좌번호/토큰 등)는 담지 않음 — 수집 대상 확장만.
 LOG_TAGS: tuple[str, ...] = (
     "[COND_STATUS]", "[COND_TRUNCATE]", "[COND]",
     "[WS]", "[SESSION_SHADOW]", "[EXPERIMENTAL]",
@@ -104,6 +128,8 @@ LOG_TAGS: tuple[str, ...] = (
     "[ORDER_STATUS_QUERY_FAILED]", "[ORDER_STATUS_BALANCE_MISMATCH]",
     "[ORDER_STATUS_UNSUPPORTED]", "[ORDER_STATUS_CONFIRMED]",
     "[LIFECYCLE_ORPHAN]",
+    "[TRACKED_ORDER_JOURNAL_ERROR]", "[ORDER_ID_MISSING]",
+    "[ORDER_PLACEMENT_AMBIGUOUS]",
 )
 
 # ── 민감정보 마스킹 ─────────────────────────────────────────────

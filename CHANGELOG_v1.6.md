@@ -9723,3 +9723,94 @@ entry_quality_guard_mode — 전부 0건. exporter(`export_daily_bundle.py`)
 F2/5분 checkpoint shadow 표본을 3~5거래일 쌓기 시작합니다. F2
 enforce나 conditional extension 구현은 이번에도 시작하지
 않았습니다.
+
+---
+
+## 🔎 E.1-A/주문접수 오류 관측성 closure — daily bundle allowlist에 CRITICAL 태그 3종 추가 (2026-08-24, observability-only)
+
+### 배경
+
+8/24 daily bundle 분석 중, 인수인계 문서가 요구한 E.1-A 운영 관측
+체크리스트("`TRACKED_ORDER_JOURNAL_ERROR`가 0인지")를 bundle
+데이터만으로는 확인할 수 없다는 사실을 발견했습니다. `export_daily_bundle.py`
+의 `LOG_TAGS` allowlist가 D.1/D.1.1 태그 5종을 추가한 8/20
+observability fix 이후로 갱신되지 않아, E.1-A(8/20 도입)와
+1P0.8-A.1(8/14 도입)의 CRITICAL 로그 3종이 여전히 걸러지고
+있었습니다 — 8/20에 D.1 태그로 이미 한 번 겪은 것과 정확히 같은
+유형의 구조적 gap이 반복된 것입니다("0건"이 "정상"인지 "번들이
+안 담았다"인지 구분 불가).
+
+민우님 지시로 범위를 최소화: exporter allowlist + 테스트만
+수정하고, 새 로직/새 로그는 만들지 않습니다. 먼저 코드베이스
+전체에서 journal/주문접수 관련 기존 로그 태그를 전수 확인했고,
+그 결과 다음 3종의 CRITICAL 태그만 실제로 존재함을 확인했습니다
+(journal 생성/갱신/orphan 갱신/terminal 삭제 등 **성공** 시점을
+남기는 별도 lifecycle 태그는 코드베이스에 존재하지 않음 — 그런
+로그를 새로 만들지 않고, 있는 것만 그대로 노출):
+
+- `[TRACKED_ORDER_JOURNAL_ERROR]` (`trading_service.py:2408, 2451`) —
+  journal 기록/유지 실패
+- `[ORDER_ID_MISSING]` (`trading_service.py:3381, 3667`) — BUY/SELL
+  accepted=True인데 order_id가 비어 있음
+- `[ORDER_PLACEMENT_AMBIGUOUS]` (`trading_service.py:3345, 3615`) —
+  주문 접수 여부 불명, 사람 확인 필요
+
+### 변경 내용
+
+`export_daily_bundle.py`의 `LOG_TAGS` 튜플에 위 3개 태그 추가.
+전부 symbol/order_id/side만 포함하고 `SENSITIVE_KEYS` 대상 필드
+(계좌번호/토큰 등)는 담지 않음을 확인 — 8/20 D.1 태그 추가와
+동일한 성격의 수집 대상 확장. 모듈 상단 docstring에 이번 변경
+배경을 기록.
+
+### 변경하지 않은 것 (민우님 지시 그대로)
+
+`TradingService`/journal 동작/BUY·SELL 로직/Broker/lifecycle/
+E.1-B/Profitability Shadow v2/threshold — 전부 0건. journal
+create/update/orphan/terminal remove 시점의 새 성공 로그도 만들지
+않음(현재 코드베이스에 없으므로).
+
+### 테스트 (test_shadow_analysis.py에 7건 신규)
+
+B-22) 태그 3종이 `LOG_TAGS`에 모두 존재. B-23~B-25) 실제 슬라이싱
+경로를 태워 세 태그 각각이 `raw/app_analysis_YYYYMMDD.log`에
+정확히 추출됨(trading_service.py의 실제 CRITICAL 로그 문구 형태
+그대로 사용). B-26) 기존 `[COND_STATUS]` 태그 정상 동작 확인.
+B-27) allowlist 밖 계좌번호 라인은 여전히 제외됨(누출 없음).
+B-28) 새 태그 추가가 정확히 4줄만 추출(누락/중복 없음). 기존
+마스킹/allowlist 가드(B-11 등)는 이 3개 태그가 TOKEN/BALANCE/AUTH/
+ORDER_RESP 관련 키워드를 포함하지 않아 그대로 통과.
+
+### 회귀 결과
+
+`test_shadow_analysis.py` 183/183 통과(신규 7건 포함). 전체 회귀
+(`run_regression_tests.py`) — 클린 HEAD 대비 새로 발생한 실패
+0건(직접 `git stash`로 대조 확인): 클린 HEAD/변경 후 둘 다 동일한
+사전 존재 실패만 남음(`test_replay_time_axis.py` 168/178 — 기존
+무관 실패, 그 외는 이 세션 환경에 `websockets` 미설치·
+`tests/fixtures/order_reconciliation/` 미포함 등 로컬 개발환경
+차이로 인한 실패이며 이 diff와 무관). `compileall` 정상.
+
+### ⚠️ 이번 세션에서 발견한 별도 사실 — `entry_quality_guard_mode` 로컬 override 유실
+
+8/24 bundle 분석 중 오늘 `entry_quality_shadow.csv`가 0행이었던
+원인도 함께 확인됐습니다: diff는 `config/settings.yaml`을 파일
+전체 덮어쓰기로 전달하는데, 리포지토리 기본값(`entry_quality_guard_mode:
+"off"`, `test_experimental_config.py`가 이 기본값을 명시적으로
+고정하는 회귀 테스트까지 보유)이 민우님이 로컬에 걸어둔
+`"shadow"` override를 조용히 되돌렸습니다. 민우님이 로컬을
+`"shadow"`로 직접 복원했고, 이 항목은 **이번 diff 범위 밖**입니다
+(설정값 변경이며 코드 변경이 아니고, 리포지토리 기본값 자체를
+바꾸는 것은 별도 판단 필요 — 이번 세션에서는 손대지 않음).
+재발 방지 후보(전략 미관여 `*_mode` 플래그를 gitignore된 로컬
+override 파일로 분리)는 제안만 해두고 미착수.
+
+### 다음 단계
+
+민우님이 로컬 `app.log`에서 위 세 태그를 직접 grep해 8/24 하루
+E.1-A/주문접수가 문제없었는지 1차 확인 → 이 diff를 적용하면
+다음 daily bundle부터는 이 grep을 매번 반복하지 않아도 됩니다.
+승인 시 그대로 적용하시면 되고, journal 성공 lifecycle 로그
+추가나 `FORCED_SELL_FAILED`(발견했으나 이번 요청 범위 밖이라
+allowlist에 넣지 않은 기존 CRITICAL 태그) 같은 추가 항목은 원하실
+때 별도 라운드로 진행하겠습니다.

@@ -310,6 +310,47 @@ check("B-20) 기존 [COND_STATUS] 태그는 이번 변경과 무관하게 여전
 check("B-21) 새 태그 추가가 회귀 없이 정확히 6줄만 추출함(줄 누락/중복 없음)",
       len([l for l in applog6.splitlines() if l.strip()]) == 6)
 
+# 2026-08-24 (observability-only closure): E.1-A(durable journal,
+# 8/20)/1P0.8-A.1(order_id 연결, 8/14)의 CRITICAL 로그 3종이
+# allowlist 신설(1I.1, 8/6) 이후로도 계속 추가되지 않고 있었음 —
+# 8/24 bundle 분석 중 발견(같은 유형의 gap이 D.1 태그 때와 동일하게
+# 반복됨). 아래 태그 3종을 추가.
+check("B-22) E.1-A/주문접수 오류 태그 3종이 allowlist에 모두 존재",
+      all(tag in B.LOG_TAGS for tag in (
+          "[TRACKED_ORDER_JOURNAL_ERROR]", "[ORDER_ID_MISSING]",
+          "[ORDER_PLACEMENT_AMBIGUOUS]",
+      )))
+
+# 실제 슬라이싱 경로를 태워서 이 3개 태그가 번들 로그 파일에 그대로
+# 담기는지, 기존 태그·마스킹·allowlist 밖 라인 제외가 여전히 정상
+# 동작하는지 함께 검증(trading_service.py의 실제 CRITICAL 로그
+# 문구 형태를 그대로 사용).
+journal_log_lines = [
+    "2026-08-24 09:01:01 | CRITICAL | [TRACKED_ORDER_JOURNAL_ERROR] 005930 | journal 기록 실패(매매 로직에는 영향 없음, 재시작 후 이 주문의 흔적이 없을 수 있음) | side=BUY | OSError: disk full",
+    "2026-08-24 09:01:02 | CRITICAL | [ORDER_ID_MISSING] 005930 | 주문 accepted=True지만 order_id가 비어 있음 | side=BUY",
+    "2026-08-24 09:01:03 | CRITICAL | [ORDER_PLACEMENT_AMBIGUOUS] 005930 | side=SELL | 주문 접수 여부 불명(응답 없음) — 사람 확인 후 acknowledge_error() 필요: Timeout",
+    "2026-08-24 09:01:04 | INFO | [COND_STATUS] seq1=1종목 | final=5종목",
+    "2026-08-24 09:01:05 | ERROR | 주문실패 account_no=1234567890 잔고부족",
+]
+root7 = Path(tempfile.mkdtemp())
+(root7 / "logs").mkdir(parents=True, exist_ok=True)
+(root7 / "logs" / "app.log").write_text("\n".join(journal_log_lines) + "\n", encoding="utf-8")
+z7 = _run_export(root7, "2026-08-24")
+texts7 = _zip_texts(z7)
+applog7 = texts7["raw/app_analysis_20260824.log"]
+check("B-23) [TRACKED_ORDER_JOURNAL_ERROR] 줄이 번들 로그에 포함됨",
+      "[TRACKED_ORDER_JOURNAL_ERROR]" in applog7 and "005930" in applog7)
+check("B-24) [ORDER_ID_MISSING] 줄이 번들 로그에 포함됨",
+      "[ORDER_ID_MISSING]" in applog7 and "side=BUY" in applog7)
+check("B-25) [ORDER_PLACEMENT_AMBIGUOUS] 줄이 번들 로그에 포함됨",
+      "[ORDER_PLACEMENT_AMBIGUOUS]" in applog7 and "side=SELL" in applog7)
+check("B-26) 기존 [COND_STATUS] 태그는 이번 변경과 무관하게 여전히 포함됨",
+      "[COND_STATUS]" in applog7)
+check("B-27) allowlist 밖 계좌번호 라인은 여전히 제외됨(누출 없음)",
+      "1234567890" not in "".join(texts7.values()))
+check("B-28) 새 태그 추가가 회귀 없이 정확히 4줄만 추출함(줄 누락/중복 없음)",
+      len([l for l in applog7.splitlines() if l.strip()]) == 4)
+
 
 # ── C. 중복 판정 ───────────────────────────────────────────────
 def _shadow_row(**kw):
