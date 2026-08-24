@@ -33,7 +33,7 @@ from infra.broker.base import Broker
 from infra.storage.daily_reporter import DailyReporter
 from infra.storage.logger import (
     AppLogger, TradeCsvLogger, SignalCsvLogger, EntryWatchShadowLogger, PositionLifecycleLogger,
-    EntryQualityShadowLogger,
+    EntryQualityShadowLogger, LowUpsideShadowLogger, MinProfitExtensionShadowLogger,
 )
 from infra.storage.minute_bar_saver import MinuteBarSaver
 from infra.storage.skip_reason import classify_skip_reason, SkipReason
@@ -64,6 +64,8 @@ class TradingService:
         position_lifecycle_logger: "PositionLifecycleLogger | None" = None,
         entry_quality_shadow_logger: "EntryQualityShadowLogger | None" = None,
         tracked_order_journal: "TrackedOrderJournalStore | None" = None,
+        low_upside_shadow_logger: "LowUpsideShadowLogger | None" = None,
+        min_profit_extension_shadow_logger: "MinProfitExtensionShadowLogger | None" = None,
     ) -> None:
         self.settings = settings
         self.broker = broker
@@ -98,6 +100,46 @@ class TradingService:
         self._tracked_order_journal = tracked_order_journal or TrackedOrderJournalStore(
             settings.storage.tracked_order_journal_file
         )
+        # 2026-08-24 (Profitability Shadow v2): 동일 패턴 — None이면 storage
+        # 설정에서 자동 생성. 둘 다 순수 관측 전용이며 BUY/SELL 판단에는
+        # 전혀 관여하지 않습니다(entry_quality_guard_mode와도 무관).
+        #
+        # 2026-08-24 (Shadow v2 재closure, 민우님 코드리뷰 P0 지적):
+        # append() 실패는 fail-open으로 막았지만, 두 로거의 __init__() 자체는
+        # mkdir/open/헤더쓰기를 즉시 수행하므로 permission/disk-full/잘못된
+        # 경로 등으로 생성자가 실패하면 예외가 그대로 TradingService.__init__
+        # 밖으로 전파돼 자동매매 프로그램 자체가 기동하지 못할 수 있었습니다.
+        # 관측용 CSV 하나 때문에 프로그램이 아예 시작 못 하는 것은
+        # observation-only 설계 조건에 맞지 않으므로, 생성 자체도
+        # try/except로 감싸 실패 시 None으로 남기고 WARNING만 남깁니다.
+        # 기존 핵심 로거(trade_logger/signal_logger/entry_watch_shadow_logger/
+        # position_lifecycle_logger/entry_quality_shadow_logger/
+        # tracked_order_journal)의 초기화 정책은 이번에 손대지 않았습니다 —
+        # 새로 추가한 profitability shadow logger 2종만 대상입니다. 호출부
+        # (_write_signal_log/_log_min_profit_extension_shadow)는 None이면
+        # 조용히 건너뜁니다.
+        try:
+            self.low_upside_shadow_logger = low_upside_shadow_logger or LowUpsideShadowLogger(
+                settings.storage.low_upside_shadow_log_file
+            )
+        except Exception as exc:
+            self.app_logger.warning(
+                f"[LOW_UPSIDE_SHADOW] 로거 생성 실패 — 이번 실행에서는 관측을 건너뜁니다"
+                f"(BUY/SELL 판단에는 영향 없음): {type(exc).__name__}: {exc}"
+            )
+            self.low_upside_shadow_logger = None
+        try:
+            self.min_profit_extension_shadow_logger = (
+                min_profit_extension_shadow_logger or MinProfitExtensionShadowLogger(
+                    settings.storage.min_profit_extension_shadow_log_file
+                )
+            )
+        except Exception as exc:
+            self.app_logger.warning(
+                f"[MIN_PROFIT_EXTENSION_SHADOW] 로거 생성 실패 — 이번 실행에서는 관측을 건너뜁니다"
+                f"(BUY/SELL 판단에는 영향 없음): {type(exc).__name__}: {exc}"
+            )
+            self.min_profit_extension_shadow_logger = None
 
         self.state, loaded_highest = self.state_store.load()
 
@@ -1523,6 +1565,7 @@ class TradingService:
 
             signal = self._check_entry_watch(
                 symbol, position, market_price.current_price, entry_watch_minute_analysis,
+                market_price=market_price, highest_price=highest_price,
             )
             if signal is None:
                 signal = strategy.generate_signal(
@@ -1798,6 +1841,8 @@ class TradingService:
         position,
         current_price: int,
         minute_analysis,
+        market_price=None,
+        highest_price: int = 0,
     ) -> "Signal | None":
         """
         매수 직후 watch_minutes 동안 실패한 진입(V자 등)을 빠르게 정리합니다.
@@ -1811,6 +1856,13 @@ class TradingService:
         watch_minutes(+버퍼)를 초과하면 더 이상 관여하지 않고 None을
         반환해 정규 전략에 판단을 위임합니다. position이 없거나
         entry_watch가 비활성화된 경우도 None을 반환합니다.
+
+        market_price/highest_price는 2026-08-24 (Profitability Shadow v2)에
+        추가된 선택 인자입니다 — 기본값 None/0이라 기존 호출부(legacy_tests
+        포함)는 전혀 수정할 필요가 없습니다. 3번 분기(최소수익미달청산)가
+        실제로 발동하는 그 순간에만 MIN_PROFIT_EXTENSION_SHADOW feature
+        snapshot을 기록하는 데 씁니다 — 판정 로직 자체(1/2/3번 조건)는
+        이 인자들과 무관하게 전혀 바뀌지 않습니다.
         """
         ew = getattr(self.settings, "entry_watch", None)
         if ew is None or not ew.enabled:
@@ -1895,6 +1947,17 @@ class TradingService:
 
         # 3) watch_minutes 경과 시점에 최소수익 미달 청산
         if elapsed_min >= ew.watch_minutes and pnl_pct < ew.min_profit_pct:
+            self._log_min_profit_extension_shadow(
+                symbol=symbol,
+                entry_time_str=entry_time_str,
+                elapsed_min=elapsed_min,
+                pnl_pct=pnl_pct,
+                current_price=current_price,
+                avg=avg,
+                highest_price=highest_price,
+                minute_analysis=minute_analysis,
+                market_price=market_price,
+            )
             return Signal(
                 type=SignalType.SELL,
                 reason=(
@@ -1904,6 +1967,114 @@ class TradingService:
             )
 
         return None
+
+    def _log_min_profit_extension_shadow(
+        self,
+        symbol: str,
+        entry_time_str: str,
+        elapsed_min: float,
+        pnl_pct: float,
+        current_price: int,
+        avg: int,
+        highest_price: int,
+        minute_analysis,
+        market_price,
+    ) -> None:
+        """MIN_PROFIT_EXTENSION_SHADOW feature snapshot을 기록합니다.
+
+        2026-08-24 (Profitability Shadow v2). Profitability Sprint v1이
+        진입 시점 feature(current_vs_vwap_pct/macd_above_signal 등)로
+        "5분 시점 조건부 연장" 후보를 검증하려다 실제로는 진입 시점
+        조건을 검증한 셈이 됐다는 리뷰 지적(민우님)에 대한 대응 —
+        이 함수는 오직 이 청산 판단이 실제로 내려지는 이 순간의 값만
+        기록합니다.
+
+        2026-08-24 (Shadow v2 closure, 민우님 코드리뷰 P0 지적): 최초
+        배치본은 이 함수 안에서 "예외를 삼키지 않는다"고 의도적으로
+        설계했으나, 이 함수는 호출부(`_check_entry_watch()`)가 SELL
+        Signal을 만들어 반환하기 *직전*에 실행됩니다 — 여기서 예외가
+        전파되면 SELL Signal 자체가 반환되지 못하고 그 폴링에서 실제
+        청산이 누락됩니다. "관측 전용, SELL 정책에 영향 0"이라는 이
+        기능의 설계 조건을 정면으로 어기는 것이므로, 이제 이 함수는
+        어떤 예외도 밖으로 내보내지 않고(fail-open) app_logger에
+        WARNING만 남깁니다 — 디스크 full/permission/CSV I/O 오류가
+        나더라도 5분 최소수익미달 SELL은 항상 정상적으로 나갑니다.
+        """
+        # 방어적 가드 — __init__을 거치지 않고 만들어진 인스턴스(단위테스트
+        # 등에서 TradingService.__new__로 속성만 채워 쓰는 경우) 대응.
+        # legacy_tests/test_entry_watch.py가 정확히 이 패턴을 씀. 로거
+        # 생성 자체가 실패해 None으로 남은 경우(위 __init__ 참고)도
+        # 동일하게 조용히 건너뜀 — 둘 다 "관측 불가"일 뿐 SELL 판정에는
+        # 영향 없음.
+        if getattr(self, "min_profit_extension_shadow_logger", None) is None:
+            return
+        try:
+            peak_pnl_pct = ((highest_price - avg) / avg * 100) if (avg > 0 and highest_price > 0) else ""
+            drawdown_from_peak_pct = (
+                (current_price - highest_price) / highest_price * 100
+                if highest_price > 0 else ""
+            )
+
+            macd_val = ""
+            macd_signal_val = ""
+            macd_above_signal_val = ""
+            rsi_val = ""
+            if market_price is not None:
+                macd_val = getattr(market_price, "indicator_macd", None)
+                macd_signal_val = getattr(market_price, "indicator_macd_signal", None)
+                rsi_val = getattr(market_price, "indicator_rsi", None)
+                if macd_val is not None and macd_signal_val is not None:
+                    macd_above_signal_val = macd_val > macd_signal_val
+                else:
+                    macd_val = macd_val if macd_val is not None else ""
+                    macd_signal_val = macd_signal_val if macd_signal_val is not None else ""
+                rsi_val = rsi_val if rsi_val is not None else ""
+
+            stale = minute_analysis is None
+            vwap_val = ""
+            price_vs_vwap_val = ""
+            ma5_val = ""
+            ma20_val = ""
+            upside_val = ""
+            if not stale:
+                ma = minute_analysis
+                vwap_val = ma.vwap
+                price_vs_vwap_val = (
+                    round((current_price - ma.vwap) / ma.vwap * 100, 2) if ma.vwap > 0 else ""
+                )
+                ma5_val = ma.ma5
+                ma20_val = ma.ma20
+                upside_val = ma.upside_to_recent_high_pct
+
+            self.min_profit_extension_shadow_logger.append_if_new({
+                "timestamp": now_kst().replace(tzinfo=None).isoformat(),
+                "symbol": symbol,
+                "entry_time": entry_time_str,
+                "holding_minutes": round(elapsed_min, 2),
+                "pnl_pct": round(pnl_pct, 3),
+                "price": current_price,
+                "vwap": vwap_val,
+                "price_vs_vwap_pct": price_vs_vwap_val,
+                "macd": macd_val,
+                "macd_signal": macd_signal_val,
+                "macd_above_signal": macd_above_signal_val,
+                "rsi": rsi_val,
+                "ma5": ma5_val,
+                "ma20": ma20_val,
+                "peak_pnl_pct": round(peak_pnl_pct, 3) if peak_pnl_pct != "" else "",
+                "drawdown_from_peak_pct": (
+                    round(drawdown_from_peak_pct, 3) if drawdown_from_peak_pct != "" else ""
+                ),
+                "upside_to_recent_high_pct": upside_val,
+                "minute_data_stale": stale,
+            })
+        except Exception as exc:
+            app_logger = getattr(self, "app_logger", None)
+            if app_logger is not None:
+                app_logger.warning(
+                    f"[MIN_PROFIT_EXTENSION_SHADOW] {symbol} | 관측 로그 기록 실패"
+                    f"(무시하고 SELL은 정상 진행): {type(exc).__name__}: {exc}"
+                )
 
     def _start_entry_watch_shadow_tracking(
         self, symbol: str, entry_price: int, trigger_price: int, trigger_type: str,
@@ -4180,5 +4351,66 @@ class TradingService:
                         assessment.would_block_pr_or_pullback_condition_session_vwap
                     ),
                 })
+
+        # ── Low Upside shadow 관측 (2026-08-24, Profitability Shadow v2) ──
+        # entry_quality_guard_mode(위 guard_mode 블록)와 완전히 무관하게
+        # 항상 계산·기록됩니다 — Profitability Sprint v1 리뷰(민우님)에서
+        # 실거래 9건 기준 가장 유력한 후보로 확인된 "upside_to_recent_
+        # high_pct < 임계값이면 스킵" 가상 판정의 실시간 표본을 빠르게
+        # 쌓기 위한 것으로, VWAP shadow 실험(guard_mode)과는 별개 축입니다.
+        # legacy_buy_candidate=True(전략이 실제로 BUY를 반환한 경우)에만
+        # 기록 — HOLD/SKIP 판단을 "스킵했을 것"이라고 부르는 건 이미
+        # 매수 후보가 아니었던 것이라 counterfactual의 정의에 맞지 않음
+        # (entry_quality_shadow와 동일한 이유). minute_analysis가 stale
+        # 이면(upside_to_recent_high_pct 계산 불가) 아예 기록하지 않음 —
+        # 빈 값을 채워서 "0.50% 미만이 아니다"처럼 잘못 읽히는 것을 방지.
+        # 주문 흐름에는 어떤 값도 전달하지 않습니다 — BUY를 절대 막지 않음.
+        #
+        # 2026-08-24 (Shadow v2 closure, 민우님 코드리뷰 지적): 이 시점은
+        # 이미 _try_buy()가 끝나고 주문 결과가 확정된 뒤이므로 여기서
+        # 예외가 나도 주문 자체는 막지 않지만, 원래는 이 블록 바로 다음의
+        # self.signal_logger.append(row)까지 함께 실패시킬 수 있었습니다 —
+        # 보조 관측 로그 하나의 쓰기 실패가 기존 signal_log 기록까지
+        # 끌고 내려가는 것은 이 로거의 설계 조건(observation-only)에
+        # 맞지 않아 fail-open으로 바꿨습니다.
+        #
+        # 2026-08-24 (Shadow v2 재closure, 민우님 코드리뷰 P0 지적): 로거
+        # 생성 자체가 __init__에서 실패해 None으로 남을 수 있으므로
+        # (위 __init__ 참고), hasattr뿐 아니라 None 여부도 함께 확인.
+        if (
+            legacy_buy_candidate_val
+            and minute_analysis is not None
+            and getattr(self, "low_upside_shadow_logger", None) is not None
+        ):
+            try:
+                upside_val = minute_analysis.upside_to_recent_high_pct
+                self.low_upside_shadow_logger.append_if_new({
+                    "timestamp": now_kst().replace(tzinfo=None).isoformat(),
+                    "symbol": symbol,
+                    "latest_bar_timestamp": latest_bar_timestamp_val,
+                    "detected_patterns": row.get("detected_patterns", "-"),
+                    "score": score,
+                    "condition_name": self._representative_condition_name(symbol),
+                    "upside_to_recent_high_pct": upside_val,
+                    "would_skip_low_upside_f1": upside_val < 1.00,
+                    "would_skip_low_upside_f2": upside_val < 0.50,
+                    "would_skip_low_upside_f3": upside_val < 0.25,
+                    "final_decision": final_decision or signal.type.value,
+                    "order_block_reason": order_block_reason,
+                    # 민우님 지적: entry_quality_shadow.csv에는 이미 있던
+                    # 실제 주문 연결 정보(order_attempt는 이 함수 상단에서
+                    # 이미 계산됨)가 이 CSV에는 빠져 있었음 — "BUY 후보"와
+                    # "실제 accepted된 거래"를 구분할 수 있어야 함.
+                    "order_attempted": order_attempt is not None,
+                    "order_accepted": order_attempt.accepted if order_attempt is not None else "",
+                    "order_id": order_attempt.order_id if order_attempt is not None else "",
+                })
+            except Exception as exc:
+                app_logger = getattr(self, "app_logger", None)
+                if app_logger is not None:
+                    app_logger.warning(
+                        f"[LOW_UPSIDE_SHADOW] {symbol} | 관측 로그 기록 실패"
+                        f"(무시하고 signal_log는 정상 기록): {type(exc).__name__}: {exc}"
+                    )
 
         self.signal_logger.append(row)

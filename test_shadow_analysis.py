@@ -849,6 +849,58 @@ check("V-4) fsync 실패 후에도 ZIP 무결성 정상",
 check("V-5) fsync 실패 후 tmp 파일이 남지 않음",
       not list((root5 / "exports").glob("*.zip.tmp")))
 
+# ══════════════════════════════════════════════════════════════
+# W. Profitability Shadow v2 CSV가 daily bundle에 포함되는지
+# (2026-08-24, Shadow v2 closure, 민우님 코드리뷰 지적)
+# ══════════════════════════════════════════════════════════════
+# CSV_SOURCES는 명시적 allowlist라 새 CSV를 추가하지 않으면 daily
+# bundle에 실리지 않음 — 최초 Shadow v2 배치본은 이 두 파일을
+# export_daily_bundle.py에 추가하지 않아, 실시간 로그는 정상
+# 쌓여도 다음 Profitability Sprint(매일 bundle 기준)가 못 쓰는
+# 상태였음. end-to-end로 실제 export 경로를 태워 확인한다.
+rootW = Path(tempfile.mkdtemp())
+_mkday(rootW, "low_upside_shadow.csv",
+       ["timestamp", "symbol", "latest_bar_timestamp", "detected_patterns",
+        "score", "condition_name", "upside_to_recent_high_pct",
+        "would_skip_low_upside_f1", "would_skip_low_upside_f2",
+        "would_skip_low_upside_f3", "final_decision", "order_block_reason",
+        "order_attempted", "order_accepted", "order_id"],
+       [
+           {"timestamp": "2026-08-05T09:30:00", "symbol": "OLDDAY1",
+            "upside_to_recent_high_pct": "0.30", "would_skip_low_upside_f2": "True"},
+           {"timestamp": "2026-08-06T09:30:00", "symbol": "NEWDAY1",
+            "upside_to_recent_high_pct": "0.20", "would_skip_low_upside_f2": "True",
+            "order_attempted": "True", "order_accepted": "True", "order_id": "ORD1"},
+       ])
+_mkday(rootW, "min_profit_extension_shadow.csv",
+       ["timestamp", "symbol", "entry_time", "holding_minutes", "pnl_pct",
+        "price", "vwap", "price_vs_vwap_pct", "macd", "macd_signal",
+        "macd_above_signal", "rsi", "ma5", "ma20", "peak_pnl_pct",
+        "drawdown_from_peak_pct", "upside_to_recent_high_pct", "minute_data_stale"],
+       [
+           {"timestamp": "2026-08-05T10:05:00", "symbol": "OLDDAY2", "entry_time": "2026-08-05T10:00:00"},
+           {"timestamp": "2026-08-06T10:05:00", "symbol": "NEWDAY2", "entry_time": "2026-08-06T10:00:00"},
+       ])
+zW = _run_export(rootW, "2026-08-06")
+textsW = _zip_texts(zW)
+check("W-1) low_upside_shadow.csv가 raw/에 포함됨",
+      "raw/low_upside_shadow_20260806.csv" in textsW)
+check("W-2) low_upside_shadow.csv가 날짜 기준으로 슬라이싱됨(전일 행 제외)",
+      "NEWDAY1" in textsW["raw/low_upside_shadow_20260806.csv"]
+      and "OLDDAY1" not in textsW["raw/low_upside_shadow_20260806.csv"])
+check("W-3) low_upside_shadow.csv에 order_attempted/order_accepted/order_id 값이 그대로 보존됨",
+      "ORD1" in textsW["raw/low_upside_shadow_20260806.csv"])
+check("W-4) min_profit_extension_shadow.csv가 raw/에 포함됨",
+      "raw/min_profit_extension_shadow_20260806.csv" in textsW)
+check("W-5) min_profit_extension_shadow.csv가 날짜 기준으로 슬라이싱됨(전일 행 제외)",
+      "NEWDAY2" in textsW["raw/min_profit_extension_shadow_20260806.csv"]
+      and "OLDDAY2" not in textsW["raw/min_profit_extension_shadow_20260806.csv"])
+check("W-6) MANIFEST에 두 파일 모두 OK로 기록됨(SCHEMA_ERROR/MISSING 아님)",
+      "low_upside_shadow.csv" in textsW["MANIFEST.txt"]
+      and "min_profit_extension_shadow.csv" in textsW["MANIFEST.txt"]
+      and "SCHEMA_ERROR" not in textsW["MANIFEST.txt"].split("low_upside_shadow.csv")[1].split("\n")[0]
+      and "MISSING" not in textsW["MANIFEST.txt"].split("low_upside_shadow.csv")[1].split("\n")[0])
+
 print()
 print(f"[최종] 총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
 if failed:

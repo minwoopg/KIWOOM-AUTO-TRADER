@@ -68,6 +68,15 @@ CSV_SOURCES: list[tuple[str, tuple[str, ...]]] = [
     ("entry_watch_shadow.csv", ("trigger_at", "timestamp", "buy_time")),
     ("trades.csv", ("timestamp", "time", "체결시간")),
     ("position_lifecycle.csv", ("timestamp",)),
+    # 2026-08-24 (Profitability Shadow v2 closure, 민우님 코드리뷰 지적):
+    # 이 목록은 명시적 allowlist라 자동으로 새 CSV를 담지 않습니다 —
+    # Shadow v2가 새로 남기는 두 파일을 여기 추가하지 않으면 실시간
+    # 로그는 정상 쌓여도 daily bundle에는 실리지 않아, Profitability
+    # Sprint가 매일 bundle 기준으로 분석하는 한 이 기능의 목적(실시간
+    # shadow 표본을 빠르게 쌓아 다음 Sprint에서 쓰는 것) 자체를 달성할
+    # 수 없습니다.
+    ("low_upside_shadow.csv", ("timestamp",)),
+    ("min_profit_extension_shadow.csv", ("timestamp",)),
 ]
 
 # app.log에서 뽑아낼 태그 — **allowlist 전용**.

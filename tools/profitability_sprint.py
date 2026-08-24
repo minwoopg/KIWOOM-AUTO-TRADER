@@ -1,0 +1,1152 @@
+#!/usr/bin/env python3
+"""Profitability Sprint v1 — 실제 거래 기반 수익성 개선 후보 발굴 (analysis-only).
+
+1P0.8 이후 첫 "수익성" 분석 전용 도구입니다. 지금까지의 1P0.8 라운드는
+전부 안전성/관측성(D.1/D.1.1/E.1-A/OBS.2)이었고, 이 도구는 그 위에서
+"실제 손실을 줄이고 기대수익을 높일 수 있는 전략 변경 후보를 좁히는"
+것이 유일한 목적입니다.
+
+절대 원칙 (이 파일 자체가 지켜야 하는 제약):
+    - Broker 호출 금지
+    - 네트워크 호출 금지
+    - 주문 API 호출 금지
+    - TradingService 동작 변경 없음(이 파일은 TradingService를 import하지
+      않고, production 코드를 어떤 방식으로도 수정/실행하지 않습니다)
+    - runtime state 변경 없음
+    100% offline 분석기입니다 — 로컬 bundle CSV만 읽고, 로컬 diagnostics/
+    폴더에만 씁니다.
+
+사용법:
+    python tools/profitability_sprint.py \\
+        --bundle /path/to/bundle_20260820_v2 \\
+        --bundle /path/to/bundle_20260821 \\
+        --out-dir diagnostics/profitability
+
+각 --bundle 인자는 daily bundle 디렉터리(내부에 raw/trades_YYYYMMDD.csv 등이
+있는 구조, export_daily_bundle.py 산출물과 동일)를 가리킵니다. 여러 날짜를
+한 번에 넘기면 합쳐서 다중일 분석을 수행합니다.
+
+출력(모두 --out-dir 아래, 기본 diagnostics/profitability/):
+    trade_feature_table.csv
+    low_upside_study.csv
+    exit_extension_study.csv
+    entry_quality_study.csv
+    candidate_scorecard.csv
+    profitability_summary_<YYYYMMDD~YYYYMMDD>.md
+
+데이터 무결성 원칙 (민우님 지시 그대로):
+    - 원본 bundle이 없는 날짜의 수치를 문서만 보고 임의로 복원하지 않습니다.
+    - 모든 산출 값에는 근거 등급(RAW/DERIVED_FROM_RAW/DOCUMENT_ONLY/
+      UNAVAILABLE)을 붙일 수 있도록 quality_notes에 기록합니다.
+    - 채울 수 없는 필드는 빈 문자열(NA)로 두고 추정하지 않습니다.
+    - live 실측 데이터 우선, replay/가상 데이터는 최후 수단이며 이 도구는
+      replay를 전혀 실행하지 않습니다(entry_watch_shadow에 이미 기록된
+      실측 checkpoint만 사용) — LIVE_SUPPORTED만 만들고 REPLAY_ONLY는
+      생성하지 않습니다(replay 재실행 자체를 하지 않으므로).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import statistics
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# ── 비용 모델 ────────────────────────────────────────────────────
+# 이 프로젝트의 비용 시나리오는 domain/cost_model.py가 단일 출처입니다
+# (1J/1J.1 — "분석기마다 비용을 직접 하드코딩하고 값이 서로 달랐다"는
+# 사고를 막기 위한 정책, test_cost_model.py가 저장소 전체를 스캔해
+# 허용 위치 밖의 0.35/0.90 리터럴 하드코딩을 검출합니다). 이 도구도
+# 예외 없이 domain.cost_model.load_cost_model()로만 비용을 얻습니다.
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from domain.cost_model import load_cost_model  # noqa: E402
+
+COST_MODEL = load_cost_model()
+BASE_SCENARIO = "base"
+STRESS_SCENARIO = "stress"
+
+# ── 승/무/패 정의 — utils/trade_outcome.py와 동일 정의를 이 파일 안에
+#    독립적으로 재정의합니다(analysis-only 도구를 production 모듈에
+#    결합시키지 않기 위해 — 정의 자체는 완전히 동일: wins/(wins+losses),
+#    breakeven은 분모 제외). ───────────────────────────────────────
+WIN = "WIN"
+LOSS = "LOSS"
+BREAKEVEN = "BREAKEVEN"
+
+
+def classify_outcome(pnl: float) -> str:
+    if pnl > 0:
+        return WIN
+    if pnl < 0:
+        return LOSS
+    return BREAKEVEN
+
+
+def win_rate_str(wins: int, losses: int, ndigits: int = 1) -> str:
+    """분모 wins+losses. 0이면 정의 불가 — '해당없음'(OBS.2 최종 리뷰와
+    동일한 semantics)."""
+    decided = wins + losses
+    if decided == 0:
+        return "해당없음"
+    return f"{wins/decided*100:.{ndigits}f}%"
+
+
+def safe_float(v):
+    """빈 문자열/None/파싱 실패/non-finite(nan/inf/-inf)는 전부 None(NA).
+    0.0은 유효값으로 유지합니다(OBS.2-B/OBS.2-C 원칙과 동일)."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == "":
+        return None
+    try:
+        f = float(s)
+    except (ValueError, TypeError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
+
+
+def safe_int(v):
+    f = safe_float(v)
+    if f is None:
+        return None
+    return int(f)
+
+
+def safe_bool(v):
+    s = str(v).strip().lower()
+    if s == "true":
+        return True
+    if s == "false":
+        return False
+    return None
+
+
+def parse_ts(v: str):
+    if not v:
+        return None
+    try:
+        return datetime.fromisoformat(v)
+    except ValueError:
+        return None
+
+
+# ── 데이터 적재 ──────────────────────────────────────────────────
+RAW_FILES = {
+    "trades": "trades_{date}.csv",
+    "entry_watch_shadow": "entry_watch_shadow_{date}.csv",
+    "entry_quality_shadow": "entry_quality_shadow_{date}.csv",
+    "position_lifecycle": "position_lifecycle_{date}.csv",
+    "signal_log": "signal_log_{date}.csv",
+}
+
+
+@dataclass
+class BundleDay:
+    date: str  # YYYYMMDD
+    source_dir: Path
+    tables: dict = field(default_factory=dict)          # name -> list[dict]
+    availability: dict = field(default_factory=dict)     # name -> "RAW" | "UNAVAILABLE"
+    quality_notes: list = field(default_factory=list)
+
+
+def _read_csv(path: Path) -> list[dict]:
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def load_bundle_day(bundle_dir: Path) -> BundleDay:
+    """bundle_dir/raw/*_<date>.csv 를 읽습니다. date는 raw/trades_*.csv
+    파일명에서 추출합니다(필수 파일). 없는 파일은 UNAVAILABLE로 표시하고
+    조용히 넘어가지 않습니다(quality_notes에 기록)."""
+    raw_dir = bundle_dir / "raw"
+    trades_candidates = sorted(raw_dir.glob("trades_*.csv")) if raw_dir.is_dir() else []
+    if not trades_candidates:
+        raise FileNotFoundError(
+            f"{bundle_dir}: raw/trades_*.csv 를 찾을 수 없습니다 — "
+            "이 디렉터리는 daily bundle이 아니거나 raw 파일이 없습니다. "
+            "원본 bundle 없이 문서만으로 이 날짜를 분석에 포함하지 않습니다."
+        )
+    trades_path = trades_candidates[0]
+    date = trades_path.stem.split("_")[-1]
+
+    day = BundleDay(date=date, source_dir=bundle_dir)
+    for name, pattern in RAW_FILES.items():
+        p = raw_dir / pattern.format(date=date)
+        if p.is_file():
+            try:
+                day.tables[name] = _read_csv(p)
+                day.availability[name] = "RAW"
+            except Exception as e:  # noqa: BLE001 — 진단 도구이므로 광범위 예외를 기록만 하고 계속
+                day.tables[name] = []
+                day.availability[name] = "UNAVAILABLE"
+                day.quality_notes.append(f"{name}: 읽기 실패({e}) — UNAVAILABLE 처리")
+        else:
+            day.tables[name] = []
+            day.availability[name] = "UNAVAILABLE"
+            day.quality_notes.append(f"{name}: 파일 없음({p.name}) — UNAVAILABLE 처리, 추정하지 않음")
+    return day
+
+
+# ── entry_quality_shadow / signal_log 조인 ──────────────────────
+def _index_entry_quality_by_order_id(rows: list[dict]) -> dict:
+    idx = {}
+    for r in rows:
+        oid = (r.get("order_id") or "").strip()
+        if oid and safe_bool(r.get("order_accepted")):
+            idx[oid] = r
+    return idx
+
+
+def _index_signal_log_buy_by_symbol(rows: list[dict]) -> dict:
+    """symbol -> [(timestamp, row), ...] (final_decision == BUY 인 행만).
+    order_id가 없는 파일이므로 심볼+초 단위 근접 시각으로 매칭합니다."""
+    idx: dict = defaultdict(list)
+    for r in rows:
+        if (r.get("final_decision") or "").strip() != "BUY":
+            continue
+        ts = parse_ts(r.get("timestamp", ""))
+        if ts is None:
+            continue
+        idx[r.get("symbol", "")].append((ts, r))
+    return idx
+
+
+def _find_nearest_signal_log(idx: dict, symbol: str, buy_ts, tolerance_sec: float = 5.0):
+    candidates = idx.get(symbol, [])
+    best = None
+    best_dt = None
+    for ts, row in candidates:
+        dt = abs((ts - buy_ts).total_seconds())
+        if dt <= tolerance_sec and (best_dt is None or dt < best_dt):
+            best, best_dt = row, dt
+    return best
+
+
+def _find_entry_watch_counterfactual(shadow_rows: list[dict], symbol: str, sell_price: float,
+                                      sell_ts, tolerance_sec: float = 60.0):
+    """entry_watch_shadow에서 이 SELL과 실제로 대응되는 checkpoint 3건을
+    찾습니다. symbol + trigger_price(정확히 SELL 체결가와 일치) +
+    trigger_at가 SELL 시각과 tolerance_sec 이내일 때만 매칭합니다.
+
+    이 이중 검증(가격+시각)이 중요한 이유: 8/21 실측 bundle에서 064260
+    심볼의 entry_watch_shadow 행이 trigger_price=5330(실제 SELL가
+    5290과 불일치) + trigger_at가 실제 SELL 시각보다 171초 늦은 것으로
+    확인됐습니다 — OBS.2-A에서 고친 "entry_watch_shadow가 실제 accepted
+    SELL이 아니라 판단 시점에 앵커링되던" 오염 패턴이 이 pre-fix 번들에
+    실제로 남아있는 사례입니다. 가격+시각이 둘 다 일치하지 않으면 이
+    counterfactual을 신뢰하지 않고 UNAVAILABLE로 처리합니다(추정 금지).
+    """
+    matches = [r for r in shadow_rows if r.get("symbol") == symbol]
+    price_matches = []
+    for r in matches:
+        tp = safe_float(r.get("trigger_price"))
+        if tp is None or abs(tp - sell_price) > 1e-6:
+            continue
+        tat = parse_ts(r.get("trigger_at", ""))
+        if tat is None:
+            continue
+        if abs((tat - sell_ts).total_seconds()) > tolerance_sec:
+            continue
+        price_matches.append(r)
+    if not price_matches:
+        return None, matches  # (검증된 매칭 없음, 참고용 후보 목록)
+    by_checkpoint = {}
+    for r in price_matches:
+        cp = safe_int(r.get("checkpoint_min"))
+        if cp is not None:
+            by_checkpoint[cp] = r
+    return by_checkpoint, matches
+
+
+# ── feature row 빌드 ─────────────────────────────────────────────
+FEATURE_COLUMNS = [
+    "trade_date", "symbol", "buy_time", "sell_time", "buy_price", "sell_price",
+    "quantity", "gross_pnl", "gross_pnl_pct", "base_net_pnl_pct", "stress_net_pnl_pct",
+    # 2026-08-24 (민우님 리뷰 3번 지적 반영, 금액 기준 scorecard용) — 비용은
+    # 여전히 domain.cost_model 단일 출처(COST_MODEL.cost_amount)로만 계산합니다.
+    "entry_notional_krw", "modeled_base_cost_krw", "modeled_stress_cost_krw",
+    "base_net_pnl_krw", "stress_net_pnl_krw",
+    "outcome",
+    "entry_score", "pattern", "condition_name", "upside_to_recent_high_pct",
+    "current_vs_vwap_pct", "rsi", "macd", "macd_signal", "macd_above_signal",
+    "macd_hist_direction", "ma5_above_ma20", "volume_ratio", "rebound_volume_spike",
+    "rebound_volume_ratio", "atr_14_pct", "bb_percent_b", "bb_position",
+    "session_metrics_ready", "condition_source_reliable",
+    "rolling_vwap_distance_pct", "session_vwap_distance_pct",
+    "would_block_macd_dead_min_score5", "would_block_macd_above_signal_required",
+    "would_block_pr_or_pullback_condition_rolling_vwap",
+    "would_block_pr_or_pullback_condition_session_vwap",
+    "is_v_rebound", "is_pulldown_recovery",
+    "exit_reason", "holding_minutes", "is_entry_watch_exit",
+    # 2026-08-24 (민우님 리뷰 2번 지적 반영): entry_watch 청산을 유형별로
+    # 명시적으로 분리 — 기존 is_entry_watch_exit 하나로는 급락청산/VWAP
+    # 이탈청산/최소수익미달청산이 전부 섞였습니다. exit_extension_study()가
+    # 이 필드로 MIN_PROFIT_5M만 골라 조건부 연장 후보를 계산합니다.
+    "entry_watch_trigger_type",
+    "first_sell_accepted_at",
+    "fwd5m_price_return_pct", "fwd5m_base_net_pct", "fwd5m_stress_net_pct",
+    "fwd10m_price_return_pct", "fwd10m_base_net_pct", "fwd10m_stress_net_pct",
+    "fwd20m_price_return_pct", "fwd20m_base_net_pct", "fwd20m_stress_net_pct",
+    "fwd_data_source",
+    "data_quality_flag",
+]
+
+# entry_watch_trigger_type 값 — exit_reason 텍스트 접두 매칭으로 결정(그 외
+# 문자열 파싱 없음). "entry_watch "로 시작하지 않으면 NOT_ENTRY_WATCH.
+TRIGGER_MIN_PROFIT_5M = "MIN_PROFIT_5M"
+TRIGGER_EARLY_VWAP_EXIT = "EARLY_VWAP_EXIT"
+TRIGGER_CRASH_CUT = "CRASH_CUT"
+TRIGGER_OTHER_ENTRY_WATCH = "OTHER_ENTRY_WATCH"
+TRIGGER_NOT_ENTRY_WATCH = "NOT_ENTRY_WATCH"
+
+
+def classify_entry_watch_trigger(exit_reason: str) -> str:
+    """exit_reason 텍스트로 entry_watch 청산 유형을 분류합니다.
+
+    2026-08-24 (민우님 코드/CSV 직접 대조 리뷰 2번 지적 반영). Sprint v1의
+    Study B는 "entry_watch " 접두사만으로 급락청산/VWAP이탈청산/최소수익
+    미달청산을 한 버킷에 섞었습니다 — "5분 최소수익 타이머를 연장할
+    것인가"라는 질문에 VWAP 조기청산(1~4분, 다른 전략 질문)이 섞여
+    들어가 근거가 약해지는 문제가 있었습니다. domain/service/trading_
+    service.py의 `_check_entry_watch()`가 만드는 정확한 문구
+    ("entry_watch 급락청산 —", "entry_watch VWAP이탈청산 —", "entry_watch
+    최소수익미달청산 —")를 그대로 재사용해 분류합니다 — 새 판정 기준을
+    만들지 않고 이미 존재하는 문구만 구분합니다.
+    """
+    r = exit_reason or ""
+    if not r.startswith("entry_watch "):
+        return TRIGGER_NOT_ENTRY_WATCH
+    if "최소수익미달청산" in r:
+        return TRIGGER_MIN_PROFIT_5M
+    if "VWAP이탈청산" in r:
+        return TRIGGER_EARLY_VWAP_EXIT
+    if "급락청산" in r:
+        return TRIGGER_CRASH_CUT
+    return TRIGGER_OTHER_ENTRY_WATCH
+
+
+def build_trade_features(days: list[BundleDay]) -> tuple[list[dict], list[str]]:
+    rows_out = []
+    warnings_out = []
+
+    for day in days:
+        trades = day.tables.get("trades", [])
+        accepted = [r for r in trades if safe_bool(r.get("accepted"))]
+        buys: dict = defaultdict(list)
+        sells: dict = defaultdict(list)
+        for r in accepted:
+            side = (r.get("side") or "").strip()
+            sym = r.get("symbol", "")
+            if side == "BUY":
+                buys[sym].append(r)
+            elif side == "SELL":
+                sells[sym].append(r)
+
+        eq_idx = _index_entry_quality_by_order_id(day.tables.get("entry_quality_shadow", []))
+        sl_idx = _index_signal_log_buy_by_symbol(day.tables.get("signal_log", []))
+        ew_rows = day.tables.get("entry_watch_shadow", [])
+
+        if day.availability.get("entry_quality_shadow") != "RAW":
+            warnings_out.append(f"{day.date}: entry_quality_shadow 없음 — 이 날짜 거래의 entry 지표(MACD/VWAP거리/게이트) 전부 NA")
+        if day.availability.get("signal_log") != "RAW":
+            warnings_out.append(f"{day.date}: signal_log 없음 — 이 날짜 거래의 MA5/ATR/BB 등 보조 지표 NA")
+        if day.availability.get("entry_watch_shadow") != "RAW":
+            warnings_out.append(f"{day.date}: entry_watch_shadow 없음 — 이 날짜 entry_watch 청산의 +5/10/20분 counterfactual 전부 NA")
+
+        for sym, sell_list in sells.items():
+            buy_list = buys.get(sym, [])
+            for sell in sell_list:
+                if not buy_list:
+                    warnings_out.append(f"{day.date} {sym}: SELL에 대응하는 BUY가 없음 — 이 SELL 스킵(추정 금지)")
+                    continue
+                buy = buy_list.pop(0)
+
+                buy_price_field = safe_float(buy.get("price"))
+                sell_price = safe_float(sell.get("price"))
+                avg_buy_price = safe_float(sell.get("avg_buy_price"))
+                qty = safe_int(sell.get("quantity"))
+                buy_qty = safe_int(buy.get("quantity"))
+
+                dq_flags = []
+                # 실제 체결 평균단가(avg_buy_price, SELL 로그에 기록)를 매수 원가로
+                # 사용합니다 — entry_watch_shadow의 actual_pnl_pct 계산 기준과
+                # 일치시키기 위함입니다. BUY 행의 "price"는 주문 시점 참조가일 뿐
+                # 실제 체결 평균과 다를 수 있습니다(8/21 005935: 요청가 197,500원 vs
+                # 실제 평균 체결가 196,933원, 차이 0.29%p). analyze_trades.py
+                # 헤드라인 계산(BUY price 필드 사용)과는 이 지점에서 다를 수 있음을
+                # 명시합니다.
+                buy_price = avg_buy_price if avg_buy_price and avg_buy_price > 0 else buy_price_field
+                if avg_buy_price and buy_price_field and abs(avg_buy_price - buy_price_field) / buy_price_field > 0.001:
+                    dq_flags.append(f"avg_buy_price({avg_buy_price})가 BUY 주문가({buy_price_field})와 {abs(avg_buy_price-buy_price_field)/buy_price_field*100:.2f}%p 차이")
+
+                # ── PnL price-source 감사 결과 (2026-08-24, 민우님 지시 3번) ──
+                # sell_price(위 sell.get("price"))는 SELL 실제 체결 평균가가
+                # 아니라 SELL 주문을 내기 직전 판단 시점의 참조가(quote)입니다.
+                # 근거(file:line, domain/service/trading_service.py):
+                #   - BUY도 SELL도 trades.csv "price" 필드는 동일하게
+                #     _write_trade_log(..., price=current_price)로 기록되고
+                #     (BUY: L3179/3232, SELL: L3448/3514), 이 current_price는
+                #     주문 발행 "직전" 폴링에서 읽은 시세입니다.
+                #   - SELL 주문 자체도 OrderRequest(symbol=.., side=SELL,
+                #     quantity=..)로 가격 없이(order_type 기본값 "market")
+                #     발행됩니다(L3420) — 즉 실제 체결가는 브로커가 결정하고,
+                #     그 값은 어디에도 기록되지 않습니다.
+                #   - OrderResult(domain/models.py L86-104)에는 애초에 체결가
+                #     필드 자체가 없습니다 — accepted/message/order_id뿐.
+                #   - 실제 체결가(cntr_pric)는 ka10076(체결조회) 응답에
+                #     존재하고 infra/broker/kiwoom_order_status.py L212의
+                #     filled_price로 이미 파싱까지 되어 있지만, 이 모듈은
+                #     아직 KiwoomBroker/Broker 인터페이스에 연결되지
+                #     않았습니다(1P0.8-C 예정, 그 파일 자체 docstring 참고)
+                #     — 즉 지금 살아있는 트레이딩 루프 어디에도 실제 SELL
+                #     체결가를 잡아서 기록하는 코드가 없습니다.
+                #   - 반대로 avg_buy_price(SELL 로그 필드)는 브로커 잔고
+                #     조회 API(position.average_price, L1634)에서 온 진짜
+                #     체결 평균단가입니다 — 이 필드는 realized 값이 맞습니다.
+                # 결론: 이 도구의 gross/base/stress PnL은 "실현손익"이 아니라
+                # "매도 판단 시점 참조가 기준 proxy 손익"입니다(매수 쪽은
+                # avg_buy_price를 쓰므로 realized). 유동성이 충분한 종목·
+                # 시장가 체결이면 참조가와 실제 체결가 차이(슬리피지)가
+                # 작겠지만, 이 데이터로는 그 크기를 검증할 방법이 없습니다.
+                # 코드는 이번 라운드에서 고치지 않습니다(민우님 지시: 감사만,
+                # 수정은 별도 승인 필요) — 대신 모든 산출 행에 아래처럼
+                # data_quality_flag로 명시합니다.
+                dq_flags.append(
+                    "sell_price는 SELL 실제 체결가가 아니라 판단 시점 참조가(proxy) — "
+                    "이 거래의 PnL은 realized가 아니라 proxy로 취급할 것"
+                )
+
+                if not buy_price or not sell_price or buy_price <= 0 or sell_price <= 0 or not qty:
+                    warnings_out.append(f"{day.date} {sym}: 가격/수량 결측으로 이 쌍 스킵")
+                    continue
+                if buy_qty is not None and qty is not None and buy_qty != qty:
+                    dq_flags.append(f"BUY수량({buy_qty})!=SELL수량({qty}) — 부분체결 가능성, quantity는 SELL 기준")
+
+                gross_pnl_pct = (sell_price - buy_price) / buy_price * 100.0
+                gross_pnl = (sell_price - buy_price) * qty
+                outcome = classify_outcome(gross_pnl_pct)
+                base_net_pnl_pct = COST_MODEL.net(gross_pnl_pct, BASE_SCENARIO)
+                stress_net_pnl_pct = COST_MODEL.net(gross_pnl_pct, STRESS_SCENARIO)
+
+                # 금액 기준(KRW) — 2026-08-24, 민우님 리뷰 3번 지적 반영.
+                # cost_amount()는 buy notional(=buy_price*qty) 기준이라
+                # base_net_pnl_krw == gross_pnl - modeled_base_cost_krw가
+                # base_net_pnl_pct*entry_notional_krw/100과 정확히 일치합니다
+                # (COST_MODEL 단일 출처, 이 파일에서 비용을 직접 계산하지 않음).
+                entry_notional_krw = buy_price * qty
+                modeled_base_cost_krw = COST_MODEL.cost_amount(entry_notional_krw, BASE_SCENARIO)
+                modeled_stress_cost_krw = COST_MODEL.cost_amount(entry_notional_krw, STRESS_SCENARIO)
+                base_net_pnl_krw = gross_pnl - modeled_base_cost_krw
+                stress_net_pnl_krw = gross_pnl - modeled_stress_cost_krw
+
+                buy_ts = parse_ts(buy.get("timestamp", ""))
+                sell_ts = parse_ts(sell.get("timestamp", ""))
+                hold_minutes = safe_float(sell.get("hold_minutes"))
+                exit_reason = sell.get("exit_reason", "") or ""
+                is_entry_watch = exit_reason.startswith("entry_watch ")
+                entry_watch_trigger_type = classify_entry_watch_trigger(exit_reason)
+
+                eq_row = eq_idx.get((buy.get("order_id") or "").strip())
+                sl_row = _find_nearest_signal_log(sl_idx, sym, buy_ts) if buy_ts else None
+
+                row = {c: "" for c in FEATURE_COLUMNS}
+                row.update({
+                    "trade_date": day.date,
+                    "symbol": sym,
+                    "buy_time": buy.get("timestamp", ""),
+                    "sell_time": sell.get("timestamp", ""),
+                    "buy_price": buy_price,
+                    "sell_price": sell_price,
+                    "quantity": qty,
+                    "gross_pnl": round(gross_pnl, 2),
+                    "gross_pnl_pct": round(gross_pnl_pct, 4),
+                    "base_net_pnl_pct": round(base_net_pnl_pct, 4),
+                    "stress_net_pnl_pct": round(stress_net_pnl_pct, 4),
+                    "entry_notional_krw": round(entry_notional_krw, 2),
+                    "modeled_base_cost_krw": round(modeled_base_cost_krw, 2),
+                    "modeled_stress_cost_krw": round(modeled_stress_cost_krw, 2),
+                    "base_net_pnl_krw": round(base_net_pnl_krw, 2),
+                    "stress_net_pnl_krw": round(stress_net_pnl_krw, 2),
+                    "outcome": outcome,
+                    "entry_score": safe_int(buy.get("entry_score")),
+                    "upside_to_recent_high_pct": safe_float(buy.get("upside_to_recent_high_pct")),
+                    "current_vs_vwap_pct": safe_float(buy.get("current_vs_vwap_pct")),
+                    "volume_ratio": safe_float(buy.get("volume_ratio")),
+                    "rebound_volume_spike": safe_bool(buy.get("rebound_volume_spike")),
+                    "is_v_rebound": safe_bool(buy.get("is_v_rebound")),
+                    "is_pulldown_recovery": safe_bool(buy.get("is_pulldown_recovery")),
+                    "exit_reason": exit_reason,
+                    "holding_minutes": hold_minutes,
+                    "is_entry_watch_exit": is_entry_watch,
+                    "entry_watch_trigger_type": entry_watch_trigger_type,
+                    "first_sell_accepted_at": sell.get("timestamp", ""),
+                    "rsi": None,  # 현재 어떤 raw 파일에도 RSI가 기록되지 않음 — UNAVAILABLE
+                    "fwd_data_source": "",
+                })
+
+                if eq_row is not None:
+                    row.update({
+                        "pattern": eq_row.get("detected_patterns", ""),
+                        "condition_name": eq_row.get("condition_name", ""),
+                        "macd": safe_float(eq_row.get("macd")),
+                        "macd_signal": safe_float(eq_row.get("macd_signal")),
+                        "macd_above_signal": safe_bool(eq_row.get("macd_above_signal")),
+                        "session_metrics_ready": safe_bool(eq_row.get("session_metrics_ready")),
+                        "condition_source_reliable": safe_bool(eq_row.get("condition_source_reliable")),
+                        "rolling_vwap_distance_pct": safe_float(eq_row.get("rolling_vwap_distance_pct")),
+                        "session_vwap_distance_pct": safe_float(eq_row.get("session_vwap_distance_pct")),
+                        "would_block_macd_dead_min_score5": safe_bool(eq_row.get("would_block_macd_dead_min_score5")),
+                        "would_block_macd_above_signal_required": safe_bool(eq_row.get("would_block_macd_above_signal_required")),
+                        "would_block_pr_or_pullback_condition_rolling_vwap": safe_bool(eq_row.get("would_block_pr_or_pullback_condition_rolling_vwap")),
+                        "would_block_pr_or_pullback_condition_session_vwap": safe_bool(eq_row.get("would_block_pr_or_pullback_condition_session_vwap")),
+                    })
+                else:
+                    dq_flags.append("entry_quality_shadow order_id 매칭 실패 — entry gate/MACD/VWAP거리 NA")
+
+                if sl_row is not None:
+                    row.update({
+                        "ma5_above_ma20": safe_bool(sl_row.get("ma5_above_ma20")),
+                        "rebound_volume_ratio": safe_float(sl_row.get("rebound_volume_ratio")),
+                        "atr_14_pct": safe_float(sl_row.get("atr_14_pct")),
+                        "bb_percent_b": safe_float(sl_row.get("bb_percent_b")),
+                        "bb_position": sl_row.get("bb_position", ""),
+                        "macd_hist_direction": sl_row.get("macd_hist_direction", ""),
+                    })
+                else:
+                    dq_flags.append("signal_log 근접 매칭 실패(±5초) — MA5/ATR/BB 보조지표 NA")
+
+                # entry_watch 청산이면 counterfactual 시도(실측 shadow checkpoint만 사용,
+                # replay 재실행 없음 — LIVE_SUPPORTED 데이터만).
+                if is_entry_watch and sell_ts is not None:
+                    by_cp, candidates = _find_entry_watch_counterfactual(ew_rows, sym, sell_price, sell_ts)
+                    if by_cp:
+                        row["fwd_data_source"] = "LIVE_SUPPORTED(entry_watch_shadow 실측 checkpoint)"
+                        for m in (5, 10, 20):
+                            r = by_cp.get(m)
+                            if r is None:
+                                continue
+                            pr = safe_float(r.get("counterfactual_pnl_pct"))
+                            if pr is None:
+                                continue
+                            row[f"fwd{m}m_price_return_pct"] = pr
+                            row[f"fwd{m}m_base_net_pct"] = round(COST_MODEL.net(pr, BASE_SCENARIO), 4)
+                            row[f"fwd{m}m_stress_net_pct"] = round(COST_MODEL.net(pr, STRESS_SCENARIO), 4)
+                    elif candidates:
+                        row["fwd_data_source"] = "UNAVAILABLE(entry_watch_shadow 후보 있으나 가격/시각 불일치 — 사용 안 함)"
+                        dq_flags.append(
+                            "entry_watch_shadow 후보가 있으나 trigger_price/trigger_at가 실제 SELL과 불일치 "
+                            "(OBS.2-A 이전 entry_watch_shadow 오염 패턴과 일치 — counterfactual 사용 안 함, 추정 금지)"
+                        )
+                    else:
+                        row["fwd_data_source"] = "UNAVAILABLE(entry_watch_shadow에 해당 심볼 없음)"
+                elif not is_entry_watch:
+                    row["fwd_data_source"] = "UNAVAILABLE(entry_watch 청산이 아니므로 shadow가 추적하지 않음)"
+
+                row["data_quality_flag"] = "; ".join(dq_flags)
+                rows_out.append(row)
+
+    return rows_out, warnings_out
+
+
+# ── Study A: Low Upside ──────────────────────────────────────────
+UPSIDE_BUCKETS = [
+    ("<0.25%", lambda u: u < 0.25),
+    ("0.25~<0.50%", lambda u: 0.25 <= u < 0.50),
+    ("0.50~<0.75%", lambda u: 0.50 <= u < 0.75),
+    ("0.75~<1.00%", lambda u: 0.75 <= u < 1.00),
+    ("1.00~<1.50%", lambda u: 1.00 <= u < 1.50),
+    ("1.50~<2.00%", lambda u: 1.50 <= u < 2.00),
+    (">=2.00%", lambda u: u >= 2.00),
+]
+
+
+def _bucket_stats(rows: list[dict]) -> dict:
+    n = len(rows)
+    wins = [r for r in rows if r["outcome"] == WIN]
+    losses = [r for r in rows if r["outcome"] == LOSS]
+    breakevens = [r for r in rows if r["outcome"] == BREAKEVEN]
+    gross = [r["gross_pnl_pct"] for r in rows]
+    return {
+        "trades": n,
+        "wins": len(wins),
+        "breakevens": len(breakevens),
+        "losses": len(losses),
+        "win_rate": win_rate_str(len(wins), len(losses)),
+        "avg_gross_return_pct": round(statistics.mean(gross), 4) if gross else "",
+        "median_gross_return_pct": round(statistics.median(gross), 4) if gross else "",
+        "gross_pnl_sum": round(sum(r["gross_pnl"] for r in rows), 2),
+        "base_net_pnl_pct_sum": round(sum(r["base_net_pnl_pct"] for r in rows), 4),
+        "stress_net_pnl_pct_sum": round(sum(r["stress_net_pnl_pct"] for r in rows), 4),
+        "worst_trade_pct": round(min(gross), 4) if gross else "",
+        "best_trade_pct": round(max(gross), 4) if gross else "",
+    }
+
+
+def low_upside_bucket_study(rows: list[dict]) -> list[dict]:
+    out = []
+    have_upside = [r for r in rows if r["upside_to_recent_high_pct"] is not None]
+    for label, pred in UPSIDE_BUCKETS:
+        grp = [r for r in have_upside if pred(r["upside_to_recent_high_pct"])]
+        stats = _bucket_stats(grp)
+        stats["bucket"] = label
+        stats["symbols"] = ";".join(sorted({r["symbol"] for r in grp}))
+        out.append(stats)
+    return out
+
+
+def low_upside_filter_candidates(rows: list[dict]) -> list[dict]:
+    """upside_to_recent_high_pct 기반 skip 후보 F0~F3을 시뮬레이션합니다.
+
+    2026-08-24 (민우님 리뷰 1번 지적 반영): F1(<1.00%)과 F2(<0.50%)가
+    실거래 9건에서 완전히 같은 6건을 제거하는 이유는 이 표본에 0.50~
+    1.00% 구간 거래가 우연히 하나도 없었기 때문입니다 — 두 후보가
+    "같은 효과"라는 뜻이 아닙니다. 새 데이터가 들어오면 F1은 그 구간도
+    추가로 차단하지만 F2는 살립니다. 동일한 과거 개선 효과라면 더 좁은
+    필터(F2)가 논리적으로 우월하므로, **주 후보는 F2입니다** — F1/F3은
+    보조 비교용으로만 계산합니다. 이 함수 자체의 계산 로직은 셋 다
+    동일하게 다루고, 우선순위 표시는 build_scorecard()/verdict에서만
+    반영합니다(과거 데이터로 셋을 차별 계산할 근거가 없기 때문).
+    """
+    have_upside = [r for r in rows if r["upside_to_recent_high_pct"] is not None]
+
+    def sim(name: str, skip_pred):
+        removed = [r for r in have_upside if skip_pred(r)]
+        kept = [r for r in have_upside if not skip_pred(r)]
+        removed_w = [r for r in removed if r["outcome"] == WIN]
+        removed_b = [r for r in removed if r["outcome"] == BREAKEVEN]
+        removed_l = [r for r in removed if r["outcome"] == LOSS]
+        orig_base = sum(r["base_net_pnl_pct"] for r in have_upside)
+        orig_stress = sum(r["stress_net_pnl_pct"] for r in have_upside)
+        kept_base = sum(r["base_net_pnl_pct"] for r in kept)
+        kept_stress = sum(r["stress_net_pnl_pct"] for r in kept)
+        orig_gross = sum(r["gross_pnl_pct"] for r in have_upside)
+        kept_gross = sum(r["gross_pnl_pct"] for r in kept)
+        # 금액 기준(KRW) — 2026-08-24, 민우님 리뷰 3번 지적 반영.
+        orig_base_krw = sum(r["base_net_pnl_krw"] for r in have_upside)
+        orig_stress_krw = sum(r["stress_net_pnl_krw"] for r in have_upside)
+        kept_base_krw = sum(r["base_net_pnl_krw"] for r in kept)
+        kept_stress_krw = sum(r["stress_net_pnl_krw"] for r in kept)
+        total_wins = [r for r in have_upside if r["outcome"] == WIN]
+        winner_preservation = (
+            "해당없음" if not total_wins else
+            f"{(len(total_wins)-len(removed_w))/len(total_wins)*100:.0f}%"
+        )
+        total_losses = [r for r in have_upside if r["outcome"] == LOSS]
+        loser_removal = (
+            "해당없음" if not total_losses else
+            f"{len(removed_l)/len(total_losses)*100:.0f}%"
+        )
+        single_large_winner_flag = ""
+        if removed_w:
+            biggest = max(removed_w, key=lambda r: r["gross_pnl_pct"])
+            # 제거된 하나의 승자가 전체 gross 변화의 절반 이상을 차지하면 경고
+            gross_delta = kept_gross - orig_gross
+            if gross_delta != 0 and abs(biggest["gross_pnl_pct"]) >= abs(gross_delta) * 0.5:
+                single_large_winner_flag = (
+                    f"⚠ 대형 승자 1건({biggest['symbol']} {biggest['trade_date']}, "
+                    f"gross {biggest['gross_pnl_pct']:+.2f}%) 제거가 전체 변화폭의 상당 부분을 차지함"
+                )
+        return {
+            "candidate": name,
+            "original_trades": len(have_upside),
+            "removed_trades": len(removed),
+            "removed_winners": len(removed_w),
+            "removed_breakevens": len(removed_b),
+            "removed_losers": len(removed_l),
+            "winner_preservation_rate": winner_preservation,
+            "loser_removal_rate": loser_removal,
+            "gross_pnl_pct_delta": round(kept_gross - orig_gross, 4),
+            "base_net_pnl_pct_delta": round(kept_base - orig_base, 4),
+            "stress_net_pnl_pct_delta": round(kept_stress - orig_stress, 4),
+            "base_net_delta_krw": round(kept_base_krw - orig_base_krw, 2),
+            "stress_net_delta_krw": round(kept_stress_krw - orig_stress_krw, 2),
+            "avg_trade_base_net_before_pct": round(orig_base / len(have_upside), 4) if have_upside else "",
+            "avg_trade_base_net_after_pct": round(kept_base / len(kept), 4) if kept else "해당없음(전량 제거)",
+            "max_single_loss_before_pct": round(min((r["gross_pnl_pct"] for r in have_upside), default=0), 4),
+            "max_single_loss_after_pct": round(min((r["gross_pnl_pct"] for r in kept), default=0), 4) if kept else "해당없음",
+            "single_large_winner_or_loser_flag": single_large_winner_flag,
+            "removed_symbols": ";".join(sorted({r["symbol"] for r in removed})),
+        }
+
+    candidates = [
+        sim("F0_current_strategy(baseline, no skip)", lambda r: False),
+        # 2026-08-24 (민우님 확정): F2가 주 후보 — 순서를 F2 우선으로 정렬.
+        sim("F2_skip_upside<0.50%(주 후보)", lambda r: r["upside_to_recent_high_pct"] < 0.50),
+        sim("F1_skip_upside<1.00%(보조 비교용)", lambda r: r["upside_to_recent_high_pct"] < 1.00),
+        sim("F3_skip_upside<0.25%(보조 비교용)", lambda r: r["upside_to_recent_high_pct"] < 0.25),
+    ]
+    return candidates
+
+
+# ── Study B: 5-Min Exit Timing ───────────────────────────────────
+def _label_trade(r: dict) -> dict:
+    NEUTRAL_BAND_PCT = 0.10
+    actual_base = r["base_net_pnl_pct"]
+    fwd5_base = r["fwd5m_base_net_pct"]
+    delta = fwd5_base - actual_base
+    if abs(delta) < NEUTRAL_BAND_PCT:
+        label = "NEUTRAL"
+    elif delta > 0:
+        label = "EXTEND_HELPED"
+    else:
+        label = "EXTEND_HURT"
+    return {
+        "trade_date": r["trade_date"], "symbol": r["symbol"], "exit_reason": r["exit_reason"],
+        "entry_watch_trigger_type": r["entry_watch_trigger_type"],
+        "actual_gross_pnl_pct": r["gross_pnl_pct"], "actual_base_net_pct": actual_base,
+        "actual_stress_net_pct": r["stress_net_pnl_pct"],
+        "fwd5m_price_return_pct": r["fwd5m_price_return_pct"],
+        "fwd5m_base_net_pct": r["fwd5m_base_net_pct"],
+        "fwd10m_price_return_pct": r["fwd10m_price_return_pct"],
+        "fwd10m_base_net_pct": r["fwd10m_base_net_pct"],
+        "fwd20m_price_return_pct": r["fwd20m_price_return_pct"],
+        "fwd20m_base_net_pct": r["fwd20m_base_net_pct"],
+        "best_forward_price_return_pct": max(
+            v for v in (r["fwd5m_price_return_pct"], r["fwd10m_price_return_pct"], r["fwd20m_price_return_pct"])
+            if v not in ("", None)
+        ),
+        "worst_forward_price_return_pct": min(
+            v for v in (r["fwd5m_price_return_pct"], r["fwd10m_price_return_pct"], r["fwd20m_price_return_pct"])
+            if v not in ("", None)
+        ),
+        "extension_label_5m": label,
+        "delta_vs_actual_base_5m_pct": round(delta, 4),
+        "entry_score": r["entry_score"],
+        "current_vs_vwap_pct": r["current_vs_vwap_pct"],
+        "macd_above_signal": r["macd_above_signal"],
+    }
+
+
+def exit_extension_study(rows: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    """entry_watch 청산 중 유효한 forward counterfactual이 있는 거래에
+    EXTEND_HELPED/EXTEND_HURT/NEUTRAL 라벨을 매깁니다.
+
+    2026-08-24 (민우님 코드/CSV 직접 대조 리뷰 2번 지적 반영, 핵심 수정):
+    Sprint v1은 "entry_watch " 접두사만으로 급락청산/VWAP이탈청산/
+    최소수익미달청산을 한 그룹(ew)으로 섞었습니다. 그런데 우리가 답해야
+    할 질문은 "5분 minimum-profit 타이머를 연장할 것인가"이고, 1~4분
+    시점 VWAP 조기청산을 5분 더 들고 있었으면 어땠는지를 보는 것은
+    "VWAP 위험청산을 무시하고 더 들고 있기"라는 **다른 전략 질문**
+    입니다. 이제 entry_watch_trigger_type으로 명확히 분리합니다:
+
+      - MIN_PROFIT_5M   → 조건부 연장 정책의 유일한 근거 표본
+                          (extension_rule_candidates가 이 그룹만 사용)
+      - EARLY_VWAP_EXIT → 별도 진단용으로만 반환. 조건부 연장 후보
+                          계산에는 절대 쓰이지 않음(다른 질문이므로).
+      - CRASH_CUT/그 외 → 이 스터디 대상 아님(제외).
+
+    반환값이 (per_trade_min_profit, per_trade_early_vwap, excluded_note)
+    3-tuple로 바뀌었습니다(기존 2-tuple에서 변경) — 호출부(run())도 함께
+    수정했습니다.
+    """
+    min_profit_rows = [
+        r for r in rows
+        if r["entry_watch_trigger_type"] == TRIGGER_MIN_PROFIT_5M
+        and r["fwd5m_price_return_pct"] not in ("", None)
+    ]
+    early_vwap_rows = [
+        r for r in rows
+        if r["entry_watch_trigger_type"] == TRIGGER_EARLY_VWAP_EXIT
+        and r["fwd5m_price_return_pct"] not in ("", None)
+    ]
+
+    per_trade_min_profit = [_label_trade(r) for r in min_profit_rows]
+    per_trade_early_vwap = [_label_trade(r) for r in early_vwap_rows]
+
+    excluded_no_cf = [
+        r for r in rows
+        if r["entry_watch_trigger_type"] in (TRIGGER_MIN_PROFIT_5M, TRIGGER_EARLY_VWAP_EXIT)
+        and r["fwd5m_price_return_pct"] in ("", None)
+    ]
+    excluded_note = [
+        {"trade_date": r["trade_date"], "symbol": r["symbol"], "exit_reason": r["exit_reason"],
+         "entry_watch_trigger_type": r["entry_watch_trigger_type"], "reason": r["fwd_data_source"]}
+        for r in excluded_no_cf
+    ]
+    return per_trade_min_profit, per_trade_early_vwap, excluded_note
+
+
+def extension_rule_candidates(per_trade: list[dict]) -> list[dict]:
+    """조건부 5분 연장 후보 R1~R3을 계산합니다.
+
+    호출부(run())는 이제 이 함수에 exit_extension_study()가 반환한
+    per_trade_min_profit(MIN_PROFIT_5M만, EARLY_VWAP_EXIT 제외)만
+    넘깁니다 — 2026-08-24 (민우님 리뷰 2번).
+
+    2026-08-24 (민우님 리뷰 3번 지적, 중요): R1/R2가 참조하는
+    current_vs_vwap_pct/macd_above_signal은 이 per_trade 딕셔너리에
+    "판단 순간"이 아니라 **매수 진입 시점** 값으로 채워져 있습니다
+    (trade_feature_table.py의 build_trade_features()가 entry_quality_
+    shadow/signal_log를 매수 시점 기준으로만 조인하기 때문 — 5분 청산
+    판단 순간의 재조회 값이 아님). 즉 R1은 실제로는 "5분 시점 PnL>0
+    AND 진입 당시 VWAP 위"를, R2는 "5분 시점 PnL>0 AND 진입 당시 MACD
+    상태"를 검증한 것이지, 원래 의도("5분 시점 PnL>0 AND 5분 시점
+    VWAP/MACD 상태")를 검증한 게 아닙니다. 이건 코드를 잘못 짠 게
+    아니라 필요한 "5분 시점 checkpoint feature"가 이 CSV들에 애초에
+    없기 때문입니다 — Profitability Shadow v2의 MIN_PROFIT_EXTENSION_
+    SHADOW가 정확히 이 공백(판단 순간의 price_vs_vwap_pct/macd/
+    macd_signal)을 새로 기록하기 시작합니다.
+    그래서 R1/R2는 valid_evidence=False로 표시하고, 이번 라운드
+    OBSERVE(n=1) 결과를 전략 후보 근거로 사용하지 않습니다(민우님
+    확정). R3(entry_score>=5 AND pnl>0)은 entry_score 자체가 원래
+    진입 시점에만 존재하는 값이라 이 문제에 해당하지 않습니다 —
+    valid_evidence=True로 유지합니다.
+    """
+    def qualifies_rule_a(t):  # 5분 시점 pnl>0 AND "진입 시점" price>VWAP(주의: 아래 docstring 참고)
+        return t["actual_gross_pnl_pct"] > 0 and (t["current_vs_vwap_pct"] or 0) > 0
+
+    def qualifies_rule_b(t):  # 5분 시점 pnl>0 AND "진입 시점" MACD>signal(주의: 아래 docstring 참고)
+        return t["actual_gross_pnl_pct"] > 0 and t["macd_above_signal"] is True
+
+    def qualifies_rule_c(t):  # entry_score >= 5 AND 5분 시점 pnl > 0 (entry_score는 원래 진입시점 값)
+        return (t["entry_score"] or 0) >= 5 and t["actual_gross_pnl_pct"] > 0
+
+    rules = [
+        ("R1_pnl>0_AND_price>VWAP", qualifies_rule_a, False),
+        ("R2_pnl>0_AND_MACD_above_signal", qualifies_rule_b, False),
+        ("R3_entry_score>=5_AND_pnl>0", qualifies_rule_c, True),
+    ]
+    out = []
+    for name, pred, valid_evidence in rules:
+        qualified = [t for t in per_trade if pred(t)]
+        helped = [t for t in qualified if t["extension_label_5m"] == "EXTEND_HELPED"]
+        hurt = [t for t in qualified if t["extension_label_5m"] == "EXTEND_HURT"]
+        neutral = [t for t in qualified if t["extension_label_5m"] == "NEUTRAL"]
+        actual_base = sum(t["actual_base_net_pct"] for t in qualified)
+        hypo_base = sum(t["fwd5m_base_net_pct"] for t in qualified)
+        actual_stress = sum(t["actual_stress_net_pct"] for t in qualified)
+        hypo_stress = sum(
+            COST_MODEL.net(t["fwd5m_price_return_pct"], STRESS_SCENARIO) for t in qualified
+        )
+        worst_case = min((t["fwd5m_base_net_pct"] - t["actual_base_net_pct"] for t in qualified), default=None)
+        n = len(qualified)
+        if n < 5:
+            tier = "OBSERVE(n<5)"
+        else:
+            directions = {t["extension_label_5m"] for t in qualified}
+            tier = "PROMISING" if len(directions) > 1 else "SHADOW_READY"
+        if not valid_evidence:
+            # 2026-08-24 (민우님 리뷰 3번): feature 시점 불일치(진입 시점
+            # 값을 5분 시점 값처럼 취급) — 표본 크기와 무관하게 전략
+            # 후보 근거로 사용 불가. 계산값 자체는 참고로 남겨두되
+            # sample_tier를 명시적으로 무효 처리합니다.
+            tier = f"INVALID(feature 시점 불일치 — 진입 시점 값을 5분 시점 값처럼 사용함, 근거로 사용 안 함; 계산상 tier는 {tier})"
+        out.append({
+            "rule": name,
+            "valid_evidence": valid_evidence,
+            "extension_qualified_trades": n,
+            "helped": len(helped),
+            "hurt": len(hurt),
+            "neutral": len(neutral),
+            "actual_base_net_pct_sum": round(actual_base, 4),
+            "hypothetical_base_net_pct_sum": round(hypo_base, 4),
+            "base_delta_pct": round(hypo_base - actual_base, 4),
+            "actual_stress_net_pct_sum": round(actual_stress, 4),
+            "hypothetical_stress_net_pct_sum": round(hypo_stress, 4),
+            "stress_delta_pct": round(hypo_stress - actual_stress, 4),
+            "worst_case_degradation_pct": round(worst_case, 4) if worst_case is not None else "해당없음",
+            "sample_tier": tier if n > 0 else "표본없음(적용 후보 아님, 관측 불가)",
+        })
+    return out
+
+
+# ── Study C: Entry Quality gates ─────────────────────────────────
+GATE_COLUMNS = [
+    "would_block_macd_dead_min_score5",
+    "would_block_macd_above_signal_required",
+    "would_block_pr_or_pullback_condition_rolling_vwap",
+    "would_block_pr_or_pullback_condition_session_vwap",
+]
+
+
+def entry_quality_gate_study(rows: list[dict]) -> list[dict]:
+    have_gate_data = [r for r in rows if r["data_quality_flag"].find("entry_quality_shadow order_id 매칭 실패") == -1]
+    out = []
+    for gate in GATE_COLUMNS:
+        would_block = [r for r in have_gate_data if r.get(gate) is True]
+        n = len(would_block)
+        blocked_w = [r for r in would_block if r["outcome"] == WIN]
+        blocked_b = [r for r in would_block if r["outcome"] == BREAKEVEN]
+        blocked_l = [r for r in would_block if r["outcome"] == LOSS]
+        all_losses = [r for r in have_gate_data if r["outcome"] == LOSS]
+        all_wins = [r for r in have_gate_data if r["outcome"] == WIN]
+        loser_removal_rate = (
+            "해당없음" if not all_losses else f"{len(blocked_l)/len(all_losses)*100:.0f}%"
+        )
+        winner_damage_rate = (
+            "해당없음" if not all_wins else f"{len(blocked_w)/len(all_wins)*100:.0f}%"
+        )
+        base_delta = -sum(r["base_net_pnl_pct"] for r in would_block)
+        stress_delta = -sum(r["stress_net_pnl_pct"] for r in would_block)
+        verdict = "관측 대상 실행 거래 0건(would_block=0에 가까움) — 효과 없음/threshold too weak/관측만" if n == 0 else (
+            f"OBSERVE(n={n}, 실제로 이 게이트가 걸린 실행 거래 존재 — 방향성 판단은 이르지만 주시 필요)"
+        )
+        out.append({
+            "gate": gate,
+            "would_block_trade_count": n,
+            "blocked_winners": len(blocked_w),
+            "blocked_breakevens": len(blocked_b),
+            "blocked_losers": len(blocked_l),
+            "loser_removal_rate": loser_removal_rate,
+            "winner_damage_rate": winner_damage_rate,
+            "base_net_pnl_pct_delta_if_enforced": round(base_delta, 4),
+            "stress_net_pnl_pct_delta_if_enforced": round(stress_delta, 4),
+            "verdict": verdict,
+        })
+    return out
+
+
+# ── Leave-one-out / sensitivity (후보별) ──────────────────────────
+def candidate_leave_one_out(rows: list[dict], skip_pred, label: str) -> dict:
+    """특정 필터 후보(skip_pred로 정의)의 base_net_pnl_pct_delta가
+    개별 거래 하나, 혹은 거래일 하나에 얼마나 좌우되는지 계산합니다.
+    '이 후보의 효과가 특정 1개 거래/거래일에 전부 의존하는가?'에 답하기
+    위한 것으로, 전체 포트폴리오 leave-one-out(leave_one_out_report)과는
+    다른 질문입니다."""
+    pool = [r for r in rows if r["upside_to_recent_high_pct"] is not None]
+    if not pool:
+        return {"candidate": label, "note": "표본 없음"}
+
+    def delta_for(subset):
+        kept = [r for r in subset if not skip_pred(r)]
+        orig = sum(r["base_net_pnl_pct"] for r in subset)
+        kept_sum = sum(r["base_net_pnl_pct"] for r in kept)
+        return round(kept_sum - orig, 4)
+
+    full_delta = delta_for(pool)
+    per_trade_removed = {}
+    for r in pool:
+        remaining = [x for x in pool if x is not r]
+        per_trade_removed[f"exclude_{r['symbol']}_{r['trade_date']}"] = delta_for(remaining)
+
+    by_day = defaultdict(list)
+    for r in pool:
+        by_day[r["trade_date"]].append(r)
+    per_day_removed = {}
+    for d in by_day:
+        remaining = [r for r in pool if r["trade_date"] != d]
+        per_day_removed[f"exclude_day_{d}"] = delta_for(remaining) if remaining else "전량 제거됨(하루짜리 표본)"
+
+    signs = [v for v in per_day_removed.values() if isinstance(v, (int, float))]
+    sign_flips = len({(v > 0) for v in signs + [full_delta]}) > 1 if signs else None
+    return {
+        "candidate": label,
+        "full_base_net_pnl_pct_delta": full_delta,
+        "per_trade_excluded_delta": per_trade_removed,
+        "per_day_excluded_delta": per_day_removed,
+        "n_trading_days": len(by_day),
+        "day_dependent_sign_flip": sign_flips,
+        "verdict": (
+            "날짜 1개뿐 — 거래일 안정성 판단 불가" if len(by_day) < 2 else
+            ("⚠ 특정 거래일을 빼면 delta 부호가 뒤집힘 — 날짜 의존적, 강한 후보 아님" if sign_flips else
+             "거래일을 하나씩 빼도 delta 부호가 유지됨")
+        ),
+    }
+
+
+def leave_one_out_report(rows: list[dict], label: str) -> dict:
+    if not rows:
+        return {"candidate": label, "note": "표본 없음"}
+    base_sum = sum(r["base_net_pnl_pct"] for r in rows)
+    best = max(rows, key=lambda r: r["gross_pnl_pct"])
+    worst = min(rows, key=lambda r: r["gross_pnl_pct"])
+    without_best = [r for r in rows if r is not best]
+    without_worst = [r for r in rows if r is not worst]
+    by_day = defaultdict(list)
+    for r in rows:
+        by_day[r["trade_date"]].append(r)
+    per_day = {}
+    for d, grp in by_day.items():
+        remaining = [r for r in rows if r["trade_date"] != d]
+        per_day[f"exclude_{d}"] = round(sum(r["base_net_pnl_pct"] for r in remaining), 4) if remaining else "전량 제거됨"
+    return {
+        "candidate": label,
+        "n": len(rows),
+        "base_net_pnl_pct_sum_full": round(base_sum, 4),
+        "base_net_pnl_pct_sum_excl_best_trade": round(sum(r["base_net_pnl_pct"] for r in without_best), 4),
+        "best_trade": f"{best['symbol']}/{best['trade_date']} {best['gross_pnl_pct']:+.2f}%",
+        "base_net_pnl_pct_sum_excl_worst_trade": round(sum(r["base_net_pnl_pct"] for r in without_worst), 4),
+        "worst_trade": f"{worst['symbol']}/{worst['trade_date']} {worst['gross_pnl_pct']:+.2f}%",
+        "per_day_exclusion": per_day,
+        "n_trading_days": len(by_day),
+        "stability_verdict": (
+            "단일 거래일 의존(하루만 있음) — 날짜별 안정성 판단 불가" if len(by_day) < 2 else
+            "여러 거래일 존재 — 날짜별 부호 일관성 참고 가능(본문 해설 참고)"
+        ),
+    }
+
+
+# ── Scorecard ─────────────────────────────────────────────────────
+def build_scorecard(low_upside_candidates, extension_rules, gate_study) -> list[dict]:
+    """통합 scorecard — 2026-08-24 (민우님 리뷰 3번): %p 델타뿐 아니라
+    금액(KRW) 델타도 함께 표시합니다(base_delta_krw/stress_delta_krw).
+    Low Upside 후보는 candidate 문자열에 이미 "(주 후보)"/"(보조 비교용)"
+    표기가 붙어 있어 정렬만으로 F2가 먼저 나옵니다(low_upside_filter_
+    candidates가 F2를 F1보다 먼저 반환하도록 이미 순서를 바꿨습니다).
+    """
+    rows = []
+    for c in low_upside_candidates:
+        if c["candidate"].startswith("F0"):
+            continue
+        n = c["removed_trades"]
+        tier = "OBSERVE" if n < 5 else ("PROMISING" if n < 8 else "SHADOW_READY")
+        rows.append({
+            "study": "Low Upside",
+            "candidate": c["candidate"],
+            "n_affected": n,
+            "removed_w_b_l": f"{c['removed_winners']}/{c['removed_breakevens']}/{c['removed_losers']}",
+            "base_delta_pct": c["base_net_pnl_pct_delta"],
+            "stress_delta_pct": c["stress_net_pnl_pct_delta"],
+            "base_delta_krw": c["base_net_delta_krw"],
+            "stress_delta_krw": c["stress_net_delta_krw"],
+            "winner_damage": "HIGH" if c["removed_winners"] else "LOW",
+            "loser_removal": c["loser_removal_rate"],
+            "stability": "LOW(단일 종목/거래일 의존 가능성 — 본문 leave-one-out 참고)",
+            "tail_risk": c["single_large_winner_or_loser_flag"] or "명시적 tail 악화 신호 없음",
+            "implementation_complexity": "LOW(기존 upside_to_recent_high_pct 필드 재사용, 단일 threshold)",
+            "verdict": tier,
+        })
+    for r in extension_rules:
+        rows.append({
+            "study": "5-Min Exit",
+            "candidate": r["rule"] + ("" if r["valid_evidence"] else " [INVALID EVIDENCE]"),
+            "n_affected": r["extension_qualified_trades"],
+            "removed_w_b_l": f"helped={r['helped']}/hurt={r['hurt']}/neutral={r['neutral']}",
+            "base_delta_pct": r["base_delta_pct"],
+            "stress_delta_pct": r["stress_delta_pct"],
+            "base_delta_krw": "",  # 2026-08-24: Study B는 아직 %p 기준만 — 표본이 1~2건뿐이라
+                                    # KRW 환산까지 더하면 정밀해 보이는 착시만 커짐(민우님 원칙: "가짜 정밀도 금지")
+            "stress_delta_krw": "",
+            "winner_damage": "해당없음(제거가 아니라 연장 실험)",
+            "loser_removal": "해당없음(제거가 아니라 연장 실험)",
+            "stability": "LOW(표본 매우 작음)",
+            "tail_risk": f"worst-case degradation {r['worst_case_degradation_pct']}",
+            "implementation_complexity": "MEDIUM(entry_watch 청산 로직 분기 추가 필요)",
+            "verdict": r["sample_tier"] if r["valid_evidence"] else (
+                "INVALID(feature 시점 불일치 — 전략 후보 근거로 사용 안 함; 판단 보류, 데이터부터 재수집)"
+            ),
+        })
+    for g in gate_study:
+        rows.append({
+            "study": "Entry Quality",
+            "candidate": g["gate"],
+            "n_affected": g["would_block_trade_count"],
+            "removed_w_b_l": f"{g['blocked_winners']}/{g['blocked_breakevens']}/{g['blocked_losers']}",
+            "base_delta_pct": g["base_net_pnl_pct_delta_if_enforced"],
+            "stress_delta_pct": g["stress_net_pnl_pct_delta_if_enforced"],
+            "base_delta_krw": "",
+            "stress_delta_krw": "",
+            "winner_damage": "LOW" if g["blocked_winners"] == 0 else "MEDIUM",
+            "loser_removal": g["loser_removal_rate"],
+            "stability": "판단불가(n=0)" if g["would_block_trade_count"] == 0 else "LOW(표본 작음)",
+            "tail_risk": "해당없음",
+            "implementation_complexity": "LOW(이미 shadow로 계산되는 값, threshold만 enforce로 전환)",
+            "verdict": "OBSERVE(효과 없음/threshold too weak)" if g["would_block_trade_count"] == 0 else "OBSERVE",
+        })
+    return rows
+
+
+# ── CSV 출력 ──────────────────────────────────────────────────────
+def write_csv(path: Path, rows: list[dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    fieldnames = list(rows[0].keys())
+    for r in rows:
+        for k in r:
+            if k not in fieldnames:
+                fieldnames.append(k)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+# ── main ──────────────────────────────────────────────────────────
+def run(bundle_dirs: list[str], out_dir: str) -> dict:
+    days = []
+    for d in bundle_dirs:
+        days.append(load_bundle_day(Path(d)))
+    days.sort(key=lambda d: d.date)
+
+    feature_rows, warnings = build_trade_features(days)
+    low_upside_buckets = low_upside_bucket_study(feature_rows)
+    low_upside_candidates = low_upside_filter_candidates(feature_rows)
+    # 2026-08-24 (민우님 리뷰 2번): MIN_PROFIT_5M과 EARLY_VWAP_EXIT을
+    # 분리 — 조건부 연장 후보(extension_rule_candidates)는 반드시
+    # MIN_PROFIT_5M만 사용합니다. EARLY_VWAP_EXIT은 진단용으로만 반환.
+    extension_per_trade_min_profit, extension_per_trade_early_vwap, extension_excluded = (
+        exit_extension_study(feature_rows)
+    )
+    extension_rules = extension_rule_candidates(extension_per_trade_min_profit)
+    gate_study = entry_quality_gate_study(feature_rows)
+    scorecard = build_scorecard(low_upside_candidates, extension_rules, gate_study)
+
+    # 2026-08-24 (민우님 확정): F2가 주 후보이므로 leave-one-out도 F2를
+    # 먼저 계산 — F1/F3은 계속 보조 비교용으로 남깁니다.
+    loo_f2 = candidate_leave_one_out(
+        feature_rows, lambda r: r["upside_to_recent_high_pct"] < 0.50, "F2_skip_upside<0.50%(주 후보)")
+    loo_f1 = candidate_leave_one_out(
+        feature_rows, lambda r: r["upside_to_recent_high_pct"] < 1.00, "F1_skip_upside<1.00%(보조 비교용)")
+    loo_f3 = candidate_leave_one_out(
+        feature_rows, lambda r: r["upside_to_recent_high_pct"] < 0.25, "F3_skip_upside<0.25%(보조 비교용)")
+
+    out = Path(out_dir)
+    write_csv(out / "trade_feature_table.csv", feature_rows)
+    write_csv(out / "low_upside_study.csv", low_upside_buckets + low_upside_candidates)
+    write_csv(
+        out / "exit_extension_study.csv",
+        extension_per_trade_min_profit + extension_per_trade_early_vwap + extension_rules,
+    )
+    write_csv(out / "entry_quality_study.csv", gate_study)
+    write_csv(out / "candidate_scorecard.csv", scorecard)
+
+    return {
+        "days": [d.date for d in days],
+        "availability": {d.date: d.availability for d in days},
+        "quality_notes": {d.date: d.quality_notes for d in days},
+        "warnings": warnings,
+        "feature_rows": feature_rows,
+        "low_upside_buckets": low_upside_buckets,
+        "low_upside_candidates": low_upside_candidates,
+        "extension_per_trade_min_profit": extension_per_trade_min_profit,
+        "extension_per_trade_early_vwap": extension_per_trade_early_vwap,
+        "extension_excluded": extension_excluded,
+        "extension_rules": extension_rules,
+        "gate_study": gate_study,
+        "scorecard": scorecard,
+        "leave_one_out_all": leave_one_out_report(feature_rows, "전체 포트폴리오(참고용)"),
+        "leave_one_out_f2": loo_f2,
+        "leave_one_out_f1": loo_f1,
+        "leave_one_out_f3": loo_f3,
+    }
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--bundle", action="append", required=True, help="daily bundle 디렉터리 (반복 가능)")
+    ap.add_argument("--out-dir", default="diagnostics/profitability")
+    args = ap.parse_args(argv)
+
+    result = run(args.bundle, args.out_dir)
+    print(f"분석 완료: {len(result['feature_rows'])}건 round-trip trade, 대상 날짜: {result['days']}")
+    for w in result["warnings"]:
+        print(f"[경고] {w}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

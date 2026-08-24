@@ -108,6 +108,15 @@ class MinuteAnalysis:
     slow_v_rise_pct: float = 0.0
     slow_v_bottom_k: int = 0
 
+    # ── 분봉 이동평균 원시값 (2026-08-24, Profitability Shadow v2) ──
+    # ma5_above_ma20(불리언)은 이미 있었지만 원시 MA5/MA20 숫자값은
+    # 어디에도 노출되지 않았음 — MIN_PROFIT_EXTENSION_SHADOW가 "5분
+    # 청산 판단 순간의 MA5/MA20"을 기록하려면 필요. 아래에서 이미
+    # 계산 중이던 로컬 변수(ma5/ma20)를 그대로 필드로 노출만 함 —
+    # 새 계산 로직이나 판단 조건은 전혀 추가하지 않음.
+    ma5: float = 0.0
+    ma20: float = 0.0
+
     def score(self) -> int:
         """진입 타이밍 점수를 계산합니다 (0~5점)."""
         return sum([
@@ -522,6 +531,8 @@ class MinuteAnalyzer:
             day_low=day_low,
             is_valid_pulldown=is_valid_pulldown,
             ma5_above_ma20=ma5_above_ma20,
+            ma5=ma5,
+            ma20=ma20,
             is_v_rebound=is_v,
             v_fail_reason=v_fail_reason,
             v_bottom_k=v_bottom_k,

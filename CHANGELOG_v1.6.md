@@ -9146,3 +9146,580 @@ E.1-A journal 로직, E.1-B, 임계값, entry-watch 5분 규칙 — 전부
 변경 없음 — 위 "다음 단계 — 순서 재조정" 그대로 유지. 이번
 라운드에서도 E.1-A.1/E.1-B는 착수하지 않았습니다. OBS.2는 이
 라운드로 최종 승인 대상입니다.
+
+## Profitability Sprint v1 — 실제 거래 기반 수익성 개선 후보 발굴 (2026-08-21, analysis-only, no production strategy change)
+
+### 배경
+
+지금까지의 1P0.8 라운드는 전부 안전성/관측성(D.1/D.1.1/E.1-A/OBS.2)
+이었습니다. 민우님이 방향을 전환해 "프로그램을 더 안전하게 만드는
+것만 계속하지 말고, 실제 손실을 줄이고 기대수익을 높일 수 있는 전략
+변경 후보를 데이터로 좁히자"고 지시하셨습니다. 이번 라운드는 그
+첫 단계이며, **이번 세션에서는 실제 BUY/SELL 전략을 단 1건도
+변경하지 않았습니다** — 순수 분석(analysis-only)입니다.
+
+### 데이터
+
+워크스페이스에 실제로 남아있는 daily bundle을 전수 탐색한 결과,
+2026-08-19는 raw bundle이 없어 UNAVAILABLE로 제외했고(문서만
+보고 복원하지 않음), 2026-08-20(`bundle_20260820_v2`)과
+2026-08-21(`bundle_20260821`)의 raw CSV 5종(trades/
+entry_watch_shadow/entry_quality_shadow/position_lifecycle/
+signal_log)을 전부 실제로 로드해 사용했습니다. 2026-08-14
+bundle은 분석 기간 이전이자 319400 사고 당일(1P0.8-P0.1/P0.2
+이전 체제)이라 이번 분석 대상에서 제외했습니다.
+
+### 구현 — `tools/profitability_sprint.py` (신규, offline 전용)
+
+- BUY-SELL round-trip 페어링, `entry_quality_shadow`를 order_id로
+  조인(entry 지표), `signal_log`를 심볼+시각 근접 매칭으로 조인
+  (MA5/ATR/BB/MACD 히스토그램 방향 등 보조 지표).
+- `entry_watch_shadow`의 실측 checkpoint(+5/+10/+20분)를
+  counterfactual로 사용 — replay를 재실행하지 않고 그날 실제로
+  기록된 미래 시세만 사용합니다(LIVE_SUPPORTED). 심볼+가격+시각을
+  모두 대조해 불일치하는 후보는 UNAVAILABLE로 fail-close합니다
+  (추정 금지) — 이 과정에서 8/20 005690, 8/21 064260의
+  `entry_watch_shadow` 후보가 실제 SELL과 가격/시각이 맞지 않는
+  것을 발견했습니다(OBS.2-A 적용 이전 시점 데이터에 남은,
+  OBS.2-A가 고친 것과 같은 유형의 오염 패턴).
+- 비용 모델은 이 도구가 자체 하드코딩하지 않고
+  `domain.cost_model.load_cost_model()`을 그대로 사용합니다
+  (Base 0.35% / Stress 0.90%, `config/settings.yaml` 기준) —
+  저장소 전체를 스캔하는 기존 `test_cost_model.py`의 "허용 위치
+  밖 비용 리터럴 하드코딩 금지" 정책을 그대로 준수합니다.
+- Low Upside bucket/interaction/filter 시뮬레이션(F0~F3),
+  5-Min Exit extension 라벨링(EXTEND_HELPED/HURT/NEUTRAL) +
+  rule 후보, Entry Quality shadow gate(would_block_*) 효과 검증,
+  전체/후보별 leave-one-trade-out·leave-one-day-out, OBSERVE/
+  PROMISING/SHADOW_READY/ENFORCE_CANDIDATE 4단계 판정,
+  Profitability Scorecard까지 전부 이 파일 하나에 구현했습니다.
+- Broker 호출 없음, 네트워크 호출 없음, 주문 API 호출 없음,
+  TradingService import/실행 없음, runtime state 변경 없음 —
+  100% offline이며 로컬 bundle CSV만 읽고 `diagnostics/
+  profitability/`에만 씁니다.
+
+### 결과 요약 (실거래 9건, 8/20 4건 + 8/21 5건)
+
+- 승률(wins/(wins+losses)) 3/8=37.5%, gross 합 +99,144원(양수)
+  이지만 대형 승자 2건(475150 +169,500원, 005930 +42,000원)이
+  손실 5건을 덮은 결과입니다. **Base 비용만 반영해도 9건 합계가
+  +1.59%p → -1.56%p로 뒤집히고, Stress 비용으로는 -6.51%p까지
+  벌어집니다** — 이번 표본에서는 거래비용/과매매가 가장 뚜렷한
+  수익성 저해 요인으로 보입니다.
+- Low Upside: upside<1.00%/<0.50% skip(F1/F2)이 Base%Δ+3.38,
+  Stress%Δ+6.68로 가장 유력한 후보이지만, 이 표본의 유일한
+  "Low Upside 성공 사례"인 005930(+0.72%)도 함께 제거합니다 —
+  이 필터를 좋은 규칙이라 결론 내리지 않고 PROMISING(shadow 관측
+  확대 필요)으로만 분류했습니다. 005930을 다른 손실 거래와
+  구분하는 interaction(entry_score/PR/session VWAP 등)은 이
+  표본 안에서조차 깨끗하게 분리되지 않아 OBSERVE로 유보했습니다.
+- 5-Min Exit: entry_watch 청산 7건 중 유효한 counterfactual이
+  있는 4건 중 2건은 5분 연장이 도움(EXTEND_HELPED), 2건은
+  중립/10-20분에서는 오히려 악화 — 일괄 연장은 위험하다는 것을
+  실측 데이터로 재확인. conditional extension 후보(R1/R2)는
+  n=1이라 OBSERVE(추가 shadow 관측 후보)로만 분류.
+- Entry Quality: 4개 shadow gate(would_block_macd_dead_min_score5
+  등)가 이번 9건 전부에 대해 한 번도 True로 걸리지 않음 — "효과
+  없음"이 아니라 "판단할 표본이 없음"으로 명시.
+- 어떤 후보도 SHADOW_READY/ENFORCE_CANDIDATE에 도달하지
+  못했습니다(표본 2거래일로는 원천적으로 불가) — 이번 세션
+  결과에 "유의미하다"/"검증됐다" 같은 표현을 쓰지 않았습니다.
+
+### 테스트 (신규 60건)
+
+`test_profitability_sprint.py` — synthetic fixture로 WIN/LOSS/
+BREAKEVEN 비용 계산, upside=0.0 포함, non-finite 제외, Low
+Upside bucket 경계(0.25/0.50/0.75/1.00/1.50/2.00) 7종, winner
+damage 정확 계산, all-breakeven "해당없음", +5/10/20 counterfactual
+결측 처리(파일 부재·가격시각 불일치 두 경우 모두), Base/Stress
+비용이 `domain.cost_model`과 항상 일치, leave-one-trade/day-out,
+bundle 일부 파일 누락 시 명시적 데이터 품질 경고(침묵 금지) —
+전부 검증. 60/60 통과.
+
+### 회귀 결과
+
+전체 회귀(`run_regression_tests.py`) 27개 파일 중 26개 통과
+(무관한 기존 `test_replay_time_axis.py`만 실패, 168/178 —
+베이스라인과 동일), `compileall` 정상.
+
+### 이번 세션에서 변경하지 않은 것 (production trading logic 변경 0건)
+
+TradingService BUY/SELL 조건, entry_score threshold, upside
+threshold, 5분 minimum-profit rule, stop loss, trailing stop,
+D.1/D.1.1, E.1-A/E.1-A.1/E.1-B, journal, Broker, API scheduler,
+entry_quality_guard_mode(shadow 유지) — 전부 무변경입니다.
+
+### 다음 단계
+
+민우님이 이 보고서를 GPT와 함께 검토한 뒤 "Profitability Sprint
+v2 — 실제 shadow/enforce 후보"를 별도로 승인합니다. 이번
+세션에서 제안한 shadow 관측 확대(Low Upside skip 카운터, 5분
+연장 조건 로깅)는 코드 반영 여부를 포함해 다음 라운드에서
+결정합니다 — 이번 라운드에서는 코드에 반영하지 않았습니다.
+
+## Profitability Sprint v1.1 — 민우님 코드 직접 대조 리뷰 3건 반영 (2026-08-24, analysis-only, no production strategy change)
+
+### 배경
+
+민우님이 v1의 `tools/profitability_sprint.py` 코드와 실제 CSV
+산출물을 직접 대조해 3가지 문제를 지적했습니다. 이번 라운드는
+분석 도구/보고서만 수정했고, **production 전략 코드는 이번에도
+0건 변경**입니다(production 코드 변경은 아래 별도 라운드
+"Profitability Shadow v2"에서 진행).
+
+### 수정 1 — Low Upside 주 후보를 F1 → F2로 변경
+
+F1(<1.00%)과 F2(<0.50%)가 실거래 9건에서 완전히 같은 6건을
+제거하는 것은 0.50~1.00% 구간에 거래가 우연히 없었기 때문이지,
+두 필터가 동등하다는 뜻이 아닙니다. 새 데이터가 들어오면 F1은
+그 구간까지 추가로 차단하지만 F2는 살립니다 — 동일한 과거
+개선 효과라면 더 좁은 필터(F2)가 논리적으로 우월하므로 F2를
+주 후보로, F1/F3을 보조 비교용으로 재정렬(`low_upside_filter_candidates()`
+순서를 F0→F2→F1→F3으로 변경, `run()`에 F2 leave-one-out
+`leave_one_out_f2` 추가). 실측 재검증 결과 F2 필터 적용 시
+Base net -85,462원 → +109,111원, Stress net -375,557원 →
++10,621원 — 민우님이 독립적으로 재계산한 수치와 정확히 일치.
+
+### 수정 2 — Study B를 MIN_PROFIT_5M / EARLY_VWAP_EXIT으로 분리
+
+기존 분석은 "entry_watch " 접두사만으로 급락청산/VWAP이탈청산/
+최소수익미달청산을 한 그룹으로 섞었습니다. "5분 minimum-profit
+타이머를 연장할 것인가"와 "VWAP 위험청산을 무시하고 더 들고
+있을 것인가"는 다른 전략 질문입니다. `classify_entry_watch_trigger()`
+(신규, exit_reason 텍스트 그대로 substring 매칭만 — 새 판정
+기준 발명 없음)로 `MIN_PROFIT_5M`/`EARLY_VWAP_EXIT`/`CRASH_CUT`/
+`OTHER_ENTRY_WATCH`/`NOT_ENTRY_WATCH` 5종을 분류. `exit_extension_study()`가
+`(per_trade_min_profit, per_trade_early_vwap, excluded_note)` 3-tuple을
+반환하도록 변경, extension rule 후보는 MIN_PROFIT_5M만 사용.
+분리 결과 순수 MIN_PROFIT_5M usable n이 **4건→2건**(8/20+8/21
+005935)으로 줄었습니다. 함께 확인된 사실: 그 n=1로 계산됐던
+R1/R2가 참조하는 `current_vs_vwap_pct`/`macd_above_signal`이
+5분 판단 시점이 아니라 **매수 진입 시점 값**이었음(§수정 3) —
+Study B 결론을 기존 "조건부 연장 방향성 있음"에서 **"판단 불가,
+데이터부터 재수집"**으로 하향.
+
+### 수정 3 — R1/R2를 INVALID EVIDENCE로 재분류 (feature 시점 불일치)
+
+`build_trade_features()`가 `entry_quality_shadow`/`signal_log`를
+매수 시점 기준으로만 조인하기 때문에, feature table의
+`current_vs_vwap_pct`/`macd_above_signal`은 애초부터 "5분 판단
+순간"의 값이 아니라 "매수 진입 순간"의 값입니다. 코드 버그가
+아니라 **필요한 checkpoint feature 자체가 어느 CSV에도 로깅되지
+않고 있다는 데이터 공백**입니다. `extension_rule_candidates()`에
+`valid_evidence` bool을 rule별로 추가(R1/R2=False, R3=True) —
+`valid_evidence=False`인 rule은 `sample_tier`가
+`INVALID(feature 시점 불일치 — ...; 근거로 사용 안 함)`로
+치환되고 `build_scorecard()`에서도 후보 문자열에
+`[INVALID EVIDENCE]`가 붙습니다. **R1/R2의 OBSERVE(n=1) 결과는
+이제 전략 후보 근거로 쓰지 않습니다.**
+
+### PnL price-source 감사 (민우님 지시, 코드 변경 전 필수 선행)
+
+`domain/service/trading_service.py`(BUY: L3179/3232, SELL:
+L3420/3448/3514), `domain/models.py`(`OrderRequest`/`OrderResult`,
+L75-104), `infra/broker/kiwoom_order_status.py`(L212)를 file:line
+단위로 추적한 결과: **BUY/SELL `trades.csv`의 `price` 필드는
+둘 다 주문 직전 폴링에서 읽은 참조 시세(`current_price`)이지
+실제 체결가가 아닙니다.** SELL 주문은 가격 없이 시장가로
+발행되고, `OrderResult`에는 체결가 필드 자체가 없습니다. 실제
+체결가(`cntr_pric`)는 아직 `KiwoomBroker`에 연결되지 않은
+`kiwoom_order_status.py`의 `filled_price`로만 존재(1P0.8-C
+예정, 이번 라운드에서 연결하지 않음 — 감사만). 반대로
+`avg_buy_price`(SELL 로그 필드)는 브로커 잔고 API 기준 실제
+체결 평균가로 realized입니다. **결론: 이 도구의 손익은
+"실현손익"이 아니라 "매도 판단 시점 참조가 기준 proxy 손익"입니다.**
+`build_trade_features()`가 모든 행의 `dq_flags`에 이 caveat
+문구를 추가하도록 수정했습니다. 코드/트레이딩 로직은 이번
+라운드에서 변경하지 않았습니다(감사만 지시받음).
+
+### KRW 기준 scorecard 추가
+
+`FEATURE_COLUMNS`에 `entry_notional_krw`/`modeled_base_cost_krw`/
+`modeled_stress_cost_krw`/`base_net_pnl_krw`/`stress_net_pnl_krw`
+추가, `low_upside_filter_candidates()`의 `sim()`이 후보별
+`base_net_delta_krw`/`stress_net_delta_krw`도 함께 반환하도록
+확장, `build_scorecard()`에 `base_delta_krw`/`stress_delta_krw`
+컬럼 추가(표본이 1~2건뿐인 5-Min Exit/Entry Quality 행은
+"가짜 정밀도 금지" 원칙에 따라 공란 유지). 비용은 전부
+`domain.cost_model.CostModel.cost_amount()`로 계산 — 이 도구/
+테스트 어디에도 비용 리터럴을 하드코딩하지 않았고, 저장소
+전체를 스캔하는 `test_cost_model.py`로 재확인.
+
+### 테스트 (60건 → **88건**)
+
+`test_profitability_sprint.py`에 28건 신규: F2 주 후보 순서
+검증, `classify_entry_watch_trigger()` 4분류 정확성(신규 합성
+번들 `20260912`: MINPROF1/VWAPEX1/CRASH1/TRAIL1), Study B
+3-way 분리 정확성, R1/R2 `valid_evidence=False` + scorecard
+`[INVALID EVIDENCE]` 표기, KRW 컬럼 산술 정확성(신규 합성 번들
+`20260913`, 심볼 KRW001), Low Upside 후보 KRW 델타 부호 일치,
+모든 feature row의 proxy PnL caveat 포함 여부. 88/88 통과.
+
+### 회귀 결과
+
+실제 `bundle_20260820_v2`+`bundle_20260821`로 도구를 재실행해
+수정된 산출물(`diagnostics/profitability/` 5개 CSV +
+`profitability_summary_20260820_20260821.md`)을 재생성하고,
+baseline(gross +99,144원/Base net -85,462원/Stress net
+-375,557원)과 F2 필터 적용 후 델타(Base +194,573원/Stress
++386,178원)가 민우님이 직접 재계산한 수치와 정확히 일치함을
+확인했습니다. 전체 회귀(`run_regression_tests.py`) 28개 파일
+중 27개 통과(무관한 기존 `test_replay_time_axis.py`만 실패,
+168/178 — 베이스라인과 동일), `compileall` 정상,
+`test_cost_model.py` 통과.
+
+### 이번 라운드에서 변경하지 않은 것
+
+TradingService BUY/SELL 판정 로직, entry_score threshold,
+upside threshold enforce, 5분 minimum-profit rule enforce,
+SELL 정책, D.1/D.1.1, E.1-A/E.1-A.1/E.1-B, journal, Broker/API
+호출, entry_quality_guard_mode(shadow 유지) — 전부 무변경.
+
+## Profitability Shadow v2 — 실시간 shadow 표본 축적용 프로덕션 관측 로그 2종 추가 (2026-08-24, production observation-only, no order blocking)
+
+### 배경
+
+민우님 지시: "이제는 더 오래 안전성 작업만 하는 단계가 아닙니다.
+F2를 shadow로 바로 깔고, 제대로 된 5분 feature를 동시에 모으고,
+3~5거래일 안에 첫 실제 수익성 변경 여부를 결정하는 일정으로
+당기겠습니다." 이번 라운드는 Profitability Sprint v1.1의 결론
+2가지(F2가 주 후보, 5분 판단 시점 feature가 어디에도 로깅되지
+않음)를 바로 production에 순수 관측 로그로 반영합니다. **BUY/SELL
+차단, threshold enforce, 5분 연장 enforce, 전략 판정 로직 변경은
+전부 0건입니다** — 두 로그 모두 기존 판정 흐름 뒤에 관찰만
+기록하고 반환값/제어흐름에 관여하지 않습니다.
+
+### 구현 1 — `LOW_UPSIDE_F2_SHADOW`
+
+BUY 후보 평가 시점(기존 entry-quality shadow와 동일 시점)에
+`upside_to_recent_high_pct` 기준으로 `would_skip_low_upside_f1`
+(<1.00)/`would_skip_low_upside_f2`(<0.50, 주 후보)/
+`would_skip_low_upside_f3`(<0.25) 3개 비교 플래그를 함께 기록.
+`infra/storage/logger.py`에 `LowUpsideShadowLogger`(신규,
+`EntryQualityShadowLogger`와 동일하게 `(symbol, latest_bar_timestamp,
+detected_patterns, score)` 기준 `append_if_new()` 중복 방지)
+추가, `domain/service/trading_service.py`의 `_write_signal_log()`에
+로깅 호출 삽입(기존 `guard_mode == "shadow"` 조건과 독립 —
+`LOW_UPSIDE_F2_SHADOW`는 별도 관측이라 guard_mode에 관계없이
+항상 기록). `config/settings.py`/`config/settings.yaml`에
+`low_upside_shadow_log_file` 추가.
+
+### 구현 2 — 5분 청산 판단 순간의 checkpoint feature 로깅
+
+Sprint v1.1이 밝힌 개념적 결함(§Study B 수정 2/3)을 production에서
+해결: `_check_entry_watch()`의 Branch 3(`최소수익미달청산`)에서만
+로깅하고, 로깅되는 값은 전부 **그 5분 판단이 실제로 일어나는
+순간**의 값입니다(진입 시점 값 아님) — timestamp/symbol/
+holding_minutes/pnl_pct/price/vwap/price_vs_vwap_pct/macd/
+macd_signal/macd_above_signal/rsi/ma5/ma20/peak_pnl_pct/
+drawdown_from_peak_pct/upside_to_recent_high_pct. VWAP 조기청산
+(1~4분, Branch 2)은 이 로그에 기록되지 않습니다 — 다른 질문이라
+분리 유지(EARLY_VWAP_EXIT은 기존 entry_watch_shadow로 계속
+관측). `infra/storage/logger.py`에 `MinProfitExtensionShadowLogger`
+(신규, 단순 `append()`) 추가. 이를 위해:
+- `domain/market_regime/minute_analyzer.py`의 `MinuteAnalysis`에
+  `ma5`/`ma20`(float, 기본값 0.0) 필드 추가 — `analyze()`가 이미
+  내부적으로 계산해두던 값을 노출만 함, 새 지표 계산 로직 없음.
+- `_check_entry_watch()` 시그니처에 `market_price=None`/
+  `highest_price: int = 0` 추가(둘 다 기본값 있어 기존 4-인자
+  호출 방식과 하위 호환). 새 메서드 `_log_min_profit_extension_shadow()`가
+  이미 폴링 사이클마다 갱신되는 `self._highest_price[symbol]`을
+  이용해 `peak_pnl_pct`/`drawdown_from_peak_pct`를 계산.
+- `config/settings.py`/`config/settings.yaml`에
+  `min_profit_extension_shadow_log_file` 추가.
+
+### 안전장치 — 방어적 초기화 하위 호환
+
+`legacy_tests/test_entry_watch.py`가 `TradingService.__new__()`로
+`__init__`을 건너뛰고 인스턴스를 만드는 기존 패턴과 충돌하지
+않도록, 두 새 로거 모두 사용 지점에 `hasattr()` 가드를 추가
+(코드베이스의 기존 "방어적 초기화" 컨벤션 그대로 적용) — 로거
+속성이 없는 인스턴스에서는 조용히 로깅을 건너뛰고 판정 로직에는
+영향 없음.
+
+### 테스트 (신규 53건)
+
+`test_profitability_shadow_v2.py`(신규) — 실제 `TradingService(...)`
+생성(`build_minimal_settings()` 경유)으로 두 로거 모두 통합
+테스트, F1/F2/F3 플래그 3종 정확성, MIN_PROFIT_5M 판단 순간
+feature 값 정확성(entry 시점 값과 다름을 직접 대조), VWAP 조기청산
+케이스에서 로깅 안 됨 확인, `market_price=None`/`minute_analysis=None`
+등 결측 시 안전 처리, 레거시 4-인자 호출 하위 호환, 로거 속성
+없는 stub 인스턴스에서 예외 없이 통과. 53/53 통과.
+
+### CSV 누출 버그 재발 방지
+
+`StorageConfig`에 상대경로 기본값(`logs/*.csv`)을 가진 새 필드를
+추가하면서, `test_run_once_integration.py`의
+`build_minimal_settings()`가 이 필드들을 tmpdir로 오버라이드하지
+않아 실제 회귀 실행 중 `logs/low_upside_shadow.csv`/
+`logs/min_profit_extension_shadow.csv`가 실제 프로젝트
+`logs/`에 누출되는 것을 자체 발견(기존 "0.5단계 CSV 누출 사고"와
+동일 유형). `build_minimal_settings()`에 두 필드의 tmpdir 경로
+오버라이드를 추가하고 누출된 파일을 삭제, 전체 회귀 재실행으로
+재발하지 않음을 확인.
+
+### 회귀 결과
+
+전체 회귀(`run_regression_tests.py`) 28개 파일 중 27개 통과
+(무관한 기존 `test_replay_time_axis.py`만 실패, 168/178 —
+베이스라인과 동일, 새로 추가된 `test_profitability_shadow_v2.py`
+포함), `legacy_tests/test_entry_watch.py`(11건, 자동 discover
+대상 아님) 별도 실행 통과, `compileall` 정상.
+
+### 이번 라운드에서 변경하지 않은 것 (전부 금지 목록 그대로 준수)
+
+BUY 차단, SELL 정책 변경, upside threshold enforce, 5분 연장
+enforce, E.1-B, 신규 Broker/API 호출 — 전부 0건. 두 신규 로거는
+순수 관측(observation-only)이며 어떤 Signal의 type/reason도
+변경하지 않습니다.
+
+### 다음 단계
+
+민우님이 진행하는 실제 거래에서 두 shadow 로그가 정상적으로
+쌓이는지(파일 생성, 필드 값 sanity) 며칠간 관측한 뒤, 지시하신
+enforce 승격 기준(LOW_UPSIDE 표본≥10건 추가/총≥15건, 손실
+제거율≥65%, 승자 훼손≤25~30%, Base net 개선 유지, ≥3거래일
+연속, 종목 하나 제외해도 부호 유지)에 도달하는지 확인합니다.
+기준 미달이면 계속 shadow만 유지 — 이번 라운드에서 정한
+threshold enforce 일정은 없습니다.
+
+**(이 다음 단계는 아래 "Profitability Shadow v2 closure"가 나가기
+전까지 보류됐습니다 — 배치 전 코드리뷰에서 P0 안전성 문제가 발견돼
+민우님이 적용을 보류했습니다.)**
+
+## Profitability Shadow v2 closure — 관측 로그 실패가 실제 SELL을 막을 수 있던 P0 결함 수정 + 중복 기록 방지 (2026-08-24, production observation-only)
+
+### 배경
+
+민우님이 직전 Shadow v2 diff를 실제로 열어 코드까지 대조 검토한
+뒤 본 프로그램 적용을 보류하고 코드리뷰 결과를 전달했습니다.
+가장 중요한 지적: `MinProfitExtensionShadowLogger`가 남긴 "예외를
+삼키지 않는다"는 설계가, 이 로거의 호출 위치(`_check_entry_watch()`
+가 SELL Signal을 반환하기 **직전**)와 결합하면 "관측 로그 실패가
+실제 SELL 청산을 막을 수 있다"는, observation-only 설계 조건을
+정면으로 어기는 결과를 낳는다는 것이었습니다. 이번 closure는
+민우님이 전달한 리뷰 항목을 순서대로 전부 반영했습니다 —
+**BUY/SELL 판정 로직, threshold, enforce 정책은 이번에도 0건
+변경**입니다.
+
+### P0 — 관측 로그 쓰기 실패가 SELL/BUY를 막을 수 있던 결함 수정
+
+`_log_min_profit_extension_shadow()`가 `_check_entry_watch()`의
+SELL Signal 반환 직전에 실행되는데, 최초 배치본은 이 함수 안에서
+의도적으로 예외를 삼키지 않았습니다 — `MinProfitExtensionShadowLogger.append()`
+의 파일 쓰기가 디스크 full/permission/CSV I/O 오류로 실패하면
+그 예외가 그대로 `_check_entry_watch()` 밖으로 전파돼, SELL
+Signal이 반환되지 못하고 그 폴링에서 최소수익미달청산 자체가
+누락될 수 있었습니다. 이제 이 함수 전체를 try/except로 감싸
+어떤 예외도 밖으로 내보내지 않고(fail-open) `app_logger.warning()`
+만 남깁니다 — 관측 로그가 실패해도 SELL은 항상 정상적으로
+나갑니다. `_write_signal_log()`의 `LOW_UPSIDE_F2_SHADOW` 기록
+블록도 동일한 이유로 fail-open 처리했습니다 — 이 시점은 이미
+주문이 끝난 뒤라 주문 자체를 막지는 않지만, 보조 관측 로그
+하나의 쓰기 실패가 `self.signal_logger.append(row)`까지 함께
+막아 기존 signal_log 기록을 끌고 내려갈 수 있었기 때문입니다.
+기존 `entry_quality_shadow_logger`(1E.5부터 있던 로거)는 이번
+범위 밖 — 민우님 지시대로 "이번에 추가한 profitability shadow
+logger 2종만" 대상으로 했습니다.
+
+새 fault-injection 테스트로 검증: 로거의 `append_if_new()`가
+`IOError`/`PermissionError`를 던지도록 대체해도 (a) 원래
+반환되어야 할 SELL Signal이 정확히 그대로 반환되고, (b)
+signal_log.csv에는 원래 BUY 판단이 정상적으로 기록됨을 직접
+확인했습니다.
+
+### 중복 기록 방지 — balance lag 동안 같은 판단이 반복되는 문제
+
+`MinProfitExtensionShadowLogger`의 최초 설계 전제("청산 이벤트당
+정확히 한 번만 호출된다")가 틀렸다는 지적을 반영했습니다 — SELL
+accepted 이후에도 잔고 API가 2~3분 늦게 반영되는 동안(OBS.2-A가
+이미 실측으로 확인한 정확히 같은 유형의 패턴) `position`이 여전히
+non-None으로 보여 `_check_entry_watch()`가 같은 포지션에 대해
+최소수익미달 판단을 매 폴링마다 반복 반환할 수 있습니다. 이
+로깅은 PSM의 중복 SELL block보다 앞선 지점에서 이뤄지므로, 이제
+`(symbol, entry_time)` 기준 중복 방지 키를 도입했습니다
+(`append()` → `append_if_new()`로 변경, `entry_time` 필드
+신규 추가 — `state.entry_time_by_symbol`의 실제 진입 시각이라
+재진입 시 값이 달라져 자동으로 새 episode로 구분됩니다). 재시작
+시에도 기존 CSV에서 키를 복원해 다시 중복되지 않도록 했습니다
+(`EntryQualityShadowLogger`/`LowUpsideShadowLogger`와 동일 패턴).
+
+accepted SELL과의 명시적 연결(리뷰의 선택적 3번째 제안)은 이번
+closure에서는 구현하지 않기로 결정했습니다 — `_try_sell_unchecked()`
+의 accepted 분기에 snapshot을 전달·보관하는 구조는 SELL 실행
+경로 자체를 건드려야 해서 "관측 전용, 판정 로직 최소 침습"이라는
+이 기능의 설계 원칙에 비해 과도하게 침습적이라고 판단했습니다.
+대신 `(symbol, entry_time)`이 position episode를 유일하게
+식별하고 `trades.csv`/`entry_watch_shadow.csv`에도 같은 종목·
+근접 시각의 SELL 행이 남으므로, 다음 Profitability Sprint가
+Sprint v1이 이미 쓰던 것과 동일한 timestamp 근접 조인으로 사후
+검증할 수 있습니다 — 이 설계 선택을 `infra/storage/logger.py`의
+모듈 주석에 명시적으로 문서화했습니다.
+
+### Low Upside CSV에 실제 주문 연결 정보 추가
+
+`entry_quality_shadow.csv`에는 이미 있던 `order_attempted`/
+`order_accepted`/`order_id`가 `low_upside_shadow.csv`에는 빠져
+있었습니다 — "F2가 True였던 BUY 후보"와 "F2가 True였고 실제
+accepted되어 돈이 들어간 거래"를 구분할 수 없으면 다음 Sprint에서
+timestamp 기반 억지 조인이 필요해집니다. `_write_signal_log()`가
+이미 계산해 둔 `order_attempt`(OrderResult)를 그대로 반영해
+`LOW_UPSIDE_SHADOW_FIELDS`에 세 필드를 추가했습니다. F1/F2/F3
+would_skip 판정 자체와 BUY 차단 여부는 전혀 바뀌지 않았습니다.
+
+### export_daily_bundle.py 연결 확인 — 명시적 allowlist라 반드시 추가해야 했음
+
+`CSV_SOURCES`가 자동 discovery가 아니라 명시적 파일 목록임을
+직접 코드로 확인했습니다 — 최초 Shadow v2 배치본은 이 목록에
+새 두 CSV를 추가하지 않아, 실시간 로그는 정상 쌓여도 daily
+bundle(`raw/`)에는 실리지 않는 상태였습니다. 민우님 지적대로
+`export_daily_bundle.py`의 `CSV_SOURCES`에 `low_upside_shadow.csv`/
+`min_profit_extension_shadow.csv`를 추가했습니다(둘 다 `timestamp`
+컬럼 기준 슬라이싱). `test_shadow_analysis.py`에 실제 export
+경로를 태우는 end-to-end 테스트(W절, 6건)를 추가해 두 파일이
+`raw/`에 날짜 기준으로 정확히 슬라이싱되어 포함되고 MANIFEST에
+OK로 기록됨을 직접 검증했습니다.
+
+### 테스트 (53건 → **68건**)
+
+`test_profitability_shadow_v2.py`에 15건 신규: `MinProfitExtensionShadowLogger`
+의 (symbol, entry_time) 중복방지 + 재시작 후 키 복원(1-3b/1-4),
+Low Upside CSV의 order_attempted/order_accepted/order_id 정확성
+(2-8/2-9), 두 로거 각각에 대한 fault-injection(2-P0/3-P0 —
+IOError/PermissionError를 던지도록 스텁으로 교체해도 원래
+Signal/signal_log가 정상 유지됨을 직접 확인), 실제
+`_check_entry_watch()` 경로에서 entry_time 기록 정확성과 balance
+lag 반복 판단 시나리오(5회 반복 폴링 모사 → 1행만 기록, 재진입
+시 새 행)까지 검증(3-6/3-7). `test_shadow_analysis.py`에도
+daily bundle 포함 여부 end-to-end 테스트 6건 추가. 68/68 +
+182/182(test_shadow_analysis.py 전체) 통과.
+
+### 회귀 결과
+
+`legacy_tests/test_entry_watch.py`(11건, 자동 discover 대상
+아님) 별도 실행 통과 — 로거 속성이 없는 `TradingService.__new__()`
+스텁에서도 fail-open try/except 이전의 `hasattr()` 가드가 여전히
+먼저 걸려 예외 없이 정상 동작함을 재확인. 전체 회귀
+(`run_regression_tests.py`) 28개 파일 중 27개 통과(무관한 기존
+`test_replay_time_axis.py`만 실패, 168/178 — 베이스라인과 동일),
+`compileall` 정상.
+
+### 이번 closure에서도 변경하지 않은 것 (전부 금지 목록 그대로 준수)
+
+BUY 차단, F2 enforce, SELL 조건, 5분 청산 threshold, 5분 연장,
+VWAP exit, stop/trailing, Broker/API 호출, D.1/D.1.1, E.1-A/E.1-B,
+entry_quality_guard_mode — 전부 0건. 이번 closure도 observation-only
+입니다. 기존 `entry_quality_shadow_logger`(1E.5부터 있던 로거)의
+동작도 변경하지 않았습니다.
+
+### 다음 단계
+
+**(이 절의 "다음 단계"는 아래 재closure로 대체됐습니다 — 민우님이
+이 closure본까지 실제 파일로 재검토해 2건을 추가로 지적하셨습니다.)**
+이 closure로 P0 안전성 문제와 중복 기록 문제가 닫혔으므로, 민우님이
+검토 후 최종 승인하면 바로 실제 운영에 적용해 F2/5분 checkpoint
+shadow 표본을 3~5거래일 쌓기 시작합니다. F2 enforce나 conditional
+extension 구현은 이번에도 시작하지 않았습니다 — 표본이 충분히
+쌓인 뒤 별도로 지시하신 enforce 승격 기준 검토 라운드에서 다룹니다.
+
+## Profitability Shadow v2 재closure — 로거 생성 실패도 fail-open + Low Upside dedup key에 주문 상태 signature 추가 (2026-08-24, production observation-only)
+
+### 배경
+
+민우님이 위 closure를 실제 파일까지 다시 대조 검토해, 이전 P0
+(append 실패 fail-open)/중복 MIN_PROFIT 기록/bundle 누락은 제대로
+닫혔음을 확인했습니다. 다만 본 프로그램 적용 전에 추가로 2건을
+지적했고, 그중 1번은 적용 blocker였습니다. **BUY/SELL 판정 로직·
+threshold·enforce 정책은 이번에도 0건 변경**입니다.
+
+### P0 — 로거 생성(__init__) 자체의 실패도 fail-open 처리
+
+`append()`/`append_if_new()` 실패는 이전 closure에서 fail-open으로
+막았지만, `LowUpsideShadowLogger`/`MinProfitExtensionShadowLogger`의
+`__init__()` 자체가 `mkdir`/파일 `open`/헤더 쓰기를 즉시 수행합니다
+— permission 오류·디스크 full·잘못된 경로 등으로 **생성자 자체가**
+실패하면 그 예외가 `TradingService.__init__()` 밖으로 그대로
+전파돼 자동매매 프로그램 전체가 기동하지 못할 수 있었습니다.
+관측용 CSV 하나 때문에 프로그램이 아예 시작 못 하는 것은
+observation-only 설계 조건에 명백히 위배됩니다. `TradingService.__init__()`
+에서 두 로거 생성을 각각 try/except로 감싸, 실패하면 `app_logger.warning()`
+만 남기고 해당 속성을 `None`으로 둡니다. 호출부(`_write_signal_log()`
+의 Low Upside 블록, `_log_min_profit_extension_shadow()`)는 이미
+`hasattr()` 가드가 있었는데, 이제 `getattr(self, "...", None) is not None`
+방식으로 바꿔 "속성이 아예 없는 경우"(레거시 `__new__` 스텁)와
+"생성에 실패해 명시적으로 None인 경우"를 모두 안전하게 건너뛰도록
+통일했습니다. 기존 핵심 로거(trade_logger/signal_logger/
+entry_watch_shadow_logger/position_lifecycle_logger/
+entry_quality_shadow_logger/tracked_order_journal)의 초기화 정책은
+이번에도 손대지 않았습니다 — 새로 추가한 profitability shadow
+logger 2종만 대상입니다.
+
+Fault-injection 테스트로 검증: 두 로거 클래스를 각각(그리고 함께)
+생성 시 `PermissionError`/`OSError`를 던지는 스텁으로 교체해도
+`TradingService`가 정상 생성되고, 실패한 로거는 `None`으로 남으며,
+BUY 판단(`_write_signal_log()`)과 최소수익미달청산 SELL
+(`_check_entry_watch()`)이 각각 정상 동작하고, 기존 핵심 로거들은
+전혀 영향받지 않음을 직접 확인했습니다.
+
+### P1 — Low Upside dedup key에 주문 상태 signature 추가
+
+`LowUpsideShadowLogger`의 중복 방지 키가 `(symbol,
+latest_bar_timestamp, detected_patterns, score)` 4개뿐이었는데,
+이전 closure에서 `order_attempted`/`order_accepted`/`order_id`를
+CSV에 새로 추가하면서 이 4개만으로는 부족해졌습니다 — 같은 분봉
+안에서 첫 폴링이 주문 거부(`order_accepted=False`)로 기록된 뒤,
+재시도로 두 번째 폴링이 accepted(`order_accepted=True`,
+`order_id=`실제값)돼도 같은 dedup key라 두 번째(accepted) 행이
+중복으로 버려져, CSV에는 rejected 행만 남을 수 있었습니다 — "F2가
+True였고 실제 accepted된 거래를 추적한다"는 이 필드 추가의 목적을
+정확히 깨뜨리는 결함이었습니다. `EntryQualityShadowLogger`의
+`assessment_signature` 개념과 동일하게, `LOW_UPSIDE_SHADOW_SIGNATURE_FIELDS`
+(`final_decision`/`order_block_reason`/`order_attempted`/
+`order_accepted`/`order_id`)를 base key에 더해 dedup key를
+확장했습니다. 값은 전부 `str()`로 정규화해(재시작 시 CSV에서
+복원한 값은 문자열, 새로 들어오는 값은 Python bool이라 타입이
+다르면 같은 논리적 값인데 키가 어긋나는 문제를 방지) 기존
+`analysis_dedup_key()` 계열과 동일한 정규화 원칙을 따랐습니다.
+
+테스트로 검증: 같은 분봉에서 rejected→accepted 전환 시 2행 모두
+남고 두 번째 행에 실제 order_id가 보존됨, BLOCKED→accepted 전환도
+동일하게 새 행 허용, 완전히 동일한 accepted 상태(같은 order_id
+포함) 5회 반복 폴링은 여전히 1행만 남음, 재시작 후에도 signature
+전체가 복원돼 동일 상태 재기록을 막음 — 로거 단위 테스트와
+`_write_signal_log()`를 통한 end-to-end 재현 시나리오(민우님이
+지적한 시나리오 그대로: rejected 폴링 → accepted 재시도 폴링)
+둘 다로 확인했습니다.
+
+### 테스트 (68건 → **86건**)
+
+`test_profitability_shadow_v2.py`에 18건 신규: 로거 생성 실패
+fault-injection 3건(LowUpsideShadowLogger만/MinProfitExtensionShadowLogger만/
+둘 다 실패), Low Upside dedup signature 5건(rejected→accepted,
+BLOCKED→accepted, 동일 accepted 5회, 재시작 후 복원 — 로거
+단위), `_write_signal_log()` 경유 end-to-end 재현 시나리오 1건(3개
+assertion). 86/86 통과.
+
+### 회귀 결과
+
+`legacy_tests/test_entry_watch.py`(11건), `test_partial_fill_lifecycle.py`
+(336건), `test_order_status_reconciliation.py`(64건),
+`test_tracked_order_journal.py`(67건) 전부 재통과. 전체 회귀
+(`run_regression_tests.py`) 28개 파일 중 27개 통과(무관한 기존
+`test_replay_time_axis.py`만 실패, 168/178 — 베이스라인과 동일),
+`compileall` 정상. CSV 누출 재확인(없음).
+
+### 이번 재closure에서도 변경하지 않은 것
+
+BUY 차단, F2 enforce, SELL 조건, 5분 청산 threshold, 5분 연장,
+VWAP exit, stop/trailing, Broker/API 호출, D.1/D.1.1, E.1-A/E.1-B,
+entry_quality_guard_mode — 전부 0건. exporter(`export_daily_bundle.py`)
+는 이번 재closure에서 추가 변경 없음(직전 closure에서 이미 완료,
+민우님도 "exporter 추가 변경 불필요"로 확인).
+
+### 다음 단계
+
+민우님이 이 재closure본을 최종 승인하면 바로 실제 운영에 적용해
+F2/5분 checkpoint shadow 표본을 3~5거래일 쌓기 시작합니다. F2
+enforce나 conditional extension 구현은 이번에도 시작하지
+않았습니다.

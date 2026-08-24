@@ -636,3 +636,287 @@ class PositionLifecycleLogger:
             for field in LIFECYCLE_FIELDS:
                 row.setdefault(field, "")
             writer.writerow(row)
+
+
+# ── low_upside_shadow.csv ────────────────────────────────────────────────────
+# Profitability Shadow v2 (2026-08-24). Profitability Sprint v1(analysis-only
+# 도구, tools/profitability_sprint.py)이 사후 분석(9건, 8/20+8/21)에서 찾은
+# "Low Upside skip" 후보를 실시간으로 표본을 쌓기 위한 shadow 관측 전용 로그.
+#
+# 중요: 이 로거는 BUY를 절대 차단하지 않습니다. legacy_buy_candidate=True
+# (전략이 실제로 BUY를 반환한 경우)일 때 "만약 upside_to_recent_high_pct가
+# 이 임계값 미만이면 걸렀을 것이다"라는 가상 판정만 기록합니다 — 실제 주문
+# 흐름(_try_buy)에는 어떤 값도 참조·전달되지 않습니다.
+#
+# entry_quality_shadow.csv와 달리 entry_quality_guard_mode 설정과 완전히
+# 무관하게 항상 기록됩니다(민우님 지시: "목적은 수익성 후보의 실시간 shadow
+# 표본을 빠르게 쌓는 것" — 기존 VWAP shadow 실험 on/off와 별개 축이므로).
+#
+# 임계값 세 개(F1<1.00%/F2<0.50%/F3<0.25%)를 함께 기록하는 이유는
+# Profitability Sprint v1 리뷰(민우님)에서 F1과 F2가 실거래 9건에서
+# 우연히 동일한 6건을 제거했을 뿐(표본에 0.50~1.00% 구간 거래가 없었음)
+# 이라는 게 확인되어, 앞으로 새 표본이 들어와도 세 후보를 동시에 비교할
+# 수 있어야 하기 때문입니다. 주 후보는 F2(<0.50%)입니다.
+
+LOW_UPSIDE_SHADOW_FIELDS = [
+    "timestamp",                    # 기록 시각(KST)
+    "symbol",
+    "latest_bar_timestamp",         # 이 판단에 쓰인 분봉의 최신 timestamp(중복 방지 키)
+    "detected_patterns",            # V/PR/A/B/C/D 패턴 조합(중복 방지 키)
+    "score",                        # 8점 체계 점수(중복 방지 키)
+    "condition_name",               # 대표 조건식(호환용)
+    "upside_to_recent_high_pct",    # 현재가→최근 고점 상승 여력(%) — minute_analysis 원값
+    "would_skip_low_upside_f1",     # upside < 1.00% (보조 비교용)
+    "would_skip_low_upside_f2",     # upside < 0.50% (주 후보, 민우님 확정)
+    "would_skip_low_upside_f3",     # upside < 0.25% (보조 비교용)
+    "final_decision",               # 실제 결과: BUY / HOLD / BLOCKED
+    "order_block_reason",
+    # 2026-08-24 (Shadow v2 closure, 민우님 코드리뷰 지적): entry_quality_
+    # shadow.csv에는 이미 있던 실제 주문 연결 정보가 이 CSV에는 빠져
+    # 있었음 — "F2가 True였던 BUY 후보"와 "F2가 True였고 실제 accepted
+    # 되어 돈이 들어간 거래"를 구분하지 못하면 다음 Sprint에서 timestamp
+    # 기반 억지 조인이 필요해짐. _write_signal_log()가 이미 계산해 둔
+    # order_attempt(OrderResult)를 그대로 반영 — BUY를 막는 데는 절대
+    # 쓰이지 않고 순수 기록용.
+    "order_attempted",
+    "order_accepted",
+    "order_id",
+]
+
+
+# 2026-08-24 (Shadow v2 재closure, 민우님 코드리뷰 P1 지적): 최초
+# closure는 (symbol, latest_bar_timestamp, detected_patterns, score)만
+# 키로 썼는데, "would_skip_*는 upside_to_recent_high_pct에만 의존하므로
+# 충분하다"는 근거는 F1/F2/F3 판정 자체에는 맞지만, 같은 closure에서
+# order_attempted/order_accepted/order_id를 CSV에 새로 추가하면서 더는
+# 충분하지 않게 됐습니다. 같은 분봉 안에서 첫 폴링은 주문이 거부됐다가
+# (order_accepted=False) 다음 폴링에서 재시도가 accepted(order_accepted=True,
+# order_id=실제값)되는 경우, 기존 4필드 키로는 두 번째(accepted) 행이
+# "중복"으로 버려져 실제로는 accepted된 거래인데 CSV에는 rejected 행만
+# 남는 문제가 있었습니다 — "F2가 True였고 실제 accepted된 거래"를
+# 추적한다는 이 필드 추가의 목적을 정확히 깨뜨리는 결함이었습니다.
+# 이제 주문 상태 신호(final_decision/order_block_reason/order_attempted/
+# order_accepted/order_id)를 키에 포함해, 같은 분봉이라도 주문 상태가
+# 바뀌면(rejected→accepted, BLOCKED→accepted 등) 새 행으로 기록되고,
+# 완전히 동일한 상태의 반복 폴링(10초 간격)은 계속 1행으로 유지됩니다.
+LOW_UPSIDE_SHADOW_SIGNATURE_FIELDS: list[str] = [
+    "final_decision",
+    "order_block_reason",
+    "order_attempted",
+    "order_accepted",
+    "order_id",
+]
+
+
+class LowUpsideShadowLogger:
+    """Low Upside skip 후보(F1/F2/F3)의 실시간 shadow 관측을 기록하는 로거입니다.
+
+    중복 방지 키 = base(symbol, latest_bar_timestamp, detected_patterns,
+    score) + signature(LOW_UPSIDE_SHADOW_SIGNATURE_FIELDS 5개). base
+    4개만으로는 같은 분봉 안에서 주문 상태가 바뀌는 경우(예: 거부 후
+    재시도로 accepted)를 별도 행으로 남기지 못해, EntryQualityShadowLogger
+    (domain/shadow_signature.py의 assessment_signature)와 같은 이유로
+    signature를 추가했습니다. 값은 전부 str()로 정규화합니다 — 새로
+    들어오는 row는 Python bool(True/False)이지만 재시작 시 CSV에서
+    복원한 row는 문자열("True"/"False")이라 타입이 다르면 같은 논리적
+    값인데 키가 어긋나는 문제를 방지하기 위함입니다.
+    """
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._seen_keys: set[tuple] = set()
+
+        if self.file_path.exists():
+            _migrate_csv_header_if_needed(self.file_path, LOW_UPSIDE_SHADOW_FIELDS, "LOW_UPSIDE_SHADOW")
+            try:
+                with self.file_path.open("r", newline="", encoding="utf-8") as fp:
+                    reader = csv.DictReader(fp)
+                    for row in reader:
+                        try:
+                            self._seen_keys.add(self._key(row))
+                        except Exception:
+                            continue
+            except Exception as exc:
+                logger.warning(
+                    f"[LOW_UPSIDE_SHADOW] 기존 파일에서 중복방지 키 복원 실패"
+                    f"(무시하고 빈 상태로 계속 진행): {exc}"
+                )
+        else:
+            with self.file_path.open("w", newline="", encoding="utf-8") as fp:
+                writer = csv.DictWriter(fp, fieldnames=LOW_UPSIDE_SHADOW_FIELDS)
+                writer.writeheader()
+
+    @staticmethod
+    def _key(row: dict[str, Any]) -> tuple:
+        base = (
+            str(row.get("symbol", "")),
+            str(row.get("latest_bar_timestamp", "")),
+            str(row.get("detected_patterns", "")),
+            str(row.get("score", "")),
+        )
+        signature = tuple(str(row.get(f, "")) for f in LOW_UPSIDE_SHADOW_SIGNATURE_FIELDS)
+        return base + signature
+
+    def append_if_new(self, row: dict[str, Any]) -> bool:
+        """중복 키가 아니면 한 줄을 추가하고 True, 이미 기록된 키면 False."""
+        key = self._key(row)
+        if key in self._seen_keys:
+            return False
+
+        with self.file_path.open("a", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=LOW_UPSIDE_SHADOW_FIELDS, extrasaction="ignore")
+            for field in LOW_UPSIDE_SHADOW_FIELDS:
+                row.setdefault(field, "")
+            writer.writerow(row)
+
+        self._seen_keys.add(key)
+        return True
+
+
+# ── min_profit_extension_shadow.csv ──────────────────────────────────────────
+# Profitability Shadow v2 (2026-08-24). Profitability Sprint v1 리뷰(민우님)
+# 지적: 기존 entry_watch_shadow.csv는 "entry_watch " 접두사의 모든 청산
+# 유형(급락청산/VWAP이탈청산/최소수익미달청산)을 한 버킷으로 섞어 추적했고,
+# 매수 시점(entry) feature만 있어 "5분 청산 판단 순간"의 실제 지표값이
+# 없었습니다 — 그래서 조건부 연장 규칙(R1/R2) 검증이 사실상 "5분 시점
+# PnL>0 AND 진입 당시 VWAP/MACD 상태"가 되어버려 원래 질문(5분 시점 상태로
+# 판단)에 답하지 못했습니다.
+#
+# 이 로그는 정확히 그 간극을 메웁니다 — `_check_entry_watch()`가
+# "entry_watch 최소수익미달청산"을 판단하는 그 순간(watch_minutes 경과 +
+# pnl_pct < min_profit_pct)에만, 오직 그 판단 순간의 값을 기록합니다.
+# VWAP 이탈청산(더 이른 시점, 다른 질문)이나 급락청산은 이 로그에 남지
+# 않습니다 — 그 두 유형은 여전히 entry_watch_shadow.csv(기존, 무변경)가
+# 다룹니다.
+#
+# 이 로거는 SELL을 절대 막지 않습니다 — `_check_entry_watch()`가 이미
+# 반환하기로 결정한 Signal을 그대로 반환하기 직전에, 그 순간의 관측치만
+# 추가로 남깁니다. 최소수익미달청산 판정 로직 자체는 단 한 줄도 바뀌지
+# 않습니다.
+#
+# 2026-08-24 (Shadow v2 closure, 민우님 코드리뷰 지적): 최초 배치본은
+# "청산 이벤트당 정확히 한 번만 호출된다"고 가정해 중복 방지 키가
+# 없었으나, 이 전제가 틀렸습니다 — SELL accepted 이후에도 잔고 API가
+# 2~3분 늦게 반영되는 동안(OBS.2-A가 이미 실측으로 확인한 패턴,
+# 064260/8·21 등) position이 여전히 non-None으로 보여 `_check_entry_
+# watch()`가 같은 포지션에 대해 최소수익미달 판단을 매 폴링마다 반복
+# 반환할 수 있습니다. PSM은 실제 중복 SELL 주문은 막지만, 이 로깅은
+# PSM의 SELL block보다 앞선 `_check_entry_watch()` 안에서 이뤄지므로
+# 그 사이 여러 행이 쌓일 수 있습니다. 이제 (symbol, entry_time) 기준
+# 중복 방지 키를 둬 같은 position episode당 최초 판단 1건만 기록합니다
+# (entry_time은 `state.entry_time_by_symbol`의 실제 진입 시각 — 재진입
+# 시 값이 달라지므로 자동으로 새 episode로 구분됩니다). 재시작 시에도
+# 기존 CSV에서 키를 복원해 중복 기록을 방지합니다.
+#
+# 설계 선택 — accepted SELL과의 연결(민우님 코드리뷰 3번 항목): 이 로그는
+# `_check_entry_watch()`가 최소수익미달청산 SELL Signal을 만들기로 "판단"
+# 하는 순간에 기록되며, 그 SELL이 실제로 broker에 accepted됐는지는 별도로
+# 확인하지 않습니다(즉 broker reject가 나도 이 행은 이미 남습니다). 리뷰가
+# 제안한 두 방식 — (a) `_check_entry_watch()`에서 snapshot만 만들어 보관
+# 하고 `_try_sell_unchecked()`의 accepted 분기에서 실제 order_id와 함께
+# 기록, (b) entry_time 기반 최초판단 dedup까지만 구현하고 후속 분석기가
+# accepted SELL과 timestamp로 검증 — 중 이번 closure에서는 **(b)를
+# 선택**했습니다. 이유: (a)는 SELL 실행 경로(_try_sell_unchecked) 자체에
+# snapshot 전달/보관 상태를 추가해야 해서 "관측 전용, 판정 로직 최소
+# 침습"이라는 이 라운드의 설계 원칙에 비해 과도하게 침습적이라고 판단했기
+# 때문입니다. (symbol, entry_time)이 position episode를 유일하게 식별하고
+# trades.csv/entry_watch_shadow.csv에도 동일 종목·근접 시각의 SELL 행이
+# 남으므로, 다음 Profitability Sprint가 timestamp 근접 매칭으로 실제
+# accepted 여부를 사후 검증할 수 있습니다 — Sprint v1이 이미 이런 근접
+# 조인을 signal_log/entry_quality_shadow에 대해 하고 있어 동일한 패턴을
+# 재사용할 수 있습니다.
+
+MIN_PROFIT_EXTENSION_SHADOW_FIELDS = [
+    "timestamp",                     # 판단(=SELL 신호 발생) 시각
+    "symbol",
+    "entry_time",                    # 이 position episode의 실제 진입 시각
+                                       # (state.entry_time_by_symbol) — (symbol,
+                                       # entry_time) 조합이 중복 방지 키
+    "holding_minutes",               # 매수 후 경과 시간(분) = elapsed_min
+    "pnl_pct",                       # 판단 순간 수익률 (avg 대비)
+    "price",                         # 판단 순간 현재가
+    "vwap",                          # 판단 순간 VWAP (minute_analysis, stale이면 공백)
+    "price_vs_vwap_pct",             # (price-vwap)/vwap*100 (stale이면 공백)
+    "macd",                          # 판단 순간 MACD 원시값 (market_price 기준)
+    "macd_signal",                   # 판단 순간 MACD Signal 원시값
+    "macd_above_signal",             # macd > macd_signal (True/False/공백=지표없음)
+    "rsi",                           # 판단 순간 RSI
+    "ma5",                           # 판단 순간 분봉 MA5 (stale이면 공백)
+    "ma20",                          # 판단 순간 분봉 MA20 (stale이면 공백)
+    "peak_pnl_pct",                  # 매수 후 최고가 기준 최대 수익률
+    "drawdown_from_peak_pct",        # 최고가 대비 현재 낙폭(%, 0 이하)
+    "upside_to_recent_high_pct",     # 판단 순간 상승 여력(%) (stale이면 공백)
+    "minute_data_stale",             # True면 vwap/price_vs_vwap_pct/ma5/ma20/
+                                       # upside_to_recent_high_pct가 전부 공백
+                                       # (그 폴링 시점 분봉 데이터가 fresh하지
+                                       # 않아 minute_analysis 자체가 None으로
+                                       # 넘어온 경우 — 425p 급락·시간초과청산과
+                                       # 동일하게 stale이어도 이 청산 자체는
+                                       # 허용되지만, 지표 관측은 불가능)
+]
+
+
+class MinProfitExtensionShadowLogger:
+    """entry_watch 최소수익미달청산(5분 시점) 판단 순간의 feature snapshot을
+    기록하는 로거입니다.
+
+    entry_watch_shadow.csv(기존)와 달리 청산 유형을 섞지 않고, 오직
+    "최소수익미달청산" 한 종류만 기록합니다.
+
+    2026-08-24 (Shadow v2 closure): 최초 배치본의 "청산 이벤트당 정확히
+    한 번만 호출된다"는 전제가 틀렸음이 코드리뷰로 확인됐습니다 — SELL
+    accepted 뒤 잔고 API 반영이 늦어지는 동안 같은 position에 대해
+    같은 판단이 반복될 수 있습니다(위 모듈 주석 참고). (symbol,
+    entry_time) 기준으로 중복을 방지합니다 — EntryQualityShadowLogger/
+    LowUpsideShadowLogger와 같은 패턴으로, 기존 파일이 있으면 키를
+    복원합니다.
+    """
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._seen_keys: set[tuple] = set()
+
+        if self.file_path.exists():
+            _migrate_csv_header_if_needed(
+                self.file_path, MIN_PROFIT_EXTENSION_SHADOW_FIELDS, "MIN_PROFIT_EXTENSION_SHADOW"
+            )
+            try:
+                with self.file_path.open("r", newline="", encoding="utf-8") as fp:
+                    reader = csv.DictReader(fp)
+                    for row in reader:
+                        try:
+                            self._seen_keys.add(self._key(row))
+                        except Exception:
+                            continue
+            except Exception as exc:
+                logger.warning(
+                    f"[MIN_PROFIT_EXTENSION_SHADOW] 기존 파일에서 중복방지 키 복원 실패"
+                    f"(무시하고 빈 상태로 계속 진행): {exc}"
+                )
+        else:
+            with self.file_path.open("w", newline="", encoding="utf-8") as fp:
+                writer = csv.DictWriter(fp, fieldnames=MIN_PROFIT_EXTENSION_SHADOW_FIELDS)
+                writer.writeheader()
+
+    @staticmethod
+    def _key(row: dict[str, Any]) -> tuple:
+        return (str(row.get("symbol", "")), str(row.get("entry_time", "")))
+
+    def append_if_new(self, row: dict[str, Any]) -> bool:
+        """같은 (symbol, entry_time) episode에 대해 최초 1건만 기록하고
+        True를 반환합니다. 이미 기록된 episode면 아무것도 안 하고
+        False를 반환합니다."""
+        key = self._key(row)
+        if key in self._seen_keys:
+            return False
+
+        with self.file_path.open("a", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=MIN_PROFIT_EXTENSION_SHADOW_FIELDS, extrasaction="ignore")
+            for field in MIN_PROFIT_EXTENSION_SHADOW_FIELDS:
+                row.setdefault(field, "")
+            writer.writerow(row)
+
+        self._seen_keys.add(key)
+        return True

@@ -121,6 +121,13 @@ def build_minimal_settings(tmpdir: str) -> Settings:
             # data/ 디렉터리에 journal 파일을 새게 됩니다(0.5단계에서
             # 발견된 CSV 누출 사고와 동일한 클래스의 버그 재발 방지).
             tracked_order_journal_file=f"{tmpdir}/tracked_order_journal.json",
+            # 2026-08-24 (Profitability Shadow v2): 위와 동일한 이유로
+            # 반드시 tmpdir 기준 경로 명시 — 안 하면 StorageConfig 기본값
+            # ("logs/low_upside_shadow.csv" 등)이 그대로 쓰여서 이 헬퍼를
+            # 재사용하는 모든 테스트가 프로젝트 루트의 실제 logs/ 에
+            # CSV를 새게 됩니다(0.5단계 CSV 누출 사고와 동일 클래스).
+            low_upside_shadow_log_file=f"{tmpdir}/low_upside_shadow.csv",
+            min_profit_extension_shadow_log_file=f"{tmpdir}/min_profit_extension_shadow.csv",
         ),
         websocket=WebSocketConfig(
             enabled=False, url="", condition_seqs=[], max_symbols=10,

@@ -261,6 +261,14 @@ class StorageConfig:
     # data/ 디렉터리 관례를 따름) — infra/storage/tracked_order_journal.py
     # 참고. 이 라운드는 저장만 하고 startup 자동 복구는 하지 않음.
     tracked_order_journal_file: str = "data/tracked_order_journal.json"
+    # Profitability Shadow v2 (2026-08-24): Low Upside skip 후보(F1/F2/F3)
+    # 실시간 shadow 관측 로그 — entry_quality_guard_mode와 무관하게 항상
+    # 기록됨(주문 차단 없음, 순수 관측).
+    low_upside_shadow_log_file: str = "logs/low_upside_shadow.csv"
+    # Profitability Shadow v2 (2026-08-24): entry_watch 최소수익미달청산
+    # (5분 시점) 판단 순간의 feature snapshot 전용 로그 — VWAP이탈청산/
+    # 급락청산과 섞이지 않도록 별도 파일로 분리.
+    min_profit_extension_shadow_log_file: str = "logs/min_profit_extension_shadow.csv"
 
 
 @dataclass(frozen=True)
