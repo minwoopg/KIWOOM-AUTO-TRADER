@@ -9814,3 +9814,227 @@ E.1-A/주문접수가 문제없었는지 1차 확인 → 이 diff를 적용하�
 추가나 `FORCED_SELL_FAILED`(발견했으나 이번 요청 범위 밖이라
 allowlist에 넣지 않은 기존 CRITICAL 태그) 같은 추가 항목은 원하실
 때 별도 라운드로 진행하겠습니다.
+
+---
+
+## 🔧 MIN_PROFIT_EXTENSION_SHADOW contamination closure — 이미 SELL 진행 중인 심볼의 중복 shadow 기록 차단 (2026-08-26, observation-only)
+
+### 배경
+
+8/25 daily bundle 분석 중, `min_profit_extension_shadow.csv`에서
+403870 종목의 오염 사례를 실측으로 발견했습니다. 타임라인:
+10:26:32 VWAP이탈청산 SELL accepted → 잔고 반영 지연으로 PSM은
+여전히 89주 보유로 관측(`SELL_PENDING` → 타임아웃 → `OPEN` +
+SELL orphan) → 10:29:18(orphan 유지 중, 즉 3분 전에 이미 다른
+사유로 청산이 확정된 포지션) `_check_entry_watch()`가 다시
+호출되어 "5분 시점 최소수익미달청산" 관측치가 하나 더 잘못
+기록됨.
+
+`entry_watch_shadow.csv`는 1P0.8-OBS.2-A(2026-08-21)로 이미 같은
+유형의 오염을 "최초 SELL accepted 시점" 기준으로 막았지만, 이
+로거(Shadow v2, OBS.2-A보다 나중 도입)에는 같은 보정이 없었습니다.
+
+민우님(GPT 검토 경유) 지시로 가드 조건은 **두 가지 모두** 커버:
+`lifecycle == SELL_PENDING`만 체크하면 403870 케이스는 놓칩니다 —
+로그가 기록된 시점엔 이미 `SELL_PENDING`을 지나 `OPEN` + orphan
+상태였기 때문입니다. 따라서 SELL_PENDING **또는** 활성 SELL
+orphan(`orphan_order_id is not None and orphan_expected_delta < 0`
+— `PositionStateMachine.resolve_stale_pending()`/`observe_for_orphan()`
+에서 SELL orphan은 항상 음수로 설정되는 기존 컨벤션) 둘 다를
+가드 조건으로 사용했습니다.
+
+### 변경 내용
+
+`domain/service/trading_service.py`의
+`_log_min_profit_extension_shadow()` 최상단(기존
+`min_profit_extension_shadow_logger is None` 조기 반환 직후, 실제
+feature snapshot 계산/기록 `try` 블록 진입 전)에 위 두 조건을
+OR로 검사해 조건이 참이면 그대로 `return`하는 가드만 추가.
+
+### 변경하지 않은 것 (민우님 지시 그대로)
+
+`_check_entry_watch()`의 SELL 판정 로직(급락청산/VWAP이탈청산/
+최소수익미달청산 3개 분기)과 반환하는 Signal 자체 — 무변경. PSM
+lifecycle 전이/orphan 판정 로직 — 무변경. 실제 주문 접수/체결
+로직, Broker 연동 — 무변경. BUY/SELL threshold, entry_quality_guard,
+D.1/E.1/E.1-B — 전부 0건. 이번 변경은 shadow 기록(관측 로그) 한
+줄의 write 여부만 바꿉니다.
+
+### 테스트 (test_profitability_shadow_v2.py에 8건 신규, "3부-C" 섹션)
+
+3-C1) `SELL_PENDING` 중에는 SELL 신호 자체는 그대로 반환되지만
+shadow 기록은 0행. 3-C2) 8/25 403870 실측 타임라인을 그대로
+재현(`lifecycle=OPEN`, `orphan_expected_delta=-89`) — SELL 신호는
+그대로 반환되지만 shadow 기록은 0행(오염 재현 방지 확인).
+3-C3) 대조군 — accepted SELL이 전혀 없는 정상 케이스(052690형)는
+그대로 1행 기록되어 회귀 없음을 확인. 3-C4) `BUY_PENDING`과 BUY
+orphan(`orphan_expected_delta>=0`)은 이 가드 대상이 아니므로 두
+경우 모두 그대로 1행씩 기록됨을 확인(과잉 차단 방지).
+
+### 회귀 결과
+
+`test_profitability_shadow_v2.py` 94/94 통과(신규 8건 포함,
+기존 86건 전부 무회귀). `legacy_tests/test_entry_watch.py`(구
+`TradingService.__new__` 스텁 패턴이라 이 가드 코드 이전의 기존
+early-return에서 이미 걸러짐 — 신규 가드는 도달 불가) 11/11 통과,
+무영향 확인. `test_partial_fill_lifecycle.py` 336/336,
+`test_order_status_reconciliation.py` 64/64,
+`test_shadow_analysis.py` 183/183 — 전부 통과.
+
+전체 회귀(`run_regression_tests.py`) 25/28 통과 — `git stash`로
+클린 HEAD 대비 정확히 대조: 클린 HEAD/변경 후 둘 다 동일한
+사전 존재·환경 전용 실패 3건만 남음(`test_broker_order_status.py`,
+`test_broker_read_only_wiring.py`, `test_replay_time_axis.py` —
+이 세션 환경 이슈이며 이 diff와 무관, 신규 실패 0건).
+`compileall` 정상.
+
+### 다음 단계
+
+이 diff 적용 후부터 쌓이는 `min_profit_extension_shadow.csv`는
+오염 없는 clean 표본입니다. 8/19~8/25 raw daily bundle이 모두
+확보되는 대로 MIN_PROFIT_5M study를 이 clean 표본만으로
+재실행할 예정입니다(Sprint v1.2, 별도 전달).
+
+---
+
+## 📊 Profitability Sprint v1.2 — F2 baseline vs 2-condition 후보(Candidate A/B) 비교, offline 분석 전용 (2026-08-26)
+
+### 배경
+
+민우님(GPT 검토 경유) 지시로 `tools/profitability_sprint.py`(analysis-only,
+TradingService/Broker/API 미import)를 확장해 F2(upside<0.50% 단독)
+대비 2-condition 조합 후보 2개를 정확히 비교했습니다. **최대 2개
+조건까지만** 허용(과거 데이터에 맞춘 추가 조합 생성 금지, 명시
+지시):
+
+- F2 baseline: `upside_to_recent_high_pct < 0.50%`
+- Candidate A: F2 **AND** `rebound_volume_spike == False`
+- Candidate B: F2 **AND** `is_pulldown_recovery`(PR 조건) `== False`
+
+대상 거래일: 8/20·8/21·8/24·8/25(raw bundle 확보) — **8/19는
+raw bundle 자체가 없어 UNAVAILABLE로 명시 제외**(Sprint v1부터
+이어진 원칙, 이번에도 추정하지 않음).
+
+### 변경 내용
+
+`tools/profitability_sprint.py`:
+1. 기존 `low_upside_filter_candidates()` 내부 `sim()` 클로저를
+   module-level `_simulate_skip_candidate(have_upside, name, skip_pred)`
+   로 순수 리팩터(계산 로직 무변경, F0~F3 반환값 100% 동일 — 기존
+   88건 테스트로 회귀 없음 확인).
+2. 신규 `two_condition_low_upside_candidates(rows)` — F2/CandidateA/
+   CandidateB를 동일 계산 로직으로 산출. 결측(빈 문자열 →
+   `safe_bool`이 `None` 반환)인 boolean feature는 `is False` 조건에
+   해당하지 않으므로 자동으로 스킵 대상에서 제외(추정 금지 원칙
+   유지) — `missing_boolean_feature_count`로 결측 건수도 함께 노출.
+3. `candidate_leave_one_out()`에 `leave_one_best_trade_out`/
+   `leave_one_worst_trade_out` 필드 추가(기존 `per_trade_excluded_delta`
+   에서 gross_pnl_pct 최댓값/최솟값 거래의 제외 결과만 명시적으로
+   뽑아 노출 — 기존 필드는 그대로 유지, 추가만).
+4. `run()`에 `two_condition_candidates`/`leave_one_out_candidate_a`/
+   `leave_one_out_candidate_b`와 신규 출력 파일
+   `low_upside_two_condition_study.csv` 추가.
+
+### 변경하지 않은 것
+
+BUY/SELL 판정 로직, threshold, TradingService/Broker — 전부 0건
+(이 도구 자체가 애초에 그 어떤 production 모듈도 import하지
+않음). F2/Candidate A 어느 쪽도 **enforce하지 않음** — 결과만
+계산·보고(민우님 명시 지시).
+
+### 테스트 (test_profitability_sprint.py에 "18)" 섹션 15건 신규)
+
+정확히 3개 후보만 반환(추가 조합 없음), 라벨링 정확성, Candidate A/B
+각각이 의도한 조건대로만 거래를 제거(spike=True/PR=True 거래는
+살아남음), 두 boolean이 모두 결측인 거래는 어느 후보에서도
+제거되지 않음(추정 금지 검증), 기존 F0~F3 계산 회귀 없음,
+leave-one-best/worst-trade-out 신규 필드의 정확성(gross_pnl_pct
+최댓값/최솟값 거래를 정확히 가리키고 `per_trade_excluded_delta`와
+값이 일치), `run()` E2E(신규 반환 키 + 신규 CSV 파일 생성) —
+전체 103/103 통과(기존 88건 전부 무회귀 + 신규 15건).
+
+### 회귀 결과
+
+`test_profitability_sprint.py` 103/103 통과. `compileall` 정상.
+전체 회귀(`run_regression_tests.py`) 25/28 — 클린 HEAD 대비 동일한
+사전 존재 실패 3건만 남음(신규 실패 0건).
+
+### 분석 결과 요약 (자세한 내용은 별도 Sprint v1.2 리포트 참고)
+
+8/20+8/21+8/24+8/25 통합 19건 round-trip 거래 기준:
+
+- **Candidate A**(F2 AND rebound_volume_spike==False)가 가장 강한
+  후보 — base 순손익 delta **+4.75%p**, 손실제거 8건(60%), 승자훼손
+  2건(25%), **leave-one-day-out 4일 전부 부호 유지**, leave-one-
+  best/worst-trade-out도 부호 유지. 008930(8/24, +3.58% 최대
+  단일승자)과 005935(8/25)는 둘 다 `rebound_volume_spike=True`라
+  Candidate A가 **살립니다**(민우님이 우려하신 "F2가 잘못 제거할
+  좋은 거래" 보존 확인됨).
+- **Candidate B**(F2 AND PR==False)는 base delta가 **+0.65%p**로
+  미미하고, **leave-one-day-out에서 부호가 뒤집힘**(8/20·8/21·8/25
+  중 아무거나 하나만 빼도 음수로 전환) — 날짜 의존적, 약한 후보.
+  008930은 `is_pulldown_recovery=False`라 Candidate B에는 **제거**됩니다
+  (최대 단일승자를 잃음).
+- **enforce 사전 기준 대조(Candidate A)**: 손실제거율 65%↑ →
+  **미달(60%, 기준 미달)**. 승자훼손 25~30%↓ → 충족(정확히 25%).
+  Base 순손익>0 → 충족. 방향성 3거래일↑ 유지 → 충족(4일 전부).
+  leave-one-out 부호 유지 → 충족. **5개 기준 중 4개 충족, 손실제거율
+  1개 기준 미달 — 이번 세션 enforce하지 않음**(민우님 명시 지시,
+  기준 충족 여부와 무관하게 이번 라운드는 계산만).
+
+---
+
+## 🔧 MIN_PROFIT_EXTENSION_SHADOW contamination closure — 재closure(2): guard의 fail-open 계약 보장 (2026-08-27)
+
+### 배경
+
+민우님(GPT 코드리뷰 경유) 지적: 2026-08-26에 추가한 contamination
+guard(`_log_min_profit_extension_shadow()` 최상단의 SELL_PENDING/
+SELL orphan 체크)가 이 함수를 감싸는 **기존 fail-open `try/except`
+블록 바깥**에 있었습니다. 이 함수는 2026-08-24 Shadow v2 closure
+때 이미 한 번 "관측 로그 기록 실패가 실제 최소수익미달 SELL
+Signal 반환을 막아서는 안 된다"는 P0 계약으로 fail-open 처리된
+바 있습니다(위 항목 참고) — 그런데 새 guard(`self._position_
+state_machine.get(symbol)` 호출과 `state` 속성 접근)는 이 계약
+대상에서 빠져 있었고, 극히 예외적인 상황(AttributeError/TypeError
+등)에서 여기서 예외가 나면 그 예외가 `_check_entry_watch()` 밖으로
+전파되어 실제 SELL 반환을 막을 여지가 있었습니다. 정상 운영에서는
+거의 발생하지 않지만, observation-only 코드는 이 경로도 예외를
+절대 밖으로 내보내지 않아야 한다는 게 민우님 지적입니다.
+
+### 변경 내용
+
+`domain/service/trading_service.py`의
+`_log_min_profit_extension_shadow()`에서 contamination guard 전체
+(`state = self._position_state_machine.get(symbol)` 및 그 이하
+lifecycle/orphan 체크)를 기존 `try` 블록 **안으로** 이동했습니다.
+`state.orphan_expected_delta`가 `None`인 경우까지 방어적으로 확인
+(`is not None` 체크 추가)했습니다 — 로직 자체(SELL_PENDING 또는
+활성 SELL orphan이면 기록만 건너뜀)는 전혀 바뀌지 않았고, 위치와
+None-안전성만 보강했습니다.
+
+### 변경하지 않은 것
+
+contamination guard의 판정 조건(SELL_PENDING/SELL orphan 커버
+범위) — 무변경. `_check_entry_watch()`의 SELL 판정 로직·Signal
+반환·PSM 전이·실제 주문 로직 — 무변경. TradingService/Broker/
+D.1/E.1 — 전부 0건.
+
+### 테스트 (test_profitability_shadow_v2.py에 "3-C5" 1건 신규)
+
+`_position_state_machine`을 `get()`이 항상 `AttributeError`를
+던지는 가짜 객체로 교체한 뒤 `_check_entry_watch()`를 호출 —
+① 예외가 밖으로 전파되지 않고 최소수익미달청산 SELL Signal이
+정상 반환됨, ② 이 폴링의 shadow 관측 기록은 남지 않지만(허용됨)
+0행으로 조용히 넘어감을 확인. 전체 96/96 통과(기존 94건 전부
+무회귀 + 신규 2건 — 체크 1개는 SELL Signal 정상 반환, 1개는
+기록 0행 확인). `legacy_tests/test_entry_watch.py` 11/11 무영향.
+
+### 회귀 결과
+
+`test_profitability_shadow_v2.py` 96/96 통과. `compileall` 정상.
+전체 회귀(`run_regression_tests.py`) 25/28 — 클린 HEAD 대비 동일한
+사전 존재 실패 3건만 남음(신규 실패 0건).
+
+이 재closure로 min-profit-shadow contamination closure는 민우님
+기준 최종 승인 대상입니다.

@@ -2008,7 +2008,54 @@ class TradingService:
         # 영향 없음.
         if getattr(self, "min_profit_extension_shadow_logger", None) is None:
             return
+
         try:
+            # 2026-08-26 (contamination closure, 8/25 bundle 실측 발견):
+            # 이 함수는 `_check_entry_watch()`가 `position`(브로커 잔고
+            # 기준)이 non-None이기만 하면 매 폴링 독립적으로 호출됩니다 —
+            # 이 심볼에 이미 다른 사유(급락청산/VWAP이탈청산)로 SELL이
+            # accepted됐는지는 전혀 고려하지 않았습니다. 8/25 403870
+            # 실측: 10:26:32 VWAP이탈청산 SELL accepted → 잔고 반영 지연으로
+            # PSM은 여전히 89주 보유로 관측(SELL_PENDING → PENDING_TIMEOUT
+            # → SELL orphan) → 10:29:18(orphan 유지 중) 이 함수가 다시
+            # 호출되어 "5분 시점 최소수익미달" 관측치가 하나 더 기록됨 —
+            # 실제로는 이미 3분 전에 다른 사유로 청산이 확정된 포지션.
+            # entry_watch_shadow.csv는 1P0.8-OBS.2-A(2026-08-21)로 이미
+            # 같은 유형의 오염을 "최초 SELL accepted 시점" 기준으로
+            # 막았는데, 이 로거(Shadow v2, OBS.2-A보다 나중 도입)에는
+            # 같은 보정이 없었습니다.
+            #
+            # 이 심볼에 이미 accepted SELL이 진행 중(SELL_PENDING) 이거나
+            # 그 SELL이 orphan으로 이관된 상태(orphan_expected_delta<0 —
+            # PositionStateMachine.resolve_stale_pending()/observe_for_orphan()
+            # 에서 SELL orphan은 항상 음수로 설정)면 이 shadow 기록만
+            # 건너뜁니다. `_check_entry_watch()`의 SELL 판정(1/2/3번 분기)과
+            # 반환하는 Signal 자체, PSM 전이, 실제 주문 로직은 전혀
+            # 건드리지 않습니다 — 이미 존재하는 `decide_sell()` 단일
+            # 관문이 이런 후속 SELL을 안전하게 HARD block하는 것과는
+            # 별개로, 관측 기록만 정확하게 맞춥니다. BUY_PENDING/BUY
+            # orphan(orphan_expected_delta>=0)은 SELL이 아직 없다는
+            # 뜻이므로 이 가드 대상이 아닙니다.
+            #
+            # 2026-08-27 (재closure, 민우님 GPT 리뷰 지적 반영): 이
+            # contamination guard는 애초에 이 함수 전체가 지키는
+            # fail-open 계약(2026-08-24 Shadow v2 closure, 위 docstring
+            # 참고) 대상입니다 — `_position_state_machine.get(symbol)`
+            # 호출이나 `state` 속성 접근에서 (극히 예외적이더라도)
+            # AttributeError/TypeError 등이 나면, 그 예외가 이 함수
+            # 밖으로 전파돼 `_check_entry_watch()`의 실제 SELL Signal
+            # 반환까지 막아서는 안 됩니다. 최초 버전은 이 블록을 기존
+            # try 앞에 둬서 이 계약을 어겼습니다 — 이제 guard 전체를
+            # try 안으로 옮기고, `orphan_expected_delta`가 None인
+            # 경우까지 방어적으로 확인합니다.
+            state = self._position_state_machine.get(symbol)
+            if state.lifecycle == PositionLifecycle.SELL_PENDING or (
+                state.orphan_order_id is not None
+                and state.orphan_expected_delta is not None
+                and state.orphan_expected_delta < 0
+            ):
+                return
+
             peak_pnl_pct = ((highest_price - avg) / avg * 100) if (avg > 0 and highest_price > 0) else ""
             drawdown_from_peak_pct = (
                 (current_price - highest_price) / highest_price * 100

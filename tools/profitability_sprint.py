@@ -619,74 +619,129 @@ def low_upside_filter_candidates(rows: list[dict]) -> list[dict]:
     반영합니다(과거 데이터로 셋을 차별 계산할 근거가 없기 때문).
     """
     have_upside = [r for r in rows if r["upside_to_recent_high_pct"] is not None]
-
-    def sim(name: str, skip_pred):
-        removed = [r for r in have_upside if skip_pred(r)]
-        kept = [r for r in have_upside if not skip_pred(r)]
-        removed_w = [r for r in removed if r["outcome"] == WIN]
-        removed_b = [r for r in removed if r["outcome"] == BREAKEVEN]
-        removed_l = [r for r in removed if r["outcome"] == LOSS]
-        orig_base = sum(r["base_net_pnl_pct"] for r in have_upside)
-        orig_stress = sum(r["stress_net_pnl_pct"] for r in have_upside)
-        kept_base = sum(r["base_net_pnl_pct"] for r in kept)
-        kept_stress = sum(r["stress_net_pnl_pct"] for r in kept)
-        orig_gross = sum(r["gross_pnl_pct"] for r in have_upside)
-        kept_gross = sum(r["gross_pnl_pct"] for r in kept)
-        # 금액 기준(KRW) — 2026-08-24, 민우님 리뷰 3번 지적 반영.
-        orig_base_krw = sum(r["base_net_pnl_krw"] for r in have_upside)
-        orig_stress_krw = sum(r["stress_net_pnl_krw"] for r in have_upside)
-        kept_base_krw = sum(r["base_net_pnl_krw"] for r in kept)
-        kept_stress_krw = sum(r["stress_net_pnl_krw"] for r in kept)
-        total_wins = [r for r in have_upside if r["outcome"] == WIN]
-        winner_preservation = (
-            "해당없음" if not total_wins else
-            f"{(len(total_wins)-len(removed_w))/len(total_wins)*100:.0f}%"
-        )
-        total_losses = [r for r in have_upside if r["outcome"] == LOSS]
-        loser_removal = (
-            "해당없음" if not total_losses else
-            f"{len(removed_l)/len(total_losses)*100:.0f}%"
-        )
-        single_large_winner_flag = ""
-        if removed_w:
-            biggest = max(removed_w, key=lambda r: r["gross_pnl_pct"])
-            # 제거된 하나의 승자가 전체 gross 변화의 절반 이상을 차지하면 경고
-            gross_delta = kept_gross - orig_gross
-            if gross_delta != 0 and abs(biggest["gross_pnl_pct"]) >= abs(gross_delta) * 0.5:
-                single_large_winner_flag = (
-                    f"⚠ 대형 승자 1건({biggest['symbol']} {biggest['trade_date']}, "
-                    f"gross {biggest['gross_pnl_pct']:+.2f}%) 제거가 전체 변화폭의 상당 부분을 차지함"
-                )
-        return {
-            "candidate": name,
-            "original_trades": len(have_upside),
-            "removed_trades": len(removed),
-            "removed_winners": len(removed_w),
-            "removed_breakevens": len(removed_b),
-            "removed_losers": len(removed_l),
-            "winner_preservation_rate": winner_preservation,
-            "loser_removal_rate": loser_removal,
-            "gross_pnl_pct_delta": round(kept_gross - orig_gross, 4),
-            "base_net_pnl_pct_delta": round(kept_base - orig_base, 4),
-            "stress_net_pnl_pct_delta": round(kept_stress - orig_stress, 4),
-            "base_net_delta_krw": round(kept_base_krw - orig_base_krw, 2),
-            "stress_net_delta_krw": round(kept_stress_krw - orig_stress_krw, 2),
-            "avg_trade_base_net_before_pct": round(orig_base / len(have_upside), 4) if have_upside else "",
-            "avg_trade_base_net_after_pct": round(kept_base / len(kept), 4) if kept else "해당없음(전량 제거)",
-            "max_single_loss_before_pct": round(min((r["gross_pnl_pct"] for r in have_upside), default=0), 4),
-            "max_single_loss_after_pct": round(min((r["gross_pnl_pct"] for r in kept), default=0), 4) if kept else "해당없음",
-            "single_large_winner_or_loser_flag": single_large_winner_flag,
-            "removed_symbols": ";".join(sorted({r["symbol"] for r in removed})),
-        }
-
     candidates = [
-        sim("F0_current_strategy(baseline, no skip)", lambda r: False),
+        _simulate_skip_candidate(have_upside, "F0_current_strategy(baseline, no skip)", lambda r: False),
         # 2026-08-24 (민우님 확정): F2가 주 후보 — 순서를 F2 우선으로 정렬.
-        sim("F2_skip_upside<0.50%(주 후보)", lambda r: r["upside_to_recent_high_pct"] < 0.50),
-        sim("F1_skip_upside<1.00%(보조 비교용)", lambda r: r["upside_to_recent_high_pct"] < 1.00),
-        sim("F3_skip_upside<0.25%(보조 비교용)", lambda r: r["upside_to_recent_high_pct"] < 0.25),
+        _simulate_skip_candidate(have_upside, "F2_skip_upside<0.50%(주 후보)", lambda r: r["upside_to_recent_high_pct"] < 0.50),
+        _simulate_skip_candidate(have_upside, "F1_skip_upside<1.00%(보조 비교용)", lambda r: r["upside_to_recent_high_pct"] < 1.00),
+        _simulate_skip_candidate(have_upside, "F3_skip_upside<0.25%(보조 비교용)", lambda r: r["upside_to_recent_high_pct"] < 0.25),
     ]
     return candidates
+
+
+def _simulate_skip_candidate(have_upside: list[dict], name: str, skip_pred) -> dict:
+    """단일 skip 후보(BUY 스킵 조건 하나)의 제거 효과를 계산합니다.
+
+    2026-08-26 (Sprint v1.2 준비, 순수 리팩터): 기존 low_upside_filter_
+    candidates() 내부의 sim() 클로저를 그대로 module-level 함수로
+    분리했습니다 — 계산 로직/반환 필드는 단 한 글자도 바뀌지 않았고,
+    `have_upside`(호출부가 미리 upside_to_recent_high_pct가 있는
+    행만 필터링해서 넘김)를 파라미터로 받도록만 바뀌었습니다. F2
+    단독 후보(low_upside_filter_candidates)와 Sprint v1.2의 2-조건
+    조합 후보(two_condition_low_upside_candidates)가 동일한 계산
+    로직을 공유하도록 하기 위함 — 후보마다 다른 metric 정의를 쓰면
+    비교 자체가 무의미해지므로, 이 함수 하나가 유일한 계산 출처입니다.
+    """
+    removed = [r for r in have_upside if skip_pred(r)]
+    kept = [r for r in have_upside if not skip_pred(r)]
+    removed_w = [r for r in removed if r["outcome"] == WIN]
+    removed_b = [r for r in removed if r["outcome"] == BREAKEVEN]
+    removed_l = [r for r in removed if r["outcome"] == LOSS]
+    orig_base = sum(r["base_net_pnl_pct"] for r in have_upside)
+    orig_stress = sum(r["stress_net_pnl_pct"] for r in have_upside)
+    kept_base = sum(r["base_net_pnl_pct"] for r in kept)
+    kept_stress = sum(r["stress_net_pnl_pct"] for r in kept)
+    orig_gross = sum(r["gross_pnl_pct"] for r in have_upside)
+    kept_gross = sum(r["gross_pnl_pct"] for r in kept)
+    # 금액 기준(KRW) — 2026-08-24, 민우님 리뷰 3번 지적 반영.
+    orig_base_krw = sum(r["base_net_pnl_krw"] for r in have_upside)
+    orig_stress_krw = sum(r["stress_net_pnl_krw"] for r in have_upside)
+    kept_base_krw = sum(r["base_net_pnl_krw"] for r in kept)
+    kept_stress_krw = sum(r["stress_net_pnl_krw"] for r in kept)
+    total_wins = [r for r in have_upside if r["outcome"] == WIN]
+    winner_preservation = (
+        "해당없음" if not total_wins else
+        f"{(len(total_wins)-len(removed_w))/len(total_wins)*100:.0f}%"
+    )
+    total_losses = [r for r in have_upside if r["outcome"] == LOSS]
+    loser_removal = (
+        "해당없음" if not total_losses else
+        f"{len(removed_l)/len(total_losses)*100:.0f}%"
+    )
+    single_large_winner_flag = ""
+    if removed_w:
+        biggest = max(removed_w, key=lambda r: r["gross_pnl_pct"])
+        # 제거된 하나의 승자가 전체 gross 변화의 절반 이상을 차지하면 경고
+        gross_delta = kept_gross - orig_gross
+        if gross_delta != 0 and abs(biggest["gross_pnl_pct"]) >= abs(gross_delta) * 0.5:
+            single_large_winner_flag = (
+                f"⚠ 대형 승자 1건({biggest['symbol']} {biggest['trade_date']}, "
+                f"gross {biggest['gross_pnl_pct']:+.2f}%) 제거가 전체 변화폭의 상당 부분을 차지함"
+            )
+    return {
+        "candidate": name,
+        "original_trades": len(have_upside),
+        "removed_trades": len(removed),
+        "removed_winners": len(removed_w),
+        "removed_breakevens": len(removed_b),
+        "removed_losers": len(removed_l),
+        "winner_preservation_rate": winner_preservation,
+        "loser_removal_rate": loser_removal,
+        "gross_pnl_pct_delta": round(kept_gross - orig_gross, 4),
+        "base_net_pnl_pct_delta": round(kept_base - orig_base, 4),
+        "stress_net_pnl_pct_delta": round(kept_stress - orig_stress, 4),
+        "base_net_delta_krw": round(kept_base_krw - orig_base_krw, 2),
+        "stress_net_delta_krw": round(kept_stress_krw - orig_stress_krw, 2),
+        "avg_trade_base_net_before_pct": round(orig_base / len(have_upside), 4) if have_upside else "",
+        "avg_trade_base_net_after_pct": round(kept_base / len(kept), 4) if kept else "해당없음(전량 제거)",
+        "max_single_loss_before_pct": round(min((r["gross_pnl_pct"] for r in have_upside), default=0), 4),
+        "max_single_loss_after_pct": round(min((r["gross_pnl_pct"] for r in kept), default=0), 4) if kept else "해당없음",
+        "single_large_winner_or_loser_flag": single_large_winner_flag,
+        "removed_symbols": ";".join(sorted({r["symbol"] for r in removed})),
+        "removed_symbol_dates": ";".join(sorted({f"{r['symbol']}@{r['trade_date']}" for r in removed})),
+    }
+
+
+# ── Study A-2 (Sprint v1.2): F2 + 보조조건 2-condition 후보 비교 ─────
+def two_condition_low_upside_candidates(rows: list[dict]) -> list[dict]:
+    """2026-08-26 (Sprint v1.2, 민우님 GPT 검토 경유 지시): F2 baseline
+    대비 정확히 2개의 2-조건 조합 후보만 비교합니다 — 최대 2개 조건
+    까지만 허용(과거 데이터에 맞춘 추가 조합 생성 금지, 민우님 명시
+    지시). 계산 로직은 _simulate_skip_candidate() 하나로 F0~F3과
+    완전히 동일하게 공유합니다.
+
+      - F2_baseline: upside_to_recent_high_pct < 0.50%
+      - CandidateA : F2 AND rebound_volume_spike == False
+      - CandidateB : F2 AND is_pulldown_recovery(PR 조건) == False
+
+    rebound_volume_spike/is_pulldown_recovery가 결측(None, safe_bool
+    파싱 실패 또는 entry_quality_shadow/signal_log 매칭 실패)인 거래는
+    `is False`가 아니므로 Candidate A/B 스킵 대상에서 자동 제외됩니다
+    — 결측을 False로 임의 대입하지 않습니다(추정 금지 원칙).
+    """
+    have_upside = [r for r in rows if r["upside_to_recent_high_pct"] is not None]
+
+    def f2(r):
+        return r["upside_to_recent_high_pct"] < 0.50
+
+    def cand_a(r):
+        return f2(r) and r.get("rebound_volume_spike") is False
+
+    def cand_b(r):
+        return f2(r) and r.get("is_pulldown_recovery") is False
+
+    missing_rvs = sum(1 for r in have_upside if f2(r) and r.get("rebound_volume_spike") is None)
+    missing_pr = sum(1 for r in have_upside if f2(r) and r.get("is_pulldown_recovery") is None)
+
+    out = [
+        _simulate_skip_candidate(have_upside, "F2_baseline(upside<0.50%)", f2),
+        _simulate_skip_candidate(have_upside, "CandidateA(F2 AND rebound_volume_spike==False)", cand_a),
+        _simulate_skip_candidate(have_upside, "CandidateB(F2 AND PR==False)", cand_b),
+    ]
+    out[1]["missing_boolean_feature_count"] = missing_rvs
+    out[2]["missing_boolean_feature_count"] = missing_pr
+    out[0]["missing_boolean_feature_count"] = 0
+    return out
 
 
 # ── Study B: 5-Min Exit Timing ───────────────────────────────────
@@ -940,6 +995,17 @@ def candidate_leave_one_out(rows: list[dict], skip_pred, label: str) -> dict:
 
     signs = [v for v in per_day_removed.values() if isinstance(v, (int, float))]
     sign_flips = len({(v > 0) for v in signs + [full_delta]}) > 1 if signs else None
+
+    # 2026-08-26 (Sprint v1.2, 민우님 명시 지시): "leave-one-best-trade-out
+    # 결과, leave-one-worst-trade-out 결과"를 별도 필드로 명시 — 기존
+    # per_trade_excluded_delta에 이미 모든 거래 각각의 제외 delta가
+    # 들어있으므로(전체를 다 도는 것이 더 엄격한 상위 집합), 그 중
+    # gross_pnl_pct 기준 최고/최저 거래 하나만 골라 명시적으로
+    # 뽑아냅니다(leave_one_out_report의 best/worst 정의와 동일 기준).
+    best = max(pool, key=lambda r: r["gross_pnl_pct"])
+    worst = min(pool, key=lambda r: r["gross_pnl_pct"])
+    best_key = f"exclude_{best['symbol']}_{best['trade_date']}"
+    worst_key = f"exclude_{worst['symbol']}_{worst['trade_date']}"
     return {
         "candidate": label,
         "full_base_net_pnl_pct_delta": full_delta,
@@ -947,6 +1013,14 @@ def candidate_leave_one_out(rows: list[dict], skip_pred, label: str) -> dict:
         "per_day_excluded_delta": per_day_removed,
         "n_trading_days": len(by_day),
         "day_dependent_sign_flip": sign_flips,
+        "leave_one_best_trade_out": {
+            "excluded_trade": f"{best['symbol']}/{best['trade_date']} (gross {best['gross_pnl_pct']:+.2f}%)",
+            "delta_after_exclusion": per_trade_removed[best_key],
+        },
+        "leave_one_worst_trade_out": {
+            "excluded_trade": f"{worst['symbol']}/{worst['trade_date']} (gross {worst['gross_pnl_pct']:+.2f}%)",
+            "delta_after_exclusion": per_trade_removed[worst_key],
+        },
         "verdict": (
             "날짜 1개뿐 — 거래일 안정성 판단 불가" if len(by_day) < 2 else
             ("⚠ 특정 거래일을 빼면 delta 부호가 뒤집힘 — 날짜 의존적, 강한 후보 아님" if sign_flips else
@@ -1104,9 +1178,25 @@ def run(bundle_dirs: list[str], out_dir: str) -> dict:
     loo_f3 = candidate_leave_one_out(
         feature_rows, lambda r: r["upside_to_recent_high_pct"] < 0.25, "F3_skip_upside<0.25%(보조 비교용)")
 
+    # 2026-08-26 (Sprint v1.2, 민우님 GPT 검토 경유 지시): F2 baseline
+    # 대비 2-condition 후보(Candidate A/B) 비교 — 정확히 이 둘만,
+    # 최대 2개 조건까지만(민우님 명시 지시). enforce는 이번 세션에
+    # 하지 않고 결과만 계산합니다.
+    two_condition_candidates = two_condition_low_upside_candidates(feature_rows)
+
+    def _rvs_false(r):
+        return r["upside_to_recent_high_pct"] < 0.50 and r.get("rebound_volume_spike") is False
+
+    def _pr_false(r):
+        return r["upside_to_recent_high_pct"] < 0.50 and r.get("is_pulldown_recovery") is False
+
+    loo_cand_a = candidate_leave_one_out(feature_rows, _rvs_false, "CandidateA(F2 AND rebound_volume_spike==False)")
+    loo_cand_b = candidate_leave_one_out(feature_rows, _pr_false, "CandidateB(F2 AND PR==False)")
+
     out = Path(out_dir)
     write_csv(out / "trade_feature_table.csv", feature_rows)
     write_csv(out / "low_upside_study.csv", low_upside_buckets + low_upside_candidates)
+    write_csv(out / "low_upside_two_condition_study.csv", two_condition_candidates)
     write_csv(
         out / "exit_extension_study.csv",
         extension_per_trade_min_profit + extension_per_trade_early_vwap + extension_rules,
@@ -1132,6 +1222,9 @@ def run(bundle_dirs: list[str], out_dir: str) -> dict:
         "leave_one_out_f2": loo_f2,
         "leave_one_out_f1": loo_f1,
         "leave_one_out_f3": loo_f3,
+        "two_condition_candidates": two_condition_candidates,
+        "leave_one_out_candidate_a": loo_cand_a,
+        "leave_one_out_candidate_b": loo_cand_b,
     }
 
 

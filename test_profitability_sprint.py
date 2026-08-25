@@ -48,6 +48,7 @@ from tools.profitability_sprint import (  # noqa: E402
     classify_outcome, win_rate_str, safe_float,
     load_bundle_day, build_trade_features,
     low_upside_bucket_study, low_upside_filter_candidates,
+    two_condition_low_upside_candidates,
     exit_extension_study, extension_rule_candidates, entry_quality_gate_study,
     candidate_leave_one_out, leave_one_out_report, build_scorecard,
     classify_entry_watch_trigger,
@@ -89,15 +90,16 @@ def _write_csv(path: Path, header: list[str], rows: list[dict]):
             w.writerow({k: r.get(k, "") for k in header})
 
 
-def _buy(ts, sym, price, qty, order_id, upside="", entry_score="5"):
+def _buy(ts, sym, price, qty, order_id, upside="", entry_score="5",
+         rebound_volume_spike="False", is_pulldown_recovery="False"):
     return {
         "timestamp": ts, "symbol": sym, "side": "BUY", "quantity": str(qty),
         "price": str(price), "accepted": "True", "message": "체결", "order_id": order_id,
         "entry_strategy": "breakout", "market_regime": "BULLISH", "entry_score": entry_score,
-        "entry_reason": "", "is_v_rebound": "False", "is_pulldown_recovery": "False",
+        "entry_reason": "", "is_v_rebound": "False", "is_pulldown_recovery": is_pulldown_recovery,
         "v_drop_pct": "0.0", "v_rise_pct": "0.0", "v_low_age": "1",
         "current_vs_vwap_pct": "1.0", "volume_ratio": "1.0", "bar_amount": "1000",
-        "rebound_volume_spike": "False", "v_bottom_spike": "False",
+        "rebound_volume_spike": rebound_volume_spike, "v_bottom_spike": "False",
         "upside_to_recent_high_pct": str(upside),
     }
 
@@ -514,6 +516,87 @@ try:
     check("17) run() 결과의 모든 feature row에 proxy 관련 data_quality_flag가 포함됨",
           len(result["feature_rows"]) > 0
           and all("proxy" in r["data_quality_flag"] for r in result["feature_rows"]))
+
+    # ══════════════════════════════════════════════════════════════
+    # 18. Sprint v1.2 (2026-08-26): F2 baseline vs Candidate A/B
+    # (F2 + rebound_volume_spike==False / F2 + PR==False) — 최대
+    # 2-조건까지만, 정확히 이 3개 후보만 계산됨을 검증
+    # ══════════════════════════════════════════════════════════════
+    date18 = "20260913"
+    rows18 = [
+        # F2 대상(upside<0.50%)이면서 rebound_volume_spike=True,
+        # is_pulldown_recovery=False → CandidateA는 살리고(spike=True라
+        # F2 AND spike==False에 해당 안 함), CandidateB는 제거(PR==False)
+        _buy("2026-09-13T09:00:00", "V2A1", 10000, 10, "B090", upside="0.20",
+             rebound_volume_spike="True", is_pulldown_recovery="False"),
+        _sell("2026-09-13T09:10:00", "V2A1", 10100, 10, "S090", "트레일링 스탑", "10.0", 10000),
+        # F2 대상, rebound_volume_spike=False, is_pulldown_recovery=True
+        # → CandidateA는 제거, CandidateB는 살림
+        _buy("2026-09-13T09:20:00", "V2A2", 10000, 10, "B091", upside="0.20",
+             rebound_volume_spike="False", is_pulldown_recovery="True"),
+        _sell("2026-09-13T09:30:00", "V2A2", 9900, 10, "S091", "트레일링 스탑", "10.0", 10000),
+        # F2 대상, 두 불리언 플래그 전부 결측(빈 문자열) → 두 후보 모두
+        # 이 거래를 제거하지 않아야 함(결측을 False로 추정 금지)
+        _buy("2026-09-13T09:40:00", "V2A3", 10000, 10, "B092", upside="0.20",
+             rebound_volume_spike="", is_pulldown_recovery=""),
+        _sell("2026-09-13T09:50:00", "V2A3", 10050, 10, "S092", "트레일링 스탑", "10.0", 10000),
+        # F2 밖(upside 높음) → 어느 후보에도 제거 대상 아님(baseline 비교용)
+        _buy("2026-09-13T10:00:00", "V2A4", 10000, 10, "B093", upside="3.00",
+             rebound_volume_spike="False", is_pulldown_recovery="False"),
+        _sell("2026-09-13T10:10:00", "V2A4", 10200, 10, "S093", "트레일링 스탑", "10.0", 10000),
+    ]
+    bundle18 = make_bundle(tmp_root, date18, rows18)
+    features18, _ = build_trade_features([load_bundle_day(bundle18)])
+    tc = two_condition_low_upside_candidates(features18)
+    check("18) 정확히 3개 후보만 반환됨(F2_baseline/CandidateA/CandidateB, 추가 조합 없음)",
+          len(tc) == 3)
+    names18 = [c["candidate"] for c in tc]
+    check("18) 후보 이름이 F2_baseline/CandidateA/CandidateB로 명확히 라벨됨",
+          names18[0].startswith("F2_baseline") and names18[1].startswith("CandidateA")
+          and names18[2].startswith("CandidateB"))
+    f2_18, candA_18, candB_18 = tc
+    check("18) F2_baseline은 upside<0.50% 3건(V2A1/V2A2/V2A3) 모두 제거",
+          f2_18["removed_trades"] == 3)
+    check("18) CandidateA는 spike=True(V2A1)를 살리고 spike=False(V2A2)만 제거 — removed_trades==1",
+          candA_18["removed_trades"] == 1 and "V2A2" in candA_18["removed_symbols"]
+          and "V2A1" not in candA_18["removed_symbols"])
+    check("18) CandidateB는 PR=False(V2A1)만 제거하고 PR=True(V2A2)는 살림 — removed_trades==1",
+          candB_18["removed_trades"] == 1 and "V2A1" in candB_18["removed_symbols"]
+          and "V2A2" not in candB_18["removed_symbols"])
+    check("18) 두 불리언 모두 결측인 V2A3는 CandidateA/B 어느 쪽에서도 제거되지 않음(추정 금지)",
+          "V2A3" not in candA_18["removed_symbols"] and "V2A3" not in candB_18["removed_symbols"])
+    check("18) CandidateA의 missing_boolean_feature_count==1(F2 대상 중 spike값 결측은 V2A3 하나)",
+          candA_18["missing_boolean_feature_count"] == 1)
+    check("18) CandidateB의 missing_boolean_feature_count도 1(F2 대상 중 PR값 결측은 V2A3 하나)",
+          candB_18["missing_boolean_feature_count"] == 1)
+    check("18) F0/F1/F3 기존 계산은 리팩터 후에도 동일 로직(_simulate_skip_candidate 공유) 사용 — "
+          "기존 low_upside_filter_candidates()가 정상 동작(회귀 없음)",
+          any(c["candidate"].startswith("F2") for c in low_upside_filter_candidates(features18)))
+
+    # ── candidate_leave_one_out()의 leave-one-best/worst-trade-out 신규 필드 ──
+    loo_candA18 = candidate_leave_one_out(
+        features18,
+        lambda r: r["upside_to_recent_high_pct"] < 0.50 and r.get("rebound_volume_spike") is False,
+        "CandidateA(테스트)")
+    check("18) leave_one_best_trade_out/leave_one_worst_trade_out 필드가 존재함",
+          "leave_one_best_trade_out" in loo_candA18 and "leave_one_worst_trade_out" in loo_candA18)
+    check("18) leave_one_best_trade_out이 gross_pnl_pct 최댓값 거래(V2A4, +2.0%)를 가리킴",
+          "V2A4" in loo_candA18["leave_one_best_trade_out"]["excluded_trade"])
+    check("18) leave_one_worst_trade_out이 gross_pnl_pct 최솟값 거래(V2A2, -1.0%)를 가리킴",
+          "V2A2" in loo_candA18["leave_one_worst_trade_out"]["excluded_trade"])
+    check("18) leave_one_best_trade_out의 delta_after_exclusion이 per_trade_excluded_delta의 동일 거래 값과 일치",
+          loo_candA18["leave_one_best_trade_out"]["delta_after_exclusion"]
+          == loo_candA18["per_trade_excluded_delta"]["exclude_V2A4_20260913"])
+
+    # ── run()이 Sprint v1.2 결과와 새 CSV를 함께 출력하는지(E2E) ──────
+    out_dir18 = tmp_root / "out_v1_2"
+    result18 = run([str(bundle18)], str(out_dir18))
+    check("18) run() 결과에 two_condition_candidates/leave_one_out_candidate_a/b가 포함됨",
+          "two_condition_candidates" in result18
+          and "leave_one_out_candidate_a" in result18
+          and "leave_one_out_candidate_b" in result18)
+    check("18) low_upside_two_condition_study.csv가 실제로 생성됨",
+          (out_dir18 / "low_upside_two_condition_study.csv").is_file())
 
 finally:
     shutil.rmtree(tmp_root, ignore_errors=True)

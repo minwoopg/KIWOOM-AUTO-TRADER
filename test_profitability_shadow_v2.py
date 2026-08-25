@@ -679,6 +679,133 @@ with tempfile.TemporaryDirectory() as tmpdir:
           sig is not None and sig.type == SignalType.SELL and "최소수익미달청산" in sig.reason)
 
 # ══════════════════════════════════════════════════════════════
+# 3부-C: MIN_PROFIT_EXTENSION_SHADOW contamination closure
+# (2026-08-26, 8/25 daily bundle 실측 발견 — 403870)
+#
+# 실제 타임라인: 10:26:32 VWAP이탈청산 SELL accepted → 잔고 반영
+# 지연으로 SELL_PENDING → PENDING_TIMEOUT → SELL orphan(브로커
+# 잔고 89주 그대로 관측) → 10:29:18(여전히 orphan 유지 중) 3번
+# 분기(최소수익미달청산)가 다시 평가되어 이미 다른 사유로 청산
+# 확정된 포지션에 대한 shadow row가 하나 더 기록됨. entry_watch_
+# shadow.csv는 1P0.8-OBS.2-A(8/21)로 이미 "최초 SELL accepted
+# 시점" 기준으로 이 유형의 오염을 막았는데, 이 로거(Shadow v2,
+# OBS.2-A보다 나중 도입)에는 같은 보정이 없었음 — 이번 라운드에서
+# 동일한 접근으로 닫음. `_check_entry_watch()`의 SELL 판정 로직·
+# 반환 Signal·PSM 전이·실제 주문 로직은 전혀 건드리지 않음 —
+# MIN_PROFIT_EXTENSION_SHADOW 기록 여부만 바뀜(observation-only).
+# ══════════════════════════════════════════════════════════════
+from domain.position.lifecycle import PositionLifecycle
+
+# ── 3-C1) SELL_PENDING(타임아웃 전) 중 — 기록 건너뜀 ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    set_entry_time(service, 5.5)
+    pos = make_position(avg=10000)
+    ma = make_ma(vwap=10000.0, price_above_vwap=True)
+    state = service._position_state_machine.get(symbol)
+    state.lifecycle = PositionLifecycle.SELL_PENDING
+    state.pending_order_id = "0066415"
+    sig = service._check_entry_watch(symbol, pos, 10020, ma, highest_price=10100)
+    check("3-C1) SELL_PENDING 중에도 최소수익미달청산 SELL 신호 자체는 그대로 반환됨(판정 로직 무변경)",
+          sig is not None and sig.type == SignalType.SELL and "최소수익미달청산" in sig.reason)
+    rows = read_rows(service.settings.storage.min_profit_extension_shadow_log_file)
+    check("   MIN_PROFIT_EXTENSION_SHADOW에는 기록되지 않음(이미 SELL 진행 중) — 0행",
+          len(rows) == 0)
+
+# ── 3-C2) SELL orphan — 8/25 403870 실측 재현(PENDING_TIMEOUT 이후
+# lifecycle은 OPEN으로 돌아가고 orphan_order_id/orphan_expected_delta
+# <0으로 SELL orphan임을 표시) — 기록 건너뜀 ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    set_entry_time(service, 5.19)  # 403870 실측(5.19분)과 동일
+    pos = make_position(avg=45550)
+    ma = make_ma(vwap=45477.0, price_above_vwap=True)  # VWAP 위로 회복 — 2번 분기 미발동(실측과 동일)
+    state = service._position_state_machine.get(symbol)
+    state.lifecycle = PositionLifecycle.OPEN
+    state.orphan_order_id = "0066415"
+    state.orphan_expected_delta = -89  # SELL orphan은 항상 음수(observe_for_orphan() 참고)
+    sig = service._check_entry_watch(symbol, pos, 45700, ma, highest_price=45850)
+    check("3-C2) SELL orphan 중에도 SELL 신호 자체는 그대로 반환됨(판정 로직 무변경)",
+          sig is not None and sig.type == SignalType.SELL and "최소수익미달청산" in sig.reason)
+    rows = read_rows(service.settings.storage.min_profit_extension_shadow_log_file)
+    check("   MIN_PROFIT_EXTENSION_SHADOW에는 기록되지 않음(8/25 403870 오염 재현 방지) — 0행",
+          len(rows) == 0)
+
+# ── 3-C3) 대조군 — accepted SELL이 전혀 없는 정상 케이스(052690형)는
+# 이번 closure와 무관하게 그대로 1행 기록(회귀 없음) ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    set_entry_time(service, 5.2)
+    pos = make_position(avg=105613)
+    ma = make_ma(vwap=104000.0, price_above_vwap=True)
+    # state는 기본값(FLAT, pending/orphan 전부 없음) — 아무것도 세팅하지 않음
+    sig = service._check_entry_watch(symbol, pos, 104900, ma, highest_price=108300)
+    check("3-C3) SELL이 전혀 진행 중이 아닌 정상 케이스는 최소수익미달청산 SELL 반환",
+          sig is not None and sig.type == SignalType.SELL and "최소수익미달청산" in sig.reason)
+    rows = read_rows(service.settings.storage.min_profit_extension_shadow_log_file)
+    check("   정상 케이스는 그대로 1행 기록됨(052690형, 회귀 없음)", len(rows) == 1)
+
+# ── 3-C4) BUY_PENDING/BUY orphan은 이 가드 대상이 아님(SELL이 아직
+# 없다는 뜻이므로 오염 시나리오가 아님) ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    set_entry_time(service, 5.5)
+    pos = make_position(avg=10000)
+    ma = make_ma(vwap=10000.0, price_above_vwap=True)
+    state = service._position_state_machine.get(symbol)
+    state.lifecycle = PositionLifecycle.BUY_PENDING
+    state.pending_order_id = "0012345"
+    service._check_entry_watch(symbol, pos, 10020, ma, highest_price=10100)
+    rows = read_rows(service.settings.storage.min_profit_extension_shadow_log_file)
+    check("3-C4) BUY_PENDING 중에는 가드가 적용되지 않고 그대로 기록됨(SELL 없음)",
+          len(rows) == 1)
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    set_entry_time(service, 5.5)
+    pos = make_position(avg=10000)
+    ma = make_ma(vwap=10000.0, price_above_vwap=True)
+    state = service._position_state_machine.get(symbol)
+    state.lifecycle = PositionLifecycle.OPEN
+    state.orphan_order_id = "0012345"
+    state.orphan_expected_delta = 5  # BUY orphan은 양수(목표수량-현재잔고, resolve_stale_pending() 참고)
+    service._check_entry_watch(symbol, pos, 10020, ma, highest_price=10100)
+    rows = read_rows(service.settings.storage.min_profit_extension_shadow_log_file)
+    check("   BUY orphan(orphan_expected_delta>=0) 중에도 가드가 적용되지 않고 그대로 기록됨",
+          len(rows) == 1)
+
+# ── 3-C5) contamination guard 자체의 fail-open 보장 (2026-08-27 재closure,
+# 민우님 GPT 코드리뷰 지적 반영). 최초 배치본은 새 guard
+# (`_position_state_machine.get(symbol)` 및 state 속성 접근)가 기존
+# try/except 블록 *앞*에 있었습니다 — 이 함수 전체가 지키는 fail-open
+# 계약(2026-08-24 Shadow v2 closure, docstring 참고: "관측 전용,
+# SELL 정책에 영향 0")을 어기는 것이었습니다. 이제 guard 전체가 try
+# 안으로 옮겨졌으므로, PositionStateMachine.get()이 (극히 예외적인
+# 상황에서) 예외를 던지더라도 그 예외가 `_check_entry_watch()` 밖으로
+# 전파되어 실제 최소수익미달청산 SELL Signal 반환을 막아서는 안
+# 됩니다. ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    set_entry_time(service, 5.5)
+    pos = make_position(avg=10000)
+    ma = make_ma(vwap=10000.0, price_above_vwap=True)
+
+    class _ExplodingPositionStateMachine:
+        """contamination guard 예외 강제용 — get()이 항상 예외를 던짐."""
+
+        def get(self, _symbol):
+            raise AttributeError("강제 예외 — contamination guard fail-open 검증용")
+
+    service._position_state_machine = _ExplodingPositionStateMachine()
+    sig = service._check_entry_watch(symbol, pos, 10020, ma, highest_price=10100)
+    check("3-C5) contamination guard(PositionStateMachine.get())가 예외를 던져도 "
+          "최소수익미달청산 SELL Signal은 정상 반환됨(fail-open 계약 유지, 예외 전파 없음)",
+          sig is not None and sig.type == SignalType.SELL and "최소수익미달청산" in sig.reason)
+    rows = read_rows(service.settings.storage.min_profit_extension_shadow_log_file)
+    check("   guard 예외로 이 폴링의 관측 기록은 남지 않지만(허용됨) SELL 판정에는 영향 없음 — 0행",
+          len(rows) == 0)
+
+# ══════════════════════════════════════════════════════════════
 # 4부: MinuteAnalysis.ma5/ma20 원시값 — 실제 분봉 종가 평균과 일치
 # ══════════════════════════════════════════════════════════════
 
