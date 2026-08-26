@@ -56,6 +56,8 @@ from tools.profitability_sprint import (  # noqa: E402
     CANDIDATE_A_FORWARD_START_DATE,
     candidate_cost_aware_metrics, split_historical_forward,
     build_cost_aware_report, flatten_cost_aware_reports,
+    # 2026-08-26 (Sprint v1.3, Candidate G/M1):
+    parse_gap_pullback_d, _candidate_g_pred, extension_rule_candidates_by_regime,
     run,
 )
 from domain.cost_model import load_cost_model as _load_cost_model_directly  # noqa: E402
@@ -94,12 +96,12 @@ def _write_csv(path: Path, header: list[str], rows: list[dict]):
 
 
 def _buy(ts, sym, price, qty, order_id, upside="", entry_score="5",
-         rebound_volume_spike="False", is_pulldown_recovery="False"):
+         rebound_volume_spike="False", is_pulldown_recovery="False", entry_reason=""):
     return {
         "timestamp": ts, "symbol": sym, "side": "BUY", "quantity": str(qty),
         "price": str(price), "accepted": "True", "message": "체결", "order_id": order_id,
         "entry_strategy": "breakout", "market_regime": "BULLISH", "entry_score": entry_score,
-        "entry_reason": "", "is_v_rebound": "False", "is_pulldown_recovery": is_pulldown_recovery,
+        "entry_reason": entry_reason, "is_v_rebound": "False", "is_pulldown_recovery": is_pulldown_recovery,
         "v_drop_pct": "0.0", "v_rise_pct": "0.0", "v_low_age": "1",
         "current_vs_vwap_pct": "1.0", "volume_ratio": "1.0", "bar_amount": "1000",
         "rebound_volume_spike": rebound_volume_spike, "v_bottom_spike": "False",
@@ -116,9 +118,18 @@ def _sell(ts, sym, price, qty, order_id, exit_reason, hold_minutes, avg_buy_pric
     }
 
 
+MIN_PROFIT_SHADOW_HEADER = [
+    "timestamp", "symbol", "entry_time", "holding_minutes", "pnl_pct", "price", "vwap",
+    "price_vs_vwap_pct", "macd", "macd_signal", "macd_above_signal", "rsi", "ma5", "ma20",
+    "peak_pnl_pct", "drawdown_from_peak_pct", "upside_to_recent_high_pct", "minute_data_stale",
+]
+
+
 def make_bundle(tmpdir: Path, date: str, trades_rows: list[dict],
                  entry_watch_rows: list[dict] | None = None,
-                 include_entry_watch_file: bool = True) -> Path:
+                 include_entry_watch_file: bool = True,
+                 min_profit_shadow_rows: list[dict] | None = None,
+                 include_min_profit_shadow_file: bool = False) -> Path:
     bundle_dir = tmpdir / f"bundle_{date}"
     _write_csv(bundle_dir / "raw" / f"trades_{date}.csv", TRADES_HEADER, trades_rows)
     if include_entry_watch_file:
@@ -129,6 +140,13 @@ def make_bundle(tmpdir: Path, date: str, trades_rows: list[dict],
                    entry_watch_rows or [])
     # entry_quality_shadow / position_lifecycle / signal_log는 의도적으로 생략
     # (요구사항 10: 일부 파일 누락 시 UNAVAILABLE + 경고, 조용히 넘어가지 않음)
+    # min_profit_extension_shadow도 기본은 생략(2026-08-26, Sprint v1.3) —
+    # 이 파일이 필요한 Candidate M1 관련 테스트에서만 명시적으로
+    # include_min_profit_shadow_file=True로 켭니다. 나머지 모든 기존
+    # 테스트는 이 파일 없이도(=UNAVAILABLE) 그대로 동작해야 합니다.
+    if include_min_profit_shadow_file:
+        _write_csv(bundle_dir / "raw" / f"min_profit_extension_shadow_{date}.csv",
+                   MIN_PROFIT_SHADOW_HEADER, min_profit_shadow_rows or [])
     return bundle_dir
 
 
@@ -355,13 +373,16 @@ try:
         _buy("2026-09-12T09:00:00", "MISS001", 10000, 10, "B080", upside="0.1"),
         _sell("2026-09-12T09:10:00", "MISS001", 10100, 10, "S080", "트레일링 스탑", "10.0", 10000),
     ])
-    # entry_watch_shadow / entry_quality_shadow / position_lifecycle / signal_log 전부 미생성
+    # entry_watch_shadow / entry_quality_shadow / position_lifecycle / signal_log /
+    # min_profit_extension_shadow 전부 미생성
     day10 = load_bundle_day(bundle10_dir)
-    check("10) trades 외 4개 raw 파일이 전부 UNAVAILABLE로 명시적 표시됨(존재하는 척 안 함)",
+    check("10) trades 외 5개 raw 파일이 전부 UNAVAILABLE로 명시적 표시됨(존재하는 척 안 함) — "
+          "2026-08-26 Sprint v1.3에서 min_profit_extension_shadow가 RAW_FILES에 추가되며 4개→5개",
           all(day10.availability[k] == "UNAVAILABLE"
-              for k in ("entry_watch_shadow", "entry_quality_shadow", "position_lifecycle", "signal_log")))
-    check("10) 누락된 4개 파일에 대한 quality_notes가 각각 기록됨(조용히 넘어가지 않음)",
-          len(day10.quality_notes) == 4)
+              for k in ("entry_watch_shadow", "entry_quality_shadow", "position_lifecycle",
+                        "signal_log", "min_profit_extension_shadow")))
+    check("10) 누락된 5개 파일에 대한 quality_notes가 각각 기록됨(조용히 넘어가지 않음)",
+          len(day10.quality_notes) == 5)
     features10, warnings10 = build_trade_features([day10])
     check("10) trades.csv만 있어도 거래 자체는 pnl/outcome 계산까지는 정상 진행(부분 분석 가능)",
           len(features10) == 1 and features10[0]["outcome"] == WIN)
@@ -791,16 +812,277 @@ try:
     # ── build_cost_aware_report() / flatten_cost_aware_reports() 자체
     # 단위 검증 — 정확히 F2/CandidateA/CandidateB 3개만 반환하는지 ──────
     report19 = build_cost_aware_report(rows_cam, "UNITTEST")
-    check("19-E) build_cost_aware_report는 정확히 3개(F2_baseline/CandidateA/CandidateB)만 반환",
-          len(report19) == 3
+    check("19-E) build_cost_aware_report는 정확히 4개(F2_baseline/CandidateA/CandidateB/CandidateG)만 반환 — "
+          "2026-08-26 Sprint v1.3에서 CandidateG 추가되며 3개→4개",
+          len(report19) == 4
           and report19[0]["candidate"].startswith("F2_baseline")
           and report19[1]["candidate"].startswith("CandidateA")
-          and report19[2]["candidate"].startswith("CandidateB"))
+          and report19[2]["candidate"].startswith("CandidateB")
+          and report19[3]["candidate"].startswith("CandidateG"))
     summary19, per_day19 = flatten_cost_aware_reports(report19)
     check("19-E) flatten_cost_aware_reports: summary는 candidate당 1행, per_day 중첩 dict는 제외됨",
-          len(summary19) == 3 and all("per_day_base_delta_pct" not in row for row in summary19))
+          len(summary19) == 4 and all("per_day_base_delta_pct" not in row for row in summary19))
     check("19-E) flatten_cost_aware_reports: per_day는 candidate x trade_date 조합만큼 행이 생김",
           len(per_day19) == sum(len(r["per_day_base_delta_pct"]) for r in report19))
+
+    # ══════════════════════════════════════════════════════════════
+    # 20. Sprint v1.3 (2026-08-26, 민우님 지시): Candidate G(갭눌림D,
+    # entry_reason 텍스트 파싱) + Candidate M1(5분 checkpoint
+    # price>VWAP AND MACD>signal, min_profit_extension_shadow.csv
+    # 조인) — production 로직/전략 파라미터는 전혀 건드리지 않고
+    # offline 분석 도구에만 추가된 자동 분류 기능을 검증합니다. 세
+    # 후보 조건 자체는 민우님 지시로 고정되어 있으며(임의 튜닝 금지),
+    # 이 테스트들은 그 고정된 조건이 정확히 구현됐는지만 검증합니다.
+    # ══════════════════════════════════════════════════════════════
+
+    # ── 20-A) parse_gap_pullback_d() 순수 파싱 경계값 ─────────────────
+    check("20-A) '갭눌림D✓(+3.2%)' 포함 문자열 → True",
+          parse_gap_pullback_d("MACD상승 갭눌림D✓(+3.2%)") is True)
+    check("20-A) '갭눌림D✗' 포함 문자열 → False",
+          parse_gap_pullback_d("MACD상승 갭눌림D✗") is False)
+    check("20-A) 마커가 전혀 없는 문자열 → None(결측, False로 추정 안 함)",
+          parse_gap_pullback_d("MACD상승 RSI과매수아님") is None)
+    check("20-A) 빈 문자열/None → None(결측)",
+          parse_gap_pullback_d("") is None and parse_gap_pullback_d(None) is None)
+
+    # ── 20-B) build_trade_features()가 entry_reason/gap_pullback_d를
+    # BUY 행의 entry_reason 텍스트에서 정확히 채우는지 ────────────────
+    date20b = "20260916"
+    rows20b = [
+        _buy("2026-09-16T09:00:00", "GAP001", 10000, 10, "BG01", upside="2.0",
+             entry_reason="눌림목 매수 갭눌림D✓(+4.1%)"),
+        _sell("2026-09-16T09:10:00", "GAP001", 10100, 10, "SG01", "트레일링 스탑", "10.0", 10000),
+        _buy("2026-09-16T09:20:00", "GAP002", 10000, 10, "BG02", upside="2.0",
+             entry_reason="눌림목 매수 갭눌림D✗"),
+        _sell("2026-09-16T09:30:00", "GAP002", 10100, 10, "SG02", "트레일링 스탑", "10.0", 10000),
+        _buy("2026-09-16T09:40:00", "GAP003", 10000, 10, "BG03", upside="2.0",
+             entry_reason="다른 전략 진입 사유(갭눌림D 마커 없음)"),
+        _sell("2026-09-16T09:50:00", "GAP003", 10100, 10, "SG03", "트레일링 스탑", "10.0", 10000),
+    ]
+    bundle20b = make_bundle(tmp_root, date20b, rows20b)
+    features20b, _ = build_trade_features([load_bundle_day(bundle20b)])
+    by_sym20b = {r["symbol"]: r for r in features20b}
+    check("20-B) GAP001: entry_reason 원문이 그대로 보존됨(감사용)",
+          "갭눌림D✓" in by_sym20b["GAP001"]["entry_reason"])
+    check("20-B) GAP001: gap_pullback_d==True", by_sym20b["GAP001"]["gap_pullback_d"] is True)
+    check("20-B) GAP002: gap_pullback_d==False", by_sym20b["GAP002"]["gap_pullback_d"] is False)
+    check("20-B) GAP003: 마커 없으면 gap_pullback_d는 None(결측, False로 추정 안 함)",
+          by_sym20b["GAP003"]["gap_pullback_d"] is None)
+
+    # ── 20-C) _candidate_g_pred() + candidate_cost_aware_metrics() 통합 —
+    # upside 문턱과 무관한 독립 조건임을 확인(F2/A/B와 달리 upside가
+    # 전부 3.0%로 높아도 gap_pullback_d==True만으로 제거 대상이 됨) ────
+    rows_cam_g = [
+        {"trade_date": "20260826", "symbol": "G1", "upside_to_recent_high_pct": 3.0,
+         "gap_pullback_d": True, "base_outcome": LOSS,
+         "base_net_pnl_pct": -0.4, "base_net_pnl_krw": -400},
+        {"trade_date": "20260826", "symbol": "G2", "upside_to_recent_high_pct": 3.0,
+         "gap_pullback_d": True, "base_outcome": WIN,
+         "base_net_pnl_pct": 0.6, "base_net_pnl_krw": 600},
+        {"trade_date": "20260826", "symbol": "G3", "upside_to_recent_high_pct": 3.0,
+         "gap_pullback_d": False, "base_outcome": LOSS,
+         "base_net_pnl_pct": -0.2, "base_net_pnl_krw": -200},
+        {"trade_date": "20260826", "symbol": "G4", "upside_to_recent_high_pct": 3.0,
+         "gap_pullback_d": None, "base_outcome": WIN,
+         "base_net_pnl_pct": 0.3, "base_net_pnl_krw": 300},
+    ]
+    removed_g = {r["symbol"] for r in rows_cam_g if _candidate_g_pred(r)}
+    check("20-C) _candidate_g_pred가 정확히 G1,G2만 선택함(gap_pullback_d==True인 것만, "
+          "upside 3.0%로 F2 문턱 밖이어도 상관없이 독립 판정)",
+          removed_g == {"G1", "G2"})
+    check("20-C) gap_pullback_d 결측(G4, None)은 True로 추정되지 않아 제거 대상에서 자동 제외됨",
+          "G4" not in removed_g)
+    cam_g = candidate_cost_aware_metrics(rows_cam_g, _candidate_g_pred, "TestCandidateG")
+    check("20-C) CandidateG의 removed_trades==2(G1,G2)", cam_g["removed_trades"] == 2)
+    check("20-C) CandidateG의 skip_precision_base==50%(제거 2건[G1,G2] 중 base LOSS는 G1 하나)",
+          cam_g["skip_precision_base"] == "50%")
+
+    # ── 20-D) build_trade_features()의 min_profit_extension_shadow 조인
+    # (Candidate M1 checkpoint 필드) — 매칭 성공/매칭 실패/트리거 유형
+    # 불일치(우연히 근접 행이 있어도 MIN_PROFIT_5M이 아니면 조인 금지)
+    # 세 케이스를 모두 검증 ─────────────────────────────────────────
+    date20d = "20260917"
+    rows20d = [
+        _buy("2026-09-17T09:00:00", "MPJ001", 10000, 10, "BM01", upside="2.0", entry_score="7"),
+        _sell("2026-09-17T09:06:00", "MPJ001", 10020, 10, "SM01",
+              "entry_watch 최소수익미달청산 — 매수 후 6.0분, 수익률 +0.20%", "6.0", 10000),
+        _buy("2026-09-17T09:10:00", "MPJ002", 10000, 10, "BM02", upside="2.0", entry_score="7"),
+        _sell("2026-09-17T09:16:00", "MPJ002", 10015, 10, "SM02",
+              "entry_watch 최소수익미달청산 — 매수 후 6.0분, 수익률 +0.15%", "6.0", 10000),
+        _buy("2026-09-17T09:20:00", "MPJ003", 10000, 10, "BM03", upside="2.0", entry_score="7"),
+        _sell("2026-09-17T09:26:00", "MPJ003", 10300, 10, "SM03", "트레일링 스탑", "6.0", 10000),
+    ]
+    min_profit_rows20d = [
+        # MPJ001: 실제 SELL 시각(09:06:00)과 30ms 차이 → 근접 매칭 성공
+        {"timestamp": "2026-09-17T09:06:00.030000", "symbol": "MPJ001", "entry_time": "2026-09-17T09:00:05",
+         "holding_minutes": "6.0", "pnl_pct": "0.2", "price": "10020", "vwap": "9940",
+         "price_vs_vwap_pct": "0.8", "macd": "1.2", "macd_signal": "0.9", "macd_above_signal": "True",
+         "rsi": "55", "ma5": "10010", "ma20": "9990", "peak_pnl_pct": "1.5",
+         "drawdown_from_peak_pct": "-1.3", "upside_to_recent_high_pct": "2.0", "minute_data_stale": "False"},
+        # MPJ003용 — 이 청산은 MIN_PROFIT_5M이 아니라 트레일링 스탑인데도
+        # 심볼/시각이 우연히 근접한 min_profit_extension_shadow 행이 존재하는
+        # 경우입니다(production 로거는 최소수익미달 분기에서만 이 CSV에
+        # 기록하므로 실제로는 있을 수 없는 인위적 케이스지만, "trigger_type
+        # 게이트가 실제로 걸려있는지" 확실히 확인하기 위해 일부러 넣습니다).
+        {"timestamp": "2026-09-17T09:26:00.030000", "symbol": "MPJ003", "entry_time": "2026-09-17T09:20:05",
+         "holding_minutes": "6.0", "pnl_pct": "3.0", "price": "10300", "vwap": "10000",
+         "price_vs_vwap_pct": "3.0", "macd": "2.0", "macd_signal": "1.0", "macd_above_signal": "True",
+         "rsi": "70", "ma5": "10200", "ma20": "10100", "peak_pnl_pct": "3.0",
+         "drawdown_from_peak_pct": "0.0", "upside_to_recent_high_pct": "2.0", "minute_data_stale": "False"},
+        # MPJ002용 행은 의도적으로 없음 → 근접 매칭 실패 케이스
+    ]
+    bundle20d = make_bundle(tmp_root, date20d, rows20d, min_profit_shadow_rows=min_profit_rows20d,
+                             include_min_profit_shadow_file=True)
+    features20d, _ = build_trade_features([load_bundle_day(bundle20d)])
+    by_sym20d = {r["symbol"]: r for r in features20d}
+    check("20-D) MPJ001(MIN_PROFIT_5M + 근접 매칭 성공): checkpoint_price_vs_vwap_pct==0.8",
+          abs(by_sym20d["MPJ001"]["checkpoint_price_vs_vwap_pct"] - 0.8) < 1e-9)
+    check("20-D) MPJ001: checkpoint_macd_above_signal==True",
+          by_sym20d["MPJ001"]["checkpoint_macd_above_signal"] is True)
+    check("20-D) MPJ001: checkpoint_peak_pnl_pct==1.5",
+          abs(by_sym20d["MPJ001"]["checkpoint_peak_pnl_pct"] - 1.5) < 1e-9)
+    check("20-D) MPJ002(MIN_PROFIT_5M이지만 매칭되는 min_profit_extension_shadow 행 없음): "
+          "checkpoint 필드 전부 결측(빈 값, 추정 안 함)",
+          by_sym20d["MPJ002"]["checkpoint_price_vs_vwap_pct"] == ""
+          and by_sym20d["MPJ002"]["checkpoint_macd_above_signal"] == ""
+          and by_sym20d["MPJ002"]["checkpoint_peak_pnl_pct"] == "")
+    check("20-D) MPJ002: 매칭 실패 사유가 data_quality_flag에 명시됨",
+          "min_profit_extension_shadow 근접 매칭 실패" in by_sym20d["MPJ002"]["data_quality_flag"])
+    check("20-D) MPJ003(트레일링 청산, MIN_PROFIT_5M 아님): 우연히 근접한 shadow 행이 있어도 "
+          "entry_watch_trigger_type 게이트 때문에 checkpoint 필드를 절대 채우지 않음",
+          by_sym20d["MPJ003"]["checkpoint_price_vs_vwap_pct"] == ""
+          and by_sym20d["MPJ003"]["checkpoint_macd_above_signal"] == ""
+          and by_sym20d["MPJ003"]["checkpoint_peak_pnl_pct"] == "")
+
+    # ── 20-E) extension_rule_candidates()의 M1 규칙 — "5분 판단 시점"
+    # checkpoint 값을 쓰는지, R1/R2가 참조하는 "진입 시점" 값
+    # (current_vs_vwap_pct/macd_above_signal)을 잘못 재사용하지 않는지
+    # 교차 검증합니다(민우님 지시: R1/R2가 갖고 있던 바로 그 결함을 M1이
+    # 실제로 고쳤는지 확실히 증명). T1/T2는 진입 시점 값과 checkpoint
+    # 값이 의도적으로 서로 반대이고, extension_label_5m도 서로 다르게
+    # 둬서(helped/hurt) 어느 거래가 각 규칙에서 실제로 집계됐는지까지
+    # 명확히 구분합니다.
+    per_trade_m1_cross = [
+        # T1: 진입 시점엔 VWAP 아래(-1.0)/MACD 아래(False) → R1/R2는 탈락
+        # 해야 함. 5분 checkpoint는 VWAP 위(+0.5)/MACD 위(True) → M1만
+        # 통과해야 함.
+        {"trade_date": "20260826", "symbol": "T1", "actual_gross_pnl_pct": 0.3,
+         "actual_base_net_pct": 0.1, "fwd5m_base_net_pct": 0.1,
+         "actual_stress_net_pct": -0.2, "fwd5m_price_return_pct": 0.3,
+         "current_vs_vwap_pct": -1.0, "macd_above_signal": False,
+         "checkpoint_price_vs_vwap_pct": 0.5, "checkpoint_macd_above_signal": True,
+         "entry_score": 3, "extension_label_5m": "EXTEND_HELPED"},
+        # T2: 진입 시점엔 VWAP 위(+1.0)/MACD 위(True) → R1/R2는 통과해야
+        # 함. 5분 checkpoint는 VWAP 아래(-0.5)/MACD 아래(False) → M1은
+        # 탈락해야 함(M1이 R1/R2와 같은 필드를 잘못 재사용했다면 이
+        # 거래를 통과시켰을 것).
+        {"trade_date": "20260826", "symbol": "T2", "actual_gross_pnl_pct": 0.4,
+         "actual_base_net_pct": -0.1, "fwd5m_base_net_pct": -0.1,
+         "actual_stress_net_pct": -0.3, "fwd5m_price_return_pct": 0.4,
+         "current_vs_vwap_pct": 1.0, "macd_above_signal": True,
+         "checkpoint_price_vs_vwap_pct": -0.5, "checkpoint_macd_above_signal": False,
+         "entry_score": 3, "extension_label_5m": "EXTEND_HURT"},
+    ]
+    ext_rules_cross = extension_rule_candidates(per_trade_m1_cross)
+    r1_cross = next(r for r in ext_rules_cross if r["rule"].startswith("R1"))
+    r2_cross = next(r for r in ext_rules_cross if r["rule"].startswith("R2"))
+    m1_cross = next(r for r in ext_rules_cross if r["rule"].startswith("M1"))
+    check("20-E) M1 규칙은 valid_evidence=True(checkpoint 시점 값 사용, R1/R2의 결함을 고침)",
+          m1_cross["valid_evidence"] is True)
+    check("20-E) R1(진입 시점 VWAP 기준)은 T2만 통과(helped=0/hurt=1) — 진입 시점 값을 그대로 씀",
+          r1_cross["extension_qualified_trades"] == 1
+          and r1_cross["helped"] == 0 and r1_cross["hurt"] == 1)
+    check("20-E) R2(진입 시점 MACD 기준)도 T2만 통과(helped=0/hurt=1)",
+          r2_cross["extension_qualified_trades"] == 1
+          and r2_cross["helped"] == 0 and r2_cross["hurt"] == 1)
+    check("20-E) M1(checkpoint 기준)은 정반대로 T1만 통과(helped=1/hurt=0) — "
+          "R1/R2가 놓친 T1을 checkpoint 값 덕분에 정확히 잡아냄",
+          m1_cross["extension_qualified_trades"] == 1
+          and m1_cross["helped"] == 1 and m1_cross["hurt"] == 0)
+
+    # T3: checkpoint 필드가 결측("" — min_profit_extension_shadow 매칭 실패를
+    # 의미) → gross는 양수여도 M1은 결측을 True/양수로 추정하지 않고 탈락시킴.
+    per_trade_m1_missing = [
+        {"trade_date": "20260826", "symbol": "T3", "actual_gross_pnl_pct": 0.5,
+         "actual_base_net_pct": 0.2, "fwd5m_base_net_pct": 0.2,
+         "actual_stress_net_pct": -0.1, "fwd5m_price_return_pct": 0.5,
+         "current_vs_vwap_pct": 1.0, "macd_above_signal": True,
+         "checkpoint_price_vs_vwap_pct": "", "checkpoint_macd_above_signal": "",
+         "entry_score": 3, "extension_label_5m": "NEUTRAL"},
+    ]
+    m1_missing = next(r for r in extension_rule_candidates(per_trade_m1_missing) if r["rule"].startswith("M1"))
+    check("20-E) checkpoint 필드가 결측이면 gross가 양수여도 M1은 qualified 0건(추정 금지)",
+          m1_missing["extension_qualified_trades"] == 0)
+
+    # T4: 재closure 회귀 고정(민우님 리뷰 지적) — M1의 고정 조건은
+    # "MIN_PROFIT_5M AND price>VWAP AND MACD>signal"이지 R1/R2/R3처럼
+    # actual_gross_pnl_pct>0 게이트가 없습니다. 최초 구현은 이 게이트를
+    # 잘못 붙여 M1을 만들게 한 핵심 회복 사례(8/25 052690 -0.68%, 8/26
+    # 003490 -0.10%, 8/26 006360 -0.43% — 전부 checkpoint는 우호적인데
+    # 실제 gross는 음수)를 전부 놓쳤습니다. T4는 그 실측 사례를 그대로
+    # 재현한 합성 거래(음수 gross + 우호적 checkpoint)로, M1이 pnl 부호와
+    # 무관하게 qualified 처리하는지 회귀 고정합니다.
+    per_trade_m1_recovery = [
+        {"trade_date": "20260826", "symbol": "T4", "actual_gross_pnl_pct": -0.68,
+         "actual_base_net_pct": -0.9, "fwd5m_base_net_pct": -0.2,
+         "actual_stress_net_pct": -1.4, "fwd5m_price_return_pct": 0.1,
+         "current_vs_vwap_pct": -1.0, "macd_above_signal": False,
+         "checkpoint_price_vs_vwap_pct": 1.23, "checkpoint_macd_above_signal": True,
+         "entry_score": 3, "extension_label_5m": "EXTEND_HELPED"},
+    ]
+    m1_recovery = next(r for r in extension_rule_candidates(per_trade_m1_recovery) if r["rule"].startswith("M1"))
+    check("20-E) [재closure] gross가 음수(-0.68%)여도 checkpoint가 우호적(price>VWAP AND "
+          "MACD>signal)이면 M1은 qualified 1건 — pnl 부호는 M1의 게이트가 아님(민우님 리뷰 반영)",
+          m1_recovery["extension_qualified_trades"] == 1)
+
+    # ── 20-F) extension_rule_candidates_by_regime() — historical/forward
+    # 분리가 Candidate A의 cost-aware regime 분리와 동일한 원칙으로
+    # 동작하는지 확인 ──────────────────────────────────────────────
+    per_trade_regime = [
+        {"trade_date": "20260825", "symbol": "RH1", "actual_gross_pnl_pct": 0.5,
+         "actual_base_net_pct": 0.2, "fwd5m_base_net_pct": 0.2,
+         "actual_stress_net_pct": -0.1, "fwd5m_price_return_pct": 0.5,
+         "current_vs_vwap_pct": 1.0, "macd_above_signal": True,
+         "checkpoint_price_vs_vwap_pct": 1.0, "checkpoint_macd_above_signal": True,
+         "entry_score": 3, "extension_label_5m": "EXTEND_HELPED"},
+        {"trade_date": "20260826", "symbol": "RF1", "actual_gross_pnl_pct": 0.5,
+         "actual_base_net_pct": 0.2, "fwd5m_base_net_pct": 0.2,
+         "actual_stress_net_pct": -0.1, "fwd5m_price_return_pct": 0.5,
+         "current_vs_vwap_pct": 1.0, "macd_above_signal": True,
+         "checkpoint_price_vs_vwap_pct": 1.0, "checkpoint_macd_above_signal": True,
+         "entry_score": 3, "extension_label_5m": "EXTEND_HELPED"},
+    ]
+    rules_by_regime = extension_rule_candidates_by_regime(per_trade_regime, CANDIDATE_A_FORWARD_START_DATE)
+    m1_name = "M1_5minCheckpoint_price>VWAP_AND_MACD_above_signal"
+    m1_hist = next(r for r in rules_by_regime if r["rule"] == f"{m1_name}[HISTORICAL]")
+    m1_fwd = next(r for r in rules_by_regime if r["rule"] == f"{m1_name}[FORWARD]")
+    m1_comb = next(r for r in rules_by_regime if r["rule"] == f"{m1_name}[COMBINED(참고용)]")
+    check("20-F) HISTORICAL regime엔 20260825(RH1)만 포함 — M1 qualified==1",
+          m1_hist["extension_qualified_trades"] == 1)
+    check("20-F) FORWARD regime엔 20260826(RF1, 경계값 그 자체 포함)만 포함 — M1 qualified==1",
+          m1_fwd["extension_qualified_trades"] == 1)
+    check("20-F) COMBINED(참고용)엔 둘 다 포함 — M1 qualified==2(절대 하나로 섞어 부풀리지 않되 "
+          "참고용 합산치는 정확히 계산됨)",
+          m1_comb["extension_qualified_trades"] == 2)
+
+    # ── 20-G) run() E2E — Sprint v1.3 신규 산출물(CSV/dict key/CandidateG
+    # wiring/신규 feature 컬럼)이 실제로 생성되는지 확인 ──────────────
+    out_dir20 = tmp_root / "out_v1_3"
+    result20 = run([str(bundle20b), str(bundle20d)], str(out_dir20))
+    check("20-G) run() 결과에 extension_rules_by_regime 키가 포함됨",
+          "extension_rules_by_regime" in result20 and len(result20["extension_rules_by_regime"]) > 0)
+    check("20-G) exit_extension_study_by_regime.csv가 실제로 생성됨",
+          (out_dir20 / "exit_extension_study_by_regime.csv").is_file())
+    cost_aware_g_forward = [c for c in result20["cost_aware_forward"] if c["candidate"].startswith("CandidateG")]
+    check("20-G) run()의 cost_aware_forward에 CandidateG가 포함됨(build_cost_aware_report "
+          "4번째 후보 wiring 확인)",
+          len(cost_aware_g_forward) == 1)
+    with (out_dir20 / "trade_feature_table.csv").open(encoding="utf-8") as f:
+        trade_feature_columns = set(next(csv.reader(f)))
+    check("20-G) trade_feature_table.csv 헤더에 entry_reason/gap_pullback_d/checkpoint_* "
+          "5개 컬럼이 모두 포함됨",
+          {"entry_reason", "gap_pullback_d", "checkpoint_price_vs_vwap_pct",
+           "checkpoint_macd_above_signal", "checkpoint_peak_pnl_pct"} <= trade_feature_columns)
 
 finally:
     shutil.rmtree(tmp_root, ignore_errors=True)

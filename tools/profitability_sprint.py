@@ -164,6 +164,12 @@ RAW_FILES = {
     "entry_quality_shadow": "entry_quality_shadow_{date}.csv",
     "position_lifecycle": "position_lifecycle_{date}.csv",
     "signal_log": "signal_log_{date}.csv",
+    # 2026-08-26 (Sprint v1.3, Candidate M1): MIN_PROFIT_5M 청산 판단
+    # "그 순간"의 price_vs_vwap_pct/macd_above_signal/peak_pnl_pct를
+    # 쓰려면 이 CSV가 필요합니다 — 없으면 UNAVAILABLE로 표시되고
+    # (load_bundle_day의 기존 동작 그대로) M1 관련 checkpoint 필드는
+    # 전부 결측으로 남습니다(추정하지 않음).
+    "min_profit_extension_shadow": "min_profit_extension_shadow_{date}.csv",
 }
 
 
@@ -285,6 +291,56 @@ def _find_entry_watch_counterfactual(shadow_rows: list[dict], symbol: str, sell_
     return by_checkpoint, matches
 
 
+# 2026-08-26 (Sprint v1.3, Candidate M1) — min_profit_extension_shadow.csv
+# 조인. entry_time 컬럼으로 매칭하지 않는 이유: entry_time은 BUY_CONFIRMED
+# (체결 확인) 시각이라 trades.csv BUY 행의 주문 시각과 초 단위로 어긋날 수
+# 있습니다(8/26 실측: 034020 entry_time=09:26:08.96 vs BUY 행 타임스탬프
+# 09:25:58.94, 약 10초 차이). 대신 이 CSV의 timestamp(=_log_min_profit_
+# extension_shadow() 호출 시각)는 대응하는 SELL이 trades.csv에 기록되는
+# 순간과 사실상 동시입니다(8/26 실측 3건 전부 27~47ms 이내) — 이 함수가
+# `_check_entry_watch()`의 SELL 판정 바로 그 순간 호출되기 때문입니다.
+# 그래서 symbol + SELL timestamp 근접 매칭을 씁니다(기존 signal_log
+# 근접 매칭과 동일한 tolerance_sec=5.0 관례).
+def _index_min_profit_shadow_by_symbol(rows: list[dict]) -> dict:
+    idx: dict = defaultdict(list)
+    for r in rows:
+        ts = parse_ts(r.get("timestamp", ""))
+        if ts is None:
+            continue
+        idx[r.get("symbol", "")].append((ts, r))
+    return idx
+
+
+def _find_nearest_min_profit_shadow(idx: dict, symbol: str, sell_ts, tolerance_sec: float = 5.0):
+    candidates = idx.get(symbol, [])
+    best = None
+    best_dt = None
+    for ts, row in candidates:
+        dt = abs((ts - sell_ts).total_seconds())
+        if dt <= tolerance_sec and (best_dt is None or dt < best_dt):
+            best, best_dt = row, dt
+    return best
+
+
+# 2026-08-26 (Sprint v1.3, Candidate G): entry_reason 텍스트에서 갭눌림D
+# (breakout_strategy.py의 cond_gap_pullback) 충족 여부를 파싱합니다. 새
+# 판정 기준을 만들지 않고 이미 존재하는 문구만 구분합니다
+# (classify_entry_watch_trigger()와 동일한 관례) — gap_label은
+# breakout_strategy.py:190에서 "갭눌림D✓(+N.N%)" 또는 "갭눌림D✗"로 고정
+# 문구이고, 이 전략의 모든 BUY/HOLD reason에 항상 포함됩니다(요약 tags의
+# 마지막 항목). trades.csv의 entry_reason은 signal.reason을 120자로 자른
+# 값이라(trading_service.py) 이론상 잘려나갈 수 있지만, 실측(8/26)으로는
+# 96~103자로 전부 여유 있게 포함됩니다. 마커가 전혀 없으면(다른 전략
+# 경로이거나 절단됐거나) False로 추정하지 않고 None(결측)을 반환합니다.
+def parse_gap_pullback_d(entry_reason: str) -> bool | None:
+    r = entry_reason or ""
+    if "갭눌림D✓" in r:
+        return True
+    if "갭눌림D✗" in r:
+        return False
+    return None
+
+
 # ── feature row 빌드 ─────────────────────────────────────────────
 FEATURE_COLUMNS = [
     "trade_date", "symbol", "buy_time", "sell_time", "buy_price", "sell_price",
@@ -326,6 +382,15 @@ FEATURE_COLUMNS = [
     "fwd20m_price_return_pct", "fwd20m_base_net_pct", "fwd20m_stress_net_pct",
     "fwd_data_source",
     "data_quality_flag",
+    # 2026-08-26 (Sprint v1.3, 민우님 지시): Candidate G(갭눌림D)와
+    # Candidate M1(5분 checkpoint price>VWAP AND MACD>signal) 자동 분류를
+    # 위한 신규 컬럼. entry_reason은 원본 텍스트 그대로 보존(감사용),
+    # gap_pullback_d는 parse_gap_pullback_d()로 파싱한 결과(True/False/
+    # 결측=None). checkpoint_* 3개는 min_profit_extension_shadow.csv에서
+    # SELL 판정 시점 값을 그대로 조인한 것 — 기존 current_vs_vwap_pct/
+    # macd_above_signal(진입 시점 값, R1/R2가 참조하던 값)과는 별개입니다.
+    "entry_reason", "gap_pullback_d",
+    "checkpoint_price_vs_vwap_pct", "checkpoint_macd_above_signal", "checkpoint_peak_pnl_pct",
 ]
 
 # entry_watch_trigger_type 값 — exit_reason 텍스트 접두 매칭으로 결정(그 외
@@ -382,6 +447,7 @@ def build_trade_features(days: list[BundleDay]) -> tuple[list[dict], list[str]]:
         eq_idx = _index_entry_quality_by_order_id(day.tables.get("entry_quality_shadow", []))
         sl_idx = _index_signal_log_buy_by_symbol(day.tables.get("signal_log", []))
         ew_rows = day.tables.get("entry_watch_shadow", [])
+        mp_idx = _index_min_profit_shadow_by_symbol(day.tables.get("min_profit_extension_shadow", []))
 
         if day.availability.get("entry_quality_shadow") != "RAW":
             warnings_out.append(f"{day.date}: entry_quality_shadow 없음 — 이 날짜 거래의 entry 지표(MACD/VWAP거리/게이트) 전부 NA")
@@ -389,6 +455,8 @@ def build_trade_features(days: list[BundleDay]) -> tuple[list[dict], list[str]]:
             warnings_out.append(f"{day.date}: signal_log 없음 — 이 날짜 거래의 MA5/ATR/BB 등 보조 지표 NA")
         if day.availability.get("entry_watch_shadow") != "RAW":
             warnings_out.append(f"{day.date}: entry_watch_shadow 없음 — 이 날짜 entry_watch 청산의 +5/10/20분 counterfactual 전부 NA")
+        if day.availability.get("min_profit_extension_shadow") != "RAW":
+            warnings_out.append(f"{day.date}: min_profit_extension_shadow 없음 — 이 날짜 최소수익미달청산의 Candidate M1 checkpoint(5분 시점 price_vs_vwap/MACD/peak_pnl) 전부 NA")
 
         for sym, sell_list in sells.items():
             buy_list = buys.get(sym, [])
@@ -519,6 +587,8 @@ def build_trade_features(days: list[BundleDay]) -> tuple[list[dict], list[str]]:
                     "is_entry_watch_exit": is_entry_watch,
                     "entry_watch_trigger_type": entry_watch_trigger_type,
                     "first_sell_accepted_at": sell.get("timestamp", ""),
+                    "entry_reason": buy.get("entry_reason", "") or "",
+                    "gap_pullback_d": parse_gap_pullback_d(buy.get("entry_reason", "")),
                     "rsi": None,  # 현재 어떤 raw 파일에도 RSI가 기록되지 않음 — UNAVAILABLE
                     "fwd_data_source": "",
                 })
@@ -580,6 +650,26 @@ def build_trade_features(days: list[BundleDay]) -> tuple[list[dict], list[str]]:
                         row["fwd_data_source"] = "UNAVAILABLE(entry_watch_shadow에 해당 심볼 없음)"
                 elif not is_entry_watch:
                     row["fwd_data_source"] = "UNAVAILABLE(entry_watch 청산이 아니므로 shadow가 추적하지 않음)"
+
+                # 2026-08-26 (Sprint v1.3, Candidate M1): MIN_PROFIT_5M
+                # 청산일 때만 min_profit_extension_shadow.csv에서 "그 판단
+                # 순간"의 checkpoint 값을 조인합니다 — 다른 청산 유형(급락/
+                # VWAP이탈/entry_watch 아님)은 애초에 이 CSV에 행이 없으므로
+                # (production 로거가 최소수익미달 분기에서만 기록) 시도하지
+                # 않습니다.
+                if entry_watch_trigger_type == TRIGGER_MIN_PROFIT_5M and sell_ts is not None:
+                    mp_row = _find_nearest_min_profit_shadow(mp_idx, sym, sell_ts)
+                    if mp_row is not None:
+                        row.update({
+                            "checkpoint_price_vs_vwap_pct": safe_float(mp_row.get("price_vs_vwap_pct")),
+                            "checkpoint_macd_above_signal": safe_bool(mp_row.get("macd_above_signal")),
+                            "checkpoint_peak_pnl_pct": safe_float(mp_row.get("peak_pnl_pct")),
+                        })
+                    else:
+                        dq_flags.append(
+                            "min_profit_extension_shadow 근접 매칭 실패(±5초) — "
+                            "Candidate M1 checkpoint(price_vs_vwap/MACD/peak_pnl) NA"
+                        )
 
                 row["data_quality_flag"] = "; ".join(dq_flags)
                 rows_out.append(row)
@@ -780,6 +870,17 @@ def _candidate_b_pred(r) -> bool:
     return _f2_pred(r) and r.get("is_pulldown_recovery") is False
 
 
+# 2026-08-26 (Sprint v1.3, Candidate G, 민우님 지시): F2/CandidateA/B와
+# 달리 upside 문턱과 무관한 독립 조건입니다 — "갭 급등 후 눌림목"
+# 패턴(갭눌림D, breakout_strategy.py의 cond_gap_pullback)이 나온 진입
+# 자체를 후보로 봅니다. gap_pullback_d가 결측(None, entry_reason에
+# 마커가 없거나 파싱 실패)이면 True로 추정하지 않고 자동으로 후보에서
+# 제외됩니다(`is True`만 인정 — Candidate A/B의 `is False`와 동일한
+# 추정 금지 관례).
+def _candidate_g_pred(r) -> bool:
+    return r.get("gap_pullback_d") is True
+
+
 # ── Sprint v1.2 후속(2026-08-27): 비용 반영(base) 기준 precision/recall
 # + 거래일별 delta breakdown, 그리고 historical/forward 표본 분리 ──────
 def candidate_cost_aware_metrics(rows: list[dict], skip_pred, label: str) -> dict:
@@ -872,12 +973,20 @@ def split_historical_forward(rows: list[dict], forward_start_date: str) -> tuple
 
 
 def build_cost_aware_report(rows: list[dict], regime_label: str) -> list[dict]:
-    """F2/CandidateA/CandidateB 세 후보의 cost-aware 지표를 한 regime
-    (HISTORICAL/FORWARD/COMBINED) 범위에서 계산해 리스트로 반환합니다."""
+    """F2/CandidateA/CandidateB/CandidateG 네 후보의 cost-aware 지표를 한
+    regime(HISTORICAL/FORWARD/COMBINED) 범위에서 계산해 리스트로 반환합니다.
+
+    2026-08-26 (Sprint v1.3, 민우님 지시): CandidateG("갭눌림D")를 추가.
+    upside 문턱과 무관한 독립 조건이지만, candidate_cost_aware_metrics()의
+    공통 유효 행 필터(upside_to_recent_high_pct 존재)는 "분석 가능한 행"을
+    걸러내는 범용 기준이라 CandidateG에도 그대로 적용합니다 — F2 전용
+    필터가 아니므로 조건 자체를 바꾸는 게 아닙니다.
+    """
     return [
         candidate_cost_aware_metrics(rows, _f2_pred, f"F2_baseline[{regime_label}]"),
         candidate_cost_aware_metrics(rows, _candidate_a_pred, f"CandidateA[{regime_label}]"),
         candidate_cost_aware_metrics(rows, _candidate_b_pred, f"CandidateB[{regime_label}]"),
+        candidate_cost_aware_metrics(rows, _candidate_g_pred, f"CandidateG[{regime_label}]"),
     ]
 
 
@@ -951,6 +1060,16 @@ def _label_trade(r: dict) -> dict:
         "entry_score": r["entry_score"],
         "current_vs_vwap_pct": r["current_vs_vwap_pct"],
         "macd_above_signal": r["macd_above_signal"],
+        # 2026-08-26 (Sprint v1.3, Candidate M1): "5분 판단 시점" checkpoint
+        # 값 — 위 current_vs_vwap_pct/macd_above_signal(진입 시점 값, R1/R2가
+        # 참조)과 별개로 그대로 통과시킵니다. extension_rule_candidates()의
+        # M1 규칙이 이 필드로 진입 시점이 아닌 청산 판단 순간의 VWAP/MACD
+        # 상태를 검증합니다. 미매칭이면 build_trade_features()에서 이미
+        # ""(FEATURE_COLUMNS 초기값)로 남아있고, 여기서도 추정하지 않고
+        # 그대로 전달합니다.
+        "checkpoint_price_vs_vwap_pct": r["checkpoint_price_vs_vwap_pct"],
+        "checkpoint_macd_above_signal": r["checkpoint_macd_above_signal"],
+        "checkpoint_peak_pnl_pct": r["checkpoint_peak_pnl_pct"],
     }
 
 
@@ -1028,6 +1147,34 @@ def extension_rule_candidates(per_trade: list[dict]) -> list[dict]:
     확정). R3(entry_score>=5 AND pnl>0)은 entry_score 자체가 원래
     진입 시점에만 존재하는 값이라 이 문제에 해당하지 않습니다 —
     valid_evidence=True로 유지합니다.
+
+    2026-08-26 (Sprint v1.3, Candidate M1, 민우님 지시): R1/R2가 안고
+    있던 바로 그 결함("판단 순간"이 아니라 진입 시점 값을 쓴다는 것)을
+    고친 버전입니다. min_profit_extension_shadow.csv에서 조인한
+    checkpoint_price_vs_vwap_pct/checkpoint_macd_above_signal은
+    _check_entry_watch()가 실제로 최소수익미달청산을 판단하던 바로 그
+    순간의 값입니다(build_trade_features()의 join 주석 참고) — 그래서
+    M1은 valid_evidence=True입니다. checkpoint 필드가 결측(매칭 실패
+    또는 이 청산이 애초에 min_profit_extension_shadow 대상이 아님)이면
+    `(x or 0) > 0`/`is True` 판정이 자연히 False가 되어 조건 미충족으로
+    빠집니다 — False로 추정해서 채워 넣는 게 아니라 결측이 그냥 탈락으로
+    이어지는 것뿐입니다(A/B/G와 동일한 무추정 관례).
+
+    2026-08-26 재closure(민우님 리뷰 지적, 의미 변경 1건): M1의 고정
+    조건은 "MIN_PROFIT_5M AND price>VWAP AND MACD>signal"이지
+    R1/R2/R3처럼 `actual_gross_pnl_pct > 0` 게이트가 없습니다. 최초
+    구현은 R1/R2의 "5분 시점 pnl>0 AND ..." 패턴을 그대로 따라
+    이 게이트를 붙였는데, 이는 M1을 만들게 한 핵심 회복 사례(8/25
+    052690 -0.68%, 8/26 003490 -0.10%, 8/26 006360 -0.43% — 전부
+    checkpoint 시점엔 VWAP 위·MACD 상방이었지만 실제 gross는 음수)를
+    전부 제외해버리는 결함이었습니다. M1이 답하려는 질문 자체가
+    "지금 당장 마이너스여도 checkpoint 기술적 상태가 좋으면 5분
+    더 들고 있는 게 회복에 도움이 되는가"이므로, pnl 부호는 애초에
+    이 규칙의 게이트가 아닙니다(대신 실제 도움이 됐는지는
+    `extension_label_5m`(EXTEND_HELPED/HURT/NEUTRAL)이 이미 별도로
+    판정합니다 — M1 예선 통과 여부와 결과 라벨은 서로 다른 질문).
+    R1/R2/R3의 `actual_gross_pnl_pct > 0` 게이트는 그 규칙들의
+    고정 정의 그대로이므로 이번 재closure에서 손대지 않습니다.
     """
     def qualifies_rule_a(t):  # 5분 시점 pnl>0 AND "진입 시점" price>VWAP(주의: 아래 docstring 참고)
         return t["actual_gross_pnl_pct"] > 0 and (t["current_vs_vwap_pct"] or 0) > 0
@@ -1038,10 +1185,17 @@ def extension_rule_candidates(per_trade: list[dict]) -> list[dict]:
     def qualifies_rule_c(t):  # entry_score >= 5 AND 5분 시점 pnl > 0 (entry_score는 원래 진입시점 값)
         return (t["entry_score"] or 0) >= 5 and t["actual_gross_pnl_pct"] > 0
 
+    def qualifies_rule_m1(t):  # "5분 판단 시점(checkpoint)" price>VWAP AND MACD>signal — pnl 게이트 없음(위 재closure 참고)
+        return (
+            (t["checkpoint_price_vs_vwap_pct"] or 0) > 0
+            and t["checkpoint_macd_above_signal"] is True
+        )
+
     rules = [
         ("R1_pnl>0_AND_price>VWAP", qualifies_rule_a, False),
         ("R2_pnl>0_AND_MACD_above_signal", qualifies_rule_b, False),
         ("R3_entry_score>=5_AND_pnl>0", qualifies_rule_c, True),
+        ("M1_5minCheckpoint_price>VWAP_AND_MACD_above_signal", qualifies_rule_m1, True),
     ]
     out = []
     for name, pred, valid_evidence in rules:
@@ -1085,6 +1239,35 @@ def extension_rule_candidates(per_trade: list[dict]) -> list[dict]:
             "sample_tier": tier if n > 0 else "표본없음(적용 후보 아님, 관측 불가)",
         })
     return out
+
+
+def extension_rule_candidates_by_regime(per_trade: list[dict], forward_start_date: str) -> list[dict]:
+    """R1~R3/M1 조건부 연장 후보를 HISTORICAL/FORWARD/COMBINED(참고용)
+    regime으로 나눠 계산합니다.
+
+    2026-08-26 (Sprint v1.3, 민우님 지시): build_cost_aware_report()의
+    regime 분리와 동일한 원칙 — "Candidate M1은 forward 실거래 표본이
+    아직 clean 4건뿐이라 historical/backtest-like 표본과 절대 한
+    덩어리로 섞어서 표본 수를 부풀리면 안 된다"(민우님 지적, Candidate
+    A 때와 동일한 원칙을 M1에도 그대로 적용). split_historical_forward()
+    는 raw feature row(trade_date 키 보유)를 대상으로 하지만, 이 함수의
+    입력 per_trade는 _label_trade()가 만든 딕셔너리입니다 — trade_date
+    키를 그대로 보존하고 있으므로 동일한 문자열 비교(YYYYMMDD)로 분리할
+    수 있습니다(새 비교 기준을 만들지 않고 기존 관례 재사용).
+    """
+    historical = [t for t in per_trade if t["trade_date"] < forward_start_date]
+    forward = [t for t in per_trade if t["trade_date"] >= forward_start_date]
+
+    def _tag(rule_rows: list[dict], regime_label: str) -> list[dict]:
+        for r in rule_rows:
+            r["rule"] = f"{r['rule']}[{regime_label}]"
+        return rule_rows
+
+    return (
+        _tag(extension_rule_candidates(historical), "HISTORICAL")
+        + _tag(extension_rule_candidates(forward), "FORWARD")
+        + _tag(extension_rule_candidates(per_trade), "COMBINED(참고용)")
+    )
 
 
 # ── Study C: Entry Quality gates ─────────────────────────────────
@@ -1337,6 +1520,12 @@ def run(bundle_dirs: list[str], out_dir: str) -> dict:
         exit_extension_study(feature_rows)
     )
     extension_rules = extension_rule_candidates(extension_per_trade_min_profit)
+    # 2026-08-26 (Sprint v1.3, Candidate M1, 민우님 지시): R1~R3/M1을
+    # historical/forward로 분리 집계 — Candidate A의 cost-aware regime
+    # 분리와 동일한 원칙(forward 표본을 historical과 섞어 부풀리지 않음).
+    extension_rules_by_regime = extension_rule_candidates_by_regime(
+        extension_per_trade_min_profit, CANDIDATE_A_FORWARD_START_DATE
+    )
     gate_study = entry_quality_gate_study(feature_rows)
     scorecard = build_scorecard(low_upside_candidates, extension_rules, gate_study)
 
@@ -1386,6 +1575,7 @@ def run(bundle_dirs: list[str], out_dir: str) -> dict:
         out / "exit_extension_study.csv",
         extension_per_trade_min_profit + extension_per_trade_early_vwap + extension_rules,
     )
+    write_csv(out / "exit_extension_study_by_regime.csv", extension_rules_by_regime)
     write_csv(out / "entry_quality_study.csv", gate_study)
     write_csv(out / "candidate_scorecard.csv", scorecard)
     write_csv(out / "candidate_cost_aware_summary.csv", cost_aware_summary_rows)
@@ -1403,6 +1593,7 @@ def run(bundle_dirs: list[str], out_dir: str) -> dict:
         "extension_per_trade_early_vwap": extension_per_trade_early_vwap,
         "extension_excluded": extension_excluded,
         "extension_rules": extension_rules,
+        "extension_rules_by_regime": extension_rules_by_regime,
         "gate_study": gate_study,
         "scorecard": scorecard,
         "leave_one_out_all": leave_one_out_report(feature_rows, "전체 포트폴리오(참고용)"),

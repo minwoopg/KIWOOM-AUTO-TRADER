@@ -10328,3 +10328,247 @@ historical evidence로 완전히 분리되어 계속 별도 집계됩니다. For
 이번 재closure에서도 여전히 관측만 합니다.
 
 민우님 최종 승인 조건: "이것만 고치면 최종 적용 승인하겠습니다."
+
+---
+
+## 📊 Profitability Sprint v1.3 — Candidate G(갭눌림D) + Candidate M1(5분 checkpoint) 자동 분류, offline 분석 전용 (2026-08-26)
+
+### 배경
+
+민우님 지시: "지금은 실제 매매 로직은 수정하지 않고 데이터를 더 쌓는
+게 맞습니다. 다만 '아무것도 안 한다'는 뜻은 아닙니다 — offline 분석
+도구만 보강해서 앞으로 들어오는 데이터를 자동으로 세 후보로 분류하도록
+만드는 겁니다." 세 후보 조건은 **고정**(임의 튜닝 금지)이며, 실제
+BUY 차단이나 5분 연장은 이번 라운드에서 전혀 하지 않습니다:
+
+- Candidate A: `upside < 0.50% AND rebound_volume_spike=False`
+  (이미 Candidate A forward shadow closure로 production shadow까지
+  가동 중 — 이번 라운드는 손대지 않음)
+- Candidate G: 갭눌림D (신규, 이번 라운드)
+- Candidate M1: 5분 최소수익 + price>VWAP + MACD>signal (신규, 이번 라운드)
+
+Candidate A는 forward 실거래 표본이 아직 0건, GapD는 5건, M1은 clean
+4건뿐이라 초기 신호는 강하지만 표본이 너무 작다는 판단 하에, 이번
+라운드는 **표본을 자동으로 분류·축적하는 도구만** 만들고 enforce
+판단은 전부 다음 라운드로 미룹니다.
+
+### 변경 내용 (`tools/profitability_sprint.py`만 — production 코드는 전혀 손대지 않음)
+
+**Candidate G(갭눌림D)** — 새 판정 기준을 만들지 않고, 이미
+`breakout_strategy.py`의 `cond_gap_pullback`이 모든 BUY/HOLD
+`signal.reason`에 항상 남기는 고정 문구("갭눌림D✓(+N.N%)" 또는
+"갭눌림D✗", 이 전략 reason의 항상 마지막 tag)를 텍스트로 파싱합니다.
+
+1. `parse_gap_pullback_d(entry_reason)` 신규 — "갭눌림D✓" 포함 시
+   `True`, "갭눌림D✗" 포함 시 `False`, 마커가 전혀 없으면(다른 전략
+   경로이거나 120자 절단으로 잘려나갔거나) `None`(결측, False로
+   추정하지 않음). `trades.csv`의 `entry_reason`이 `signal.reason`을
+   120자로 자른 값이라 이론상 절단 가능하지만, 실측(8/26 bundle)으로는
+   96~103자로 전부 여유 있게 포함됨을 확인.
+2. `FEATURE_COLUMNS`에 `entry_reason`(원문 보존, 감사용)/`gap_pullback_d`
+   추가, `build_trade_features()`가 BUY 행의 `entry_reason`에서 파싱해
+   채움.
+3. `_candidate_g_pred(r) = r.get("gap_pullback_d") is True` — F2/A/B와
+   달리 upside 문턱과 무관한 독립 조건. `build_cost_aware_report()`에
+   4번째 후보로 wiring(F2_baseline/CandidateA/CandidateB/**CandidateG**),
+   기존 HISTORICAL/FORWARD/COMBINED(참고용) regime 분리·CSV export
+   배선을 그대로 재사용(추가 `run()` 변경 불필요).
+
+**Candidate M1(5분 checkpoint price>VWAP AND MACD>signal)** — 기존
+R1/R2(`extension_rule_candidates()`)가 안고 있던 결함(5분 "판단 순간"이
+아니라 "진입 시점" VWAP/MACD 값을 잘못 참조해 `valid_evidence=False`로
+표시되던 문제)을 실제로 고친 버전.
+
+4. `RAW_FILES`에 `min_profit_extension_shadow_{date}.csv` 추가(없으면
+   기존 관례대로 UNAVAILABLE + 경고, 관련 필드는 전부 결측 처리).
+5. `_index_min_profit_shadow_by_symbol()`/`_find_nearest_min_profit_shadow()`
+   신규 — 이 CSV의 `timestamp`(로거 호출 시각)로 symbol+시각 근접
+   매칭(±5초). **`entry_time`으로 매칭하지 않은 이유**: `entry_time`은
+   BUY_CONFIRMED(체결 확인) 시각이라 trades.csv BUY 시각과 초 단위로
+   어긋날 수 있음(8/26 실측: 10초 차이 확인). 반면 이 CSV의
+   `timestamp`는 `_check_entry_watch()`의 SELL 판정 바로 그 순간
+   호출되므로 대응 SELL과 사실상 동시(8/26 실측 3건 전부 27~47ms 이내).
+6. `FEATURE_COLUMNS`에 `checkpoint_price_vs_vwap_pct`/
+   `checkpoint_macd_above_signal`/`checkpoint_peak_pnl_pct` 추가.
+   `entry_watch_trigger_type == MIN_PROFIT_5M`인 SELL에만(다른 청산
+   유형은 이 CSV에 애초에 행이 없으므로) 조인 시도 — 매칭 실패 시
+   결측 + `data_quality_flag`에 사유 명시.
+7. `_label_trade()`가 이 3개 checkpoint 필드를 그대로 통과시키도록
+   반환 dict에 추가.
+8. `extension_rule_candidates()`에 M1 규칙 추가 —
+   `checkpoint_price_vs_vwap_pct>0 AND checkpoint_macd_above_signal is True
+   AND actual_gross_pnl_pct>0`, **`valid_evidence=True`**(R1/R2와 달리
+   실제 판단 순간 값을 쓰므로).
+9. 신규 `extension_rule_candidates_by_regime(per_trade, forward_start_date)`
+   — Candidate A의 cost-aware regime 분리와 동일한 원칙으로 R1~R3/M1을
+   HISTORICAL/FORWARD/COMBINED(참고용)로 분리 집계("M1은 forward 실거래
+   clean 4건뿐이라 historical과 절대 섞지 않는다"는 지시 반영).
+10. `run()`에 `extension_rules_by_regime` 배선 + 신규 출력 파일
+    `exit_extension_study_by_regime.csv` 추가.
+
+### 변경하지 않은 것
+
+Candidate A/G/M1 조건 자체(threshold·점수·VWAP·시간대 등 어떤
+파라미터도 추가/조정 없음, 민우님 명시 지시 그대로 고정), BUY/HOLD/SELL
+판정 로직, `LowUpsideShadowLogger`/`MIN_PROFIT_EXTENSION_SHADOW` 로거의
+필드·dedup·fail-open 계약, `trading_service.py`/`logger.py` — 전부 0건.
+Candidate A/G/M1 중 어느 것도 **enforce하지 않음**(BUY 차단, 5분 연장
+전부 미시행) — 이번 라운드는 표본 자동 분류·축적까지만.
+
+### 테스트 (`test_profitability_sprint.py`에 "20)" 섹션 30건 신규)
+
+- 20-A: `parse_gap_pullback_d()` 순수 파싱 경계값(✓/✗/마커없음/빈 문자열).
+- 20-B: `build_trade_features()`가 BUY `entry_reason`에서
+  `entry_reason`/`gap_pullback_d`를 정확히 채움(원문 보존 + True/False/
+  결측 3-state).
+- 20-C: `_candidate_g_pred()` + `candidate_cost_aware_metrics()` 통합
+  — upside가 F2 문턱 밖(3.0%)이어도 `gap_pullback_d==True`만으로
+  독립 판정, 결측(None)은 True로 추정되지 않아 자동 제외.
+- 20-D: `min_profit_extension_shadow` 조인 3케이스 — 근접 매칭 성공
+  (checkpoint 3필드 정확), 매칭 실패(결측 + data_quality_flag 사유
+  명시), **MIN_PROFIT_5M이 아닌 청산은 우연히 근접한 shadow 행이
+  있어도 절대 조인하지 않음**(trigger_type 게이트 검증).
+- 20-E: M1 규칙 교차 검증 — 진입 시점 값과 checkpoint 값이 의도적으로
+  반대인 합성 거래 2건으로 "R1/R2는 진입 시점 값만 보고, M1은
+  checkpoint 값만 본다"를 helped/hurt 집계로 명확히 구분 증명(R1/R2가
+  놓친 거래를 M1이 정확히 잡아내고, 반대로 R1/R2가 잡은 거래를 M1이
+  정확히 걸러냄). checkpoint 결측 시 gross 양수여도 M1 qualified 0건도
+  확인(추정 금지).
+- 20-F: `extension_rule_candidates_by_regime()` — HISTORICAL/FORWARD/
+  COMBINED(참고용) 분리가 Candidate A의 regime 분리와 동일하게 동작.
+- 20-G: `run()` E2E — `extension_rules_by_regime` 키, 신규 CSV,
+  `cost_aware_forward`에 CandidateG 포함, `trade_feature_table.csv`
+  헤더에 신규 5개 컬럼 전부 확인.
+
+기존 19-E(`build_cost_aware_report()` 단위 테스트)의 "정확히 3개
+후보만 반환" 검증을 CandidateG 추가에 맞춰 "정확히 4개"로 갱신했습니다.
+10번 섹션("일부 파일 누락 시 경고")도 `min_profit_extension_shadow`가
+`RAW_FILES`에 새로 추가되며 누락 파일 개수가 4개→5개로 바뀐 것을
+반영해 갱신했습니다(둘 다 새 기능이 기존 계약을 깨지 않았음을
+재확인하는 순수 카운트 보정이며, 계산 로직 변경은 아닙니다).
+
+전체 170/170 통과(기존 140건 전부 무회귀 + 신규 30건).
+
+### 회귀 결과
+
+`test_profitability_sprint.py` 170/170,
+`legacy_tests/test_entry_watch.py` 11/11 — 전부 통과. `compileall`
+정상(저장소 전체).
+
+전체 회귀(`run_regression_tests.py`) 25/28 통과 — 클린 HEAD 대비
+동일한 사전 존재·환경 전용 실패 3건만 남음(`test_broker_order_status.py`,
+`test_broker_read_only_wiring.py`, `test_replay_time_axis.py` —
+이 세션 환경 이슈이며 이 diff와 무관, 신규 실패 0건).
+
+### 다음 단계
+
+이 diff는 표본을 세 후보로 자동 분류·축적하는 도구만 추가합니다 —
+production 전략은 그대로입니다. 민우님 지시대로 앞으로 2~5거래일
+정도 forward 데이터가 더 쌓이면 방향이 정리될 가능성이 높습니다:
+GapD가 계속 손실만 만들거나, M1이 계속 +5분 개선을 보이면 그쪽이
+실제 전략 변경 1호 후보가 됩니다. enforce 전환 여부는 다음 라운드
+표본이 쌓인 뒤 별도로 판단합니다(이번 diff는 그 판단에 쓰일 데이터를
+자동으로 정리해주는 역할까지만).
+
+---
+
+## 🔧 Profitability Sprint v1.3 재closure — Candidate M1 조건에서 잘못 붙은 `pnl>0` 게이트 제거 (2026-08-26)
+
+### 배경
+
+민우님이 Sprint v1.3 diff를 조사한 뒤 Candidate G는 구현 방향이 맞다고
+확인했지만, Candidate M1의 `qualifies_rule_m1()`에 의미 변경 1건이
+있음을 지적했습니다. 우리가 고정한 M1 조건은:
+
+```text
+MIN_PROFIT_5M
+AND price > VWAP
+AND MACD > signal
+```
+
+이지 `actual_gross_pnl_pct > 0`(pnl 부호) 게이트가 없습니다. 그런데
+최초 구현은 R1/R2의 "5분 시점 pnl>0 AND ..." 패턴을 그대로 따라
+이 게이트를 붙였습니다:
+
+```python
+def qualifies_rule_m1(t):
+    return (
+        t["actual_gross_pnl_pct"] > 0
+        and (t["checkpoint_price_vs_vwap_pct"] or 0) > 0
+        and t["checkpoint_macd_above_signal"] is True
+    )
+```
+
+이 게이트 때문에 M1 가설을 만들게 한 핵심 회복 사례 — 8/25 052690
+(-0.675%), 8/26 003490(-0.098%), 8/26 006360(-0.431%), 전부 실제
+gross는 음수인데 checkpoint 시점엔 VWAP 위·MACD 상방이었던 거래 —
+가 전부 제외됐고, 실측 재실행에서 "clean 4건" 중 단 1건(034020,
+gross가 우연히 양수였던 건)만 qualified 처리되는 결과를 냈습니다.
+M1이 답하려는 질문 자체가 "지금 당장 마이너스여도 checkpoint 기술적
+상태가 좋으면 5분 더 들고 있는 게 회복에 도움이 되는가"이므로, pnl
+부호는 애초에 이 규칙의 예선 조건이 될 수 없습니다.
+
+### 변경 내용
+
+`tools/profitability_sprint.py`의 `qualifies_rule_m1()`에서
+`actual_gross_pnl_pct > 0` 절만 제거했습니다:
+
+```python
+def qualifies_rule_m1(t):
+    return (
+        (t["checkpoint_price_vs_vwap_pct"] or 0) > 0
+        and t["checkpoint_macd_above_signal"] is True
+    )
+```
+
+M1이 실제로 qualified 처리하는 표본이 늘었을 뿐, "5분 더 들고
+있었으면 도움이 됐는지"를 판정하는 `extension_label_5m`
+(EXTEND_HELPED/HURT/NEUTRAL, `_label_trade()`가 이미 별도로 계산)
+로직은 전혀 건드리지 않았습니다 — M1 예선 통과 여부와 결과 라벨은
+서로 다른 계산이었고 그대로 유지됩니다.
+
+### 변경하지 않은 것
+
+Candidate G(갭눌림D) 전체 — 민우님이 검토 후 그대로 승인. R1/R2/R3의
+`actual_gross_pnl_pct > 0` 게이트 — 이 규칙들의 고정 정의 그대로라
+손대지 않음. `extension_rule_candidates_by_regime()`/
+`build_cost_aware_report()`/`build_trade_features()`의 checkpoint
+조인 로직 — 전부 무변경(예선 조건 한 줄만 수정). BUY/HOLD/SELL 판정
+로직, 전략 파라미터, Broker/API — 전부 0건.
+
+### 테스트
+
+`test_profitability_sprint.py` "20-E" 섹션에 회귀 고정용 신규 케이스
+추가(T4) — gross가 음수(-0.68%)인데 checkpoint는 우호적인 합성 거래가
+M1에서 qualified 1건으로 잡히는지 직접 검증(이 테스트가 없으면 미래에
+같은 pnl>0 게이트가 재도입돼도 기존 케이스만으로는 잡히지 않았을
+것입니다 — 기존 cross-check 케이스(T1/T2)는 마침 T1의 gross가 양수라
+게이트 제거 여부와 무관하게 통과했기 때문). 나머지 20-A~20-G 섹션은
+Candidate G/체크포인트 조인/regime 분리 로직을 검증하는 것들이라
+전부 무변경으로 재통과.
+
+전체 171/171 통과(기존 170건 전부 무회귀 + 신규 1건).
+
+### 회귀 결과
+
+`test_profitability_sprint.py` 171/171,
+`legacy_tests/test_entry_watch.py` 11/11 — 전부 통과. `compileall`
+정상(저장소 전체).
+
+전체 회귀(`run_regression_tests.py`) 25/28 통과 — 클린 HEAD 대비
+동일한 사전 존재·환경 전용 실패 3건만 남음(`test_broker_order_status.py`,
+`test_broker_read_only_wiring.py`, `test_replay_time_axis.py` —
+이 세션 환경 이슈이며 이 diff와 무관, 신규 실패 0건).
+
+### 실측 재검증 (8/20~8/26 통합, `min_profit_extension_shadow`가 존재하는 8/25~8/26 구간)
+
+게이트 제거 전에는 "clean 4건" 중 1건만 M1 qualified였지만, 게이트
+제거 후에는 **4건 전부 qualified**이고 **전부 `EXTEND_HELPED`**입니다
+(052690/003490/006360/034020 — 8/25 1건 historical, 8/26 3건
+forward). base net 기준 합계 delta는 +4.56%p(actual -2.12%p →
+hypothetical +2.44%p), worst-case degradation은 +0.18%p(즉 이
+4건 중 가장 안 좋았던 경우도 여전히 도움이 되는 방향)입니다. 이
+숫자는 여전히 **n=4로 OBSERVE(n<5) 티어이며 어떤 결론도 낼 수
+없습니다** — 다만 게이트 버그가 이 후보의 핵심 증거 표본 3/4를
+통째로 숨기고 있었다는 점에서, 이번 재closure는 계산 오류를 고친
+것 이상으로 M1의 실제 관측 방향을 처음으로 정확히 보여줍니다.
