@@ -905,13 +905,18 @@ _mkday(rootW, "low_upside_shadow.csv",
         "score", "condition_name", "upside_to_recent_high_pct",
         "would_skip_low_upside_f1", "would_skip_low_upside_f2",
         "would_skip_low_upside_f3", "final_decision", "order_block_reason",
-        "order_attempted", "order_accepted", "order_id"],
+        "order_attempted", "order_accepted", "order_id",
+        # 2026-08-27 (Candidate A forward shadow) — CSV_SOURCES/slice_csv는
+        # 소스 파일 자체의 헤더를 그대로 쓰는 컬럼-불문 슬라이서라 exporter
+        # 코드 변경 없이도 신규 컬럼이 보존돼야 함(아래 W-7에서 확인).
+        "rebound_volume_spike", "would_skip_low_upside_no_spike"],
        [
            {"timestamp": "2026-08-05T09:30:00", "symbol": "OLDDAY1",
             "upside_to_recent_high_pct": "0.30", "would_skip_low_upside_f2": "True"},
            {"timestamp": "2026-08-06T09:30:00", "symbol": "NEWDAY1",
             "upside_to_recent_high_pct": "0.20", "would_skip_low_upside_f2": "True",
-            "order_attempted": "True", "order_accepted": "True", "order_id": "ORD1"},
+            "order_attempted": "True", "order_accepted": "True", "order_id": "ORD1",
+            "rebound_volume_spike": "False", "would_skip_low_upside_no_spike": "True"},
        ])
 _mkday(rootW, "min_profit_extension_shadow.csv",
        ["timestamp", "symbol", "entry_time", "holding_minutes", "pnl_pct",
@@ -931,6 +936,19 @@ check("W-2) low_upside_shadow.csv가 날짜 기준으로 슬라이싱됨(전일 
       and "OLDDAY1" not in textsW["raw/low_upside_shadow_20260806.csv"])
 check("W-3) low_upside_shadow.csv에 order_attempted/order_accepted/order_id 값이 그대로 보존됨",
       "ORD1" in textsW["raw/low_upside_shadow_20260806.csv"])
+# 2026-08-27 (Candidate A forward shadow) — CSV_SOURCES/slice_csv는 소스
+# 파일 자체의 헤더를 그대로 쓰는 컬럼-불문 슬라이서라 exporter 코드
+# 변경 없이도 신규 컬럼이 보존돼야 함. 문자열 부분매치가 아니라
+# csv.DictReader로 정확히 그 행의 그 컬럼 값을 확인한다.
+_w7_reader = csv.DictReader(textsW["raw/low_upside_shadow_20260806.csv"].splitlines())
+_w7_rows = list(_w7_reader)
+check("W-7) low_upside_shadow.csv 헤더에 신규 Candidate A 컬럼 2개가 exporter 코드 변경 없이도 보존됨",
+      "rebound_volume_spike" in (_w7_reader.fieldnames or [])
+      and "would_skip_low_upside_no_spike" in (_w7_reader.fieldnames or []))
+check("W-7b) NEWDAY1 행의 rebound_volume_spike/would_skip_low_upside_no_spike 값이 정확히 보존됨",
+      len(_w7_rows) == 1 and _w7_rows[0]["symbol"] == "NEWDAY1"
+      and _w7_rows[0]["rebound_volume_spike"] == "False"
+      and _w7_rows[0]["would_skip_low_upside_no_spike"] == "True")
 check("W-4) min_profit_extension_shadow.csv가 raw/에 포함됨",
       "raw/min_profit_extension_shadow_20260806.csv" in textsW)
 check("W-5) min_profit_extension_shadow.csv가 날짜 기준으로 슬라이싱됨(전일 행 제외)",

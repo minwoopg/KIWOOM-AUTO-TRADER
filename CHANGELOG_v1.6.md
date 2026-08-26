@@ -10038,3 +10038,293 @@ D.1/E.1 — 전부 0건.
 
 이 재closure로 min-profit-shadow contamination closure는 민우님
 기준 최종 승인 대상입니다.
+
+**2026-08-27 민우님 최종 승인**: "이번
+`kiwoom_v1.6_min_profit_shadow_contamination_reclosure_diff.zip`은
+최종 승인합니다. 추가 closure는 필요 없습니다." — min-profit-shadow
+contamination closure는 이 시점부로 완전히 종료됩니다.
+
+---
+
+## 🔬 Candidate A forward shadow — observation-only 승격, 실제 BUY 차단 없음 (2026-08-27)
+
+### 배경
+
+Sprint v1.2(위 항목)에서 Candidate A(F2 AND `rebound_volume_spike
+== False`)가 historical 4개 거래일(8/20·8/21·8/24·8/25) 데이터에서
+가장 강한 후보로 확인됐습니다. 민우님 지시: 이제 필요한 것은
+"과거 데이터에 더 잘 맞추는 것"이 아니라 "앞으로 들어오는 거래에서
+재현되는지"이므로, Candidate A 정의를 **이 시점부터 영구 동결**하고
+(score/PR/VWAP/시간대 등 추가 조건 탐색 금지), historical 후보
+탐색 단계에서 forward validation 단계로 승격합니다.
+
+```
+Candidate A (동결):
+  upside_to_recent_high_pct < 0.50%
+  AND
+  rebound_volume_spike == False
+```
+
+**실제 BUY 차단은 이번에도 하지 않습니다** — 기존 `LowUpsideShadowLogger`에
+관측 컬럼만 추가하는 순수 observation-only 확장입니다.
+
+### 변경 내용 — production (관측 컬럼 추가에 한정)
+
+`infra/storage/logger.py`: `LowUpsideShadowLogger`의
+`LOW_UPSIDE_SHADOW_FIELDS`에 신규 필드 2개 추가(기존 필드는 전부
+유지, 순서 변경 없음):
+
+- `rebound_volume_spike` — `minute_analysis`의 원시값(True/False),
+  결측이면 빈 문자열.
+- `would_skip_low_upside_no_spike` — Candidate A 판정 결과. 정확히
+  `upside_to_recent_high_pct < 0.50 and rebound_volume_spike is False`로
+  계산. `rebound_volume_spike`가 결측(None)이면 **False로 추정하지
+  않고** 빈 문자열(unknown)로 기록 — Sprint v1.2의 "결측 feature는
+  skip 대상으로 추정하지 않는다" 원칙과 production shadow를
+  동일하게 맞춰 historical/forward 결과를 1:1로 비교할 수 있게
+  했습니다.
+
+두 신규 필드는 기존 dedup 계약(`LOW_UPSIDE_SHADOW_SIGNATURE_FIELDS`
+— `final_decision`/`order_block_reason`/`order_attempted`/
+`order_accepted`/`order_id`)에 포함시키지 않았습니다 — 이미
+symbol+latest_bar_timestamp로 식별되는 관측에 대해 결정적으로
+계산되는 값이라 signature에 추가할 필요가 없고, 추가했다면
+불필요하게 same-bar rejected→accepted 보존 계약을 건드릴 위험만
+생겼을 것입니다. 기존 CSV에 새 컬럼이 추가돼도
+`_migrate_csv_header_if_needed()`가 자동으로 헤더를 마이그레이션하고
+과거 행은 빈 값으로 채웁니다(기존 범용 헬퍼 재사용, 신규 로직
+없음).
+
+`domain/service/trading_service.py`: `_write_signal_log()`의
+기존 `low_upside_shadow_logger.append_if_new()` 호출부(이미 기존
+`try/except Exception` fail-open 블록 안)에서 `rebound_volume_spike`를
+`getattr(minute_analysis, "rebound_volume_spike", None)`로 방어적으로
+읽고, `is True`/`is False`로만 판정(결측이면 두 필드 모두 빈 문자열)한
+뒤 두 신규 필드를 채워 기록합니다. 새로 추가한 코드 전체가 기존
+fail-open `try` 블록 내부에 있어 이 블록에서 발생하는 어떤 예외도
+BUY 판단이나 주문 흐름에 영향을 주지 않습니다.
+
+### 변경하지 않은 것
+
+Candidate A enforce, F2 enforce, BUY/SELL threshold, 5분 hold
+연장, Broker/API, PositionLifecycle, D.1/E.1 — 전부 0건(민우님
+명시 금지 목록). 기존 `would_skip_f1/f2/f3`, `order_attempted/
+accepted/id` 등 기존 필드의 계산 로직·dedup key·signature — 전부
+무변경.
+
+### exporter
+
+`low_upside_shadow.csv`는 이미 daily bundle `CSV_SOURCES`에
+포함돼 있고, `export_daily_bundle.py`의 `slice_csv()`는
+`csv.DictReader`로 원본 파일의 `fieldnames`을 그대로 읽어 쓰는
+column-agnostic 구조라 exporter 코드는 전혀 건드리지 않았습니다.
+`test_shadow_analysis.py`에 신규 컬럼 2개가 실제 raw export CSV에
+그대로 보존되는지 확인하는 E2E 체크(W-7/W-7b)만 추가했습니다.
+
+### 테스트
+
+`test_profitability_shadow_v2.py`에 "2부-CA" 섹션(8개 하위 블록,
+15건) 신규:
+
+- upside=0.49+spike=False→Candidate A=True, spike=True→False
+- upside=0.50(경계값)→False, upside=0.51→False
+- `rebound_volume_spike=None`(결측) → 두 신규 필드 모두 빈
+  문자열(unknown), `would_skip_low_upside_no_spike`가 `"True"`로
+  둔갑하지 않음을 확인(같은 상황에서 `would_skip_low_upside_f2`는
+  여전히 `"True"`로 나와 F2 자체는 spike와 무관함도 대조 확인)
+- E2E: 실제 accepted BUY(`order_id="ORD_CANDA_1"`) row에
+  `order_accepted`/`order_id`/`rebound_volume_spike`/
+  `would_skip_low_upside_no_spike`가 모두 함께 정확히 기록됨
+- same-bar rejected→accepted dedup 보존 — 신규 컬럼이 있어도 두
+  상태 모두 보존되고 각각 올바른 신규 필드 값을 가짐
+- fail-open — `rebound_volume_spike` 접근을 첫 번째는 통과시키고
+  두 번째(신규 코드의 접근)만 예외를 던지는 프록시로, 새 코드
+  블록만의 fail-open을 정밀하게 격리 검증(사전에 존재하던 무관한
+  첫 번째 접근 지점과 분리) — 예외가 밖으로 전파되지 않고
+  signal_log에는 정상 BUY 행이, low_upside_shadow.csv에는 0행이
+  기록됨(관측 유실은 허용, BUY 흐름은 무영향)
+
+`test_shadow_analysis.py`에 W-7/W-7b 2건 신규(exporter passthrough,
+`csv.DictReader` 기반 검증). 전체 111/111
+(`test_profitability_shadow_v2.py`) + 185/185
+(`test_shadow_analysis.py`) 통과.
+
+### 분석 도구 (offline 전용, production import 없음)
+
+`tools/profitability_sprint.py`에 cost-aware 지표와 historical/
+forward 표본 분리를 추가했습니다(민우님 지시 #6, "이것은 offline
+분석 코드만 변경"):
+
+1. `FEATURE_COLUMNS`에 `base_outcome`/`stress_outcome` 추가 —
+   기존 `outcome`(gross 기준)은 무변경, `classify_outcome()`을
+   `base_net_pnl_pct`/`stress_net_pnl_pct`에도 동일하게 적용해
+   비용 반영 후 WIN/LOSS/BREAKEVEN을 별도로 기록. gross WIN이
+   비용 반영 후 base/stress에서 LOSS로 바뀌는 케이스를 구분할 수
+   있게 됐습니다(민우님 지적: "+0.3%짜리 거래는 gross로는 승자여도
+   왕복비용을 내면 실제 전략에는 좋은 거래가 아닐 수 있다").
+2. `two_condition_low_upside_candidates()`의 내부 클로저를
+   module-level `_f2_pred`/`_candidate_a_pred`/`_candidate_b_pred`로
+   순수 리팩터(행동 변화 없음, 기존 103건 테스트로 회귀 없음 확인).
+3. 신규 `candidate_cost_aware_metrics(rows, skip_pred, label)` —
+   `skip_precision_base`(제거한 거래 중 실제 base 손실 비율),
+   `loss_recall_base`(전체 base 손실 중 막은 비율),
+   `winner_damage_base`(base 승자 중 잘못 막은 비율), 거래일별
+   `per_day_base_delta_pct`/`per_day_base_delta_krw`를 계산.
+   해당 없음 케이스(제거 대상 0건/base 손실 0건/base 승자 0건)는
+   전부 "해당없음(...)" 문자열로 명시.
+4. 신규 `CANDIDATE_A_FORWARD_START_DATE = "20260827"` 상수 +
+   `split_historical_forward(rows, forward_start_date)` —
+   `trade_date < forward_start_date`는 historical, `>=`는 forward.
+   forward 표본이 아직 없으면 조용히 빈 리스트를 반환하고
+   historical로 끌어와 채우지 않습니다(표본을 부풀리지 않음).
+5. 신규 `build_cost_aware_report(rows, regime_label)` /
+   `flatten_cost_aware_reports(reports)` — F2/CandidateA/CandidateB
+   3개 후보의 cost-aware 지표를 한 regime(HISTORICAL/FORWARD/
+   COMBINED(참고용)) 범위에서 계산해 CSV로 쓸 수 있는 flat 리스트로
+   변환.
+6. `run()`에 historical/forward 분리 + 3-regime(HISTORICAL/
+   FORWARD/COMBINED(참고용)) cost-aware 리포트 계산을 배선하고,
+   신규 출력 파일 `candidate_cost_aware_summary.csv`(candidate당
+   1행)/`candidate_cost_aware_per_day.csv`(candidate x 거래일별
+   1행)를 추가. `run()` 반환 dict에 `historical_rows`/`forward_rows`/
+   `cost_aware_historical`/`cost_aware_forward`/`cost_aware_combined`/
+   `cost_aware_summary_rows`/`cost_aware_per_day_rows` 신규 키 추가.
+   각 candidate 라벨에 `[HISTORICAL]`/`[FORWARD]`/`[COMBINED(참고용)]`을
+   명시적으로 표기해 세 regime이 절대 하나로 섞이지 않도록 함 —
+   COMBINED는 참고용으로만 별도 표기, enforce 판단은 forward
+   증거를 최우선으로 봅니다(민우님 명시 지시).
+
+### 분석 도구 테스트 (test_profitability_sprint.py "19)" 섹션 37건 신규)
+
+- 19-A: gross WIN이 base/stress에서 LOSS로 전환되는 실제 거래
+  케이스(2건) + `classify_outcome()` 경계(0.0→BREAKEVEN, 미세
+  양수/음수→WIN/LOSS) 직접 고정
+- 19-B: `candidate_cost_aware_metrics()`의 skip_precision_base/
+  loss_recall_base/winner_damage_base/per_day delta 계산을 손으로
+  설계한 synthetic 4건 fixture로 정확한 수치까지 검증 + 3가지
+  "해당없음" 케이스
+- 19-C: `split_historical_forward()` 경계값(`<`/`>=` 정확히 확인)과
+  forward 표본이 없을 때 조용히 빈 리스트 반환하는지 확인
+- 19-D: `run()` E2E — historical 2026-08-26 bundle과 forward
+  2026-08-28 bundle을 함께 넘겨도 표본이 섞이지 않고 각 regime의
+  n_trades_in_scope/removed_trades가 정확히 분리 집계되며, 신규
+  CSV 2개가 실제로 생성되고 헤더에 신규 컬럼이 포함되는지 확인
+- 19-E: `build_cost_aware_report()`/`flatten_cost_aware_reports()`
+  단위 검증(정확히 3개 후보만 반환, summary/per_day 행 개수 정합성)
+
+전체 140/140 통과(기존 103건 전부 무회귀 + 신규 37건).
+
+### 회귀 결과
+
+`test_profitability_shadow_v2.py` 111/111,
+`test_shadow_analysis.py` 185/185,
+`test_profitability_sprint.py` 140/140,
+`legacy_tests/test_entry_watch.py` 11/11 — 전부 통과.
+
+전체 회귀(`run_regression_tests.py`) 25/28 통과 — 클린 HEAD 대비
+동일한 사전 존재·환경 전용 실패 3건만 남음(`test_broker_order_status.py`,
+`test_broker_read_only_wiring.py`, `test_replay_time_axis.py` —
+이 세션 환경 이슈이며 이 diff와 무관, 신규 실패 0건). `compileall`
+정상.
+
+### 다음 단계
+
+**(이 절의 forward 시작일은 아래 date-boundary 재closure로 8/27→8/26으로
+수정됐습니다 — 민우님이 실제 적용 시점을 8/26 장 시작 전으로 확정하며
+발견.)**
+
+~~이 diff 적용 이후(2026-08-27~)부터 쌓이는 `low_upside_shadow.csv`
+관측이 forward evidence입니다.~~ 8/20~8/25는 Candidate A를 도출하는
+데 쓰인 historical evidence로 완전히 분리되어 계속 별도 집계됩니다.
+Forward에서 며칠간 비슷한 성능(특히 skip_precision_base/
+loss_recall_base)이 재현되면, 그때 실제 BUY 차단(enforce) 전환을
+진지하게 검토합니다 — 이번 closure에서는 여전히 관측만 합니다.
+
+---
+
+## 🔧 Candidate A forward shadow — date-boundary 재closure: forward 시작일 8/27→8/26 (2026-08-26)
+
+### 배경
+
+민우님이 위 Candidate A forward shadow diff를 검토하던 시점(2026-08-26
+오전, 오늘 장 시작 전)에 `CANDIDATE_A_FORWARD_START_DATE = "20260827"`가
+하루 늦게 잡혀 있음을 지적했습니다. 이 diff를 오늘(8/26) 장 시작 전에
+적용해 오늘부터 production shadow를 가동할 예정이므로, **오늘 8/26
+실측이 Candidate A의 최초 forward 표본**이어야 합니다. 상수가
+`"20260827"`로 남아 있으면:
+
+```
+8/20~8/25  historical ✅
+8/26       historical ❌  ← 오늘 실제 forward 표본인데 잘못 분류
+8/27~      forward
+```
+
+이 되어, 정작 가장 먼저 기다리던 forward 1일차 표본이 historical에
+섞여버립니다. 실거래 로직 사고는 아니지만 forward/historical 분리라는
+분석 정합성 계약을 그대로 위반하는 것이라 적용 전 closure로 처리했습니다.
+
+### 변경 내용
+
+`tools/profitability_sprint.py`: `CANDIDATE_A_FORWARD_START_DATE`를
+`"20260827"` → `"20260826"`로 수정하고, 이 상수 위 주석에 date-boundary
+재closure 배경을 추가했습니다. 그 외 Candidate A 판정식
+(`_candidate_a_pred`), `split_historical_forward()`/
+`candidate_cost_aware_metrics()`/`build_cost_aware_report()`의
+계산 로직, `run()`의 배선 방식은 전혀 손대지 않았습니다 — **값
+하나만 하루 당겼습니다.**
+
+### 변경하지 않은 것
+
+Candidate A 계산식, `LowUpsideShadowLogger`의 필드/dedup/signature,
+`_write_signal_log()`의 fail-open 블록, BUY/SELL 판정 로직 —
+전부 0건(민우님 명시 지시). `infra/storage/logger.py`,
+`domain/service/trading_service.py`는 이번 재closure에서 아예
+건드리지 않았습니다.
+
+### 테스트
+
+`test_profitability_sprint.py` "19-C"/"19-D" 섹션의 경계값을
+새 상수에 맞춰 하루씩 당겼습니다:
+
+- 19-C: `CANDIDATE_A_FORWARD_START_DATE == "20260826"` 확정 검증,
+  `20260825`(historical만 해당)/`20260826`(경계값 그 자체, forward에
+  포함되고 historical에는 없음을 대조 확인)/`20260828`(forward)
+  3개 날짜로 `<`/`>=` 경계를 재검증.
+- 19-D: `run()` E2E의 historical bundle을 `20260825`로, forward
+  bundle을 **정확히 새 상수값인 `20260826`**(실제 최초 forward
+  거래일 그 자체)로 옮겨 "오늘(8/26) 데이터가 최초 forward 표본"이라는
+  민우님 지적을 그대로 회귀고정했습니다.
+
+19-B(synthetic fixture로 `candidate_cost_aware_metrics()` 자체의
+계산을 검증하는 섹션)는 `CANDIDATE_A_FORWARD_START_DATE`를 참조하지
+않는 순수 단위 테스트라 변경하지 않았습니다 — 그 안의 임의 날짜
+문자열(`"20260826"`/`"20260827"`)은 그저 서로 다른 두 거래일을
+구분하는 라벨일 뿐, 실제 forward 시작일과는 무관합니다.
+
+전체 140/140 통과(기존 103건 + 신규 37건, 전부 무회귀 — 날짜만
+이동했을 뿐 검증하는 계약 자체는 동일).
+
+### 회귀 결과
+
+`test_profitability_sprint.py` 140/140,
+`test_profitability_shadow_v2.py` 111/111(무관, 재확인만),
+`test_shadow_analysis.py` 185/185(무관, 재확인만),
+`legacy_tests/test_entry_watch.py` 11/11 — 전부 통과.
+
+전체 회귀(`run_regression_tests.py`) 25/28 — 클린 HEAD 대비 동일한
+사전 존재·환경 전용 실패 3건만 남음(`test_broker_order_status.py`,
+`test_broker_read_only_wiring.py`, `test_replay_time_axis.py` —
+이 세션 환경 이슈이며 이 diff와 무관, 신규 실패 0건). `compileall`
+정상.
+
+### 다음 단계
+
+이 diff 적용 이후(2026-08-26 장 시작~)부터 쌓이는
+`low_upside_shadow.csv` 관측이 Candidate A의 최초 forward
+evidence입니다. 8/20~8/25는 Candidate A를 도출하는 데 쓰인
+historical evidence로 완전히 분리되어 계속 별도 집계됩니다. Forward에서
+며칠간 비슷한 성능(특히 skip_precision_base/loss_recall_base)이
+재현되면, 그때 실제 BUY 차단(enforce) 전환을 진지하게 검토합니다 —
+이번 재closure에서도 여전히 관측만 합니다.
+
+민우님 최종 승인 조건: "이것만 고치면 최종 적용 승인하겠습니다."

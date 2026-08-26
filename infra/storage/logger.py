@@ -681,6 +681,25 @@ LOW_UPSIDE_SHADOW_FIELDS = [
     "order_attempted",
     "order_accepted",
     "order_id",
+    # 2026-08-27 (Candidate A forward shadow, Profitability Sprint v1.2
+    # historical 결과 승인 후 민우님 지시): Sprint v1.2가 8/20~8/25
+    # historical 데이터로 F2(upside<0.50%) 대비 가장 강한 후보로 확인한
+    # "Candidate A"(upside<0.50% AND rebound_volume_spike==False)를
+    # 이 시점부터 조건 고정(더 이상 score/PR/VWAP/시간대 등 추가 조건
+    # 탐색 안 함)하고, historical이 아닌 forward 표본을 실시간으로
+    # 쌓기 위한 필드입니다. rebound_volume_spike는 이미 signal_log.csv
+    # 에 있던 것과 동일한 minute_analysis 원시값(BUY를 절대 막지
+    # 않음)이고, would_skip_low_upside_no_spike가 Candidate A 판정
+    # 그 자체입니다. rebound_volume_spike가 결측(None)이면 False로
+    # 추정하지 않고 두 필드 모두 빈 문자열로 남깁니다 — Sprint v1.2
+    # 분석 도구의 "결측 feature는 skip 대상으로 추정하지 않는다"
+    # 원칙과 production shadow가 동일해야 나중에 offline historical
+    # 결과와 forward shadow 결과를 1:1로 비교할 수 있기 때문입니다
+    # (domain/service/trading_service.py의 기록 지점 참고).
+    "rebound_volume_spike",             # minute_analysis 원시값(True/False/빈값=결측)
+    "would_skip_low_upside_no_spike",   # Candidate A 판정: upside<0.50% AND
+                                          # rebound_volume_spike==False. spike가
+                                          # 결측이면 빈 문자열(False로 추정 금지).
 ]
 
 
@@ -699,6 +718,15 @@ LOW_UPSIDE_SHADOW_FIELDS = [
 # order_accepted/order_id)를 키에 포함해, 같은 분봉이라도 주문 상태가
 # 바뀌면(rejected→accepted, BLOCKED→accepted 등) 새 행으로 기록되고,
 # 완전히 동일한 상태의 반복 폴링(10초 간격)은 계속 1행으로 유지됩니다.
+#
+# 2026-08-27 (Candidate A forward shadow): 위 rebound_volume_spike/
+# would_skip_low_upside_no_spike 두 필드는 의도적으로 이 키에
+# 포함하지 않았습니다 — 둘 다 이미 키에 있는 (symbol,
+# latest_bar_timestamp)와 같은 minute_analysis 스냅샷에서 나온
+# 결정론적 값이라, 같은 base+signature 키를 공유하는 행이라면
+# 이 두 값도 항상 동일합니다. 순수 컬럼 추가이므로 dedup 계약
+# (rejected→accepted 상태변화 보존, 동일 accepted 반복 폴링은 1행
+# 유지)에는 영향이 없습니다.
 LOW_UPSIDE_SHADOW_SIGNATURE_FIELDS: list[str] = [
     "final_decision",
     "order_block_reason",

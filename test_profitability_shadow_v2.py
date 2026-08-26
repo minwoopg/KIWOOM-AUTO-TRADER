@@ -488,6 +488,203 @@ with tempfile.TemporaryDirectory() as tmpdir:
     check("2-P0-2) 관측 로그 실패와 무관하게 signal_log.csv에는 정상적으로 행이 기록됨(BUY 판단 자체는 영향 없음)",
           len(sig_rows) == 1 and sig_rows[-1]["signal"] == "BUY")
 
+# 2부-CA: Candidate A forward shadow (2026-08-27, Sprint v1.2
+# historical 결과 승인 후 민우님 지시)
+#
+# Sprint v1.2가 8/20~8/25 historical 데이터로 F2(upside<0.50%) 대비
+# 가장 강한 후보로 확인한 Candidate A(upside<0.50% AND
+# rebound_volume_spike==False)를 이 시점부터 조건 고정하고,
+# low_upside_shadow.csv에 두 필드(rebound_volume_spike,
+# would_skip_low_upside_no_spike)를 추가해 forward 표본을 쌓는다.
+# 새 logger는 만들지 않고 기존 LowUpsideShadowLogger row를 확장 —
+# 기존 would_skip_f1/f2/f3, order_attempted/accepted/id 등은 무변경.
+
+# ── 2-CA-1~4) 경계값 — upside<0.50% AND spike==False일 때만 True ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    ma = make_ma(upside_to_recent_high_pct=0.49, rebound_volume_spike=False)
+    signal = Signal(type=SignalType.BUY, reason="테스트 6/8")
+    service._write_signal_log(
+        symbol=symbol, price=10000, regime=MarketRegime.BULLISH,
+        signal=signal, minute_analysis=ma, final_decision="BUY",
+        order_block_reason="", latest_bar_timestamp="20260827090000",
+    )
+    r = read_rows(service.settings.storage.low_upside_shadow_log_file)[0]
+    check("2-CA-1) upside=0.49% + spike=False → would_skip_low_upside_no_spike=True(Candidate A 성립)",
+          r["would_skip_low_upside_no_spike"] == "True")
+    check("   rebound_volume_spike 원시값도 함께 기록됨(False)", r["rebound_volume_spike"] == "False")
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    ma = make_ma(upside_to_recent_high_pct=0.49, rebound_volume_spike=True)
+    signal = Signal(type=SignalType.BUY, reason="테스트 6/8")
+    service._write_signal_log(
+        symbol=symbol, price=10000, regime=MarketRegime.BULLISH,
+        signal=signal, minute_analysis=ma, final_decision="BUY",
+        order_block_reason="", latest_bar_timestamp="20260827090100",
+    )
+    r = read_rows(service.settings.storage.low_upside_shadow_log_file)[0]
+    check("2-CA-2) upside=0.49% + spike=True → would_skip_low_upside_no_spike=False(spike가 있으면 Candidate A는 스킵 안 함)",
+          r["would_skip_low_upside_no_spike"] == "False")
+    check("   rebound_volume_spike 원시값=True", r["rebound_volume_spike"] == "True")
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    ma = make_ma(upside_to_recent_high_pct=0.50, rebound_volume_spike=False)  # 경계값(0.50은 <0.50 아님)
+    signal = Signal(type=SignalType.BUY, reason="테스트 6/8")
+    service._write_signal_log(
+        symbol=symbol, price=10000, regime=MarketRegime.BULLISH,
+        signal=signal, minute_analysis=ma, final_decision="BUY",
+        order_block_reason="", latest_bar_timestamp="20260827090200",
+    )
+    r = read_rows(service.settings.storage.low_upside_shadow_log_file)[0]
+    check("2-CA-3) upside=0.50%(경계값, F2와 동일하게 미만이 아니므로 미해당) + spike=False → would_skip=False",
+          r["would_skip_low_upside_no_spike"] == "False"
+          and r["would_skip_low_upside_f2"] == "False")  # F2 자체도 경계값에서 False임을 함께 확인(일관성)
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    ma = make_ma(upside_to_recent_high_pct=0.51, rebound_volume_spike=False)
+    signal = Signal(type=SignalType.BUY, reason="테스트 6/8")
+    service._write_signal_log(
+        symbol=symbol, price=10000, regime=MarketRegime.BULLISH,
+        signal=signal, minute_analysis=ma, final_decision="BUY",
+        order_block_reason="", latest_bar_timestamp="20260827090300",
+    )
+    r = read_rows(service.settings.storage.low_upside_shadow_log_file)[0]
+    check("2-CA-4) upside=0.51%(F2 밖) + spike=False → would_skip_low_upside_no_spike=False",
+          r["would_skip_low_upside_no_spike"] == "False")
+
+# ── 2-CA-5) rebound_volume_spike가 결측(None)이면 False로 추정하지
+# 않고 두 필드 모두 빈 값(unknown)으로 남김 — Sprint v1.2 분석 도구의
+# "결측을 skip 대상으로 추정하지 않는다" 원칙과 동일해야 offline
+# historical 결과와 forward shadow 결과를 1:1로 비교할 수 있음 ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    ma = make_ma(upside_to_recent_high_pct=0.10, rebound_volume_spike=None)  # 극단적 결측 상황 모사
+    signal = Signal(type=SignalType.BUY, reason="테스트 6/8")
+    service._write_signal_log(
+        symbol=symbol, price=10000, regime=MarketRegime.BULLISH,
+        signal=signal, minute_analysis=ma, final_decision="BUY",
+        order_block_reason="", latest_bar_timestamp="20260827090400",
+    )
+    r = read_rows(service.settings.storage.low_upside_shadow_log_file)[0]
+    check("2-CA-5) rebound_volume_spike=None(결측) → rebound_volume_spike 필드는 빈 값(공백), 'False' 아님",
+          r["rebound_volume_spike"] == "")
+    check("   would_skip_low_upside_no_spike도 빈 값(unknown) — upside=0.10%로 F2는 성립하지만 Candidate A는 True로 추정하지 않음",
+          r["would_skip_low_upside_no_spike"] == "" and r["would_skip_low_upside_no_spike"] != "True")
+    check("   (대조) 같은 행의 F2 자체는 spike와 무관하므로 정상적으로 True", r["would_skip_low_upside_f2"] == "True")
+
+# ── 2-CA-6) 실제 accepted BUY 행에 order_accepted/order_id와
+# rebound_volume_spike/would_skip_low_upside_no_spike가 함께 존재
+# (E2E, 민우님 지시: "실제로 샀던 거래 중 Candidate A가 무엇을
+# 막았을 것이며, 그 거래가 나중에 돈을 벌었는가"를 answer하려면
+# order 연결과 Candidate A 플래그가 반드시 같은 행에 있어야 함) ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    service._last_order_attempt_by_symbol[symbol] = OrderResult(
+        order_id="ORD_CANDA_1", symbol=symbol, side=OrderSide.BUY,
+        requested_quantity=10, accepted=True, message="OK",
+        timestamp=datetime.now(),
+    )
+    ma = make_ma(upside_to_recent_high_pct=0.30, rebound_volume_spike=False)
+    signal = Signal(type=SignalType.BUY, reason="테스트 6/8")
+    service._write_signal_log(
+        symbol=symbol, price=10000, regime=MarketRegime.BULLISH,
+        signal=signal, minute_analysis=ma, final_decision="BUY",
+        order_block_reason="", latest_bar_timestamp="20260827090500",
+    )
+    r = read_rows(service.settings.storage.low_upside_shadow_log_file)[0]
+    check("2-CA-6) 실제 accepted BUY 행에 order_accepted=True + order_id + "
+          "rebound_volume_spike + would_skip_low_upside_no_spike가 모두 같은 행에 존재",
+          r["order_accepted"] == "True" and r["order_id"] == "ORD_CANDA_1"
+          and r["rebound_volume_spike"] == "False"
+          and r["would_skip_low_upside_no_spike"] == "True")
+
+# ── 2-CA-7) dedup 계약 보존 — same-bar rejected→accepted가 신규
+# 필드 추가 후에도 여전히 두 행 모두 보존됨(2-10과 동일 시나리오,
+# Candidate A 필드가 dedup key에 없다는 것까지 함께 확인) ──
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    ma = make_ma(upside_to_recent_high_pct=0.30, rebound_volume_spike=False)
+    signal = Signal(type=SignalType.BUY, reason="테스트 6/8")
+
+    service._last_order_attempt_by_symbol[symbol] = OrderResult(
+        order_id="", symbol=symbol, side=OrderSide.BUY,
+        requested_quantity=10, accepted=False, message="REJECTED",
+        timestamp=datetime.now(),
+    )
+    service._write_signal_log(
+        symbol=symbol, price=10000, regime=MarketRegime.BULLISH,
+        signal=signal, minute_analysis=ma, final_decision="BUY",
+        order_block_reason="", latest_bar_timestamp="20260827093000",
+    )
+    service._last_order_attempt_by_symbol[symbol] = OrderResult(
+        order_id="REAL_ORD_CANDA", symbol=symbol, side=OrderSide.BUY,
+        requested_quantity=10, accepted=True, message="OK",
+        timestamp=datetime.now(),
+    )
+    service._write_signal_log(
+        symbol=symbol, price=10000, regime=MarketRegime.BULLISH,
+        signal=signal, minute_analysis=ma, final_decision="BUY",
+        order_block_reason="", latest_bar_timestamp="20260827093000",  # 같은 분봉
+    )
+    rows_ca7 = read_rows(service.settings.storage.low_upside_shadow_log_file)
+    check("2-CA-7) Candidate A 필드 추가 후에도 same-bar rejected→accepted 두 행이 그대로 보존됨(dedup key 무변경 확인)",
+          len(rows_ca7) == 2
+          and rows_ca7[0]["order_accepted"] == "False"
+          and rows_ca7[-1]["order_accepted"] == "True" and rows_ca7[-1]["order_id"] == "REAL_ORD_CANDA")
+    check("   두 행 모두 rebound_volume_spike/would_skip_low_upside_no_spike 값이 정상적으로 채워짐(신규 필드가 dedup을 깨지 않음)",
+          all(row["rebound_volume_spike"] == "False" and row["would_skip_low_upside_no_spike"] == "True"
+              for row in rows_ca7))
+
+# ── 2-CA-8) fail-open — Candidate A 블록(신규 코드) 자체에서
+# rebound_volume_spike 접근이 예외를 던져도 BUY 판단/signal_log에는
+# 영향이 없어야 함. `rebound_volume_spike`는 _write_signal_log() 안에서
+# 두 번 읽힘 — ① 기존 patterns 블록(이 closure 이전부터 있던 코드,
+# 이번 변경 대상 아님), ② 신규 Candidate A 블록(이번에 추가한 코드,
+# 기존 fail-open try 안에 위치). 이 테스트는 ①은 정상 통과시키고
+# ②에서만 예외가 나도록 해, 신규 코드의 fail-open만 정확히 겨냥한다 ──
+class _SpikeExplodesOnSecondAccess:
+    """rebound_volume_spike 접근을 가로채 두 번째부터 예외를 던지는
+    MinuteAnalysis 프록시. 나머지 속성은 실제 MinuteAnalysis로 위임."""
+
+    def __init__(self, ma):
+        object.__setattr__(self, "_ma", ma)
+        object.__setattr__(self, "_spike_access_count", 0)
+
+    def __getattr__(self, name):
+        if name == "rebound_volume_spike":
+            count = object.__getattribute__(self, "_spike_access_count")
+            object.__setattr__(self, "_spike_access_count", count + 1)
+            if count >= 1:
+                raise RuntimeError("강제 예외 — Candidate A 블록의 2번째 rebound_volume_spike 접근 실패 모사")
+        return getattr(object.__getattribute__(self, "_ma"), name)
+
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    service = build_service(tmpdir)
+    ma_real = make_ma(upside_to_recent_high_pct=0.30, rebound_volume_spike=False)
+    ma_boom = _SpikeExplodesOnSecondAccess(ma_real)
+    signal = Signal(type=SignalType.BUY, reason="테스트 6/8")
+    raised = False
+    try:
+        service._write_signal_log(
+            symbol=symbol, price=10000, regime=MarketRegime.BULLISH,
+            signal=signal, minute_analysis=ma_boom, final_decision="BUY",
+            order_block_reason="", latest_bar_timestamp="20260827090600",
+        )
+    except Exception:
+        raised = True
+    check("2-CA-8) Candidate A 블록에서 rebound_volume_spike 접근이 예외를 던져도 예외가 밖으로 전파되지 않음",
+          raised is False)
+    sig_rows_ca8 = read_rows(service.settings.storage.signal_log_file)
+    check("   signal_log.csv에는 정상적으로 BUY 판단이 기록됨(Candidate A 관측 실패와 무관)",
+          len(sig_rows_ca8) == 1 and sig_rows_ca8[-1]["signal"] == "BUY")
+    rows_ca8 = read_rows(service.settings.storage.low_upside_shadow_log_file)
+    check("   low_upside_shadow.csv에는 이 관측 실패로 행이 남지 않음(관측만 포기, 0행)",
+          len(rows_ca8) == 0)
+
 # ══════════════════════════════════════════════════════════════
 # 3부: _check_entry_watch() — MIN_PROFIT_EXTENSION_SHADOW
 # ══════════════════════════════════════════════════════════════

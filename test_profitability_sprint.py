@@ -53,6 +53,9 @@ from tools.profitability_sprint import (  # noqa: E402
     candidate_leave_one_out, leave_one_out_report, build_scorecard,
     classify_entry_watch_trigger,
     TRIGGER_MIN_PROFIT_5M, TRIGGER_EARLY_VWAP_EXIT, TRIGGER_CRASH_CUT, TRIGGER_NOT_ENTRY_WATCH,
+    CANDIDATE_A_FORWARD_START_DATE,
+    candidate_cost_aware_metrics, split_historical_forward,
+    build_cost_aware_report, flatten_cost_aware_reports,
     run,
 )
 from domain.cost_model import load_cost_model as _load_cost_model_directly  # noqa: E402
@@ -597,6 +600,207 @@ try:
           and "leave_one_out_candidate_b" in result18)
     check("18) low_upside_two_condition_study.csv가 실제로 생성됨",
           (out_dir18 / "low_upside_two_condition_study.csv").is_file())
+
+    # ══════════════════════════════════════════════════════════════
+    # 19. Candidate A forward shadow (2026-08-27, 민우님 지시 #6):
+    # base_outcome/stress_outcome, candidate_cost_aware_metrics(),
+    # split_historical_forward(), run()이 historical/forward/combined
+    # 세 regime을 분리해서 계산·CSV로 내보내는지 검증
+    # ══════════════════════════════════════════════════════════════
+
+    # ── 19-A) base_outcome/stress_outcome — gross WIN이 비용 반영 후
+    # base/stress에서 LOSS로 바뀌는 케이스(민우님 지적 그대로 재현) ─────
+    # 참고: base_outcome/stress_outcome은 기존 outcome/gross_pnl_pct와
+    # 동일한 기존 관례대로 반올림 전 raw float 값으로 판정합니다(이
+    # 관례 자체는 이번 변경으로 새로 만든 게 아니라 기존 코드를 그대로
+    # 따른 것). 그래서 여기서는 정확히 0(BREAKEVEN)이 되는 가격 조합
+    # 대신, 부동소수점 나눗셈 오차와 무관하게 항상 명확한 부호가 나오는
+    # 여유 있는 값을 씁니다 — tri-state 경계(0.0) 자체는 classify_outcome()
+    # 직접 호출로 별도 고정합니다.
+    date19a = "20260914"
+    rows19a = [
+        # gross +0.50%(WIN) > Base 비용(0.35%) → base=+0.15%(WIN 유지)
+        # 하지만 Stress 비용(0.90%)보다는 작음 → stress=-0.40%(LOSS).
+        # "gross WIN·base WIN인데 stress에서만 LOSS로 전환"되는 케이스.
+        _buy("2026-09-14T09:00:00", "COST01", 10000, 10, "B100", upside="2.0"),
+        _sell("2026-09-14T09:10:00", "COST01", 10050, 10, "S100", "트레일링 스탑", "10.0", 10000),
+        # gross +0.20% < Base 비용(0.35%) → base_net_pnl_pct=-0.15% →
+        # base_outcome=LOSS. gross는 WIN인데 base는 LOSS인 핵심 케이스.
+        _buy("2026-09-14T09:20:00", "COST02", 10000, 10, "B101", upside="2.0"),
+        _sell("2026-09-14T09:30:00", "COST02", 10020, 10, "S101", "트레일링 스탑", "10.0", 10000),
+    ]
+    bundle19a = make_bundle(tmp_root, date19a, rows19a)
+    features19a, _ = build_trade_features([load_bundle_day(bundle19a)])
+    cost01 = next(r for r in features19a if r["symbol"] == "COST01")
+    cost02 = next(r for r in features19a if r["symbol"] == "COST02")
+    check("19-A) COST01: gross_pnl_pct=+0.50%(WIN)", cost01["outcome"] == WIN)
+    check("19-A) COST01: base_outcome도 WIN 유지(0.50%-0.35%=+0.15%>0, Base 비용은 버텨냄)",
+          cost01["base_outcome"] == WIN and cost01["base_net_pnl_pct"] > 0)
+    check("19-A) COST01: stress_outcome은 LOSS로 전환(0.50%-0.90%=-0.40%<0) — "
+          "gross/base가 WIN이어도 Stress에서는 손실로 바뀔 수 있음을 보여줌",
+          cost01["stress_outcome"] == LOSS and cost01["stress_net_pnl_pct"] < 0)
+    check("19-A) classify_outcome() 경계 자체는 정확히 고정됨: 0.0→BREAKEVEN",
+          classify_outcome(0.0) == BREAKEVEN)
+    check("19-A) classify_outcome() 경계: 미세 양수→WIN, 미세 음수→LOSS",
+          classify_outcome(1e-9) == WIN and classify_outcome(-1e-9) == LOSS)
+    check("19-A) COST02: gross_pnl_pct=+0.20%(WIN)인데 base_outcome은 LOSS(비용 반영 후 손실로 전환)",
+          cost02["outcome"] == WIN and cost02["base_outcome"] == LOSS)
+    check("19-A) COST02: stress_outcome도 LOSS(Stress 비용이 Base보다 커서 gross WIN → 손실 폭 더 큼)",
+          cost02["stress_outcome"] == LOSS
+          and cost02["stress_net_pnl_pct"] < cost02["base_net_pnl_pct"])
+
+    # ── 19-B) candidate_cost_aware_metrics() — skip_precision_base /
+    # loss_recall_base / winner_damage_base / per_day base delta 계산
+    # 자체를 손으로 설계한 synthetic row로 정확히 검증 ─────────────────
+    rows_cam = [
+        {"trade_date": "20260826", "symbol": "M1", "upside_to_recent_high_pct": 0.20,
+         "rebound_volume_spike": False, "base_outcome": LOSS,
+         "base_net_pnl_pct": -0.5, "base_net_pnl_krw": -500},
+        {"trade_date": "20260826", "symbol": "M2", "upside_to_recent_high_pct": 0.20,
+         "rebound_volume_spike": True, "base_outcome": LOSS,
+         "base_net_pnl_pct": -0.3, "base_net_pnl_krw": -300},
+        {"trade_date": "20260826", "symbol": "M3", "upside_to_recent_high_pct": 3.0,
+         "rebound_volume_spike": False, "base_outcome": WIN,
+         "base_net_pnl_pct": 1.0, "base_net_pnl_krw": 1000},
+        {"trade_date": "20260827", "symbol": "M4", "upside_to_recent_high_pct": 0.20,
+         "rebound_volume_spike": False, "base_outcome": WIN,
+         "base_net_pnl_pct": 0.1, "base_net_pnl_krw": 100},
+    ]
+    cand_a_skip = lambda r: r["upside_to_recent_high_pct"] < 0.50 and r.get("rebound_volume_spike") is False
+    cam = candidate_cost_aware_metrics(rows_cam, cand_a_skip, "TestCandidateA")
+    check("19-B) n_trades_in_scope==4(upside 결측 없음, 4건 전부 집계)", cam["n_trades_in_scope"] == 4)
+    check("19-B) removed_trades==2(M1, M4 — spike==False AND upside<0.50%)", cam["removed_trades"] == 2)
+    check("19-B) skip_precision_base==50%(제거 2건 중 base LOSS는 M1 하나)", cam["skip_precision_base"] == "50%")
+    check("19-B) loss_recall_base==50%(base 손실 2건[M1,M2] 중 제거된 건 M1 하나)",
+          cam["loss_recall_base"] == "50%")
+    check("19-B) winner_damage_base==50%(base 승자 2건[M3,M4] 중 잘못 제거된 건 M4 하나)",
+          cam["winner_damage_base"] == "50%")
+    check("19-B) per_day_base_delta_pct[20260826]==0.5(M1 제거로 그 날 base net이 0.2%→0.7%)",
+          abs(cam["per_day_base_delta_pct"]["20260826"] - 0.5) < 1e-9)
+    check("19-B) per_day_base_delta_krw[20260826]==500", abs(cam["per_day_base_delta_krw"]["20260826"] - 500) < 1e-6)
+    check("19-B) per_day_base_delta_pct[20260827]==-0.1(M4가 제거되며 그 날 유일한 거래가 사라짐)",
+          abs(cam["per_day_base_delta_pct"]["20260827"] - (-0.1)) < 1e-9)
+    check("19-B) per_day_base_delta_krw[20260827]==-100", abs(cam["per_day_base_delta_krw"]["20260827"] - (-100)) < 1e-6)
+
+    # 제거 대상 0건 / base 손실 0건 / base 승자 0건 각각의 '해당없음' 처리
+    cam_empty = candidate_cost_aware_metrics(rows_cam, lambda r: False, "NeverSkip")
+    check("19-B) 제거 대상 0건이면 skip_precision_base가 '해당없음(제거 대상 0건)'",
+          cam_empty["skip_precision_base"] == "해당없음(제거 대상 0건)")
+    all_wins_rows = [r for r in rows_cam if r["base_outcome"] == WIN]
+    cam_no_loss = candidate_cost_aware_metrics(all_wins_rows, lambda r: True, "AllWinsRemoved")
+    check("19-B) base 손실 0건이면 loss_recall_base가 '해당없음(base 손실 0건)'",
+          cam_no_loss["loss_recall_base"] == "해당없음(base 손실 0건)")
+    all_loss_rows = [r for r in rows_cam if r["base_outcome"] == LOSS]
+    cam_no_win = candidate_cost_aware_metrics(all_loss_rows, lambda r: True, "AllLossesRemoved")
+    check("19-B) base 승자 0건이면 winner_damage_base가 '해당없음(base 승자 0건)'",
+          cam_no_win["winner_damage_base"] == "해당없음(base 승자 0건)")
+
+    # ── 19-C) split_historical_forward() — 경계값 및 forward 빈 표본 ──
+    # 2026-08-26 date-boundary reclosure(민우님 지적): 실제 적용 시점이
+    # 8/26 장 시작 전으로 확정되어 CANDIDATE_A_FORWARD_START_DATE가
+    # "20260826"으로 수정됨 — 경계 테스트도 그에 맞춰 하루 당김
+    # (8/25=historical, 8/26=forward 경계값 그 자체, 8/28=forward).
+    rows_split = [
+        {"trade_date": "20260825"}, {"trade_date": "20260826"}, {"trade_date": "20260828"},
+    ]
+    hist_c, fwd_c = split_historical_forward(rows_split, CANDIDATE_A_FORWARD_START_DATE)
+    check("19-C) CANDIDATE_A_FORWARD_START_DATE == '20260826'(민우님 확정값, "
+          "실제 적용일이 8/26 장 시작 전으로 확정되어 8/27→8/26으로 재closure됨)",
+          CANDIDATE_A_FORWARD_START_DATE == "20260826")
+    check("19-C) trade_date < forward_start_date는 historical(20260825만 해당)",
+          [r["trade_date"] for r in hist_c] == ["20260825"])
+    check("19-C) trade_date == forward_start_date(경계값 20260826)는 forward에 포함(historical 아님)",
+          "20260826" in [r["trade_date"] for r in fwd_c]
+          and "20260826" not in [r["trade_date"] for r in hist_c])
+    check("19-C) trade_date > forward_start_date(20260828)도 forward에 포함",
+          "20260828" in [r["trade_date"] for r in fwd_c])
+    all_historical = [{"trade_date": "20260820"}, {"trade_date": "20260825"}]
+    hist_only, fwd_empty = split_historical_forward(all_historical, CANDIDATE_A_FORWARD_START_DATE)
+    check("19-C) forward 표본이 아직 없으면 조용히 빈 리스트를 반환(historical로 끌어와 채우지 않음)",
+          len(hist_only) == 2 and fwd_empty == [])
+
+    # ── 19-D) run() E2E — historical/forward 두 날짜의 bundle을 함께
+    # 넘겼을 때 표본이 절대 하나로 섞이지 않고 별도 regime으로 집계되며,
+    # 새 CSV 두 개가 실제로 생성되는지 확인 ────────────────────────────
+    # date_fwd를 CANDIDATE_A_FORWARD_START_DATE와 정확히 같은 값(실제
+    # 최초 forward 거래일인 8/26 그 자체)으로 둬서, "오늘(8/26) 데이터가
+    # 최초 forward 표본"이라는 민우님 지적을 그대로 회귀고정합니다.
+    date_hist = "20260825"  # < CANDIDATE_A_FORWARD_START_DATE → historical
+    rows_hist = [
+        # F2 + spike==False → CandidateA 제거 대상, base LOSS
+        _buy("2026-08-25T09:00:00", "CA_H1", 10000, 10, "BH1", upside="0.20",
+             rebound_volume_spike="False"),
+        _sell("2026-08-25T09:10:00", "CA_H1", 9900, 10, "SH1", "트레일링 스탑", "10.0", 10000),
+        # F2지만 spike==True → CandidateA는 안 건드림
+        _buy("2026-08-25T09:20:00", "CA_H2", 10000, 10, "BH2", upside="0.20",
+             rebound_volume_spike="True"),
+        _sell("2026-08-25T09:30:00", "CA_H2", 9900, 10, "SH2", "트레일링 스탑", "10.0", 10000),
+        # F2 밖(upside 높음) → 어느 후보에도 제거 대상 아님
+        _buy("2026-08-25T09:40:00", "CA_H3", 10000, 10, "BH3", upside="3.00",
+             rebound_volume_spike="False"),
+        _sell("2026-08-25T09:50:00", "CA_H3", 10200, 10, "SH3", "트레일링 스탑", "10.0", 10000),
+    ]
+    date_fwd = "20260826"  # == CANDIDATE_A_FORWARD_START_DATE(경계 그 자체) → forward
+    rows_fwd = [
+        # F2 + spike==False → CandidateA 제거 대상, base LOSS
+        _buy("2026-08-26T09:00:00", "CA_F1", 10000, 10, "BF1", upside="0.20",
+             rebound_volume_spike="False"),
+        _sell("2026-08-26T09:10:00", "CA_F1", 9800, 10, "SF1", "트레일링 스탑", "10.0", 10000),
+        # F2 밖 → 제거 대상 아님
+        _buy("2026-08-26T09:20:00", "CA_F2", 10000, 10, "BF2", upside="3.00",
+             rebound_volume_spike="False"),
+        _sell("2026-08-26T09:30:00", "CA_F2", 10100, 10, "SF2", "트레일링 스탑", "10.0", 10000),
+    ]
+    bundle_hist19 = make_bundle(tmp_root, date_hist, rows_hist)
+    bundle_fwd19 = make_bundle(tmp_root, date_fwd, rows_fwd)
+    out_dir19 = tmp_root / "out_v1_2_candA_forward"
+    result19 = run([str(bundle_hist19), str(bundle_fwd19)], str(out_dir19))
+    check("19-D) run() 결과의 historical_rows가 20260825 3건만 포함(20260826 섞이지 않음)",
+          len(result19["historical_rows"]) == 3
+          and all(r["trade_date"] == "20260825" for r in result19["historical_rows"]))
+    check("19-D) run() 결과의 forward_rows가 20260826(경계값 그 자체) 2건만 포함(20260825 섞이지 않음)",
+          len(result19["forward_rows"]) == 2
+          and all(r["trade_date"] == "20260826" for r in result19["forward_rows"]))
+    hist_candA19 = next(c for c in result19["cost_aware_historical"] if c["candidate"].startswith("CandidateA"))
+    fwd_candA19 = next(c for c in result19["cost_aware_forward"] if c["candidate"].startswith("CandidateA"))
+    combined_candA19 = next(c for c in result19["cost_aware_combined"] if c["candidate"].startswith("CandidateA"))
+    check("19-D) HISTORICAL CandidateA: n_trades_in_scope==3, removed_trades==1(CA_H1만)",
+          hist_candA19["n_trades_in_scope"] == 3 and hist_candA19["removed_trades"] == 1)
+    check("19-D) FORWARD CandidateA: n_trades_in_scope==2, removed_trades==1(CA_F1만)",
+          fwd_candA19["n_trades_in_scope"] == 2 and fwd_candA19["removed_trades"] == 1)
+    check("19-D) COMBINED(참고용) CandidateA: n_trades_in_scope==5(3+2, historical+forward 합)",
+          combined_candA19["n_trades_in_scope"] == 5 and combined_candA19["removed_trades"] == 2)
+    check("19-D) 각 regime 라벨에 [HISTORICAL]/[FORWARD]/[COMBINED(참고용)]이 명시적으로 표기됨",
+          "[HISTORICAL]" in hist_candA19["candidate"]
+          and "[FORWARD]" in fwd_candA19["candidate"]
+          and "[COMBINED(참고용)]" in combined_candA19["candidate"])
+    check("19-D) result에 cost_aware_summary_rows/cost_aware_per_day_rows 키가 포함됨",
+          "cost_aware_summary_rows" in result19 and "cost_aware_per_day_rows" in result19
+          and len(result19["cost_aware_summary_rows"]) > 0)
+    check("19-D) candidate_cost_aware_summary.csv가 실제로 생성됨",
+          (out_dir19 / "candidate_cost_aware_summary.csv").is_file())
+    check("19-D) candidate_cost_aware_per_day.csv가 실제로 생성됨",
+          (out_dir19 / "candidate_cost_aware_per_day.csv").is_file())
+    with (out_dir19 / "candidate_cost_aware_summary.csv").open(encoding="utf-8") as f:
+        summary_csv_rows = list(csv.DictReader(f))
+    check("19-D) candidate_cost_aware_summary.csv 헤더에 skip_precision_base/loss_recall_base/"
+          "winner_damage_base가 포함됨",
+          {"skip_precision_base", "loss_recall_base", "winner_damage_base"}
+          <= set(summary_csv_rows[0].keys()) if summary_csv_rows else False)
+
+    # ── build_cost_aware_report() / flatten_cost_aware_reports() 자체
+    # 단위 검증 — 정확히 F2/CandidateA/CandidateB 3개만 반환하는지 ──────
+    report19 = build_cost_aware_report(rows_cam, "UNITTEST")
+    check("19-E) build_cost_aware_report는 정확히 3개(F2_baseline/CandidateA/CandidateB)만 반환",
+          len(report19) == 3
+          and report19[0]["candidate"].startswith("F2_baseline")
+          and report19[1]["candidate"].startswith("CandidateA")
+          and report19[2]["candidate"].startswith("CandidateB"))
+    summary19, per_day19 = flatten_cost_aware_reports(report19)
+    check("19-E) flatten_cost_aware_reports: summary는 candidate당 1행, per_day 중첩 dict는 제외됨",
+          len(summary19) == 3 and all("per_day_base_delta_pct" not in row for row in summary19))
+    check("19-E) flatten_cost_aware_reports: per_day는 candidate x trade_date 조합만큼 행이 생김",
+          len(per_day19) == sum(len(r["per_day_base_delta_pct"]) for r in report19))
 
 finally:
     shutil.rmtree(tmp_root, ignore_errors=True)

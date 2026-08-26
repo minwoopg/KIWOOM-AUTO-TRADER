@@ -4431,6 +4431,33 @@ class TradingService:
         ):
             try:
                 upside_val = minute_analysis.upside_to_recent_high_pct
+
+                # 2026-08-27 (Candidate A forward shadow, 민우님 지시):
+                # Sprint v1.2 historical 분석에서 F2 대비 가장 강한
+                # 후보로 확인된 Candidate A(upside<0.50% AND
+                # rebound_volume_spike==False)를 이 시점부터 조건
+                # 고정하고 forward 표본을 쌓습니다. rebound_volume_spike
+                # 는 minute_analysis 원시값(row.get()이 아니라 직접
+                # 읽음 — 위 patterns 블록이 minute_analysis is not None
+                # 일 때 이미 row에도 같은 값을 넣지만, 이 블록만 따로
+                # 봐도 값의 출처가 분명하도록 함)이고, dataclass 필드
+                # 자체는 non-Optional bool이라 minute_analysis가
+                # None이 아니면 이론상 항상 True/False지만, getattr +
+                # "is True/is False" 명시 비교로 방어적으로 다룹니다
+                # — 만에 하나 True/False가 아닌 값(None 등)이 들어오면
+                # False로 추정하지 않고 두 필드 모두 빈 문자열로 남깁니다
+                # (Sprint v1.2 분석 도구의 safe_bool/"결측을 skip 대상
+                # 으로 추정하지 않는다" 원칙과 동일 — 나중에 offline
+                # historical 결과와 forward shadow 결과를 1:1로 비교
+                #하려면 두 계산이 결측을 같은 방식으로 다뤄야 함).
+                rebound_volume_spike_val = getattr(minute_analysis, "rebound_volume_spike", None)
+                if rebound_volume_spike_val is True or rebound_volume_spike_val is False:
+                    rebound_volume_spike_out = rebound_volume_spike_val
+                    would_skip_no_spike_val = bool(upside_val < 0.50 and rebound_volume_spike_val is False)
+                else:
+                    rebound_volume_spike_out = ""
+                    would_skip_no_spike_val = ""
+
                 self.low_upside_shadow_logger.append_if_new({
                     "timestamp": now_kst().replace(tzinfo=None).isoformat(),
                     "symbol": symbol,
@@ -4451,6 +4478,8 @@ class TradingService:
                     "order_attempted": order_attempt is not None,
                     "order_accepted": order_attempt.accepted if order_attempt is not None else "",
                     "order_id": order_attempt.order_id if order_attempt is not None else "",
+                    "rebound_volume_spike": rebound_volume_spike_out,
+                    "would_skip_low_upside_no_spike": would_skip_no_spike_val,
                 })
             except Exception as exc:
                 app_logger = getattr(self, "app_logger", None)

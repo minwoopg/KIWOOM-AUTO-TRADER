@@ -73,6 +73,22 @@ COST_MODEL = load_cost_model()
 BASE_SCENARIO = "base"
 STRESS_SCENARIO = "stress"
 
+# 2026-08-26 (Candidate A forward shadow 착수, 민우님 지시): Candidate A
+# (upside<0.50% AND rebound_volume_spike==False)를 8/20~8/25 historical
+# 데이터로 탐색을 마치고 이 날짜부터 production shadow(observation-only,
+# BUY 차단 없음)로 조건을 고정했습니다. "8/20~8/25는 이 후보를 만드는 데
+# 쓰인 historical/backtest-like evidence, 이날 이후 쌓이는 표본은 forward
+# evidence — 절대 한 덩어리로 섞어서 표본 수를 부풀리면 안 된다"는 민우님
+# 지시에 따라, trade_date가 이 날짜 이전이면 HISTORICAL, 이날 이후(포함)면
+# FORWARD로 분류합니다. YYYYMMDD 문자열 비교로 충분합니다(trade_date가
+# 항상 이 포맷).
+# 2026-08-26 date-boundary reclosure(민우님 지적): 최초 구현 시점에는
+# "내일(8/27)부터 적용"을 가정해 8/27로 썼으나, 실제 적용 시점이 8/26
+# 장 시작 전으로 확정되면서 8/26 실측이 최초 forward 표본이 됩니다.
+# 8/27로 두면 8/26 하루치 forward 데이터가 historical로 잘못 섞이므로
+# 8/26으로 수정합니다(계산식/로직 변경 없음, 상수값만 하루 당김).
+CANDIDATE_A_FORWARD_START_DATE = "20260826"
+
 # ── 승/무/패 정의 — utils/trade_outcome.py와 동일 정의를 이 파일 안에
 #    독립적으로 재정의합니다(analysis-only 도구를 production 모듈에
 #    결합시키지 않기 위해 — 정의 자체는 완전히 동일: wins/(wins+losses),
@@ -278,6 +294,16 @@ FEATURE_COLUMNS = [
     "entry_notional_krw", "modeled_base_cost_krw", "modeled_stress_cost_krw",
     "base_net_pnl_krw", "stress_net_pnl_krw",
     "outcome",
+    # 2026-08-27 (Candidate A forward shadow 착수, 민우님 지시): "outcome"
+    # (위)은 기존 F0~F3 계산 전체가 의존하는 gross 기준 정의라 의미를
+    # 바꾸지 않고 그대로 둡니다. base_outcome/stress_outcome은 비용
+    # 반영 후 WIN/LOSS/BREAKEVEN이 gross와 달라질 수 있음을 보려는
+    # 순수 추가 컬럼입니다 — "+0.3%짜리 거래는 gross로는 승자여도
+    # 왕복비용을 내면 실제로는 좋은 거래가 아닐 수 있다"(민우님
+    # 지적)를 그대로 노출. candidate_cost_aware_metrics()가 이
+    # base_outcome을 기준으로 skip_precision_base/loss_recall_base/
+    # winner_damage_base를 계산합니다.
+    "base_outcome", "stress_outcome",
     "entry_score", "pattern", "condition_name", "upside_to_recent_high_pct",
     "current_vs_vwap_pct", "rsi", "macd", "macd_signal", "macd_above_signal",
     "macd_hist_direction", "ma5_above_ma20", "volume_ratio", "rebound_volume_spike",
@@ -479,6 +505,8 @@ def build_trade_features(days: list[BundleDay]) -> tuple[list[dict], list[str]]:
                     "base_net_pnl_krw": round(base_net_pnl_krw, 2),
                     "stress_net_pnl_krw": round(stress_net_pnl_krw, 2),
                     "outcome": outcome,
+                    "base_outcome": classify_outcome(base_net_pnl_pct),
+                    "stress_outcome": classify_outcome(stress_net_pnl_pct),
                     "entry_score": safe_int(buy.get("entry_score")),
                     "upside_to_recent_high_pct": safe_float(buy.get("upside_to_recent_high_pct")),
                     "current_vs_vwap_pct": safe_float(buy.get("current_vs_vwap_pct")),
@@ -721,27 +749,170 @@ def two_condition_low_upside_candidates(rows: list[dict]) -> list[dict]:
     """
     have_upside = [r for r in rows if r["upside_to_recent_high_pct"] is not None]
 
-    def f2(r):
-        return r["upside_to_recent_high_pct"] < 0.50
-
-    def cand_a(r):
-        return f2(r) and r.get("rebound_volume_spike") is False
-
-    def cand_b(r):
-        return f2(r) and r.get("is_pulldown_recovery") is False
-
-    missing_rvs = sum(1 for r in have_upside if f2(r) and r.get("rebound_volume_spike") is None)
-    missing_pr = sum(1 for r in have_upside if f2(r) and r.get("is_pulldown_recovery") is None)
+    missing_rvs = sum(1 for r in have_upside if _f2_pred(r) and r.get("rebound_volume_spike") is None)
+    missing_pr = sum(1 for r in have_upside if _f2_pred(r) and r.get("is_pulldown_recovery") is None)
 
     out = [
-        _simulate_skip_candidate(have_upside, "F2_baseline(upside<0.50%)", f2),
-        _simulate_skip_candidate(have_upside, "CandidateA(F2 AND rebound_volume_spike==False)", cand_a),
-        _simulate_skip_candidate(have_upside, "CandidateB(F2 AND PR==False)", cand_b),
+        _simulate_skip_candidate(have_upside, "F2_baseline(upside<0.50%)", _f2_pred),
+        _simulate_skip_candidate(have_upside, "CandidateA(F2 AND rebound_volume_spike==False)", _candidate_a_pred),
+        _simulate_skip_candidate(have_upside, "CandidateB(F2 AND PR==False)", _candidate_b_pred),
     ]
     out[1]["missing_boolean_feature_count"] = missing_rvs
     out[2]["missing_boolean_feature_count"] = missing_pr
     out[0]["missing_boolean_feature_count"] = 0
     return out
+
+
+# 2026-08-27 (Candidate A forward shadow): F2/CandidateA/CandidateB 판정
+# 조건을 module-level 함수로 뽑아 candidate_cost_aware_metrics()와
+# split_historical_forward() 이후의 run()에서도 재사용합니다 — 판정
+# 로직 자체는 two_condition_low_upside_candidates()가 원래 쓰던 것과
+# 완전히 동일합니다(순수 위치 이동, 행동 변화 없음).
+def _f2_pred(r) -> bool:
+    return r["upside_to_recent_high_pct"] < 0.50
+
+
+def _candidate_a_pred(r) -> bool:
+    return _f2_pred(r) and r.get("rebound_volume_spike") is False
+
+
+def _candidate_b_pred(r) -> bool:
+    return _f2_pred(r) and r.get("is_pulldown_recovery") is False
+
+
+# ── Sprint v1.2 후속(2026-08-27): 비용 반영(base) 기준 precision/recall
+# + 거래일별 delta breakdown, 그리고 historical/forward 표본 분리 ──────
+def candidate_cost_aware_metrics(rows: list[dict], skip_pred, label: str) -> dict:
+    """base_outcome(비용 반영) 기준 skip precision/recall/winner damage와
+    거래일별 delta를 계산합니다.
+
+    2026-08-27 (Candidate A forward shadow, 민우님 지시): 기존
+    _simulate_skip_candidate()의 loser_removal_rate/winner_preservation_rate
+    는 gross outcome 기준입니다 — "+0.3%짜리 거래는 gross로는 승자여도
+    왕복비용을 내면 실제 전략에는 좋은 거래가 아닐 수 있다"는 지적에
+    대응해 base_outcome(비용 반영 후 WIN/LOSS/BREAKEVEN) 기준으로
+    별도 계산합니다. 세 지표는 서로 다른 질문에 답합니다:
+
+      - skip_precision_base: 이 후보가 스킵한 거래 중 몇 %가 실제로
+        base 기준 손실이었나 — "막겠다고 찍은 거래가 실제로 나쁜
+        거래일 확률"(민우님 표현 그대로). Candidate A는 "모든 손실을
+        잡는 필터"가 아니라 이 정밀도가 핵심인 필터에 가깝습니다.
+      - loss_recall_base: 전체 base 손실 중 몇 %를 이 후보가 막았나
+        (기존 loser_removal_rate의 base-cost 버전 — gross 기준과
+        다를 수 있음, gross WIN이 비용 반영 후 base LOSS가 되는
+        경우가 있기 때문).
+      - winner_damage_base: base 기준 승자 중 몇 %를 잘못 막았나.
+
+    거래일별 delta(per_day_base_delta_pct/krw)는 "그 날 하루의 거래만
+    놓고 이 후보를 적용하면 base net이 얼마나 바뀌는가"를 봅니다 —
+    candidate_leave_one_out()의 "그 날을 빼면"과는 다른 질문(그쪽은
+    나머지 날짜 전체의 안정성, 이쪽은 그 날 하루의 기여도)입니다.
+    """
+    have_upside = [r for r in rows if r["upside_to_recent_high_pct"] is not None]
+    removed = [r for r in have_upside if skip_pred(r)]
+
+    removed_base_losses = [r for r in removed if r["base_outcome"] == LOSS]
+    removed_base_wins = [r for r in removed if r["base_outcome"] == WIN]
+    all_base_losses = [r for r in have_upside if r["base_outcome"] == LOSS]
+    all_base_wins = [r for r in have_upside if r["base_outcome"] == WIN]
+
+    skip_precision_base = (
+        "해당없음(제거 대상 0건)" if not removed else
+        f"{len(removed_base_losses)/len(removed)*100:.0f}%"
+    )
+    loss_recall_base = (
+        "해당없음(base 손실 0건)" if not all_base_losses else
+        f"{len(removed_base_losses)/len(all_base_losses)*100:.0f}%"
+    )
+    winner_damage_base = (
+        "해당없음(base 승자 0건)" if not all_base_wins else
+        f"{len(removed_base_wins)/len(all_base_wins)*100:.0f}%"
+    )
+
+    by_day: dict[str, list[dict]] = defaultdict(list)
+    for r in have_upside:
+        by_day[r["trade_date"]].append(r)
+    per_day_base_delta_pct: dict[str, float] = {}
+    per_day_base_delta_krw: dict[str, float] = {}
+    for d, grp in sorted(by_day.items()):
+        kept_d = [r for r in grp if not skip_pred(r)]
+        orig_d_pct = sum(r["base_net_pnl_pct"] for r in grp)
+        kept_d_pct = sum(r["base_net_pnl_pct"] for r in kept_d)
+        orig_d_krw = sum(r["base_net_pnl_krw"] for r in grp)
+        kept_d_krw = sum(r["base_net_pnl_krw"] for r in kept_d)
+        per_day_base_delta_pct[d] = round(kept_d_pct - orig_d_pct, 4)
+        per_day_base_delta_krw[d] = round(kept_d_krw - orig_d_krw, 2)
+
+    return {
+        "candidate": label,
+        "n_trades_in_scope": len(have_upside),
+        "removed_trades": len(removed),
+        "skip_precision_base": skip_precision_base,
+        "loss_recall_base": loss_recall_base,
+        "winner_damage_base": winner_damage_base,
+        "per_day_base_delta_pct": per_day_base_delta_pct,
+        "per_day_base_delta_krw": per_day_base_delta_krw,
+    }
+
+
+def split_historical_forward(rows: list[dict], forward_start_date: str) -> tuple[list[dict], list[dict]]:
+    """trade_date(YYYYMMDD)를 기준으로 historical(그 이전)/forward(그날
+    이후 포함)로 나눕니다.
+
+    2026-08-27 (Candidate A forward shadow, 민우님 명시 지시): "8/20~
+    8/25는 Candidate A를 만드는 데 쓰인 historical/backtest-like
+    evidence이고, Candidate A shadow 적용 이후는 forward evidence —
+    절대 한 덩어리로 섞어서 표본 수를 부풀리면 안 된다." forward가
+    아직 비어 있어도(수집 이제 막 시작) 조용히 0건으로 보고할 뿐
+    historical로 끌어와 채우지 않습니다.
+    """
+    historical = [r for r in rows if r["trade_date"] < forward_start_date]
+    forward = [r for r in rows if r["trade_date"] >= forward_start_date]
+    return historical, forward
+
+
+def build_cost_aware_report(rows: list[dict], regime_label: str) -> list[dict]:
+    """F2/CandidateA/CandidateB 세 후보의 cost-aware 지표를 한 regime
+    (HISTORICAL/FORWARD/COMBINED) 범위에서 계산해 리스트로 반환합니다."""
+    return [
+        candidate_cost_aware_metrics(rows, _f2_pred, f"F2_baseline[{regime_label}]"),
+        candidate_cost_aware_metrics(rows, _candidate_a_pred, f"CandidateA[{regime_label}]"),
+        candidate_cost_aware_metrics(rows, _candidate_b_pred, f"CandidateB[{regime_label}]"),
+    ]
+
+
+def flatten_cost_aware_reports(reports: list[dict]) -> tuple[list[dict], list[dict]]:
+    """candidate_cost_aware_metrics()가 candidate별로 반환하는 결과를
+    CSV로 쓸 수 있는 두 개의 flat 리스트로 변환합니다: candidate당 1행인
+    summary(per_day 중첩 dict 제외)와 candidate x trade_date당 1행인
+    per_day breakdown.
+
+    2026-08-27 (Candidate A forward shadow, 민우님 지시 #6): historical/
+    forward/combined 세 regime의 리스트를 이 함수에 그대로 이어붙여
+    호출해도 candidate 라벨에 이미 regime이 포함돼 있어([HISTORICAL]/
+    [FORWARD]/[COMBINED(참고용)]) 섞이지 않습니다.
+    """
+    summary_rows = []
+    per_day_rows = []
+    for rep in reports:
+        summary_rows.append({
+            "candidate": rep["candidate"],
+            "n_trades_in_scope": rep["n_trades_in_scope"],
+            "removed_trades": rep["removed_trades"],
+            "skip_precision_base": rep["skip_precision_base"],
+            "loss_recall_base": rep["loss_recall_base"],
+            "winner_damage_base": rep["winner_damage_base"],
+        })
+        pct_map = rep["per_day_base_delta_pct"]
+        krw_map = rep["per_day_base_delta_krw"]
+        for d in sorted(pct_map.keys()):
+            per_day_rows.append({
+                "candidate": rep["candidate"],
+                "trade_date": d,
+                "per_day_base_delta_pct": pct_map[d],
+                "per_day_base_delta_krw": krw_map[d],
+            })
+    return summary_rows, per_day_rows
 
 
 # ── Study B: 5-Min Exit Timing ───────────────────────────────────
@@ -1193,6 +1364,20 @@ def run(bundle_dirs: list[str], out_dir: str) -> dict:
     loo_cand_a = candidate_leave_one_out(feature_rows, _rvs_false, "CandidateA(F2 AND rebound_volume_spike==False)")
     loo_cand_b = candidate_leave_one_out(feature_rows, _pr_false, "CandidateB(F2 AND PR==False)")
 
+    # 2026-08-27 (Candidate A forward shadow, 민우님 지시 #6): historical
+    # (Candidate A를 도출하는 데 쓰인 8/20~8/25 근방 표본)과 forward(
+    # CANDIDATE_A_FORWARD_START_DATE 이후 실제 shadow 관측 표본)를
+    # 분리해서 별도 집계합니다 — 절대 하나로 합쳐서 표본 수를 부풀리지
+    # 않습니다. COMBINED는 참고용으로만 별도 표기(enforce 판단에는
+    # forward 증거를 최우선으로 둡니다).
+    historical_rows, forward_rows = split_historical_forward(feature_rows, CANDIDATE_A_FORWARD_START_DATE)
+    cost_aware_historical = build_cost_aware_report(historical_rows, "HISTORICAL")
+    cost_aware_forward = build_cost_aware_report(forward_rows, "FORWARD")
+    cost_aware_combined = build_cost_aware_report(feature_rows, "COMBINED(참고용)")
+    cost_aware_summary_rows, cost_aware_per_day_rows = flatten_cost_aware_reports(
+        cost_aware_historical + cost_aware_forward + cost_aware_combined
+    )
+
     out = Path(out_dir)
     write_csv(out / "trade_feature_table.csv", feature_rows)
     write_csv(out / "low_upside_study.csv", low_upside_buckets + low_upside_candidates)
@@ -1203,6 +1388,8 @@ def run(bundle_dirs: list[str], out_dir: str) -> dict:
     )
     write_csv(out / "entry_quality_study.csv", gate_study)
     write_csv(out / "candidate_scorecard.csv", scorecard)
+    write_csv(out / "candidate_cost_aware_summary.csv", cost_aware_summary_rows)
+    write_csv(out / "candidate_cost_aware_per_day.csv", cost_aware_per_day_rows)
 
     return {
         "days": [d.date for d in days],
@@ -1225,6 +1412,13 @@ def run(bundle_dirs: list[str], out_dir: str) -> dict:
         "two_condition_candidates": two_condition_candidates,
         "leave_one_out_candidate_a": loo_cand_a,
         "leave_one_out_candidate_b": loo_cand_b,
+        "historical_rows": historical_rows,
+        "forward_rows": forward_rows,
+        "cost_aware_historical": cost_aware_historical,
+        "cost_aware_forward": cost_aware_forward,
+        "cost_aware_combined": cost_aware_combined,
+        "cost_aware_summary_rows": cost_aware_summary_rows,
+        "cost_aware_per_day_rows": cost_aware_per_day_rows,
     }
 
 
