@@ -1,0 +1,163 @@
+════════════════════════════════════════════════════════════
+  📊 signal_log 분석  2026-08-27 ~ 2026-08-27  (총 8,537건)
+════════════════════════════════════════════════════════════
+
+── 1. 시그널 분포 ──
+  전체 판단                                8,537건
+  BUY                                  3건  (0.0%)
+  BLOCKED                              124건  (1.5%)
+  HOLD / SKIP                          8,410건  (98.5%)
+
+── 1-1. BLOCKED 사유 분포 ──
+  DAILY_ENTRY_LIMIT                    88건  (71.0%)
+  AFTER_1450                           20건  (16.1%)
+  SKIP_CONSECUTIVE_LOSS (3회 연속 손절 / 한도 3회) 16건  (12.9%)
+
+  [ 종목별 BLOCKED Top 5 ]
+    028050                             68건  (주사유: DAILY_ENTRY_LIMIT)
+    178320                             24건  (주사유: AFTER_1450)
+    000660                             12건  (주사유: DAILY_ENTRY_LIMIT)
+    122630                             8건  (주사유: DAILY_ENTRY_LIMIT)
+    069500                             8건  (주사유: SKIP_CONSECUTIVE_LOSS (3회 연속 손절 / 한도 3회))
+
+── 2. 장세 분포 ──
+  BULLISH                              7,100건  (83.2%)
+  NEUTRAL                              1,425건  (16.7%)
+  BEARISH                              10건  (0.1%)
+  UNKNOWN                              2건  (0.0%)
+
+── 3. skip_reason 분포  (BUY 제외) ──
+  SKIP_LOW_UPSIDE_REQUIRE5             3,872건  (46.0%)
+  NO_PAT_BELOW_VWAP                    2,540건  (30.2%)
+  SKIP_PULLBACK_OUT_OF_RANGE           340건  (4.0%)
+  SKIP_SCORE_TOO_LOW                   159건  (1.9%)
+  NO_PAT_B_REBOUND_SMALL(+0.8%)        104건  (1.2%)
+  NO_PAT_A_RATE(+1.8%)                 89건  (1.1%)
+  HOLD_POSITION                        82건  (1.0%)
+  NO_PAT_A_RATE(+1.9%)                 81건  (1.0%)
+  종목별 진입제한 3/8 — 000660 → 최소 5점 필요 — MACD 골든✓ | 모멘텀 둔화✗ | 거래량  80건  (1.0%)
+  NO_PAT_B_REBOUND_SMALL(+1.1%)        80건  (1.0%)
+  NO_PAT_A_RATE(+1.5%)                 80건  (1.0%)
+  SKIP_NO_VOLUME                       78건  (0.9%)
+  NO_PAT_A_RATE(+1.6%)                 76건  (0.9%)
+  NO_PAT_A_RATE(+1.2%)                 51건  (0.6%)
+  NO_PAT_A_RATE(+1.3%)                 48건  (0.6%)
+  NO_PAT_B_REBOUND_SMALL(+1.0%)        48건  (0.6%)
+  NO_PAT_A_RATE(+2.0%)                 48건  (0.6%)
+  NO_PAT_B_REBOUND_SMALL(+0.6%)        48건  (0.6%)
+  SKIP_NO_INDICATORS                   45건  (0.5%)
+  NO_PAT_A_RATE(+1.4%)                 44건  (0.5%)
+  NO_PAT_B_REBOUND_SMALL(+1.5%)        40건  (0.5%)
+  NO_PAT_B_REBOUND_SMALL(+0.9%)        40건  (0.5%)
+  NO_PAT_B_REBOUND_SMALL(+0.5%)        40건  (0.5%)
+  SKIP_NO_CONFIRMATION_SCORE5          36건  (0.4%)
+  NO_PAT_B_REBOUND_SMALL(+1.4%)        35건  (0.4%)
+  NO_PAT_B_REBOUND_SMALL(+0.7%)        28건  (0.3%)
+  NO_PAT_B_REBOUND_SMALL(+1.2%)        24건  (0.3%)
+  종목별 진입제한 4/8 — 000660 → 최소 5점 필요 — MACD 골든✓ | 모멘텀 둔화✗ | 거래량  20건  (0.2%)
+  NO_PAT_B_REBOUND_SMALL(+1.3%)        20건  (0.2%)
+  NO_PAT_B_REBOUND_SMALL(+0.4%)        20건  (0.2%)
+  NO_PAT_B_REBOUND_SMALL(+1.7%)        16건  (0.2%)
+  NO_PAT_B_REBOUND_SMALL(+1.6%)        16건  (0.2%)
+  NO_PAT_A_RATE(+1.7%)                 16건  (0.2%)
+  NO_PAT_A_RATE(+1.1%)                 16건  (0.2%)
+  NEUTRAL_C_BLOCKED                    12건  (0.1%)
+  SKIP_MARKET_NOT_ALLOWED              10건  (0.1%)
+  NO_PAT_B_REBOUND_SMALL(+1.9%)        5건  (0.1%)
+  NO_PAT_B_REBOUND_SMALL(+1.8%)        4건  (0.0%)
+  종목별 진입제한 2/8 — 000660 → 최소 5점 필요 — MACD 골든✓ | 모멘텀 둔화✗ | 거래량  4건  (0.0%)
+  SKIP_NO_MINUTE_DATA                  3건  (0.0%)
+  NO_PAT_PR_LOW_FAIL                   3건  (0.0%)
+  NO_PAT_C_MA_FAIL                     2건  (0.0%)
+  장세불명 — 신규 매수를 보류합니다                  2건  (0.0%)
+  entry_watch 최소수익미달청산 — 매수 후 5.0분, 수익률 -0.08% (기준 +0.5% 미달) 1건  (0.0%)
+  entry_watch 최소수익미달청산 — 매수 후 5.1분, 수익률 -0.71% (기준 +0.5% 미달) 1건  (0.0%)
+  entry_watch 최소수익미달청산 — 매수 후 5.2분, 수익률 -0.23% (기준 +0.5% 미달) 1건  (0.0%)
+  entry_watch 최소수익미달청산 — 매수 후 5.5분, 수익률 -0.43% (기준 +0.5% 미달) 1건  (0.0%)
+  entry_watch 최소수익미달청산 — 매수 후 5.8분, 수익률 -0.23% (기준 +0.5% 미달) 1건  (0.0%)
+
+── 3-1. NO_PATTERN 세분화 ──
+    NO_PAT_BELOW_VWAP                  2,540건  (69.4%)
+    NO_PAT_B_REBOUND_SMALL             568건  (15.5%)
+    NO_PAT_A_RATE                      549건  (15.0%)
+    NO_PAT_PR_LOW_FAIL                 3건  (0.1%)
+    NO_PAT_C_MA_FAIL                   2건  (0.1%)
+    A 등락률 평균                           +1.61%  ((min +1.1% max +2.0%))
+    B 반등폭 평균                           +0.99%  ((min +0.4% max +1.9%))
+
+── 4. 감지 패턴 분포 ──
+  A                                    3,909건  →  BUY 0건  (0.0%)
+  -                                    3,685건  →  BUY 0건  (0.0%)
+  A/B                                  844건  →  BUY 3건  (0.4%)
+  C                                    48건  →  BUY 0건  (0.0%)
+  PR/A                                 23건  →  BUY 0건  (0.0%)
+  B                                    16건  →  BUY 0건  (0.0%)
+  PR                                   12건  →  BUY 0건  (0.0%)
+
+── 5. V자 반등 분석 ──
+  V자 감지                                0건  (0.0%)
+  V자 → BUY                             0건  (0.0%)
+
+── 5-1. V자 실패 사유 분포 ──
+  V자 실패 판단 건수                          8,521건
+    낙폭부족                               7,938건  (93.2%)
+    거래량부족                              438건  (5.1%)
+    반등부족                               115건  (1.3%)
+    VWAP미회복                            8건  (0.1%)
+
+── 5-2. v_drop_pct 실제 분포 (기준 -2.5% 대비) ──
+  낙폭 데이터 보유                            7,938건
+    > -1.0% (얕음)                       5,347건  (67.4%)
+    -1.0~-1.5%                         1,661건  (20.9%)
+    -1.5~-2.0%                         472건  (5.9%)
+    -2.0~-2.5% (기준 직전, 병목 의심)          424건  (5.3%)
+    -2.5%↓ (기준 통과)                     34건  (0.4%)
+
+──   v_low_age 분포 (V자 감지 여부 무관) ──
+  1~3봉                                 1,506건  (17.6%)
+  4~5봉                                 502건  (5.9%)
+  6~8봉                                 796건  (9.3%)
+  9~15봉                                1,488건  (17.4%)
+  16봉↑                                 4,229건  (49.5%)
+
+── 6. 상승 여력 (upside_to_recent_high_pct) 분포 ──
+  < 1%                                 7,135건  →  BUY 0건
+  1~2%                                 811건  →  BUY 3건
+  2~3%                                 246건  →  BUY 0건
+  3~5%                                 46건  →  BUY 0건
+  5%↑                                  24건  →  BUY 0건
+
+── 7. VWAP 대비 위치 ──
+  VWAP 위  (현재가 > VWAP)                 3,984건  (47.0%)
+  VWAP 아래                              4,492건  (53.0%)
+  평균 VWAP 거리                           +0.03%
+
+── 8. 종목별 판단 횟수 Top 10 ──
+  005930                               1,358건  →  BUY 0건  BLOCKED 0건
+  069500                               1,190건  →  BUY 0건  BLOCKED 8건
+  102110                               1,114건  →  BUY 0건  BLOCKED 4건
+  000660                               1,087건  →  BUY 1건  BLOCKED 12건
+  005935                               1,079건  →  BUY 0건  BLOCKED 0건
+  028050                               990건  →  BUY 1건  BLOCKED 68건
+  009150                               912건  →  BUY 0건  BLOCKED 0건
+  122630                               463건  →  BUY 1건  BLOCKED 8건
+  178320                               215건  →  BUY 0건  BLOCKED 24건
+  288980                               13건  →  BUY 0건  BLOCKED 0건
+
+── 9. 조건검색식별 성과 ──
+    자동매매_V자_BV                         판단 370건  BUY 0건(0.0%)  BLOCKED 0건
+      skip: SKIP_LOW_UPSIDE_REQUIRE5 370건
+    자동매매_눌림목_PR                        판단 4,357건  BUY 0건(0.0%)  BLOCKED 24건
+      skip: SKIP_LOW_UPSIDE_REQUIRE5 2137건
+      skip: NO_PAT_BELOW_VWAP 1527건
+      skip: NO_PAT_B_REBOUND_SMALL(+0.8%) 104건
+    자동매매_돌파형A                          판단 934건  BUY 0건(0.0%)  BLOCKED 56건
+      skip: SKIP_LOW_UPSIDE_REQUIRE5 840건
+      skip: SKIP_SCORE_TOO_LOW 25건
+      skip: SKIP_NO_CONFIRMATION_SCORE5 12건
+
+── 10. 트레일링 발동 조건 가상 분석 ──
+  진입 당시 평균 상승여력                        +1.19%
+  구간                                   해당 BUY건 / 트레일링폭 / 예상최대수익
+    1.0%~2.0%       3건 | 트레일링 -1.2% | 예상최대 +1.19% | 기대수익 -0.01%
+════════════════════════════════════════════════════════════

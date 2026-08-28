@@ -10572,3 +10572,173 @@ hypothetical +2.44%p), worst-case degradation은 +0.18%p(즉 이
 없습니다** — 다만 게이트 버그가 이 후보의 핵심 증거 표본 3/4를
 통째로 숨기고 있었다는 점에서, 이번 재closure는 계산 오류를 고친
 것 이상으로 M1의 실제 관측 방향을 처음으로 정확히 보여줍니다.
+
+### 민우님 최종 승인
+
+민우님이 최초 v1.3 ZIP과 이번 reclosure ZIP을 직접 대조 검토해
+"실제 변경 범위는 설명과 정확히 일치"하며 "숨은 전략 변경은 없음"을
+확인했습니다. 핵심 수정(`qualifies_rule_m1()`의 `actual_gross_pnl_pct > 0`
+게이트 제거), 회귀 테스트(T4, 음수 gross + 우호적 checkpoint → qualified
+1건 고정), 실측 재검증(4/4 EXTEND_HELPED, Base delta +4.56%p) 모두
+확인 후 **"APPROVE — 적용/커밋 진행 가능"**으로 최종 승인했습니다.
+다만 판단은 여전히 **OBSERVE**임을 명시적으로 재확인 — "n=4는 좋은
+초기 신호지만 enforce 근거로는 아직 작다"는 것이 민우님의 판정입니다.
+다음 실제 거래일에 M1 표본이 1~3건만 더 추가돼도 방향성 판단이
+중요해질 것으로 예상됩니다.
+
+---
+
+## 📐 Profitability Sprint v1.3.1 — methodology closure: 후보별 forward 경계 분리 + sample_tier 명칭 중립화 + PnL 용어집 (2026-08-27, offline/reporting-only, production 코드·전략 파라미터·predicate 변경 없음)
+
+### 배경
+
+8/27 daily bundle 분석 중 Candidate M1이 8/25~26의 4건(전부
+EXTEND_HELPED)과 정반대로 8/27 3건 전부 EXTEND_HURT를 보였습니다.
+COMBINED 표본이 n=4→7로 늘며 `sample_tier`가 `OBSERVE(n<5)`에서
+`PROMISING`으로 바뀌었는데, 이 결과를 보고하는 과정에서 민우님이 이번
+스프린트 전체의 방법론 자체에 있는 세 가지 구조적 문제를 지적했습니다
+— 오늘은 이 세 가지를 닫는 것에만 집중하고 새 전략 조건은 만들지
+않기로 했습니다.
+
+1. **공통 forward 경계의 오용**: `CANDIDATE_A_FORWARD_START_DATE`
+   (20260826) 하나를 Candidate G/M1까지 공유해서 forward 표본을
+   나눴습니다. 그런데 Candidate G/M1은 이 조건/코드 자체가 8/26
+   Sprint v1.3 구현·디버깅 도중 만들어지고 고쳐졌습니다 — 특히 M1은
+   8/25(052690)~8/26(003490/006360) 실거래를 보고 만든 가설이고, 8/26
+   데이터로 `qualifies_rule_m1()`의 pnl 게이트 버그까지 잡았습니다.
+   이 날짜들을 "forward 검증 표본"으로 쓰면 가설을 만드는 데 쓴
+   데이터로 그 가설을 검증하는 순환논리가 됩니다.
+2. **성과를 암시하는 sample_tier 명칭**: `PROMISING`/`SHADOW_READY`는
+   표본 크기·방향 혼재 여부를 표현한 것이지 성과를 표현한 게
+   아닌데, 단어 자체가 긍정적으로 읽힙니다. 옛 로직대로면 n>=5인
+   표본이 **전부 EXTEND_HURT**로 일관되어도 (방향이 하나뿐이므로)
+   `SHADOW_READY`가 찍혔을 것입니다 — 성과가 전부 나쁜데 좋아 보이는
+   이름이 붙는 경우였습니다.
+3. **"손익" 용어 혼용**: `daily_reporter.py`가 쓰는 주문가 기준 실현
+   손익, 이 도구가 쓰는 avg_buy 기준 proxy gross 손익, Base/Stress
+   비용모델 반영 순손익이 전부 "손익"이라는 같은 이름으로 리포트에
+   섞여 나와 서로 다른 수치를 비교하는 실수를 유발하기 쉽습니다.
+
+### 변경 내용
+
+`tools/profitability_sprint.py`만 수정했습니다(민우님 지시대로
+offline/reporting-only — `TradingService`/전략 클래스/`Broker`/
+lifecycle/BUY-SELL 조건, `Candidate A/G/M1` predicate 자체(`_f2_pred`/
+`_candidate_a_pred`/`_candidate_b_pred`/`_candidate_g_pred`/
+`qualifies_rule_a/b/c/m1`)는 전부 0건 변경, 새 후보 조건 추가도 0건).
+
+**1) 후보별 3-way regime 분리** — `CANDIDATE_REGIME_BOUNDARIES` 신설:
+
+```python
+CANDIDATE_REGIME_BOUNDARIES = {
+    "CandidateG": {"hypothesis_forming_start": "20260826", "true_forward_start": "20260827"},
+    "M1": {"hypothesis_forming_start": "20260826", "true_forward_start": "20260827"},
+}
+```
+
+Candidate A/B/F2 baseline은 기존 `CANDIDATE_A_FORWARD_START_DATE`
+(20260826)를 그대로 씁니다 — 이 후보들은 Sprint v1.2에서 8/26 이전에
+이미 조건이 고정돼 hypothesis-forming 구간이 사실상 비어 있으므로
+민우님 지시 범위(A/G/M1 중 G/M1만 경계 재조정) 밖입니다. 새 함수
+`split_regimes_3way()`(HISTORICAL/HYPOTHESIS_FORMING/TRUE_FORWARD)와
+`build_candidate_regime_cost_aware_report()`(후보 하나를 그 후보
+고유 경계로 계산)를 추가했고, `extension_rule_candidates_by_regime()`
+시그니처를 `(per_trade, forward_start_date)` 2-way에서
+`(per_trade, hypothesis_forming_start, true_forward_start)` 3-way로
+바꿔 M1의 8/25~26 데이터가 TRUE_FORWARD에서 완전히 빠지도록 했습니다.
+`run()`에서 CandidateG를 기존 A-경계 리포트(`cost_aware_historical/
+forward/combined`)에서 제외하고, G 고유 경계로 계산한 새 결과를
+`cost_aware_candidate_g` 키로 분리했습니다. `build_cost_aware_report()`/
+`split_historical_forward()` 자체는 순수 함수로 완전히 무변경(여전히
+4후보/2-way를 그대로 계산 — Candidate A/B/F2 wiring에 계속 재사용).
+
+**2) sample_tier 명칭 중립화** — `extension_rule_candidates()` 내부에
+`_evidence_tier()` 헬퍼 추가:
+
+```text
+n < 5                    → OBSERVE_N_LT_5
+n >= 5, 전부 EXTEND_HELPED → DIRECTIONAL_HELPED
+n >= 5, 전부 EXTEND_HURT   → DIRECTIONAL_HURT
+n >= 5, 전부 NEUTRAL       → DIRECTIONAL_NEUTRAL
+n >= 5, 방향 혼재          → MIXED_EVIDENCE
+```
+
+`INVALID(...)` 래핑(feature 시점 불일치, R1/R2 전용)과 "표본없음" 처리는
+그대로 유지 — 명칭 안쪽 값만 교체. Low Upside 스킵 후보(F1~G)용
+`build_scorecard()`의 별도 `OBSERVE/PROMISING/SHADOW_READY` 티어(표본
+크기만 기준, 방향과 무관한 완전히 다른 지표)는 손대지 않았습니다 —
+민우님 지적이 정확히 "방향 혼재를 성과처럼 읽히게 하는" M1의 티어를
+겨냥한 것이었고, 이번 rename으로 두 티어 체계의 문자열이 더 이상
+겹치지 않아 혼동 위험도 자연히 해소됩니다.
+
+**3) PnL 용어집** — `PNL_TERMINOLOGY`(4개 정의: daily_report_order_
+price_pnl/avg_buy_proxy_gross_pnl/base_modeled_net_pnl/stress_modeled_
+net_pnl)와 `write_pnl_terminology_md()`를 추가해 `run()`이 매번
+`pnl_terminology.md`를 출력 디렉터리에 씁니다. `daily_reporter.py`(주문가
+기준 실현손익을 실제로 계산하는 production 코드)는 이번에도 손대지
+않았습니다 — 이 도구는 그 정의를 참조용으로 문서화만 합니다.
+
+### 변경하지 않은 것
+
+`Candidate A/G/M1` predicate 자체(4개 함수) — 0건. 새 후보 조건 추가
+— 0건. `TradingService`/전략 클래스(`breakout_strategy.py` 등)/
+`Broker`/lifecycle/BUY-SELL 판정 로직 — 0건(애초에 이 도구가 import도
+하지 않음). `build_cost_aware_report()`/`split_historical_forward()`/
+`candidate_cost_aware_metrics()` 자체의 계산 로직 — 0건(순수 함수로
+그대로 재사용, wiring만 바뀜). `CANDIDATE_A_FORWARD_START_DATE` 값
+(20260826) — 0건(그대로 유지, Candidate A/B/F2에 계속 사용). Low
+Upside 스킵 후보용 scorecard 티어(OBSERVE/PROMISING/SHADOW_READY,
+표본 크기 기준) — 0건.
+
+### 테스트
+
+`test_profitability_sprint.py`에 20-F(3-way 재작성)/20-H(`split_
+regimes_3way()` 경계값+순서 오류 검증)/20-I(sample_tier 5개 케이스:
+n<5, 전부 helped, **전부 hurt**, 전부 neutral, 혼재)/20-J(M1 실측
+형태 재현 — 민우님이 명시한 기대값 "true-forward == 8/27 3건, HELPED
+0/HURT 3"을 합성 데이터로 회귀 고정)/20-L(CandidateG가 더 이상
+Candidate A 경계 리포트에 섞이지 않음 + 고유 경계 리포트 검증)/20-M
+(PnL 용어집 생성 검증) 섹션을 추가했습니다. 20-I에는 민우님이 명시
+요구한 가드를 그대로 넣었습니다 — "전부 HURT인 sample_tier 문자열에
+PROMISING/READY/GOOD/HELP 같은 긍정적으로 읽힐 단어가 전혀 없음"을
+직접 assert. 기존 19-A~20-E(총 170건)는 전부 무변경 로직이라 그대로
+재통과, 20-F/20-G(현 20-K)는 새 3-way API에 맞춰 갱신.
+
+전체 192/192 통과(기존 171건 전부 무회귀 + 신규 21건).
+
+### 회귀 결과
+
+`test_profitability_sprint.py` 192/192, `compileall` 정상(저장소
+전체). 전체 회귀(`run_regression_tests.py`) 25/28 통과 — 클린 HEAD
+대비 동일한 사전 존재·환경 전용 실패 3건만 남음(`test_broker_order_
+status.py`, `test_broker_read_only_wiring.py`, `test_replay_time_
+axis.py` — 이 diff와 무관, 신규 실패 0건).
+
+### 실측 재검증 (8/20~8/27 6개 bundle 통합)
+
+새 경계로 다시 계산한 결과, 민우님이 명시한 기대값과 정확히
+일치합니다:
+
+- **Candidate M1**: HISTORICAL(8/25 이전) 1건(052690, helped),
+  HYPOTHESIS_FORMING(8/26) 3건(034020/003490/006360, 전부 helped —
+  가설을 만드는 데 쓴 구간이라 enforce 근거로 쓰지 않음),
+  **TRUE_FORWARD(8/27) 3건, HELPED 0 / HURT 3**(000660/122630/028050
+  — 민우님 기대값과 정확히 일치). COMBINED(참고용) n=7, sample_tier는
+  `MIXED_EVIDENCE`(옛 명칭으로는 `PROMISING`이었을 값 — 이제 "방향이
+  아직 안 정해짐"이라는 뜻이 이름에 그대로 드러남). TRUE_FORWARD
+  단독 n=3은 `OBSERVE_N_LT_5`.
+- **Candidate G**: HISTORICAL(8/20~25) 19건 중 3건 매칭, HYPOTHESIS_
+  FORMING(8/26) 4건 중 2건 매칭(base delta +2.18%p — 예전엔 이
+  숫자가 "FORWARD 증거"로 잘못 보고됐던 값), **TRUE_FORWARD(8/27)
+  3건 중 0건 매칭**(오늘 실거래 3건 전부 갭눌림D✗) — G의 진짜 forward
+  검증은 이제 이 0건에서부터 새로 시작합니다.
+- Candidate A/B/F2는 경계가 그대로라 결과 무변경.
+
+### 민우님 지시 반영 확인
+
+"이 세 작업은 전부 offline/reporting-only로 제한" — `tools/
+profitability_sprint.py` 한 파일만 수정, production 코드/predicate/
+새 후보 조건 0건. "테스트 후 작은 diff만 전달" — 이 파일과
+`test_profitability_sprint.py`만 포함한 diff로 전달(3파일: 이 둘 +
+CHANGELOG). 판단은 여전히 **OBSERVE**입니다 — 이번 작업은 measurement
+방법론을 바로잡은 것이고, enforce 근거를 만든 것이 아닙니다.

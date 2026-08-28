@@ -30,8 +30,12 @@
     trade_feature_table.csv
     low_upside_study.csv
     exit_extension_study.csv
+    exit_extension_study_by_regime.csv
     entry_quality_study.csv
     candidate_scorecard.csv
+    candidate_cost_aware_summary.csv
+    candidate_cost_aware_per_day.csv
+    pnl_terminology.md  (2026-08-27, Sprint v1.3.1 — PnL 용어집, 데이터 무관 고정 문서)
     profitability_summary_<YYYYMMDD~YYYYMMDD>.md
 
 데이터 무결성 원칙 (민우님 지시 그대로):
@@ -88,6 +92,100 @@ STRESS_SCENARIO = "stress"
 # 8/27로 두면 8/26 하루치 forward 데이터가 historical로 잘못 섞이므로
 # 8/26으로 수정합니다(계산식/로직 변경 없음, 상수값만 하루 당김).
 CANDIDATE_A_FORWARD_START_DATE = "20260826"
+
+# 2026-08-27 (Sprint v1.3.1, methodology closure, 민우님 지시): 위
+# CANDIDATE_A_FORWARD_START_DATE 하나를 Candidate G/M1까지 공유해서
+# forward 경계로 쓰면 안 됩니다 — Candidate A는 Sprint v1.2 GPT 리뷰로
+# 8/26 이전에 이미 조건이 고정됐지만, Candidate G(갭눌림D 자동분류)와
+# Candidate M1(5분 checkpoint)은 이 조건/분류 코드 자체가 8/26 Sprint
+# v1.3 구현·디버깅 도중 만들어지고 고쳐졌습니다. 특히 M1은 8/25(052690)
+# ~8/26(003490/006360) 실거래를 직접 보고 만든 가설이고, 8/26 데이터로
+# qualifies_rule_m1()의 pnl 게이트 버그까지 잡았습니다 — 이 날짜들을
+# "forward 검증 표본"으로 쓰면 가설을 만드는 데 쓴 데이터로 그 가설을
+# 검증하는 순환논리가 됩니다. 그래서 세 구간으로 분리합니다:
+#   HISTORICAL         : 이 후보를 구성하는 데 전혀 관여하지 않은 순수 이전 데이터
+#   HYPOTHESIS_FORMING  : 이 후보의 조건/코드를 만들거나 디버깅하는 데 실제로
+#                         들여다본 데이터 — enforce 근거로 쓰지 않음
+#   TRUE_FORWARD        : 후보 조건이 완전히 고정된 뒤 새로 쌓인 진짜
+#                         out-of-sample 데이터 — enforce 판단의 유일한 근거 구간
+# Candidate A/B/F2 baseline은 이 표에 없습니다 — 위 CANDIDATE_A_FORWARD_
+# START_DATE 그대로(HYPOTHESIS_FORMING 구간이 사실상 비어 있어 기존
+# HISTORICAL/FORWARD 2-way 분리와 동일한 결과를 냄, 굳이 3-way로
+# 바꾸지 않음 — 민우님 지시 범위(A/G/M1) 밖).
+CANDIDATE_REGIME_BOUNDARIES = {
+    "CandidateG": {"hypothesis_forming_start": "20260826", "true_forward_start": "20260827"},
+    "M1": {"hypothesis_forming_start": "20260826", "true_forward_start": "20260827"},
+}
+
+# 2026-08-27 (Sprint v1.3.1, methodology closure, 민우님 지시): 리포트에
+# 섞여 나오는 "손익" 수치가 서로 다른 정의라 혼동하기 쉽다는 지적 —
+# daily_reporter.py(production, 이 도구 밖)가 쓰는 주문가 기준 실현
+# 손익과, 이 도구가 쓰는 avg_buy 기준 proxy gross/Base/Stress 모델
+# 순손익은 전부 "손익"이라는 같은 이름을 쓰지만 계산 기준이 다릅니다.
+# 이 도구는 production 코드(daily_reporter.py 포함)를 수정하지 않으므로
+# (민우님 지시: TradingService/전략/Broker/lifecycle/BUY-SELL 조건은
+# 물론이고, 이 리포트 파일도 손대지 않음) 대신 이 도구 자체의 출력
+# 옆에 참조용 용어집을 남깁니다 — write_pnl_terminology_md()가
+# out_dir에 pnl_terminology.md로 씁니다.
+PNL_TERMINOLOGY = [
+    {
+        "term": "daily_report_order_price_pnl",
+        "korean_label": "일일 리포트 손익(주문가 기준 예상)",
+        "computed_by": "infra/storage/daily_reporter.py (production, 이 도구 밖 — 이 도구는 계산하지 않음)",
+        "definition": (
+            "그날 신규 매매의 손익을 BUY/SELL 각각의 '주문 발행 시점 참조가'로 계산한 값. "
+            "실제 체결가 기준이 아니고, 비용(수수료/슬리피지) 모델도 반영하지 않은 값입니다."
+        ),
+    },
+    {
+        "term": "avg_buy_proxy_gross_pnl",
+        "korean_label": "avg_buy 기준 proxy gross 손익",
+        "computed_by": "이 도구의 gross_pnl_pct/gross_pnl (build_trade_features 내부 계산)",
+        "definition": (
+            "매수 원가는 실제 체결 평균단가(avg_buy_price, 브로커 잔고조회 기준 realized 값)를 "
+            "쓰지만, 매도가는 SELL 판단 시점의 참조가(proxy quote)입니다 — 실제 SELL 체결가가 "
+            "아닙니다(모든 feature row의 data_quality_flag에 이 caveat이 항상 명시됨). "
+            "비용(수수료/슬리피지) 미반영."
+        ),
+    },
+    {
+        "term": "base_modeled_net_pnl",
+        "korean_label": "Base 비용모델 반영 순손익",
+        "computed_by": "이 도구의 base_net_pnl_pct/base_net_pnl_krw (COST_MODEL.net(.., 'base'))",
+        "definition": "avg_buy_proxy_gross_pnl에서 domain.cost_model의 Base 시나리오(0.35%) 비용을 반영한 값.",
+    },
+    {
+        "term": "stress_modeled_net_pnl",
+        "korean_label": "Stress 비용모델 반영 순손익(보수적 상한)",
+        "computed_by": "이 도구의 stress_net_pnl_pct/stress_net_pnl_krw (COST_MODEL.net(.., 'stress'))",
+        "definition": "avg_buy_proxy_gross_pnl에서 domain.cost_model의 Stress 시나리오(0.90%, 보수적 상한) 비용을 반영한 값.",
+    },
+]
+
+
+def write_pnl_terminology_md(out_dir: Path) -> Path:
+    """PNL_TERMINOLOGY를 사람이 읽을 수 있는 용어집 md로 씁니다.
+
+    2026-08-27 (Sprint v1.3.1, methodology closure): 데이터에 의존하지
+    않는 고정 문서이므로 run()마다 그대로 덮어씁니다 — 새 bundle을
+    더한다고 내용이 달라지지 않습니다.
+    """
+    lines = [
+        "# PnL 용어집 (Profitability Sprint v1.3.1)",
+        "",
+        "리포트에 등장하는 \"손익\"이 전부 같은 정의가 아닙니다. 아래 4개를 섞어서 비교하지 마세요.",
+        "",
+    ]
+    for item in PNL_TERMINOLOGY:
+        lines.append(f"## {item['korean_label']} (`{item['term']}`)")
+        lines.append("")
+        lines.append(f"- 계산 위치: {item['computed_by']}")
+        lines.append(f"- 정의: {item['definition']}")
+        lines.append("")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "pnl_terminology.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 # ── 승/무/패 정의 — utils/trade_outcome.py와 동일 정의를 이 파일 안에
 #    독립적으로 재정의합니다(analysis-only 도구를 production 모듈에
@@ -972,6 +1070,56 @@ def split_historical_forward(rows: list[dict], forward_start_date: str) -> tuple
     return historical, forward
 
 
+def split_regimes_3way(rows: list[dict], hypothesis_forming_start: str,
+                        true_forward_start: str) -> tuple[list[dict], list[dict], list[dict]]:
+    """trade_date(YYYYMMDD) 기준 HISTORICAL/HYPOTHESIS_FORMING/TRUE_FORWARD
+    3-way 분리 (2026-08-27, Sprint v1.3.1 methodology closure).
+
+    split_historical_forward()의 2-way 분리를 대체하는 게 아니라(Candidate
+    A/B/F2는 여전히 그쪽을 씁니다 — 위 CANDIDATE_REGIME_BOUNDARIES 주석
+    참고), Candidate G/M1처럼 "이 후보를 만드는 데 실제로 들여다본 구간"이
+    "이 후보가 완전히 고정된 뒤의 진짜 forward 구간"과 분리되어야 하는
+    경우에만 씁니다. hypothesis_forming_start > true_forward_start이면
+    설정 실수이므로 조용히 잘못 계산하지 않고 즉시 예외를 던집니다.
+    """
+    if hypothesis_forming_start > true_forward_start:
+        raise ValueError(
+            f"hypothesis_forming_start({hypothesis_forming_start})가 "
+            f"true_forward_start({true_forward_start})보다 늦을 수 없습니다"
+        )
+    historical = [r for r in rows if r["trade_date"] < hypothesis_forming_start]
+    hypothesis_forming = [
+        r for r in rows if hypothesis_forming_start <= r["trade_date"] < true_forward_start
+    ]
+    true_forward = [r for r in rows if r["trade_date"] >= true_forward_start]
+    return historical, hypothesis_forming, true_forward
+
+
+def build_candidate_regime_cost_aware_report(
+    rows: list[dict], skip_pred, candidate_name: str,
+    hypothesis_forming_start: str, true_forward_start: str,
+) -> list[dict]:
+    """단일 후보(Candidate G 등)의 HISTORICAL/HYPOTHESIS_FORMING/TRUE_FORWARD/
+    COMBINED(참고용) cost-aware 리포트를, 그 후보 고유의 regime 경계로
+    계산합니다 (2026-08-27, Sprint v1.3.1 methodology closure).
+
+    build_cost_aware_report()와 계산 로직 자체는 candidate_cost_aware_
+    metrics() 하나를 그대로 재사용해 완전히 동일합니다 — 차이는 이
+    함수가 F2/CandidateA/CandidateB/CandidateG를 한 번에 묶어 계산하지
+    않고, 후보 하나만 그 후보 고유의 3-way 경계로 분리해서 계산한다는
+    점뿐입니다(Candidate G가 Candidate A의 forward 경계를 공유하면 안
+    된다는 이번 재closure의 핵심 지적을 반영).
+    """
+    historical, hypothesis_forming, true_forward = split_regimes_3way(
+        rows, hypothesis_forming_start, true_forward_start)
+    return [
+        candidate_cost_aware_metrics(historical, skip_pred, f"{candidate_name}[HISTORICAL]"),
+        candidate_cost_aware_metrics(hypothesis_forming, skip_pred, f"{candidate_name}[HYPOTHESIS_FORMING]"),
+        candidate_cost_aware_metrics(true_forward, skip_pred, f"{candidate_name}[TRUE_FORWARD]"),
+        candidate_cost_aware_metrics(rows, skip_pred, f"{candidate_name}[COMBINED(참고용)]"),
+    ]
+
+
 def build_cost_aware_report(rows: list[dict], regime_label: str) -> list[dict]:
     """F2/CandidateA/CandidateB/CandidateG 네 후보의 cost-aware 지표를 한
     regime(HISTORICAL/FORWARD/COMBINED) 범위에서 계산해 리스트로 반환합니다.
@@ -1175,6 +1323,15 @@ def extension_rule_candidates(per_trade: list[dict]) -> list[dict]:
     판정합니다 — M1 예선 통과 여부와 결과 라벨은 서로 다른 질문).
     R1/R2/R3의 `actual_gross_pnl_pct > 0` 게이트는 그 규칙들의
     고정 정의 그대로이므로 이번 재closure에서 손대지 않습니다.
+
+    2026-08-27 재closure 2(Sprint v1.3.1, methodology closure, 민우님
+    지시): sample_tier 명칭을 PROMISING/SHADOW_READY에서 중립적인
+    evidence label로 바꿨습니다 — 아래 _evidence_tier() 참고. 기존
+    명칭은 표본 크기·방향 혼재 여부를 표현한 것이지 성과를 표현한 게
+    아닌데, "PROMISING"/"SHADOW_READY"라는 단어 자체가 긍정적으로
+    읽혀 오해를 삽니다(특히 n>=5인데 방향이 전부 EXTEND_HURT로
+    일관되면 옛 로직은 "SHADOW_READY"를 찍었습니다 — 성과가 전부
+    나쁜데 좋아 보이는 이름이 붙는 경우였습니다).
     """
     def qualifies_rule_a(t):  # 5분 시점 pnl>0 AND "진입 시점" price>VWAP(주의: 아래 docstring 참고)
         return t["actual_gross_pnl_pct"] > 0 and (t["current_vs_vwap_pct"] or 0) > 0
@@ -1190,6 +1347,29 @@ def extension_rule_candidates(per_trade: list[dict]) -> list[dict]:
             (t["checkpoint_price_vs_vwap_pct"] or 0) > 0
             and t["checkpoint_macd_above_signal"] is True
         )
+
+    def _evidence_tier(qualified: list[dict]) -> str:
+        """2026-08-27 (Sprint v1.3.1, methodology closure, 민우님 지시):
+        성과를 암시하지 않는 중립적 evidence label. n<5는 표본 부족을
+        그대로 이름에 담고(OBSERVE_N_LT_5), n>=5부터는 방향이 일관되면
+        DIRECTIONAL_HELPED/DIRECTIONAL_HURT/DIRECTIONAL_NEUTRAL, 방향이
+        섞여 있으면 MIXED_EVIDENCE — 어떤 조합에서도 "좋다"고 읽히는
+        단어(PROMISING/READY/GOOD 등)가 나오지 않습니다. 특히 전부
+        EXTEND_HURT인 경우 반드시 DIRECTIONAL_HURT가 되어야 하고, 절대
+        긍정적으로 읽히는 이름이 붙지 않아야 합니다(민우님 명시 요구
+        — test_profitability_sprint.py의 회귀 테스트가 이를 고정합니다).
+        """
+        n = len(qualified)
+        if n < 5:
+            return "OBSERVE_N_LT_5"
+        directions = {t["extension_label_5m"] for t in qualified}
+        if directions == {"EXTEND_HELPED"}:
+            return "DIRECTIONAL_HELPED"
+        if directions == {"EXTEND_HURT"}:
+            return "DIRECTIONAL_HURT"
+        if directions == {"NEUTRAL"}:
+            return "DIRECTIONAL_NEUTRAL"
+        return "MIXED_EVIDENCE"
 
     rules = [
         ("R1_pnl>0_AND_price>VWAP", qualifies_rule_a, False),
@@ -1211,11 +1391,7 @@ def extension_rule_candidates(per_trade: list[dict]) -> list[dict]:
         )
         worst_case = min((t["fwd5m_base_net_pct"] - t["actual_base_net_pct"] for t in qualified), default=None)
         n = len(qualified)
-        if n < 5:
-            tier = "OBSERVE(n<5)"
-        else:
-            directions = {t["extension_label_5m"] for t in qualified}
-            tier = "PROMISING" if len(directions) > 1 else "SHADOW_READY"
+        tier = _evidence_tier(qualified)
         if not valid_evidence:
             # 2026-08-24 (민우님 리뷰 3번): feature 시점 불일치(진입 시점
             # 값을 5분 시점 값처럼 취급) — 표본 크기와 무관하게 전략
@@ -1241,22 +1417,34 @@ def extension_rule_candidates(per_trade: list[dict]) -> list[dict]:
     return out
 
 
-def extension_rule_candidates_by_regime(per_trade: list[dict], forward_start_date: str) -> list[dict]:
-    """R1~R3/M1 조건부 연장 후보를 HISTORICAL/FORWARD/COMBINED(참고용)
-    regime으로 나눠 계산합니다.
+def extension_rule_candidates_by_regime(per_trade: list[dict], hypothesis_forming_start: str,
+                                         true_forward_start: str) -> list[dict]:
+    """R1~R3/M1 조건부 연장 후보를 HISTORICAL/HYPOTHESIS_FORMING/
+    TRUE_FORWARD/COMBINED(참고용) regime으로 나눠 계산합니다.
 
     2026-08-26 (Sprint v1.3, 민우님 지시): build_cost_aware_report()의
     regime 분리와 동일한 원칙 — "Candidate M1은 forward 실거래 표본이
     아직 clean 4건뿐이라 historical/backtest-like 표본과 절대 한
     덩어리로 섞어서 표본 수를 부풀리면 안 된다"(민우님 지적, Candidate
-    A 때와 동일한 원칙을 M1에도 그대로 적용). split_historical_forward()
-    는 raw feature row(trade_date 키 보유)를 대상으로 하지만, 이 함수의
-    입력 per_trade는 _label_trade()가 만든 딕셔너리입니다 — trade_date
-    키를 그대로 보존하고 있으므로 동일한 문자열 비교(YYYYMMDD)로 분리할
-    수 있습니다(새 비교 기준을 만들지 않고 기존 관례 재사용).
+    A 때와 동일한 원칙을 M1에도 그대로 적용).
+
+    2026-08-27 재closure(Sprint v1.3.1, methodology closure, 민우님
+    지시): 기존 2-way(HISTORICAL/FORWARD)는 forward_start_date 하나로
+    Candidate A와 같은 경계(20260826)를 썼는데, 이는 M1을 만드는 데
+    실제로 쓰인 8/26 데이터(003490/006360 — qualifies_rule_m1()의 pnl
+    게이트 버그를 잡는 데도 쓰인 바로 그 날짜)를 "forward 증거"로
+    잘못 포함시켰습니다. 3-way로 바꿔 hypothesis_forming_start(이
+    후보를 만들거나 디버깅하는 데 들여다본 구간의 시작)와
+    true_forward_start(후보가 완전히 고정된 뒤의 진짜 forward 시작)를
+    분리했습니다 — 호출부(run())는 CANDIDATE_REGIME_BOUNDARIES["M1"]의
+    두 값을 넘깁니다. split_historical_forward()는 raw feature
+    row(trade_date 키 보유)를 대상으로 하지만, 이 함수의 입력 per_trade는
+    _label_trade()가 만든 딕셔너리입니다 — trade_date 키를 그대로
+    보존하고 있으므로 split_regimes_3way()를 그대로 재사용할 수
+    있습니다(새 비교 기준을 만들지 않고 기존 관례 재사용).
     """
-    historical = [t for t in per_trade if t["trade_date"] < forward_start_date]
-    forward = [t for t in per_trade if t["trade_date"] >= forward_start_date]
+    historical, hypothesis_forming, true_forward = split_regimes_3way(
+        per_trade, hypothesis_forming_start, true_forward_start)
 
     def _tag(rule_rows: list[dict], regime_label: str) -> list[dict]:
         for r in rule_rows:
@@ -1265,7 +1453,8 @@ def extension_rule_candidates_by_regime(per_trade: list[dict], forward_start_dat
 
     return (
         _tag(extension_rule_candidates(historical), "HISTORICAL")
-        + _tag(extension_rule_candidates(forward), "FORWARD")
+        + _tag(extension_rule_candidates(hypothesis_forming), "HYPOTHESIS_FORMING")
+        + _tag(extension_rule_candidates(true_forward), "TRUE_FORWARD")
         + _tag(extension_rule_candidates(per_trade), "COMBINED(참고용)")
     )
 
@@ -1523,8 +1712,14 @@ def run(bundle_dirs: list[str], out_dir: str) -> dict:
     # 2026-08-26 (Sprint v1.3, Candidate M1, 민우님 지시): R1~R3/M1을
     # historical/forward로 분리 집계 — Candidate A의 cost-aware regime
     # 분리와 동일한 원칙(forward 표본을 historical과 섞어 부풀리지 않음).
+    # 2026-08-27 재closure(Sprint v1.3.1, methodology closure): M1 고유의
+    # 3-way 경계(CANDIDATE_REGIME_BOUNDARIES["M1"])를 씁니다 — Candidate A
+    # 경계(20260826)를 그대로 쓰면 M1을 만드는 데 실제로 쓰인 8/26
+    # 데이터(003490/006360)가 forward 증거로 잘못 섞입니다.
     extension_rules_by_regime = extension_rule_candidates_by_regime(
-        extension_per_trade_min_profit, CANDIDATE_A_FORWARD_START_DATE
+        extension_per_trade_min_profit,
+        CANDIDATE_REGIME_BOUNDARIES["M1"]["hypothesis_forming_start"],
+        CANDIDATE_REGIME_BOUNDARIES["M1"]["true_forward_start"],
     )
     gate_study = entry_quality_gate_study(feature_rows)
     scorecard = build_scorecard(low_upside_candidates, extension_rules, gate_study)
@@ -1560,14 +1755,37 @@ def run(bundle_dirs: list[str], out_dir: str) -> dict:
     # 않습니다. COMBINED는 참고용으로만 별도 표기(enforce 판단에는
     # forward 증거를 최우선으로 둡니다).
     historical_rows, forward_rows = split_historical_forward(feature_rows, CANDIDATE_A_FORWARD_START_DATE)
-    cost_aware_historical = build_cost_aware_report(historical_rows, "HISTORICAL")
-    cost_aware_forward = build_cost_aware_report(forward_rows, "FORWARD")
-    cost_aware_combined = build_cost_aware_report(feature_rows, "COMBINED(참고용)")
+    # 2026-08-27 재closure(Sprint v1.3.1, methodology closure, 민우님 지시):
+    # build_cost_aware_report()는 F2_baseline/CandidateA/CandidateB/
+    # CandidateG 네 후보를 한 번에 계산하는데, 넷 다 Candidate A의 forward
+    # 경계(CANDIDATE_A_FORWARD_START_DATE=20260826)를 공유하는 건 F2/A/B
+    # 에는 맞지만(셋 다 Sprint v1.2에서 8/26 이전에 조건이 고정됨)
+    # CandidateG에는 틀립니다(G는 8/26 Sprint v1.3 구현 도중 분류 코드가
+    # 만들어짐 — 위 CANDIDATE_REGIME_BOUNDARIES 주석 참고). 그래서
+    # 이 A-경계 3종 리포트에서는 CandidateG를 걸러내고, 바로 아래에서
+    # CandidateG 고유의 3-way 경계로 따로 계산합니다(함수 자체는 손대지
+    # 않음 — build_cost_aware_report()의 직접 단위 테스트는 그대로 4개
+    # 후보를 반환하는 순수 계산 함수로 남아있습니다).
+    cost_aware_historical = [
+        c for c in build_cost_aware_report(historical_rows, "HISTORICAL") if not c["candidate"].startswith("CandidateG")
+    ]
+    cost_aware_forward = [
+        c for c in build_cost_aware_report(forward_rows, "FORWARD") if not c["candidate"].startswith("CandidateG")
+    ]
+    cost_aware_combined = [
+        c for c in build_cost_aware_report(feature_rows, "COMBINED(참고용)") if not c["candidate"].startswith("CandidateG")
+    ]
+    cost_aware_candidate_g = build_candidate_regime_cost_aware_report(
+        feature_rows, _candidate_g_pred, "CandidateG",
+        CANDIDATE_REGIME_BOUNDARIES["CandidateG"]["hypothesis_forming_start"],
+        CANDIDATE_REGIME_BOUNDARIES["CandidateG"]["true_forward_start"],
+    )
     cost_aware_summary_rows, cost_aware_per_day_rows = flatten_cost_aware_reports(
-        cost_aware_historical + cost_aware_forward + cost_aware_combined
+        cost_aware_historical + cost_aware_forward + cost_aware_combined + cost_aware_candidate_g
     )
 
     out = Path(out_dir)
+    write_pnl_terminology_md(out)
     write_csv(out / "trade_feature_table.csv", feature_rows)
     write_csv(out / "low_upside_study.csv", low_upside_buckets + low_upside_candidates)
     write_csv(out / "low_upside_two_condition_study.csv", two_condition_candidates)
@@ -1608,8 +1826,10 @@ def run(bundle_dirs: list[str], out_dir: str) -> dict:
         "cost_aware_historical": cost_aware_historical,
         "cost_aware_forward": cost_aware_forward,
         "cost_aware_combined": cost_aware_combined,
+        "cost_aware_candidate_g": cost_aware_candidate_g,
         "cost_aware_summary_rows": cost_aware_summary_rows,
         "cost_aware_per_day_rows": cost_aware_per_day_rows,
+        "pnl_terminology": PNL_TERMINOLOGY,
     }
 
 

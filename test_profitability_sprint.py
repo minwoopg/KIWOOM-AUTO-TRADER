@@ -58,6 +58,9 @@ from tools.profitability_sprint import (  # noqa: E402
     build_cost_aware_report, flatten_cost_aware_reports,
     # 2026-08-26 (Sprint v1.3, Candidate G/M1):
     parse_gap_pullback_d, _candidate_g_pred, extension_rule_candidates_by_regime,
+    # 2026-08-27 (Sprint v1.3.1, methodology closure, 민우님 지시):
+    CANDIDATE_REGIME_BOUNDARIES, split_regimes_3way, build_candidate_regime_cost_aware_report,
+    PNL_TERMINOLOGY, write_pnl_terminology_md,
     run,
 )
 from domain.cost_model import load_cost_model as _load_cost_model_directly  # noqa: E402
@@ -1035,9 +1038,14 @@ try:
           "MACD>signal)이면 M1은 qualified 1건 — pnl 부호는 M1의 게이트가 아님(민우님 리뷰 반영)",
           m1_recovery["extension_qualified_trades"] == 1)
 
-    # ── 20-F) extension_rule_candidates_by_regime() — historical/forward
-    # 분리가 Candidate A의 cost-aware regime 분리와 동일한 원칙으로
-    # 동작하는지 확인 ──────────────────────────────────────────────
+    # ── 20-F) extension_rule_candidates_by_regime() — 2026-08-27 재closure
+    # (Sprint v1.3.1): 2-way(HISTORICAL/FORWARD)가 아니라 M1 고유의 3-way
+    # (HISTORICAL/HYPOTHESIS_FORMING/TRUE_FORWARD)로 분리되는지 확인 ──────
+    m1_hfs = CANDIDATE_REGIME_BOUNDARIES["M1"]["hypothesis_forming_start"]
+    m1_tfs = CANDIDATE_REGIME_BOUNDARIES["M1"]["true_forward_start"]
+    check("20-F) CANDIDATE_REGIME_BOUNDARIES['M1']이 민우님 지시값(hypothesis_forming=20260826, "
+          "true_forward=20260827)과 일치",
+          m1_hfs == "20260826" and m1_tfs == "20260827")
     per_trade_regime = [
         {"trade_date": "20260825", "symbol": "RH1", "actual_gross_pnl_pct": 0.5,
          "actual_base_net_pct": 0.2, "fwd5m_base_net_pct": 0.2,
@@ -1045,44 +1053,190 @@ try:
          "current_vs_vwap_pct": 1.0, "macd_above_signal": True,
          "checkpoint_price_vs_vwap_pct": 1.0, "checkpoint_macd_above_signal": True,
          "entry_score": 3, "extension_label_5m": "EXTEND_HELPED"},
-        {"trade_date": "20260826", "symbol": "RF1", "actual_gross_pnl_pct": 0.5,
+        {"trade_date": "20260826", "symbol": "RG1", "actual_gross_pnl_pct": 0.5,
          "actual_base_net_pct": 0.2, "fwd5m_base_net_pct": 0.2,
          "actual_stress_net_pct": -0.1, "fwd5m_price_return_pct": 0.5,
          "current_vs_vwap_pct": 1.0, "macd_above_signal": True,
          "checkpoint_price_vs_vwap_pct": 1.0, "checkpoint_macd_above_signal": True,
          "entry_score": 3, "extension_label_5m": "EXTEND_HELPED"},
+        {"trade_date": "20260827", "symbol": "RF1", "actual_gross_pnl_pct": -0.2,
+         "actual_base_net_pct": -0.4, "fwd5m_base_net_pct": -0.9,
+         "actual_stress_net_pct": -0.6, "fwd5m_price_return_pct": -0.7,
+         "current_vs_vwap_pct": 1.0, "macd_above_signal": True,
+         "checkpoint_price_vs_vwap_pct": 1.0, "checkpoint_macd_above_signal": True,
+         "entry_score": 3, "extension_label_5m": "EXTEND_HURT"},
     ]
-    rules_by_regime = extension_rule_candidates_by_regime(per_trade_regime, CANDIDATE_A_FORWARD_START_DATE)
+    rules_by_regime = extension_rule_candidates_by_regime(per_trade_regime, m1_hfs, m1_tfs)
     m1_name = "M1_5minCheckpoint_price>VWAP_AND_MACD_above_signal"
     m1_hist = next(r for r in rules_by_regime if r["rule"] == f"{m1_name}[HISTORICAL]")
-    m1_fwd = next(r for r in rules_by_regime if r["rule"] == f"{m1_name}[FORWARD]")
+    m1_hf = next(r for r in rules_by_regime if r["rule"] == f"{m1_name}[HYPOTHESIS_FORMING]")
+    m1_tf = next(r for r in rules_by_regime if r["rule"] == f"{m1_name}[TRUE_FORWARD]")
     m1_comb = next(r for r in rules_by_regime if r["rule"] == f"{m1_name}[COMBINED(참고용)]")
-    check("20-F) HISTORICAL regime엔 20260825(RH1)만 포함 — M1 qualified==1",
-          m1_hist["extension_qualified_trades"] == 1)
-    check("20-F) FORWARD regime엔 20260826(RF1, 경계값 그 자체 포함)만 포함 — M1 qualified==1",
-          m1_fwd["extension_qualified_trades"] == 1)
-    check("20-F) COMBINED(참고용)엔 둘 다 포함 — M1 qualified==2(절대 하나로 섞어 부풀리지 않되 "
+    check("20-F) HISTORICAL regime엔 20260825(RH1)만 포함 — M1 qualified==1, helped==1",
+          m1_hist["extension_qualified_trades"] == 1 and m1_hist["helped"] == 1)
+    check("20-F) HYPOTHESIS_FORMING regime엔 20260826(RG1, 경계값 그 자체)만 포함 — "
+          "M1 qualified==1, helped==1 (M1을 만드는 데 실제로 쓰인 구간, forward 증거 아님)",
+          m1_hf["extension_qualified_trades"] == 1 and m1_hf["helped"] == 1)
+    check("20-F) TRUE_FORWARD regime엔 20260827(RF1, 경계값 그 자체)만 포함 — "
+          "M1 qualified==1, hurt==1 (조건이 고정된 뒤의 진짜 forward 표본)",
+          m1_tf["extension_qualified_trades"] == 1 and m1_tf["hurt"] == 1)
+    check("20-F) COMBINED(참고용)엔 셋 다 포함 — M1 qualified==3(절대 하나로 섞어 부풀리지 않되 "
           "참고용 합산치는 정확히 계산됨)",
-          m1_comb["extension_qualified_trades"] == 2)
+          m1_comb["extension_qualified_trades"] == 3)
 
-    # ── 20-G) run() E2E — Sprint v1.3 신규 산출물(CSV/dict key/CandidateG
+    # ── 20-H) split_regimes_3way() 자체의 경계값 검증 (19-C의 3-way 버전) ──
+    rows_3way = [
+        {"trade_date": "20260825"}, {"trade_date": "20260826"}, {"trade_date": "20260827"},
+    ]
+    hist3, hf3, tf3 = split_regimes_3way(rows_3way, "20260826", "20260827")
+    check("20-H) split_regimes_3way: trade_date<hypothesis_forming_start만 HISTORICAL(20260825)",
+          [r["trade_date"] for r in hist3] == ["20260825"])
+    check("20-H) split_regimes_3way: hypothesis_forming_start<=trade_date<true_forward_start만 "
+          "HYPOTHESIS_FORMING(20260826, 경계값 그 자체 포함)",
+          [r["trade_date"] for r in hf3] == ["20260826"])
+    check("20-H) split_regimes_3way: trade_date>=true_forward_start만 TRUE_FORWARD(20260827)",
+          [r["trade_date"] for r in tf3] == ["20260827"])
+    raised_order_error = False
+    try:
+        split_regimes_3way(rows_3way, "20260827", "20260826")
+    except ValueError:
+        raised_order_error = True
+    check("20-H) hypothesis_forming_start > true_forward_start(설정 실수)이면 조용히 계산하지 "
+          "않고 ValueError를 던짐",
+          raised_order_error)
+
+    # ── 20-I) sample_tier 명칭 재closure(민우님 지시) — 성과를 암시하는
+    # PROMISING/SHADOW_READY를 중립적 evidence label로 교체, 특히 "전부
+    # HURT인데 긍정적인 이름이 붙는 경우가 절대 없도록" 회귀 고정 ──────
+    def _mk_m1_trade(date, sym, label):
+        favorable = {"checkpoint_price_vs_vwap_pct": 1.0, "checkpoint_macd_above_signal": True}
+        return {
+            "trade_date": date, "symbol": sym, "actual_gross_pnl_pct": -0.3,
+            "actual_base_net_pct": -0.5, "fwd5m_base_net_pct": -0.5,
+            "actual_stress_net_pct": -0.7, "fwd5m_price_return_pct": -0.4,
+            "current_vs_vwap_pct": 1.0, "macd_above_signal": True,
+            "entry_score": 3, "extension_label_5m": label, **favorable,
+        }
+
+    per_trade_n_lt_5 = [_mk_m1_trade("20260827", f"S{i}", "EXTEND_HELPED") for i in range(4)]
+    tier_n_lt_5 = next(r for r in extension_rule_candidates(per_trade_n_lt_5)
+                        if r["rule"].startswith("M1"))["sample_tier"]
+    check("20-I) n<5(4건)이면 sample_tier=='OBSERVE_N_LT_5' — 예전 'OBSERVE(n<5)' 대체",
+          tier_n_lt_5 == "OBSERVE_N_LT_5")
+
+    per_trade_all_helped = [_mk_m1_trade("20260827", f"H{i}", "EXTEND_HELPED") for i in range(5)]
+    tier_all_helped = next(r for r in extension_rule_candidates(per_trade_all_helped)
+                            if r["rule"].startswith("M1"))["sample_tier"]
+    check("20-I) n>=5(5건) 전부 EXTEND_HELPED면 sample_tier=='DIRECTIONAL_HELPED'",
+          tier_all_helped == "DIRECTIONAL_HELPED")
+
+    per_trade_all_hurt = [_mk_m1_trade("20260827", f"U{i}", "EXTEND_HURT") for i in range(5)]
+    tier_all_hurt = next(r for r in extension_rule_candidates(per_trade_all_hurt)
+                          if r["rule"].startswith("M1"))["sample_tier"]
+    check("20-I) [민우님 명시 요구] n>=5(5건) 전부 EXTEND_HURT면 sample_tier=='DIRECTIONAL_HURT' "
+          "— 절대 긍정적으로 읽히는 이름이 붙지 않음(예전 로직은 이 경우 'SHADOW_READY'를 찍었음)",
+          tier_all_hurt == "DIRECTIONAL_HURT")
+    check("20-I) [민우님 명시 요구, 회귀 가드] 전부 HURT인 sample_tier 문자열에 긍정적으로 읽힐 "
+          "수 있는 단어(PROMISING/READY/GOOD/HELP)가 전혀 포함되지 않음",
+          not any(word in tier_all_hurt for word in ("PROMISING", "READY", "GOOD", "HELP")))
+
+    per_trade_all_neutral = [_mk_m1_trade("20260827", f"N{i}", "NEUTRAL") for i in range(5)]
+    tier_all_neutral = next(r for r in extension_rule_candidates(per_trade_all_neutral)
+                             if r["rule"].startswith("M1"))["sample_tier"]
+    check("20-I) n>=5(5건) 전부 NEUTRAL이면 sample_tier=='DIRECTIONAL_NEUTRAL'",
+          tier_all_neutral == "DIRECTIONAL_NEUTRAL")
+
+    per_trade_mixed = (
+        [_mk_m1_trade("20260827", f"MH{i}", "EXTEND_HELPED") for i in range(3)]
+        + [_mk_m1_trade("20260827", f"MU{i}", "EXTEND_HURT") for i in range(3)]
+    )
+    tier_mixed = next(r for r in extension_rule_candidates(per_trade_mixed)
+                       if r["rule"].startswith("M1"))["sample_tier"]
+    check("20-I) n>=5(6건)에 helped/hurt가 섞여 있으면 sample_tier=='MIXED_EVIDENCE' "
+          "— 예전 'PROMISING'을 대체(성과가 아니라 '방향이 아직 안 정해짐'을 뜻함)",
+          tier_mixed == "MIXED_EVIDENCE")
+
+    # ── 20-J) M1 실측 재현(2026-08-25~27, 민우님 리뷰 실측값 그대로) —
+    # true-forward가 8/25~26(가설 형성에 실제로 쓰인 052690/003490/006360)을
+    # 제외하고 8/27 3건(HELPED 0/HURT 3)만 남기는지 회귀 고정. 민우님이
+    # 직접 명시한 기대값("M1 true-forward의 현재 기대 결과는 8/27 3건,
+    # HELPED 0 / HURT 3")을 그대로 검증합니다.
+    per_trade_m1_actual_shape = [
+        # 8/25 052690 — historical(가설 형성 이전 데이터로 취급)
+        _mk_m1_trade("20260825", "052690", "EXTEND_HELPED"),
+        # 8/26 003490/006360 — hypothesis_forming(가설을 만들고 predicate
+        # 버그를 잡는 데 실제로 쓰인 구간)
+        _mk_m1_trade("20260826", "003490", "EXTEND_HELPED"),
+        _mk_m1_trade("20260826", "006360", "EXTEND_HELPED"),
+        # 8/27 000660/122630/028050 — true_forward, 전부 EXTEND_HURT
+        _mk_m1_trade("20260827", "000660", "EXTEND_HURT"),
+        _mk_m1_trade("20260827", "122630", "EXTEND_HURT"),
+        _mk_m1_trade("20260827", "028050", "EXTEND_HURT"),
+    ]
+    rules_actual_shape = extension_rule_candidates_by_regime(per_trade_m1_actual_shape, m1_hfs, m1_tfs)
+    m1_actual_tf = next(r for r in rules_actual_shape if r["rule"] == f"{m1_name}[TRUE_FORWARD]")
+    m1_actual_hf = next(r for r in rules_actual_shape if r["rule"] == f"{m1_name}[HYPOTHESIS_FORMING]")
+    check("20-J) [민우님 명시 기대값] M1 true-forward == 8/27 3건, HELPED 0 / HURT 3",
+          m1_actual_tf["extension_qualified_trades"] == 3
+          and m1_actual_tf["helped"] == 0 and m1_actual_tf["hurt"] == 3)
+    check("20-J) M1 hypothesis_forming(8/26)엔 003490/006360 2건이 들어가고 true_forward엔 "
+          "섞이지 않음 — 가설을 만드는 데 쓴 데이터로 그 가설을 검증하지 않음",
+          m1_actual_hf["extension_qualified_trades"] == 2)
+    check("20-J) true_forward 3건은 n<5라서 sample_tier=='OBSERVE_N_LT_5'(전부 HURT여도 표본이 "
+          "작으면 방향 판정 이전에 표본 부족이 먼저 — enforce 근거로 쓰지 않음)",
+          m1_actual_tf["sample_tier"] == "OBSERVE_N_LT_5")
+
+    # ── 20-K) run() E2E — Sprint v1.3 신규 산출물(CSV/dict key/CandidateG
     # wiring/신규 feature 컬럼)이 실제로 생성되는지 확인 ──────────────
     out_dir20 = tmp_root / "out_v1_3"
     result20 = run([str(bundle20b), str(bundle20d)], str(out_dir20))
-    check("20-G) run() 결과에 extension_rules_by_regime 키가 포함됨",
+    check("20-K) run() 결과에 extension_rules_by_regime 키가 포함됨",
           "extension_rules_by_regime" in result20 and len(result20["extension_rules_by_regime"]) > 0)
-    check("20-G) exit_extension_study_by_regime.csv가 실제로 생성됨",
+    check("20-K) exit_extension_study_by_regime.csv가 실제로 생성됨",
           (out_dir20 / "exit_extension_study_by_regime.csv").is_file())
-    cost_aware_g_forward = [c for c in result20["cost_aware_forward"] if c["candidate"].startswith("CandidateG")]
-    check("20-G) run()의 cost_aware_forward에 CandidateG가 포함됨(build_cost_aware_report "
-          "4번째 후보 wiring 확인)",
-          len(cost_aware_g_forward) == 1)
     with (out_dir20 / "trade_feature_table.csv").open(encoding="utf-8") as f:
         trade_feature_columns = set(next(csv.reader(f)))
-    check("20-G) trade_feature_table.csv 헤더에 entry_reason/gap_pullback_d/checkpoint_* "
+    check("20-K) trade_feature_table.csv 헤더에 entry_reason/gap_pullback_d/checkpoint_* "
           "5개 컬럼이 모두 포함됨",
           {"entry_reason", "gap_pullback_d", "checkpoint_price_vs_vwap_pct",
            "checkpoint_macd_above_signal", "checkpoint_peak_pnl_pct"} <= trade_feature_columns)
+
+    # ── 20-L) 2026-08-27 재closure(Sprint v1.3.1): CandidateG는 더 이상
+    # Candidate A의 forward 경계(cost_aware_historical/forward/combined)를
+    # 공유하지 않고, 자기 고유의 3-way 경계(cost_aware_candidate_g)로만
+    # 집계됨 ──────────────────────────────────────────────────────
+    cost_aware_g_in_shared = [
+        c for regime_key in ("cost_aware_historical", "cost_aware_forward", "cost_aware_combined")
+        for c in result20[regime_key] if c["candidate"].startswith("CandidateG")
+    ]
+    check("20-L) [재closure] cost_aware_historical/forward/combined(Candidate A 경계 공유 "
+          "리포트)엔 CandidateG가 전혀 섞이지 않음 — G가 A의 forward 경계를 공유하던 버그 제거",
+          len(cost_aware_g_in_shared) == 0)
+    check("20-L) run() 결과에 cost_aware_candidate_g 키가 포함되고 정확히 4개 regime "
+          "(HISTORICAL/HYPOTHESIS_FORMING/TRUE_FORWARD/COMBINED)을 담음",
+          "cost_aware_candidate_g" in result20 and len(result20["cost_aware_candidate_g"]) == 4)
+    g_true_forward = next(
+        c for c in result20["cost_aware_candidate_g"] if c["candidate"] == "CandidateG[TRUE_FORWARD]")
+    check("20-L) CandidateG[TRUE_FORWARD]는 CandidateG 고유 경계(20260827)를 씀 — 이 fixture의 "
+          f"거래일({date20b}/{date20d})이 전부 그 이후라 true_forward에 포함됨",
+          g_true_forward["n_trades_in_scope"] > 0)
+    check("20-L) candidate_cost_aware_summary.csv에 CandidateG[TRUE_FORWARD] 행이 실제로 포함됨",
+          any(row["candidate"] == "CandidateG[TRUE_FORWARD]" for row in result20["cost_aware_summary_rows"]))
+
+    # ── 20-M) PnL 용어집(pnl_terminology.md, 민우님 지시) — daily order-price
+    # PnL / avg_buy proxy gross / Base modeled net / Stress modeled net
+    # 네 정의가 전부 문서화되어 있는지 확인 ──────────────────────────
+    check("20-M) PNL_TERMINOLOGY에 4개 용어(order_price/proxy_gross/base_modeled/"
+          "stress_modeled)가 모두 정의됨",
+          {t["term"] for t in PNL_TERMINOLOGY} == {
+              "daily_report_order_price_pnl", "avg_buy_proxy_gross_pnl",
+              "base_modeled_net_pnl", "stress_modeled_net_pnl",
+          })
+    check("20-M) run()이 pnl_terminology.md 파일을 실제로 생성함",
+          (out_dir20 / "pnl_terminology.md").is_file())
+    pnl_md_text = (out_dir20 / "pnl_terminology.md").read_text(encoding="utf-8")
+    check("20-M) pnl_terminology.md 본문에 4개 용어 korean_label이 전부 등장함",
+          all(t["korean_label"] in pnl_md_text for t in PNL_TERMINOLOGY))
 
 finally:
     shutil.rmtree(tmp_root, ignore_errors=True)
