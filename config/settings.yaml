@@ -238,4 +238,10 @@ experimental:
   reward_risk_guard_mode: "off"     # 4단계: 상승여력·손익비 하드 게이트
   candidate_ranking_mode: "off"     # 5단계: 후보 순위화
   trailing_breakeven_mode: "off"    # 6단계: 순본전 트레일링
-  entry_quality_guard_mode: "shadow"   # 1E.5단계: MACD/VWAP 진입 품질 shadow 관측 (off/shadow만 지원)
+  entry_quality_guard_mode: "off"   # 1E.5단계: MACD/VWAP 진입 품질 shadow 관측 (off/shadow만 지원)
+  # Candidate A Production Pilot v1 (2026-08-28, 민우님 승인 A단계):
+  # predicate 고정(candidate_a_guard.py) — upside_to_recent_high_pct<0.50
+  # AND rebound_volume_spike is False. shadow: 계산·로그만, 주문 미개입.
+  # enforce 전환은 B단계(오프라인 분봉 재구성 검증) 통과 후 별도 승인 필요 — 지금 켜지 마세요.
+  candidate_a_guard_mode: "shadow"
+

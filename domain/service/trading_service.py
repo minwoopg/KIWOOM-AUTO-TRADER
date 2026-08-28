@@ -29,6 +29,7 @@ from domain.position.lifecycle import PositionLifecycle, PositionStateMachine, i
 from domain.risk.risk_manager import RiskManager
 from domain.strategy.strategy_router import StrategyRouter
 from domain.strategy.entry_quality_shadow import evaluate_vwap_shadow
+from domain.strategy.candidate_a_guard import evaluate_candidate_a, CANDIDATE_A_UPSIDE_THRESHOLD_PCT
 from infra.broker.base import Broker
 from infra.storage.daily_reporter import DailyReporter
 from infra.storage.logger import (
@@ -3366,6 +3367,49 @@ class TradingService:
             # reason을 그대로 반환하도록 정정.
             return reason
 
+        # ── Candidate A guard (Production Pilot v1, 2026-08-28) ──────
+        # 민우님 명세 v1, Section 1~6. risk_manager.can_place_order()
+        # 통과 직후 · on_buy_requested() 이전에 둡니다 — 이 시점이
+        # "이 종목에 실제로 주문을 낼지" 최종 결정 직전의 마지막
+        # 게이트이고, 아직 broker/PSM/journal 중 어느 쪽도 건드리지
+        # 않은 상태이기 때문입니다(차단 시 아무 side effect도 남기지
+        # 않아야 함).
+        #
+        # predicate는 domain/strategy/candidate_a_guard.
+        # evaluate_candidate_a() 하나로 고정 — 이 함수가 _write_
+        # signal_log()의 low_upside_shadow 관측과 완전히 동일한
+        # 입력(minute_analysis, 이 폴링 사이클에서 한 번만 계산되어
+        # 변형 없이 양쪽에 전달됨)을 받으므로, shadow 로그와 enforce
+        # 판정이 구조적으로 항상 일치합니다.
+        #
+        # off/shadow에서는 이 블록 전체가 계산조차 하지 않습니다 —
+        # shadow 관측은 _write_signal_log()의 low_upside_shadow
+        # 블록이 mode와 무관하게 항상 계산하므로, 여기서 shadow일
+        # 때 evaluate_candidate_a()를 다시 부를 필요가 없습니다
+        # (모드 여부와 무관하게 항상 켜져 있던 관측 로직을 건드리지
+        # 않기 위함이기도 함 — 명세 Section 5).
+        candidate_a_mode = getattr(self.settings.experimental, "candidate_a_guard_mode", "off")
+        if candidate_a_mode == "enforce":
+            candidate_a_verdict = evaluate_candidate_a(minute_analysis)
+            # None(판정 불가)은 차단하지 않음(PASS) — False로 추정하지
+            # 않습니다. 아래 "is True" 명시 비교가 이를 보장합니다.
+            if candidate_a_verdict is True:
+                upside_val = getattr(minute_analysis, "upside_to_recent_high_pct", None)
+                spike_val = getattr(minute_analysis, "rebound_volume_spike", None)
+                self.app_logger.info(
+                    f"[CANDIDATE_A_GUARD] {symbol} | 매수 차단 — "
+                    f"upside_to_recent_high_pct={upside_val} "
+                    f"(<{CANDIDATE_A_UPSIDE_THRESHOLD_PCT} 임계값) AND "
+                    f"rebound_volume_spike={spike_val}(=False)"
+                )
+                # 2026-08-28: 위쪽 MAX_POSITIONS 분기의 로컬 import가
+                # "SkipReason"을 이 함수 전체 스코프에서 지역변수로
+                # 만들어버려서(파이썬 스코프 규칙), 그 분기를 타지 않은
+                # 이 경로에서 모듈 전역 SkipReason을 그냥 참조하면
+                # UnboundLocalError가 남 — 동일하게 로컬 import로 방어.
+                from infra.storage.skip_reason import SkipReason
+                return SkipReason.CANDIDATE_A_GUARD
+
         # ── 포지션 상태머신 shadow 통지 (2026-07-22→23) ──────────────
         # BUY_PENDING → OPEN 실체결 확인: 이전엔 accepted=True이면
         # 여기서 바로 OPEN으로 확정했는데(요청 수량을 그대로 신뢰),
@@ -4436,24 +4480,26 @@ class TradingService:
                 # Sprint v1.2 historical 분석에서 F2 대비 가장 강한
                 # 후보로 확인된 Candidate A(upside<0.50% AND
                 # rebound_volume_spike==False)를 이 시점부터 조건
-                # 고정하고 forward 표본을 쌓습니다. rebound_volume_spike
-                # 는 minute_analysis 원시값(row.get()이 아니라 직접
-                # 읽음 — 위 patterns 블록이 minute_analysis is not None
-                # 일 때 이미 row에도 같은 값을 넣지만, 이 블록만 따로
-                # 봐도 값의 출처가 분명하도록 함)이고, dataclass 필드
-                # 자체는 non-Optional bool이라 minute_analysis가
-                # None이 아니면 이론상 항상 True/False지만, getattr +
-                # "is True/is False" 명시 비교로 방어적으로 다룹니다
-                # — 만에 하나 True/False가 아닌 값(None 등)이 들어오면
-                # False로 추정하지 않고 두 필드 모두 빈 문자열로 남깁니다
-                # (Sprint v1.2 분석 도구의 safe_bool/"결측을 skip 대상
-                # 으로 추정하지 않는다" 원칙과 동일 — 나중에 offline
-                # historical 결과와 forward shadow 결과를 1:1로 비교
-                #하려면 두 계산이 결측을 같은 방식으로 다뤄야 함).
+                # 고정하고 forward 표본을 쌓습니다.
+                #
+                # 2026-08-28 (Candidate A Production Pilot v1, 명세
+                # Section 4): predicate 계산을 domain/strategy/
+                # candidate_a_guard.evaluate_candidate_a()로 위임 —
+                # _try_buy()의 enforce gate가 부르는 것과 완전히
+                # 동일한 함수입니다. 이 블록이 자체적으로 predicate를
+                # 다시 계산하면(이전 방식) 언젠가 두 계산이 미묘하게
+                # 갈라질(drift) 위험이 있으므로, 단일 진실 소스로
+                # 통합합니다. 출력 필드의 의미는 기존과 동일하게
+                # 유지합니다 — None(판정 불가)이면 두 필드 모두 빈
+                # 문자열, False로 추정하지 않습니다(Sprint v1.2
+                # "결측을 skip 대상으로 추정하지 않는다" 원칙과 동일
+                # — historical 결과와 forward shadow 결과를 1:1로
+                # 비교하려면 두 계산이 결측을 같은 방식으로 다뤄야 함).
                 rebound_volume_spike_val = getattr(minute_analysis, "rebound_volume_spike", None)
+                candidate_a_verdict = evaluate_candidate_a(minute_analysis)
                 if rebound_volume_spike_val is True or rebound_volume_spike_val is False:
                     rebound_volume_spike_out = rebound_volume_spike_val
-                    would_skip_no_spike_val = bool(upside_val < 0.50 and rebound_volume_spike_val is False)
+                    would_skip_no_spike_val = candidate_a_verdict if candidate_a_verdict is not None else ""
                 else:
                     rebound_volume_spike_out = ""
                     would_skip_no_spike_val = ""

@@ -54,6 +54,13 @@ class SkipReason:
     # 2026-07-22: trades.csv 파싱 실패로 당일 손익을 신뢰할 수 없어
     # 신규매수를 차단(fail-close)한 경우. RiskManager.DailyPnlUnavailableError 참고.
     DAILY_PNL_UNAVAILABLE   = "SKIP_DAILY_PNL_UNAVAILABLE"
+    # 2026-08-28 (Candidate A Production Pilot v1): experimental.
+    # candidate_a_guard_mode="enforce"일 때 domain/strategy/
+    # candidate_a_guard.evaluate_candidate_a()가 True를 반환해
+    # _try_buy()가 주문을 차단한 경우. 상세(upside/spike 값)는
+    # order_block_reason에 넣지 않고 [CANDIDATE_A_GUARD] app_logger
+    # 라인에만 남김(1P0.3 컨벤션).
+    CANDIDATE_A_GUARD        = "SKIP_CANDIDATE_A_GUARD"
 
     # ── 보유 중 포지션 관리 ──────────────────────────────────────
     HOLDING_TRAILING        = "HOLD_TRAILING"             # 트레일링 스탑 추적 중

@@ -295,6 +295,17 @@ class ExperimentalConfig:
     # shadow 관측 — off/shadow만 지원, enforce는 이번 단계에서
     # 의도적으로 구현하지 않음(아래 __post_init__에서 별도 검증).
     entry_quality_guard_mode: str = "off"
+    # 2026-08-28 (Candidate A Production Pilot v1, 민우님 명세+승인):
+    # 이 프레임워크에서 enforce까지 구현되는 첫 플래그입니다. predicate
+    # (upside_to_recent_high_pct<0.50 AND rebound_volume_spike is
+    # False)는 domain/strategy/candidate_a_guard.py에 하드코딩되어
+    # 있고 여기서는 바꿀 수 없습니다. entry_quality_guard_mode와
+    # 달리 enforce 동작 자체는 이번 라운드에 구현되지만, 이번
+    # 승인 범위는 "off"→"shadow" 배포까지입니다 — "enforce"로의
+    # 전환은 설정 파일 값을 사람이 직접 바꾸는 별도 승인 단계로만
+    # 이뤄집니다(코드 레벨에서 enforce를 막지 않음 — B단계 검증에서
+    # 실제로 enforce가 정확히 동작하는지 테스트로 확인해야 하므로).
+    candidate_a_guard_mode: str = "off"
 
     def __post_init__(self) -> None:
         # 2026-07-27: YAML에서 off/on처럼 quote 없는 특정 단어는 YAML 1.1
@@ -306,7 +317,7 @@ class ExperimentalConfig:
         for field_name in (
             "session_metrics_mode", "decision_engine_mode", "position_lifecycle_mode",
             "reward_risk_guard_mode", "candidate_ranking_mode", "trailing_breakeven_mode",
-            "entry_quality_guard_mode",
+            "entry_quality_guard_mode", "candidate_a_guard_mode",
         ):
             value = getattr(self, field_name)
             if not isinstance(value, str) or value not in valid:
