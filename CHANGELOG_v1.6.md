@@ -10742,3 +10742,156 @@ profitability_sprint.py` 한 파일만 수정, production 코드/predicate/
 `test_profitability_sprint.py`만 포함한 diff로 전달(3파일: 이 둘 +
 CHANGELOG). 판단은 여전히 **OBSERVE**입니다 — 이번 작업은 measurement
 방법론을 바로잡은 것이고, enforce 근거를 만든 것이 아닙니다.
+
+## 🎯 Candidate A Production Pilot v1 — A단계: 코드 구현 + shadow 배포
+(2026-08-28, 민우님 명세 v1 + 승인. **B단계 검증·별도 승인 전에는
+enforce로 전환하지 않음** — 이번 diff는 실제 매수 차단을 활성화하지
+않습니다.)
+
+### 배경
+
+5일치(8/24~8/28) 종합분석에서 MIN_PROFIT_5M이 시스템 손실의
+대부분(18건 중 15건 손실, -551,068원)을 차지하고, Candidate A
+(upside_to_recent_high_pct<0.50% AND rebound_volume_spike==False)의
+shadow 관측(low_upside_shadow.csv)이 8/28 true-forward 표본 기준
+100% skip precision·0% 승자 손상을 보인 것을 근거로, 민우님이
+Candidate A만을 대상으로 한 제한적 production enforce pilot을
+제안했습니다. Claude의 1차 코드베이스 리뷰(5개 지적: 통계적 독립성/
+boolean 대신 기존 off·shadow·enforce 패턴/order_block_reason
+bare-code 컨벤션/오프라인 반사실 재구성/evaluator 공유)를 전부
+반영한 "Candidate A Production Pilot 명세 v1"을 민우님이 작성했고,
+Claude가 코드베이스 대조 검증(`_try_buy()` 삽입 위치, 공유
+evaluator 보장, ExperimentalConfig 패턴, order_block_reason
+컨벤션, 분봉 저장 범위의 구조적 한계)을 거쳐 APPROVE 의견을
+전달했습니다. 민우님이 이 리뷰를 승인하며, 이번 라운드의 승인
+범위를 **A단계(코드 구현 + `candidate_a_guard_mode="shadow"`
+배포)까지로 명시적으로 한정**했습니다 — enforce 전환은 B단계
+(오프라인 분봉 재구성 검증) 통과 후 별도 승인이 필요합니다.
+
+### 변경 내용
+
+- **`domain/strategy/candidate_a_guard.py` (신규)**: predicate를
+  단일 함수 `evaluate_candidate_a(minute_analysis) -> bool | None`
+  로 고정. `CANDIDATE_A_UPSIDE_THRESHOLD_PCT = 0.50`은 코드
+  상수(YAML 미노출) — 설정 파일 수정만으로 predicate가 조용히
+  바뀌는 것을 막음. 3진 반환(True=매치/False=불일치/None=판정불가)
+  이며, 호출부는 반드시 None을 "차단 안 함(PASS)"으로 취급.
+  `domain/strategy/entry_quality_shadow.py`(1E.5단계 VWAP shadow
+  evaluator)와 동일한 순수함수 패턴.
+- **`config/settings.py`**: `ExperimentalConfig`에
+  `candidate_a_guard_mode: str = "off"` 추가, 기존
+  off/shadow/enforce 검증 목록에 포함. `entry_quality_guard_mode`와
+  달리 enforce 자체는 이번 라운드에 구현되므로(명세 요구사항)
+  enforce 하드 차단은 두지 않음 — 안전장치는 "settings.yaml에
+  실제로 shadow만 배포한다"는 배포 규율.
+- **`config/settings.yaml`**: `experimental.candidate_a_guard_mode:
+  "shadow"` 추가.
+- **`infra/storage/skip_reason.py`**: `SkipReason.CANDIDATE_A_GUARD
+  = "SKIP_CANDIDATE_A_GUARD"` 추가(파라미터 없는 bare code, 1P0.3
+  컨벤션).
+- **`domain/service/trading_service.py`**:
+  - `_try_buy()`: `risk_manager.can_place_order()` 통과 직후 ·
+    `_position_state_machine.on_buy_requested()` 이전에 enforce
+    게이트 삽입. `candidate_a_guard_mode=="enforce"`일 때만
+    `evaluate_candidate_a()`를 호출하고, `True`일 때만
+    `SkipReason.CANDIDATE_A_GUARD`를 반환(상세는
+    `[CANDIDATE_A_GUARD]` app_logger 라인에만 남김). off/shadow는
+    이 블록 자체를 실행하지 않음. 전략의 `SignalType.BUY`는 전혀
+    건드리지 않음 — 주문 최종 단계에서만 차단하므로 `low_upside_
+    shadow`의 `legacy_buy_candidate` 관측이 계속 유지됨(명세
+    Section 2).
+  - `_write_signal_log()`의 low_upside_shadow 블록: 자체 predicate
+    재계산을 제거하고 `evaluate_candidate_a()` 호출로 위임 — shadow
+    로그와 enforce gate가 완전히 동일한 함수를 쓰도록 통합(명세
+    Section 4). CSV 필드명/의미는 기존과 동일하게 유지(신규 필드
+    추가 없음).
+- **`test_candidate_a_guard.py` (신규, 40건)**: predicate 정확성
+  (매치/불일치/경계값 0.50/음수/Unknown), ExperimentalConfig 검증
+  (기본값/유효값/잘못된 문자열/YAML boolean coercion), `_try_buy()`
+  게이트(off·shadow는 predicate 매치와 무관하게 주문 통과, enforce는
+  정확히 매치일 때만 차단하고 broker/PSM/journal에 side effect
+  없음, Unknown은 PASS), 배포 설정 회귀 가드(`config/settings.yaml`
+  이 실제로 "shadow"인지), precedence(RiskManager가 이미 차단한
+  경우 Candidate A gate가 끼어들지 않음), logging parity
+  (low_upside_shadow와 evaluate_candidate_a()가 같은 값을 씀),
+  order_block_reason이 bare code인지.
+
+### 변경하지 않은 것
+
+Candidate A predicate 자체(임계값·조건 추가·PR/VWAP/시간대 예외
+전부 미변경), Candidate G/M1/MIN_PROFIT_5M/entry_score/동시진입
+제한/Broker/PositionLifecycle/D.1/E.1, `low_upside_shadow.csv`의
+CSV 스키마(필드 추가 없음), `config/settings.yaml`의
+`candidate_a_guard_mode`는 **"shadow"로만 배포** — "enforce"는
+이번 diff에 포함되지 않음.
+
+### 테스트 및 회귀 결과
+
+`test_candidate_a_guard.py` 40/40 통과. `python -m compileall`
+클린. `run_regression_tests.py` 26/29 통과 — 실패 3건은 기존
+환경 전용 실패(`test_broker_order_status.py`,
+`test_broker_read_only_wiring.py`, `test_replay_time_axis.py`,
+이 diff와 무관, 신규 실패 0건). 기존 `test_order_block_reason.py`
+(SkipReason 반환값 정확성)도 그대로 통과 — Candidate A gate 삽입이
+기존 차단 사유(MAX_POSITIONS/RISK_LIMIT/ALREADY_HOLDING/
+BUY_SIGNAL_COOLDOWN)의 우선순위를 건드리지 않음을 재확인.
+
+### 남은 전제조건 (B단계에서 확인 필요, 명세 Section 7)
+
+`_try_buy()` 삽입 위치·공유 evaluator·ExperimentalConfig 패턴·
+order_block_reason 컨벤션은 코드베이스와 전부 일치 확인됨. 다만
+차단된(매수 안 된) 종목은 보유종목과 달리 `update_targets()`가
+조건검색 편출 시 자동으로 재편입시켜주지 않으므로, +5/+10/+20분
+반사실 분봉이 항상 확보된다고 가정할 수 없음(2026-08-28-candidate-
+a-pilot-spec-review.md 참고). B단계에서 8/28 실제 종목
+(122630/069500/102110)의 `data/minute_bars/20260828/{symbol}.csv`
+가 차단 시점부터 +20분까지 끊기지 않고 존재하는지 실측 확인 필요 —
+확보 안 되면 해당 데이터 포인트는 `MISSING`으로 처리(명세 Section
+8과 일치), pilot 자체를 막을 사유는 아님.
+
+---
+
+## 요약 (v1.6 종료, 2026-08-28)
+
+v1.6은 애초 "0~6단계 experimental flag 리팩터링" 계획으로 시작했지만
+(7/27), 실제로는 이 기간에 초점이 두 번 바뀌었습니다.
+
+**원 계획(0~6단계) 진행 상황**: 1단계(`session_metrics_mode`)만
+`"shadow"`까지 진행했고, 2~6단계(`decision_engine_mode`/
+`position_lifecycle_mode`/`reward_risk_guard_mode`/
+`candidate_ranking_mode`/`trailing_breakeven_mode`)는 전부
+`"off"`로 남아 있습니다 — 착수하지 않은 게 아니라, 아래 두 흐름이
+더 시급한 실제 사고(체결 확인 불일치·중복 매도 등)와 손익 데이터
+문제를 먼저 드러냈기 때문에 우선순위가 자연스럽게 이동했습니다.
+
+**실제로 진행된 두 흐름**:
+1. **1P0.x 계열(8/10~8/24)** — 부분체결·중복매도·orphan 주문·
+   PENDING 타임아웃 등 실거래 사고 대응으로 시작해, 체결 확인
+   상태머신(PSM)·durable order journal·read-only 주문조회 wiring
+   까지 안전성 인프라를 실제로 단단하게 만들었습니다. 원 계획의
+   "3단계: 체결 확인 상태머신 실제화"와 목표는 같지만, 별도의
+   `position_lifecycle_mode` 플래그 승격이 아니라 필요한 안전장치를
+   그때그때 직접 구현하는 방식으로 진행됐습니다.
+2. **Profitability 계열(8/21~8/28)** — "왜 수익이 안 나는가"를
+   실거래 데이터로 직접 추적하는 쪽으로 전환. Sprint v1 → v1.1 →
+   Shadow v2(실시간 관측 로그) → v1.2(Candidate A/B) → v1.3
+   (Candidate G/M1) → v1.3.1(방법론 정리: 후보별 forward 경계
+   분리, sample_tier 중립화, PnL 용어집) → **Candidate A Production
+   Pilot v1 A단계**(이 프레임워크에서 최초로 enforce까지 구현된
+   experimental flag, 단 아직 `"shadow"`로만 배포)로 이어졌습니다.
+
+**이 프레임워크에서 처음 있는 일**: `candidate_a_guard_mode`가
+`entry_quality_guard_mode`를 포함해 지금까지 나온 8개 experimental
+flag 중 최초로 enforce 동작이 실제로 구현된 플래그입니다(배포값은
+아직 `"off"`가 아닌 `"shadow"`이고, enforce 전환은 별도 승인
+필요). 이 지점이 v1.7로 넘어가는 자연스러운 경계라고 판단해
+CHANGELOG를 여기서 마무리합니다.
+
+## 다음 버전(v1.7) 예정 방향
+
+| 우선순위 | 항목 | 내용 |
+|---|---|---|
+| 🔴 최우선 | Candidate A pilot B단계 | 8/28 실제 종목(122630/069500/102110) 분봉이 차단 시점+20분까지 확보되는지 실측 → 오프라인 반사실 재구성 → 통과 시 C단계(`shadow`→`enforce`) 별도 승인 |
+| 🟡 중간 | MIN_PROFIT_5M 구조 분석 | 18건 중 15건 손실(-551,068원)의 진입시점 feature를 정상 청산 8건과 univariate 비교(민우님 5일 종합분석 제안, 아직 착수 전) — 파라미터 변경이 아니라 분석부터 |
+| 🟢 낮음 | 원 6단계 계획 잔여분 재검토 | 2~6단계 flag가 계속 off로 남아 있는 게 여전히 맞는 판단인지, 아니면 Profitability 계열 성과가 그 자리를 대체했다고 볼지 v1.7 초반에 한 번 정리 |
+| 🟢 낮음 | CHANGELOG 파일 크기 | v1.6.md가 10,800줄을 넘어서 이번에 분리 — v1.7도 비슷한 임계치(대략 8,000~10,000줄 또는 두 달 분량)에서 다시 분리 고려 |
