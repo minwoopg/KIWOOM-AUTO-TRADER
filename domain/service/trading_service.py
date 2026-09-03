@@ -3341,7 +3341,13 @@ class TradingService:
             # 고정되어 있었음 — 실제 사유(최대보유종목수)와 무관한 문자열이라
             # signal_analysis의 BLOCKED 사유 분포를 왜곡시켜 왔음(GPT 검토로
             # 발견). SkipReason.MAX_POSITIONS로 정정.
-            from infra.storage.skip_reason import SkipReason
+            # 2026-08-28 (Candidate A pilot reclosure, 민우님 지적): 여기
+            # 있던 로컬 import가 "SkipReason"을 _try_buy() 함수 전체의
+            # 지역변수로 만들어서, 이 분기를 안 타는 다른 경로(Candidate A
+            # gate 등)에서 모듈 전역 SkipReason을 참조하면 UnboundLocalError
+            # 가 났음(파일 상단에 이미 `from infra.storage.skip_reason
+            # import classify_skip_reason, SkipReason`이 있으므로 이 로컬
+            # import는 애초에 불필요했음). 제거하고 상단 import 하나만 사용.
             return SkipReason.MAX_POSITIONS
         quantity = max(1, self.settings.trading.order_cash_per_trade // current_price)
         order = OrderRequest(
@@ -3402,12 +3408,6 @@ class TradingService:
                     f"(<{CANDIDATE_A_UPSIDE_THRESHOLD_PCT} 임계값) AND "
                     f"rebound_volume_spike={spike_val}(=False)"
                 )
-                # 2026-08-28: 위쪽 MAX_POSITIONS 분기의 로컬 import가
-                # "SkipReason"을 이 함수 전체 스코프에서 지역변수로
-                # 만들어버려서(파이썬 스코프 규칙), 그 분기를 타지 않은
-                # 이 경로에서 모듈 전역 SkipReason을 그냥 참조하면
-                # UnboundLocalError가 남 — 동일하게 로컬 import로 방어.
-                from infra.storage.skip_reason import SkipReason
                 return SkipReason.CANDIDATE_A_GUARD
 
         # ── 포지션 상태머신 shadow 통지 (2026-07-22→23) ──────────────

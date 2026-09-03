@@ -4,7 +4,8 @@ Candidate A guard — 상승여력 낮음 + 반등거래량 spike 없음 매수 
 (2026-08-28, Candidate A Production Pilot v1)
 
 배경: Profitability Sprint v1.2/v1.3.1의 forward shadow 관측(low_upside_
-shadow.csv, 2026-08-27~)에서 "upside_to_recent_high_pct < 0.50% AND
+shadow.csv, 2026-08-26~ — CANDIDATE_A_FORWARD_START_DATE, tools/
+profitability_sprint.py 참고)에서 "upside_to_recent_high_pct < 0.50% AND
 rebound_volume_spike is False"(Candidate A) 조건이 8/28 true-forward
 표본 기준 100% skip precision, 0% 승자 손상(민우님 5일 종합분석,
 2026-08-28-sprint-synthesis-and-plan.md 참고)을 보였습니다. 이 모듈은

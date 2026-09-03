@@ -305,6 +305,17 @@ class ExperimentalConfig:
     # 전환은 설정 파일 값을 사람이 직접 바꾸는 별도 승인 단계로만
     # 이뤄집니다(코드 레벨에서 enforce를 막지 않음 — B단계 검증에서
     # 실제로 enforce가 정확히 동작하는지 테스트로 확인해야 하므로).
+    #
+    # 2026-08-28 (reclosure, 민우님 지적): 이 플래그는 위 클래스
+    # docstring의 일반 계약("off=새 로직 아예 미실행")과 다르게
+    # 동작합니다 — candidate_a_guard_mode는 **_try_buy()의 주문
+    # 차단 gate 승격 상태만** 제어하고, low_upside_shadow.csv 관측
+    # (_write_signal_log()의 would_skip_low_upside_no_spike 계산)은
+    # 이 값이 "off"여도 legacy_buy_candidate 조건만 맞으면 항상
+    # 그대로 기록됩니다(2026-08-24 Profitability Shadow v2 도입 때부터
+    # 이 모드와 독립적이었음 — Candidate A가 이 관측 위에 gate를
+    # 얹은 것뿐). "off"를 보고 "Candidate A 계산 자체가 꺼졌다"고
+    # 오해하지 마세요.
     candidate_a_guard_mode: str = "off"
 
     def __post_init__(self) -> None:

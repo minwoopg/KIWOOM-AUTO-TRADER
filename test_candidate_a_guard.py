@@ -1,10 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Candidate A Production Pilot v1 검증 (2026-08-28, 민우님 명세 v1 + 승인 A단계)
+Candidate A Production Pilot v1 검증 (2026-08-28 A단계 승인, 2026-09-03
+B단계 완료 + 민우님 명시 승인으로 C단계 limited enforce pilot 시작)
 
-이번 승인 범위: 코드 구현 + candidate_a_guard_mode="shadow" 배포까지.
-enforce는 여기서 검증만 하고(코드 레벨 동작 확인), settings.yaml에는
-절대 "enforce"로 배포하지 않는다(별도 배포 확인은 4부).
+2026-09-03 (C단계): B단계(미보유 종목 001210·096770 자연실험 20건,
+분봉 +5/+10분 100%·+20분 90% 확보) 통과 후 민우님이 "Candidate A
+limited C-stage enforce pilot = APPROVE"로 명시 승인 — 실제 전략
+동작 변경은 config/settings.yaml의 candidate_a_guard_mode를
+"shadow" → "enforce" 한 항목으로만 제한. predicate/gate 위치/
+threshold와 Candidate G/M1/MIN_PROFIT_5M/CRASH_CUT/entry score/
+BULLISH/동시진입 제한 등 다른 BUY/HOLD/SELL 로직은 전혀 건드리지
+않음. 지금부터는 실제 배포값이 "enforce"인지 확인하는 것이 4부의
+역할(과거엔 반대로 "shadow"인지 확인해 실수로 enforce가 커밋되지
+않았는지 막는 가드였음 — 방향이 바뀌었으므로 아래 4부도 함께 갱신).
 
 predicate: upside_to_recent_high_pct < 0.50 AND rebound_volume_spike is False
 (domain/strategy/candidate_a_guard.py에 고정, 여기서 재계산하지 않음)
@@ -16,10 +24,13 @@ predicate: upside_to_recent_high_pct < 0.50 AND rebound_volume_spike is False
        YAML boolean 자동coercion 방어, 잘못된 문자열 거부.
   3부: _try_buy() 게이트 — off/shadow에서는 predicate 매치 여부와
        무관하게 주문이 그대로 나가고, enforce에서만 정확히 predicate가
-       True일 때만 차단됨. 차단 시 broker.place_order/PSM/journal
-       어느 쪽에도 side effect가 없음. Unknown(None)은 PASS.
-  4부: 배포 설정(config/settings.yaml) 회귀 가드 — 지금 배포값이
-       "shadow"인지(실수로 "enforce"가 커밋되지 않았는지) 확인.
+       True일 때만 차단됨. 차단 시 broker.place_order/PSM/journal/
+       _pending_buy_side_effects/symbol_entry_count_today/
+       bought_symbols_today/_last_buy_signal_at 어느 쪽에도 side
+       effect가 없음. Unknown(None)은 PASS.
+  4부: 배포 설정(config/settings.yaml) 회귀 가드 — 2026-09-03 C단계
+       승인 이후로는 배포값이 "enforce"인지(민우님이 명시 승인한
+       limited pilot 상태가 실수로 되돌아가지 않았는지) 확인.
   5부: precedence — RiskManager가 이미 차단한 경우 Candidate A gate가
        그보다 먼저 끼어들지 않고 원래 사유가 그대로 반환됨(삽입 위치가
        risk_manager.can_place_order() "이후"라는 것의 동작 증거).
@@ -27,9 +38,26 @@ predicate: upside_to_recent_high_pct < 0.50 AND rebound_volume_spike is False
        evaluate_candidate_a()와 동일한 값을 쓰는지(단일 진실 소스 증명).
   7부: order_block_reason이 bare code(SkipReason.CANDIDATE_A_GUARD)이고
        파라미터가 섞여 있지 않은지(1P0.3 컨벤션).
+  8부: E2E — _try_buy()만 단독 호출하는 3부와 달리, 실제 운영 호출
+       흐름(_process_symbol())을 그대로 태워서 enforce 차단이
+       low_upside_shadow.csv 한 행에 would_skip_low_upside_no_spike=
+       True/final_decision=BLOCKED/order_block_reason=
+       SKIP_CANDIDATE_A_GUARD/order_attempted=False/order_accepted=
+       빈값/order_id=빈값으로 함께 찍히는지 확인(민우님 1차 reclosure
+       지적 2번). 전략의 generate_signal()만 BUY로 고정하고 나머지는
+       전부 실제 프로덕션 코드 경로.
+
+       2026-09-03 (2차 reclosure, 민우님 지적): 1차 reclosure의 8부는
+       broker 포지션·trades.csv·low_upside_shadow.csv만 _process_
+       symbol() E2E 경로로 확인했고, PSM/journal/_pending_buy_side_
+       effects/entry_count/bought_symbols_today/_last_buy_signal_at
+       6종은 3부(_try_buy() 단독 호출)에서만 검증했었음 — 이 6종을
+       enforce 최초 배포 전 "실제 BUY 후보 → enforce 차단"이라는 한
+       흐름 안에서 함께 고정해야 한다는 지적을 반영해 8-1에 통합.
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import sys
 import tempfile
@@ -41,7 +69,8 @@ sys.path.insert(0, ".")
 from test_run_once_integration import build_minimal_settings
 from config.settings import ExperimentalConfig, load_settings
 from domain.market_regime.classifier import MarketRegimeClassifier
-from domain.market_regime.minute_analyzer import MinuteAnalysis
+from domain.market_regime.minute_analyzer import MinuteAnalysis, MinuteDataResult
+from domain.position.lifecycle import PositionLifecycle
 from domain.risk.risk_manager import RiskManager
 from domain.service.trading_service import TradingService
 from domain.strategy.strategy_router import StrategyRouter
@@ -241,6 +270,19 @@ with tempfile.TemporaryDirectory() as tmpdir:
           service._position_state_machine.get(symbol).lifecycle == PositionLifecycle.FLAT)
     check("   차단 시 tracked_order_journal에 기록 없음",
           service._tracked_order_journal.get(symbol) is None)
+    # 2026-08-28 (reclosure 1차, 민우님 지적): _pending_buy_side_effects/
+    # symbol_entry_count_today/bought_symbols_today/_last_buy_signal_at은
+    # 전부 _apply_first_fill_buy_side_effects()(첫 실체결 확인 후)에서만
+    # 채워짐 — Candidate A가 broker.place_order() 자체를 호출하기 전에
+    # 반환하므로 이 네 상태 중 어느 것도 이 심볼에 대해 소모되면 안 됨.
+    check("   차단 시 _pending_buy_side_effects에 이 심볼이 없음",
+          symbol not in service._pending_buy_side_effects)
+    check("   차단 시 symbol_entry_count_today가 증가하지 않음",
+          service.state.symbol_entry_count_today.get(symbol, 0) == 0)
+    check("   차단 시 bought_symbols_today에 추가되지 않음",
+          symbol not in service.state.bought_symbols_today)
+    check("   차단 시 _last_buy_signal_at이 갱신되지 않음",
+          symbol not in service._last_buy_signal_at)
 
 # ── 3-4) enforce + predicate 불일치(upside 충분) → 정상 주문 ──
 with tempfile.TemporaryDirectory() as tmpdir:
@@ -282,9 +324,10 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
 try:
     _deployed = load_settings("config/settings.yaml")
-    check("4-1) config/settings.yaml의 candidate_a_guard_mode는 현재 'shadow' "
-          "(이번 승인 범위는 A단계까지 — 'enforce'가 실수로 커밋되지 않았는지 확인)",
-          _deployed.experimental.candidate_a_guard_mode == "shadow")
+    check("4-1) config/settings.yaml의 candidate_a_guard_mode는 현재 'enforce' "
+          "(2026-09-03 민우님 명시 승인 — Candidate A limited C-stage enforce "
+          "pilot. 'shadow'로 되돌아가 있으면 승인된 pilot이 실수로 꺼진 것)",
+          _deployed.experimental.candidate_a_guard_mode == "enforce")
 except Exception as exc:
     check(f"4-1) config/settings.yaml 로딩 실패 — {type(exc).__name__}: {exc}", False)
 
@@ -394,6 +437,114 @@ with tempfile.TemporaryDirectory() as tmpdir:
     check("7-2) upside 값이 달라도(0.05 vs 0.49) 반환되는 order_block_reason은 "
           "완전히 동일한 문자열(값마다 다른 사유로 오염되지 않음, 1P0.3 컨벤션)",
           block1 == block2 == SkipReason.CANDIDATE_A_GUARD)
+
+
+# ══════════════════════════════════════════════════════════════
+# 8부: E2E — _process_symbol() 실제 호출 흐름으로 enforce 차단이
+#      low_upside_shadow.csv 한 행에 정확히 함께 기록되는지 확인
+#      (민우님 reclosure 지적 2·3번)
+# ══════════════════════════════════════════════════════════════
+
+def run_process_symbol_candidate_a_case(mode: str, upside: float, spike: bool):
+    """_process_symbol()을 실제로 한 번 태워서 BUY 후보가 Candidate A로
+    처리되는 전체 흐름을 검증합니다. 전략의 generate_signal()만 BUY로
+    고정(그래야 breakout 전략의 8개 진입조건을 다 맞출 필요 없이 이
+    테스트의 관심사인 "BUY 후보가 왔을 때 Candidate A gate/로깅이
+    올바르게 얽히는지"만 정확히 격리해서 볼 수 있음)하고, 장세 판단
+    (_get_regime_with_cache)과 분봉 분석(_get_minute_analysis)도
+    이 시나리오에 필요한 값으로 고정합니다 — 그 외 _try_buy()/
+    _write_signal_log()/PSM/journal/broker는 전부 실제 프로덕션
+    코드가 그대로 실행됩니다.
+    """
+    # 2026-08-28: tempfile.TemporaryDirectory()는 with 블록을 벗어나는
+    # 순간(return 포함) 디렉터리를 즉시 삭제함 — service 객체를 그대로
+    # 반환하면 호출부가 CSV를 읽으려 할 때 이미 파일이 사라진 뒤라
+    # FileNotFoundError가 남(최초 작성 시 실제로 재현됨). 그래서 CSV
+    # 읽기와 필요한 상태 스냅샷을 전부 with 블록 "안에서" 끝내고,
+    # 살아있는 값만 담은 dict를 반환한다.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        service = build_service(tmpdir)
+        object.__setattr__(service.settings.experimental, "candidate_a_guard_mode", mode)
+        ma = make_ma(upside_to_recent_high_pct=upside, rebound_volume_spike=spike)
+        strategy = service.strategy_router.select(MarketRegime.BULLISH)
+        balance = service.broker.get_account_balance()
+        with patch("domain.service.trading_service.now_kst", return_value=FIXED_MARKET_TIME), \
+             patch.object(service, "_get_regime_with_cache", return_value=(MarketRegime.BULLISH, "test")), \
+             patch.object(service, "_get_minute_analysis", return_value=MinuteDataResult(
+                 analysis=ma, entry_safe=True, source="LIVE", reason="",
+                 latest_bar_timestamp="20260828100000", age_seconds=1.0,
+             )), \
+             patch.object(strategy, "generate_signal", return_value=Signal(
+                 type=SignalType.BUY, reason="E2E 테스트 고정 BUY",
+             )):
+            asyncio.run(service._process_symbol(symbol, balance))
+
+        # 2026-09-03 (2차 reclosure): PSM/journal/_pending_buy_side_effects/
+        # entry_count/bought_symbols_today/_last_buy_signal_at은 파일이
+        # 아니라 service 객체의 인메모리 상태라 tempdir 소멸과는 무관하지만,
+        # 반환 dict에 함께 담아 이 함수가 "살아있는 값만 반환한다"는 기존
+        # 패턴을 계속 지킨다(호출부가 죽은 service 객체를 들고 있지 않게).
+        return {
+            "low_upside_shadow_rows": read_rows(service.settings.storage.low_upside_shadow_log_file),
+            "trade_rows": read_rows(service.settings.storage.trade_log_file),
+            "position_created": symbol in service.broker._positions,
+            "psm_lifecycle": service._position_state_machine.get(symbol).lifecycle,
+            "journal_entry": service._tracked_order_journal.get(symbol),
+            "in_pending_buy_side_effects": symbol in service._pending_buy_side_effects,
+            "symbol_entry_count_today": service.state.symbol_entry_count_today.get(symbol, 0),
+            "in_bought_symbols_today": symbol in service.state.bought_symbols_today,
+            "in_last_buy_signal_at": symbol in service._last_buy_signal_at,
+        }
+
+
+for _mode, _label in (("enforce", "enforce"),):
+    result = run_process_symbol_candidate_a_case(_mode, upside=0.1, spike=False)
+    rows = result["low_upside_shadow_rows"]
+    check(f"8-1) {_label} + Candidate A 매치: low_upside_shadow.csv에 정확히 1행 기록됨",
+          len(rows) == 1)
+    if rows:
+        r = rows[0]
+        check("   would_skip_low_upside_no_spike=True", r["would_skip_low_upside_no_spike"] == "True")
+        check("   final_decision=BLOCKED", r["final_decision"] == "BLOCKED")
+        check("   order_block_reason=SKIP_CANDIDATE_A_GUARD",
+              r["order_block_reason"] == SkipReason.CANDIDATE_A_GUARD == "SKIP_CANDIDATE_A_GUARD")
+        check("   order_attempted=False(주문 자체가 안 나감)", r["order_attempted"] == "False")
+        check("   order_accepted는 빈 값(주문 시도 자체가 없었으므로)", r["order_accepted"] == "")
+        check("   order_id는 빈 값", r["order_id"] == "")
+    check("   실제로 broker에 포지션이 생기지 않음(place_order 미호출)",
+          not result["position_created"])
+    check("   trades.csv에 이 심볼의 BUY 행이 없음",
+          not any(row["symbol"] == symbol and row["side"] == "BUY" for row in result["trade_rows"]))
+    # 2026-09-03 (2차 reclosure, 민우님 지적): 아래 6종은 전부
+    # _apply_first_fill_buy_side_effects()(첫 실체결 확인 후)에서만
+    # 채워지는 상태 — enforce가 broker.place_order() 호출 전에 이미
+    # 반환했으므로 _process_symbol() 전체 E2E 흐름을 태워도 이 심볼에
+    # 대해서는 어느 것도 소모되면 안 된다. 3부(_try_buy() 단독 호출)에서
+    # 이미 검증했던 것과 같은 내용을 실제 운영 호출 경로로 다시 고정한다.
+    check("   PositionStateMachine이 BUY_PENDING으로 전이하지 않음(FLAT 유지)",
+          result["psm_lifecycle"] == PositionLifecycle.FLAT)
+    check("   tracked_order_journal에 기록 없음", result["journal_entry"] is None)
+    check("   _pending_buy_side_effects에 이 심볼이 없음",
+          not result["in_pending_buy_side_effects"])
+    check("   symbol_entry_count_today가 증가하지 않음(0)",
+          result["symbol_entry_count_today"] == 0)
+    check("   bought_symbols_today에 추가되지 않음",
+          not result["in_bought_symbols_today"])
+    check("   _last_buy_signal_at이 갱신되지 않음",
+          not result["in_last_buy_signal_at"])
+
+# ── 8-2) off 모드 대조군: 같은 predicate 매치 조건이어도 정상 진행되고
+#         low_upside_shadow는 여전히 관측만 기록(주문은 나감) ──
+result_off = run_process_symbol_candidate_a_case("off", upside=0.1, spike=False)
+rows_off = result_off["low_upside_shadow_rows"]
+check("8-2) off 모드(대조군): 같은 조건이어도 low_upside_shadow에는 여전히 "
+      "would_skip_low_upside_no_spike=True가 관측 기록되지만 final_decision은 BUY",
+      len(rows_off) == 1
+      and rows_off[0]["would_skip_low_upside_no_spike"] == "True"
+      and rows_off[0]["final_decision"] == "BUY"
+      and rows_off[0]["order_block_reason"] == "")
+check("   off 모드(대조군): 실제로 주문이 접수됨(포지션 생성)",
+      result_off["position_created"])
 
 
 print()

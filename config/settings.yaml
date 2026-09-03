@@ -239,9 +239,18 @@ experimental:
   candidate_ranking_mode: "off"     # 5단계: 후보 순위화
   trailing_breakeven_mode: "off"    # 6단계: 순본전 트레일링
   entry_quality_guard_mode: "off"   # 1E.5단계: MACD/VWAP 진입 품질 shadow 관측 (off/shadow만 지원)
-  # Candidate A Production Pilot v1 (2026-08-28, 민우님 승인 A단계):
+  # Candidate A Production Pilot v1 (2026-08-28 A단계 shadow 배포,
+  # 2026-09-03 B단계 완료 + 민우님 승인으로 C단계 limited enforce
+  # pilot 시작):
   # predicate 고정(candidate_a_guard.py) — upside_to_recent_high_pct<0.50
-  # AND rebound_volume_spike is False. shadow: 계산·로그만, 주문 미개입.
-  # enforce 전환은 B단계(오프라인 분봉 재구성 검증) 통과 후 별도 승인 필요 — 지금 켜지 마세요.
-  candidate_a_guard_mode: "shadow"
+  # AND rebound_volume_spike is False. enforce: _try_buy()에서 predicate
+  # 매치 시 실제로 주문을 차단(SkipReason.CANDIDATE_A_GUARD). B단계
+  # (미보유 종목 001210·096770 자연실험 20건, 분봉 +5/+10분 100%·+20분
+  # 90% 확보) 통과 후 민우님이 명시 승인한 limited pilot — 최소 3~5
+  # clean 거래일 동안 Candidate A 외 다른 매매 로직(Candidate G/M1/
+  # MIN_PROFIT_5M/CRASH_CUT/entry score/BULLISH/동시진입 제한)은
+  # 전부 동결. 평가 단위는 이제 candidate_a_guard actual blocks —
+  # 졸업/재심사 기준(actual blocks≥10, unique symbols≥5, independent
+  # clusters≥3, clean days≥3) 충족 여부를 별도로 재검토합니다.
+  candidate_a_guard_mode: "enforce"
 
