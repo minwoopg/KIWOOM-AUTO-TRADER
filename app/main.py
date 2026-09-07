@@ -30,7 +30,8 @@ from infra.broker.mock_broker import MockBroker
 from infra.storage.logger import TradeCsvLogger, SignalCsvLogger, build_app_logger
 from infra.storage.state_reconciler import StateReconciler
 from infra.storage.state_store import JsonStateStore
-from utils.time_utils import is_market_open, seconds_until_market_open
+from infra.storage.process_lock import single_instance_lock
+from utils.time_utils import is_market_open, seconds_until_market_open, now_local
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -92,11 +93,13 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
 
     while True:
         try:
-            from datetime import datetime as _dt
-            now = _dt.now()
+            now = now_local()
             if is_market_open() or settings.broker.use_mock:
                 await trading_service.run_once()
             else:
+                # A last order can fill after the order window closes.
+                # Keep its state/side effects current without generating orders.
+                trading_service.reconcile_after_market_close()
                 # 장 외 시간 — 대기 메시지 (분 단위로 한 번)
                 if now.second < poll:
                     app_logger.info(
@@ -126,13 +129,17 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
 
 async def async_main() -> None:
     load_dotenv()
+    settings = load_settings()
+    with single_instance_lock(Path(settings.storage.state_file).with_suffix(".lock")):
+        await _run_application(settings)
+
+
+async def _run_application(settings: Settings) -> None:
 
     # 구버전 .pyc 캐시가 남아 AttributeError를 일으키는 것을 방지합니다.
     # 업데이트 후 첫 실행 시 자동으로 재컴파일됩니다.
     for cache_dir in Path(".").rglob("__pycache__"):
         shutil.rmtree(cache_dir, ignore_errors=True)
-
-    settings = load_settings()
 
     app_logger   = build_app_logger(settings.storage.app_log_file, settings.app.log_level)
     print("=" * 50)

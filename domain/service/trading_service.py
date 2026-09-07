@@ -267,6 +267,8 @@ class TradingService:
         # 검증 완료 후 실제 교체 예정 — domain/position/lifecycle.py 참고.
         self._position_state_machine = PositionStateMachine(logger=self.position_lifecycle_logger)
         self._position_state_machine_initialized = False
+        self._journal_recovery_failed = False
+        self._restore_order_recovery_blocks()
         # 1P0.4: 종목별 마지막 강제 매도 시각(최소 간격 적용용)
         self._last_forced_sell_at: dict[str, datetime] = {}
         # 1P0.6: 강제 매도가 브로커에 거부된 연속 횟수(종목별)
@@ -414,11 +416,23 @@ class TradingService:
         """자동 제외된 종목 목록을 반환합니다."""
         return self._excluded_symbols.copy()
 
-    def _get_balance_with_cache(self) -> AccountBalance:
-        """계좌 조회를 매번 하지 않고 일정 시간 동안 캐시를 재사용합니다."""
-        now = datetime.now()
+    def _has_unresolved_orders(self) -> bool:
+        return bool(self.state.unresolved_order_intents) or any(
+            state.lifecycle in (PositionLifecycle.BUY_PENDING, PositionLifecycle.SELL_PENDING)
+            or state.orphan_order_id
+            for state in self._position_state_machine._states.values()
+        )
 
-        if self.cached_balance is None or self.cached_balance_loaded_at is None:
+    def reconcile_after_market_close(self) -> None:
+        """Observe outstanding orders outside the order window; submit none."""
+        if self._has_unresolved_orders():
+            self._sync_position_state_machine_shadow(self._get_balance_with_cache())
+            self.state_store.save(self.state, self._highest_price)
+
+    def _get_balance_with_cache(self) -> AccountBalance:
+        """Cache settled accounts; unresolved orders always need a fresh read."""
+        now = datetime.now()
+        if self.cached_balance is None or self.cached_balance_loaded_at is None or self._has_unresolved_orders():
             balance = self.broker.get_account_balance()
             self.cached_balance = balance
             self.cached_balance_loaded_at = now
@@ -1283,27 +1297,24 @@ class TradingService:
         # 2026-07-20: 프로세스 재시작 타이밍에 의존하지 않는 날짜변경 감지.
         # main.py의 조건부 reset_daily_loss_counts() 호출과 별개로, 여기서
         # 매 폴링마다 직접 오늘 날짜를 확인해 확실하게 리셋되도록 보강.
-        today = date.today()
+        today = now_kst().date()
         if self._last_reset_date != today:
             if self._last_reset_date is not None:
                 self.app_logger.info(
                     f"[RESET] 날짜변경 감지 {self._last_reset_date} → {today} — 일별 상태 초기화"
                 )
-            self.reset_daily_loss_counts()
+            if self.state.roll_trading_day(today.isoformat()):
+                self.reset_daily_loss_counts()
             self._last_reset_date = today
 
         balance = self._get_balance_with_cache()
 
-        # ── 포지션 상태머신 shadow 동기화 + 불변조건 검사 (2026-07-22) ──
-        # 아직 실제 매매 판정에는 관여하지 않음(shadow 모드). 매 폴링마다
-        # PENDING이 아닌 종목은 브로커 잔고로 동기화하고, "잔고>0인데
-        # 로컬상태=FLAT"인 불변조건 위반이 있는지 검사해 CRITICAL 로그만
-        # 남김. 기존 _sold_today_qty_snapshot 기반 실제 판정과는 별개.
+        # Reconcile lifecycle before orders. Despite the historical "shadow"
+        # method name, these states actively gate BUY and SELL submissions.
         self._sync_position_state_machine_shadow(balance)
 
         # ── 이월 포지션 강제청산 체크 ──────────────────────────
-        # settings.yaml의 force_exit_before_market_close_minutes (기본 12분 전 = 14:48)
-        # 14:40~14:50 사이에 수익 쿠션 없는 보유 포지션을 청산해 이월 방지
+        # Configured minutes before 15:30; current configuration starts 15:10.
         await self._check_force_exit_overnight(balance)
 
         # ── 보유 종목 우선 처리 (2026-07-20) ──────────────────────
@@ -1318,15 +1329,18 @@ class TradingService:
         # 순서만 바꿔서 보유 종목이 앞선 미보유 종목들의 sleep 누적을
         # 기다리지 않게 함. (완전 별도 async 루프로 분리하지 않은 이유:
         # state/balance 캐시를 두 태스크가 동시에 건드리면 경쟁 조건 위험)
-        held_symbols = {p.symbol for p in balance.positions}
+        held_symbols = {p.symbol for p in balance.positions if p.quantity > 0}
+        # Holdings must be monitored even without a condition callback, after
+        # a restart, or after exclusion from the entry watchlist.
+        cycle_targets = list(dict.fromkeys([*self.targets, *sorted(held_symbols)]))
         ordered_targets = sorted(
-            enumerate(self.targets),
+            enumerate(cycle_targets),
             key=lambda pair: 0 if pair[1] in held_symbols else 1,
         )
 
         for order_idx, (_orig_i, symbol) in enumerate(ordered_targets):
 
-            if symbol in self._excluded_symbols:
+            if symbol in self._excluded_symbols and symbol not in held_symbols:
                 continue
 
             if order_idx > 0:
@@ -1412,7 +1426,7 @@ class TradingService:
 
             if regime == MarketRegime.UNKNOWN:
                 self._unknown_count[symbol] = self._unknown_count.get(symbol, 0) + 1
-                if self._unknown_count[symbol] >= 3:
+                if self._unknown_count[symbol] >= 3 and position_check is None:
                     self._excluded_symbols.add(symbol)
                     self.app_logger.warning(
                         f"[EXCL] {symbol} | UNKNOWN 3회 연속 — 감시 대상에서 제외합니다"
@@ -1633,6 +1647,7 @@ class TradingService:
             if minute_data_entry_safe:
                 if (
                     signal.type == SignalType.HOLD
+                    and position is None
                     and minute_analysis is not None
                     and not minute_analysis.is_valid_trading_value
                 ):
@@ -1767,7 +1782,7 @@ class TradingService:
         이 로직은 매 폴링(10초)마다 호출되지만,
         이미 청산 처리된 포지션은 balance 갱신 후 사라지므로 중복 청산 없음.
         """
-        now = datetime.now()
+        now = now_kst()
         force_exit_minutes = getattr(
             self.settings.trading,
             'force_exit_before_market_close_minutes',
@@ -1785,7 +1800,7 @@ class TradingService:
         if not is_force_exit_window:
             return
 
-        cushion_threshold = 0.3  # +0.3% 이상이면 이월 허용
+        cushion_threshold = self.settings.trading.force_exit_cushion_pct
 
         for pos in balance.positions:
             symbol = pos.symbol
@@ -2220,16 +2235,11 @@ class TradingService:
             self._entry_watch_shadow_tracking.pop(symbol, None)
 
     def _sync_position_state_machine_shadow(self, balance: AccountBalance) -> None:
-        """포지션 상태머신(shadow)을 브로커 잔고로 동기화하고 불변조건을 검사합니다.
+        """Reconcile holdings and tracked orders through lifecycle methods.
 
-        shadow 모드 — 여기서 나온 판정은 실제 매매 로직에 아직 반영되지
-        않습니다. 목적은 두 가지: (1) 실제 운영 데이터로 상태머신 자체가
-        올바르게 동작하는지 검증, (2) POSITION_STATE_MISMATCH가 실제로
-        얼마나 자주 발생하는지 관찰.
-
-        PENDING 중인 종목은 건드리지 않음 — on_buy_result/on_sell_result가
-        명시적으로 전이시키는 게 원칙이므로, 여기서 강제로 잔고 동기화하면
-        PENDING 로직과 충돌함.
+        The historical method name is retained for compatibility. Lifecycle
+        states gate real orders; ERROR and unresolved orders are never treated
+        as flat merely because a balance snapshot reports zero.
         """
         psm = self._position_state_machine
 
@@ -2413,6 +2423,50 @@ class TradingService:
             # 오직 _create_tracked_order_journal_entry()(accepted
             # 직후)에서만.
             self._maintain_tracked_order_journal(symbol)
+            self._clear_resolved_order_intent(symbol)
+
+    def _restore_order_recovery_blocks(self) -> None:
+        """Restore uncertainty, never infer a fill from a startup balance.
+
+        Existing ack_error commands may clear these blocks only after the
+        operator checks both broker orders and holdings. Automatic recovery
+        of partial/cancelled orders remains unsupported.
+        """
+        facts = dict(self.state.unresolved_order_intents)
+        try:
+            for symbol, record in self._tracked_order_journal.load_all().items():
+                facts.setdefault(symbol, {}).update(side=record.side, order_id=record.order_id)
+        except Exception as exc:
+            self._journal_recovery_failed = True
+            self.app_logger.critical(f"[STARTUP_ORDER_RECOVERY] journal 확인 실패 — 자동주문 차단: {exc}")
+        for symbol, fact in facts.items():
+            state = self._position_state_machine.get(symbol)
+            state.pending_order_id = fact.get("order_id") or "UNKNOWN_ORDER_ID"
+            self._position_state_machine.on_placement_ambiguous(
+                symbol, fact.get("side", "UNKNOWN"), "unresolved order from previous process")
+            self.app_logger.critical(
+                f"[STARTUP_ORDER_RECOVERY] {symbol} | 미확인 주문 복원 — 주문·잔고 대조 필요"
+            )
+
+    def _begin_order_intent(self, symbol: str, side: str, quantity: int) -> bool:
+        """Write before sending: a crash/timeout must not erase a submission."""
+        self.state.unresolved_order_intents[symbol] = {
+            "side": side, "quantity": quantity, "order_id": "",
+            "created_at": now_kst().isoformat(),
+        }
+        try:
+            self.state_store.save(self.state, self._highest_price)
+            return True
+        except Exception as exc:
+            self._journal_recovery_failed = True
+            self.app_logger.critical(f"[ORDER_INTENT_WRITE_FAILED] {symbol} | 주문 미전송: {exc}")
+            return False
+
+    def _clear_resolved_order_intent(self, symbol: str) -> None:
+        state = self._position_state_machine.get(symbol)
+        if (state.lifecycle in (PositionLifecycle.OPEN, PositionLifecycle.FLAT)
+                and not state.pending_order_id and not state.orphan_order_id):
+            self.state.unresolved_order_intents.pop(symbol, None)
 
     # ── 1P0.8-E.1-A: Durable Tracked Order Journal ──────────────────
     # 아래 두 메서드가 이번 라운드의 전체 범위입니다 — journal에
@@ -3167,6 +3221,13 @@ class TradingService:
         # 1P0.3: order_block_reason에는 **파라미터 없는 code**만 넣습니다.
         # 상세(expected_final=174, observed=7 등)를 그대로 넣으면 값마다
         # 다른 사유가 되어 skip_reason 분포가 오염됩니다.
+        if self._journal_recovery_failed:
+            return "ORDER_RECOVERY_UNAVAILABLE"
+        loaded_at = self.cached_market_price_loaded_at.get(symbol)
+        if loaded_at is not None:
+            age = (datetime.now() - loaded_at).total_seconds()
+            if age < 0 or age >= self.settings.trading.price_refresh_seconds:
+                return "STALE_MARKET_PRICE"
         _buy_block = self._position_state_machine.would_block_buy_detail(symbol)
         if _buy_block:
             _code, _detail = _buy_block
@@ -3174,6 +3235,15 @@ class TradingService:
                 f"[LIFECYCLE_BLOCK] {symbol} BUY 차단 | {_code} | {_detail}"
             )
             return _code
+
+        # An unresolved account order can consume cash/slots even while the
+        # balance endpoint still shows the pre-order snapshot. Serialize new
+        # entries until its outcome is reconciled; exits use a separate path.
+        if any(
+            self._position_state_machine.would_block_buy_detail(sym)
+            for sym in self._position_state_machine._states
+        ):
+            return "ACCOUNT_ORDER_UNRESOLVED"
 
         # ── excluded_symbols 차단 ───────────────────────────────
         excluded = getattr(self.settings.trading, 'excluded_symbols', [])
@@ -3329,8 +3399,11 @@ class TradingService:
         # ── 최대 보유 종목 수 체크 ────────────────────────────────
         try:
             live_balance = self.broker.get_account_balance()
-        except Exception:
-            live_balance = balance
+        except Exception as exc:
+            self.app_logger.warning(
+                f"[ACCOUNT_BALANCE_UNAVAILABLE] {symbol} | 신규매수 차단: {exc}"
+            )
+            return "ACCOUNT_BALANCE_UNAVAILABLE"
         held_count = len(live_balance.positions)
         if held_count >= self.settings.trading.max_positions:
             self.app_logger.info(
@@ -3416,8 +3489,14 @@ class TradingService:
         # 이제 accepted 여부만 알리고 BUY_PENDING을 유지 — 실제 체결
         # 확인은 다음 폴링의 confirm_buy_from_broker()가 담당(SELL과
         # 대칭 구조, GPT 제안 반영).
+        if not self._begin_order_intent(symbol, "BUY", order.quantity):
+            return "ORDER_INTENT_WRITE_FAILED"
         self._position_state_machine.on_buy_requested(symbol, order.quantity, "pending")
-        result = self.broker.place_order(order)
+        try:
+            result = self.broker.place_order(order)
+        except Exception:
+            self._position_state_machine.on_placement_ambiguous(symbol, "BUY", "unexpected placement exception")
+            raise
 
         # 2026-08-14 (1P0.8-P0.1/P0.2, 319400 실측 P0 사고 대응):
         # place_order() 응답 자체를 받지 못한 경우(타임아웃/connection
@@ -3454,6 +3533,9 @@ class TradingService:
             return "ORDER_PLACEMENT_AMBIGUOUS"
 
         self._position_state_machine.on_buy_result(symbol, result.accepted)
+        if not result.accepted:
+            self._clear_resolved_order_intent(symbol)
+            self.state_store.save(self.state, self._highest_price)
         # 2026-08-14 (1P0.8-A.1, GPT 코드리뷰 제안): 브로커가 이미
         # 반환한 실제 주문번호(result.order_id)를 "pending" placeholder
         # 대신 PSM에 연결. 자세한 사유는 confirm_pending_order_id()
@@ -3632,6 +3714,9 @@ class TradingService:
         `decide_sell()` 한 곳에서만 하고, 여기서는 결과를 기록하고
         실행할지만 정합니다.
         """
+        if self._journal_recovery_failed:
+            self.app_logger.critical(f"[ORDER_RECOVERY_UNAVAILABLE] {symbol} SELL — journal 수동 확인 필요")
+            return
         if not force and self._is_forced_exit_reason(exit_reason):
             force = True
         decision = self._position_state_machine.decide_sell(symbol, forced=force)
@@ -3685,8 +3770,14 @@ class TradingService:
         # 다음 폴링에서 브로커 잔고를 다시 조회해야 알 수 있으므로,
         # 실제 판정 흐름과 동일하게 _sync_position_state_machine_shadow가
         # 다음 폴링에서 처리하도록 SELL_PENDING만 표시.
+        if not self._begin_order_intent(symbol, "SELL", quantity):
+            return
         self._position_state_machine.on_sell_requested(symbol, quantity, "pending")
-        result = self.broker.place_order(order)
+        try:
+            result = self.broker.place_order(order)
+        except Exception:
+            self._position_state_machine.on_placement_ambiguous(symbol, "SELL", "unexpected placement exception")
+            raise
 
         # 2026-08-14 (1P0.8-P0.1/P0.2, 319400 실측 P0 사고 대응): BUY와
         # 동일한 이유로, 응답을 못 받은 경우는 롤백하지 않고 ERROR로
@@ -3729,6 +3820,8 @@ class TradingService:
                 symbol, accepted=False, broker_quantity=0,
                 reject_reason=str(getattr(result, "message", "") or "")[:80],
             )
+            self._clear_resolved_order_intent(symbol)
+            self.state_store.save(self.state, self._highest_price)
             # 1P0.6: 강제 매도(손절·강제청산)가 브로커에 거부되면
             # 시스템이 자체 해결할 수 없습니다 — 조용히 넘기지 않고
             # CRITICAL로 즉시 노출합니다.
@@ -3961,6 +4054,14 @@ class TradingService:
             # cnt==1(해당 종목 첫 손실)일 때만 전역 카운터 증가.
             # 같은 종목 반복 손실은 symbol_loss_count_today(종목별
             # DAILY_LOSS_LIMIT, 한도 2)로 별도 차단됨.
+            # 2026-09-07: 외부 안전성 감사가 이 정책을 "같은 종목
+            # 반복손실도 전역 카운터에 반영"으로 뒤집는 수정을
+            # 제안했으나, 민우님이 원래 2026-06-15 설계 철학(종목
+            # 분산 실패에만 계좌 전체 정지, 한 종목의 불운은 그
+            # 종목만 차단)을 명시적으로 유지하기로 결정 — 이 부분만
+            # 되돌림. 감사의 다른 지적(재시작이 당일 상태를 초기화
+            # 하는 버그)은 별개로 수정 유지(RuntimeState.roll_
+            # trading_day 참고).
             if cnt == 1:
                 self.state.consecutive_losses += 1
             self.app_logger.info(

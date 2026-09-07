@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, PriceBar, WeeklyBar, MinuteBar
+from domain.models import AccountBalance, BrokerOrder, MarketPrice, OrderRequest, OrderResult, PriceBar, WeeklyBar, MinuteBar
 
 
 class Broker(ABC):
@@ -36,6 +36,14 @@ class Broker(ABC):
     def place_order(self, order: OrderRequest) -> OrderResult:
         """주문을 브로커에 전달합니다."""
 
+        raise NotImplementedError
+
+    def get_order_status(self, order_id: str, symbol: str) -> BrokerOrder:
+        """Read execution state. Unsupported brokers must not imply a fill."""
+        raise NotImplementedError
+
+    def get_open_orders(self, symbol: str) -> list[BrokerOrder]:
+        """Read outstanding orders. Unsupported is different from empty."""
         raise NotImplementedError
 
     @abstractmethod

@@ -552,13 +552,11 @@ check("11-4) 폴링 유지보수 훅에서도 journal 실패가 폴링 자체를
 check("12-1) TradingService.__init__이 journal을 주입 안 하면 storage 설정에서 자동 생성",
       "self._tracked_order_journal = tracked_order_journal or TrackedOrderJournalStore("
       in TS_SRC)
-check("12-2) __init__ 안에서 journal.load_all()/get()을 호출해 startup에 자동 판단하지 않음"
-      "(E.1-A는 저장소 객체만 만들 뿐, 이 라운드는 startup enforcement가 범위 밖)",
-      "_tracked_order_journal.load_all()" not in TS_SRC
-      and "_tracked_order_journal.get(" not in TS_SRC.split(
-          "def _maintain_tracked_order_journal")[0].split(
-          "def __init__")[1].split("def run_once")[0]
-      if "def run_once" in TS_SRC else True)
+# 2026-09-07 audit supersedes E.1-A's historical no-startup-read scope.
+# Behavioral duplicate-order checks live in test_review_safety_regressions.py.
+check("12-2) 재시작 시 journal의 미확인 주문을 읽어 매매 차단을 복원함",
+      "self._restore_order_recovery_blocks()" in TS_SRC
+      and "self._tracked_order_journal.load_all()" in TS_SRC)
 check("12-3) 이번 라운드에서 get_order_status() 호출부를 추가로 늘리지 않음"
       "(D.1/D.1.1이 이미 만든 호출부 개수 그대로)",
       TS_SRC.count("self.broker.get_order_status(") == 1)

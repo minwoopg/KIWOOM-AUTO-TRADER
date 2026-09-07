@@ -11,7 +11,7 @@ from __future__ import annotations
     main.py에서 TradingService 시작 직전에 reconcile() 한 번 호출
 """
 
-from datetime import date, datetime
+from utils.time_utils import now_kst
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -38,16 +38,12 @@ class StateReconciler:
             3. 보유 종목인데 peak_price 없으면 현재가로 초기화
             4. consecutive_losses 날짜 검증
         """
-        today = date.today()
+        today = now_kst().date()
         holding_symbols = {p.symbol for p in balance.positions}
 
         # ── 1. 날짜 변경 시 일별 상태 초기화 ────────────────────
-        last_date_str = getattr(state, "_last_run_date", None)
-        if last_date_str != today.isoformat():
-            prev = state.bought_symbols_today.copy()
-            state.bought_symbols_today = set()
-            state.consecutive_losses   = 0
-            state._last_run_date       = today.isoformat()
+        prev = state.bought_symbols_today.copy()
+        if state.roll_trading_day(today.isoformat()):
             if prev:
                 self.app_logger.info(
                     f"[RECONCILE] 날짜 변경 → 일별 상태 초기화 "

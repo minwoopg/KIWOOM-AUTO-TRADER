@@ -36,10 +36,7 @@ REGULAR_MARKET_CLOSE = time(15, 30)
 # diagnostics.py에서 이미 같은 방식으로 tzdata 의존성 문제를 해결한
 # 바 있음(1B.2절), 그 방식을 그대로 재사용.
 #
-# 기존 now_local()/MARKET_OPEN/MARKET_CLOSE(naive datetime 기반)는
-# 이번 라운드에서 건드리지 않음 — 이 값들을 쓰는 다른 코드 경로
-# (14:50 시간 게이트 등)까지 한 번에 바꾸면 검증 범위가 지나치게
-# 커짐. 이번엔 분봉 신선도 판정 전용으로 KST_TZ와 now_kst()만 신설.
+# now_local() also uses KST for application market-window gates.
 KST_TZ = timezone(timedelta(hours=9), name="Asia/Seoul")
 
 
@@ -68,16 +65,16 @@ def parse_kst_bar_timestamp(cntr_tm: str | None) -> datetime | None:
 
 
 def now_local() -> datetime:
-    """현재 로컬 시간을 반환합니다."""
+    """Return naive Korean market time, independent of the host timezone."""
 
-    return datetime.now()
+    return now_kst().replace(tzinfo=None)
 
 
 def is_market_open() -> bool:
     """현재 시간이 장중인지 아주 단순하게 판단합니다."""
 
-    current = now_local().time()
-    return MARKET_OPEN <= current <= MARKET_CLOSE
+    current = now_local()
+    return current.weekday() < 5 and MARKET_OPEN <= current.time() <= MARKET_CLOSE
 
 
 def seconds_until_market_open() -> float:
@@ -90,6 +87,8 @@ def seconds_until_market_open() -> float:
         hour=MARKET_OPEN.hour, minute=MARKET_OPEN.minute,
         second=0, microsecond=0
     )
+    if current.weekday() >= 5:
+        open_dt += timedelta(days=7 - current.weekday())
     remaining = (open_dt - current).total_seconds()
     return max(remaining, 0.0)
 
@@ -98,6 +97,8 @@ def is_near_market_close(minutes_before_close: int) -> bool:
     """장 마감 직전 강제 청산 시점을 판단합니다."""
 
     current = now_local()
+    if current.weekday() >= 5:
+        return False
     close_dt = current.replace(hour=MARKET_CLOSE.hour, minute=MARKET_CLOSE.minute, second=0, microsecond=0)
     threshold = close_dt - timedelta(minutes=minutes_before_close)
     return threshold <= current <= close_dt

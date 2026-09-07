@@ -20,6 +20,7 @@ from __future__ import annotations
 """
 
 import time
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -556,15 +557,35 @@ class KiwoomBroker(Broker):
             next_key="",
         )
 
-        cash = self._parse_abs_int(deposit_response.body.get("ord_alow_amt"))
+        def balance_int(value, field: str, *, signed=False, decimal=False) -> int:
+            raw = str(value).strip().replace(",", "")
+            pattern = (r"[+-]?" if signed else r"[+]?") + r"\d+" + (r"(?:\.\d+)?" if decimal else "")
+            if not re.fullmatch(pattern, raw):
+                raise KiwoomPaginationIncompleteError(f"잔고 {field} 값 오류: {value!r}")
+            from decimal import Decimal
+            return int(Decimal(raw))
+
+        # A cash deficit provides no buying power, but must not hide holdings
+        # that still need liquidation. Malformed values remain a hard error.
+        cash = max(0, balance_int(deposit_response.body.get("ord_alow_amt"), "ord_alow_amt", signed=True))
         total_asset = self._parse_abs_int(holdings_response.body.get("prsm_dpst_aset_amt"))
 
         positions: list[Position] = []
-        for item in holdings_response.body.get("acnt_evlt_remn_indv_tot", []):
+        holding_rows = self._fetch_paginated_rows(
+            "kt00018", {"qry_tp": "1", "dmst_stex_tp": "KRX"},
+            "acnt_evlt_remn_indv_tot", first_page=holdings_response,
+        )
+        seen_symbols: set[str] = set()
+        for item in holding_rows:
             raw_symbol = str(item.get("stk_cd", "")).strip()
             symbol = raw_symbol[1:] if raw_symbol.startswith("A") else raw_symbol
-            quantity = self._parse_abs_int(item.get("rmnd_qty"))
-            average_price = self._parse_abs_int(item.get("pur_pric"))
+            if not symbol or symbol in seen_symbols:
+                raise KiwoomPaginationIncompleteError("잔고 종목 누락/중복 — 계좌 수량을 신뢰할 수 없음")
+            seen_symbols.add(symbol)
+            quantity = balance_int(item.get("rmnd_qty"), "rmnd_qty")
+            average_price = balance_int(item.get("pur_pric"), "pur_pric", decimal=True) if quantity else 0
+            if quantity and average_price <= 0:
+                raise KiwoomPaginationIncompleteError("보유 수량이 있으나 평균단가가 0")
 
             if symbol and quantity > 0:
                 positions.append(
@@ -639,7 +660,8 @@ class KiwoomBroker(Broker):
     # ══════════════════════════════════════════════════════════════
 
     def _fetch_paginated_rows(
-        self, api_id: str, payload: dict[str, Any], response_key: str
+        self, api_id: str, payload: dict[str, Any], response_key: str,
+        *, first_page: KiwoomApiResponse | None = None,
     ) -> list[dict[str, Any]]:
         """cont-yn/next-key를 따라가며 `api_id` 응답의 `response_key`
         배열을 전부 모아 반환합니다.
@@ -681,7 +703,7 @@ class KiwoomBroker(Broker):
         page_index = 1
 
         while True:
-            api_response = self._post(
+            api_response = first_page if page_index == 1 and first_page is not None else self._post(
                 endpoint="/api/dostk/acnt",
                 api_id=api_id,
                 payload=payload,
@@ -971,6 +993,17 @@ class KiwoomBroker(Broker):
                     is_ambiguous=True,
                 )
 
+        # HTTP success is not proof of a business rejection. A truncated or
+        # malformed body may follow a successfully submitted order; do not
+        # roll the lifecycle back and allow a duplicate submission.
+        if (not isinstance(response.body, dict)
+                or type(response.body.get("return_code")) is not int):
+            return OrderResult(
+                order_id="", symbol=order.symbol, side=order.side,
+                requested_quantity=order.quantity, accepted=False,
+                message="Malformed order response: return_code is not an integer",
+                timestamp=datetime.now(), is_ambiguous=True,
+            )
         accepted = response.body.get("return_code") == 0
         message = str(response.body.get("return_msg", ""))
         order_id = str(response.body.get("ord_no", ""))

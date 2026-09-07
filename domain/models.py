@@ -295,3 +295,26 @@ class RuntimeState:
     # entry_watch VWAP 연속 이탈 카운터 (히스테리시스용, 2026-07-22)
     # 종목이 VWAP 위로 회복하면 이 값은 0으로 리셋됨
     vwap_break_streak_by_symbol: dict[str, int] = field(default_factory=dict)
+
+    # Persist the trading date: process startup is not a new trading day.
+    _last_run_date: str | None = None
+    unresolved_order_intents: dict[str, dict] = field(default_factory=dict)
+
+    def roll_trading_day(self, today: str) -> bool:
+        """Reset dated limits once. Undated legacy state is kept conservatively."""
+        previous = self._last_run_date
+        if previous == today:
+            return False
+        if previous is not None:
+            # Invalid saved dates must not silently unlock daily limits.
+            from datetime import date
+            date.fromisoformat(previous)
+            self.bought_symbols_today.clear()
+            self.consecutive_losses = 0
+            self.symbol_loss_count_today.clear()
+            self.symbol_entry_count_today.clear()
+            self.symbol_stoploss_at.clear()
+            self.symbol_trail_loss_at.clear()
+            self.symbol_block_today.clear()
+        self._last_run_date = today
+        return previous is not None

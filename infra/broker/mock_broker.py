@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from itertools import count
 
-from domain.models import AccountBalance, MarketPrice, OrderRequest, OrderResult, Position, PriceBar, WeeklyBar, MinuteBar
+from domain.models import AccountBalance, BrokerOrder, BrokerOrderStatus, MarketPrice, OrderRequest, OrderResult, Position, PriceBar, WeeklyBar, MinuteBar
 from infra.broker.base import Broker
 
 
@@ -22,6 +22,7 @@ class MockBroker(Broker):
         self._seq = count(1)
         self._cash = 1_000_000
         self._positions: dict[str, Position] = {}
+        self._orders: dict[str, BrokerOrder] = {}
         self._prices = {
             "005930": 71000,
             "000660": 185000,
@@ -53,6 +54,8 @@ class MockBroker(Broker):
         """매수/매도를 메모리 상에서 흉내 냅니다."""
 
         order_id = f"MOCK-{next(self._seq):06d}"
+        if order.quantity <= 0:
+            return OrderResult(order_id, order.symbol, order.side, order.quantity, False, "invalid quantity", datetime.now())
 
         if order.side.value == "BUY":
             current_price = self._prices.get(order.symbol, 10000)
@@ -60,16 +63,44 @@ class MockBroker(Broker):
             if self._cash < cost:
                 return OrderResult(order_id, order.symbol, order.side, order.quantity, False, "insufficient cash", datetime.now())
             self._cash -= cost
-            self._positions[order.symbol] = Position(order.symbol, order.quantity, current_price)
+            existing = self._positions.get(order.symbol)
+            old_qty = existing.quantity if existing else 0
+            old_cost = old_qty * existing.average_price if existing else 0
+            new_qty = old_qty + order.quantity
+            self._positions[order.symbol] = Position(order.symbol, new_qty, (old_cost + cost) // new_qty)
+            fill_price = current_price
         else:
             position = self._positions.get(order.symbol)
             if position is None:
                 return OrderResult(order_id, order.symbol, order.side, order.quantity, False, "no position", datetime.now())
+            if order.quantity > position.quantity:
+                return OrderResult(order_id, order.symbol, order.side, order.quantity, False, "insufficient quantity", datetime.now())
             sell_price = self._prices.get(order.symbol, position.average_price)
             self._cash += sell_price * order.quantity
-            self._positions.pop(order.symbol, None)
+            remaining = position.quantity - order.quantity
+            if remaining:
+                self._positions[order.symbol] = Position(order.symbol, remaining, position.average_price)
+            else:
+                self._positions.pop(order.symbol, None)
+            fill_price = sell_price
 
+        self._orders[order_id] = BrokerOrder(
+            order_id, order.symbol, BrokerOrderStatus.FILLED, side=order.side,
+            requested_quantity=order.quantity, open_quantity=0,
+            filled_quantity=order.quantity, filled_price=fill_price,
+        )
         return OrderResult(order_id, order.symbol, order.side, order.quantity, True, "accepted", datetime.now())
+
+    def get_order_status(self, order_id: str, symbol: str) -> BrokerOrder:
+        order = self._orders.get(order_id)
+        if order is not None and order.symbol == symbol:
+            return order
+        return BrokerOrder(order_id, symbol, BrokerOrderStatus.UNKNOWN)
+
+    def get_open_orders(self, symbol: str) -> list[BrokerOrder]:
+        # This broker intentionally models immediate fills only. Async/partial
+        # fill safety tests must use an explicitly controlled pending broker.
+        return []
 
     def get_daily_prices(self, symbol: str, days: int) -> list[PriceBar]:
         """테스트용 가짜 일봉을 생성합니다.

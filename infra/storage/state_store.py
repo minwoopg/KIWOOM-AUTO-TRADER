@@ -3,6 +3,8 @@ from __future__ import annotations
 """간단한 JSON 상태 저장소."""
 
 import json
+import os
+import tempfile
 from pathlib import Path
 
 from domain.models import RuntimeState
@@ -35,6 +37,8 @@ class JsonStateStore:
             symbol_stoploss_at          = raw.get("symbol_stoploss_at", {}),
             symbol_trail_loss_at        = raw.get("symbol_trail_loss_at", {}),
             symbol_block_today          = set(raw.get("symbol_block_today", [])),
+            _last_run_date              = raw.get("_last_run_date"),
+            unresolved_order_intents    = raw.get("unresolved_order_intents", {}),
         )
         highest_price = {k: int(v) for k, v in raw.get("highest_price", {}).items()}
         return state, highest_price
@@ -42,6 +46,8 @@ class JsonStateStore:
     def save(self, state: RuntimeState, highest_price: dict[str, int] | None = None) -> None:
         """현재 상태를 JSON 파일에 저장합니다."""
         payload = {
+            "_last_run_date":           state._last_run_date,
+            "unresolved_order_intents": state.unresolved_order_intents,
             "bought_symbols_today":     sorted(state.bought_symbols_today),
             "last_order_id_by_symbol":  state.last_order_id_by_symbol,
             "last_sold_at_by_symbol":   state.last_sold_at_by_symbol,
@@ -55,6 +61,18 @@ class JsonStateStore:
             "symbol_block_today":       sorted(state.symbol_block_today),
             "highest_price":            highest_price or {},
         }
-        self.path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        # A crash must not truncate the last valid risk state.
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.path.parent,
+                prefix=self.path.name + ".", suffix=".tmp", delete=False,
+            ) as handle:
+                tmp_path = Path(handle.name)
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self.path)
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)

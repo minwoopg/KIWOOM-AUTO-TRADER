@@ -245,4 +245,113 @@ blocks≥10, unique symbols≥5, independent clusters≥3, clean days≥3)을
 
 ---
 
+## 🛡️ 외부 안전성 감사(2026-09-07) 검토 후 채택 — P0/P1 인프라 버그 수정 (전략 로직 무변경)
+
+### 배경
+
+민우님이 별도 경로로 받은 외부 안전성 감사(`KIWOOM_AUDIT_20260907.md` +
+`KIWOOM_safety_review_20260907.patch` + `KIWOOM_audit_evidence_20260907.zip`,
+기준 `main@a5106df`)를 검토·적용해달라고 요청. 감사는 8/26~9/4 8일·26회
+왕복거래의 주문가 추정 기대값이 비용 전부터 음수(-12,677원/거래, Base
+비용 후 -33,334원/거래)이며, 실제 체결가·비용 원장이 없어 실현 손익은
+계산 불가하다는 별도 수익성 결론과, 재시작·잔고캐시·HTTP 응답 파싱 등
+운영 안전성 P0/P1 버그 10건(F1~F10)을 담고 있었음. 이번 항목은 **코드
+수정 부분만** 다룸(수익성 분석은 프로젝트 문서
+`kiwoom-auto-trader/2026-09-07-external-safety-audit-review.md` 참고).
+
+### 독립 검증 절차 (Claude, 적용 전)
+
+1. 실제 GitHub `main`을 별도로 clone해 감사가 명시한 기준 커밋
+   `a5106dfba031ab1440d0ba9c4f0238fffd1bdfa7`와 일치함을 직접 확인.
+2. 첨부 patch를 그 clone에 `git am`으로 적용 — 충돌 없이 5개 커밋 전부
+   적용됨.
+3. 수정 전/후 `run_regression_tests.py` 직접 실행:
+   - 수정 전: 29개 파일 중 26 PASS·3 FAIL
+     (`test_broker_order_status.py`, `test_broker_read_only_wiring.py`,
+     `test_replay_time_axis.py`)
+   - 수정 후: 30개 파일 중 28 PASS·2 FAIL
+     (`test_broker_read_only_wiring.py`만 해결, 신규 실패 0건) —
+     감사 보고서의 주장과 정확히 일치.
+4. 신규 `test_review_safety_regressions.py` 25/25 PASS 직접 실행 확인.
+5. 일부 재현 로그(`reproductions_before.txt`)를 수정 전 코드에 대해
+   재실행해 F1(보유 종목 감시 누락)·F3(malformed HTTP 응답)·F6(재시작
+   시 당일 리셋) 실패가 실제로 재현됨을 확인.
+6. `git diff --stat`으로 14개 변경 파일 목록을 확인 — `domain/strategy/`,
+   `config/settings.yaml`, `config/settings.py`, `domain/market_regime/`
+   등 전략 predicate·threshold·설정 파일은 **단 한 줄도 포함되지
+   않음**을 직접 확인.
+
+### 채택한 수정 (F1~F5, F7~F10 + F6의 재시작 버그 부분)
+
+- 보유 종목이 조건검색 targets/excluded_symbols/UNKNOWN 3연속 제외에
+  걸려도 손절 감시에서 빠지지 않도록 수정(F1).
+- 재시작 시 미확인 주문 상태를 journal에서 복원해 중복 주문을 막고,
+  journal을 읽을 수 없으면 자동 주문을 전부 차단(fail-close)(F2).
+- 브로커 HTTP 200 응답의 `return_code`가 정상 int가 아니면 확정
+  거절이 아닌 ambiguous로 처리(F3).
+- 계좌에 미확정 주문이 남아있는 동안 신규 진입을 직렬화, 실시간 잔고
+  조회 실패 시 신규매수 차단(F4).
+- 미확정 주문 동안 180초 잔고 캐시를 우회(F5).
+- **재시작이 당일 거래일을 리셋하지 않도록 `RuntimeState.roll_
+  trading_day()` 신설**(F6의 절반만 — 아래 "채택하지 않은 부분" 참고).
+- 잔고 페이지네이션 누락·음수 현금 처리 보정(F7).
+- 시장 개장/마감 판정을 호스트 타임존이 아닌 KST 기준으로 통일,
+  주말 제외, 장 마감 후에도 미확정 주문 대조는 계속(F9).
+- 현재가 캐시가 오래됐거나 미래 시각이면 신규 매수 차단(F10).
+- `MockBroker`가 부분매도·재조회를 정확히 흉내내도록 보강, 프로세스
+  중복 실행 방지용 OS 파일 잠금 신설.
+- F8(손익 한도가 체결가 아닌 주문가 기준)은 감사도 명시적으로
+  **미해결**로 분류 — 이번에도 손대지 않음.
+
+### 채택하지 않은 부분 — 민우님 명시 결정
+
+감사 원안은 F6에 "같은 종목 반복손실도 전역 `consecutive_losses`에
+반영"하는 수정을 포함했음. 이는 2026-06-15에 민우님이 이미 의도적으로
+내린 결정(한 종목의 불운이 계좌 전체 매수를 막지 않도록, 전역
+카운터는 종목별 **첫** 손실만 반영하고 반복 손실은 `symbol_loss_
+count_today`로 그 종목만 별도 차단)을 뒤집는 것. `max_consecutive_
+losses=3`이므로 원안대로면 한 종목이 하루 3번만 손절해도 계좌 전체
+신규매수가 중단됨.
+
+민우님 검토 결과: **2026-06-15 정책을 그대로 유지**하기로 결정 —
+`if cnt == 1: self.state.consecutive_losses += 1`를 그대로 보존.
+재시작 시 당일 상태가 리셋되는 버그 수정(F6의 나머지 절반)만 채택.
+실측 데이터 확인: 감사가 분석한 8일·26건 중 같은 날 같은 종목이
+2번 이상 거래된 사례는 0건이므로, 이번 결정은 과거 어떤 날의 결과도
+바꾸지 않음 — 앞으로의 방향성 선택.
+
+이 결정에 맞춰 `test_review_safety_regressions.py`의 관련 테스트를
+`test_symbol_loss_count_ignores_duplicate_observation_global_counter_
+kept_2026_06_15_policy`로 이름 변경하고 기대값을
+`consecutive_losses == 2` → `== 1`로 수정, `docs/SAFETY_REVIEW_
+20260907.md`도 이 결정을 반영해 갱신.
+
+### 최종 검증 (F6 수정 후 재실행)
+
+`test_review_safety_regressions.py` **25/25 PASS**(변경 후에도 유지),
+`run_regression_tests.py` **30개 파일 중 28 PASS·2 FAIL**(변경 전과
+동일, 신규 실패 0건), `python -m compileall` 클린.
+
+### 변경하지 않은 것
+
+Candidate A predicate·gate·threshold, Candidate G/M1/MIN_PROFIT_5M/
+CRASH_CUT/entry score/BULLISH 판정, `config/settings.yaml`/`config/
+settings.py`의 모든 전략 파라미터, `domain/market_regime/` 분류기 —
+전부 무변경. F8(손익 한도 회계)도 미해결로 남김.
+
+### 전달 파일
+
+- `KIWOOM_safety_review_20260907_reviewed.patch` — 감사 원본 5개
+  커밋 + F6 조정 1개 커밋(총 6개), 기준 커밋(`a5106df`)에 `git am`
+  적용 검증 완료.
+- 14개 파일 전체 덮어쓰기(diff zip) — `app/main.py`, `domain/models.py`,
+  `domain/service/trading_service.py`, `infra/broker/{base,kiwoom_
+  broker,mock_broker}.py`, `infra/storage/{process_lock(신규),
+  state_reconciler,state_store}.py`, `utils/time_utils.py`,
+  `test_review_safety_regressions.py`(신규),
+  `test_tracked_order_journal.py`, `tools/audit_trade_bundles.py`
+  (신규, 감사용 분석기), `docs/SAFETY_REVIEW_20260907.md`(신규).
+
+---
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
