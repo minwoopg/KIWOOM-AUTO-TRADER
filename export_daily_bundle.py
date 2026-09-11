@@ -69,6 +69,13 @@ import zipfile
 from datetime import date, datetime
 from pathlib import Path
 
+from infra.storage.run_baseline import (
+    RUN_BASELINE_FIELDS,
+    load_run_baselines,
+    parse_run_timestamp,
+)
+from utils.time_utils import KST_TZ
+
 LOGS_DIR = Path("logs")
 REPORTS_DIR = Path("reports")
 EXPORTS_DIR = Path("exports")
@@ -121,6 +128,13 @@ CSV_SOURCES: list[tuple[str, tuple[str, ...]]] = [
 # _maintain_tracked_order_journal()/_try_buy()/SELL accepted 분기)
 # 에서만 쓰이고, symbol/order_id/side만 포함할 뿐 SENSITIVE_KEYS
 # 대상 필드(계좌번호/토큰 등)는 담지 않음 — 수집 대상 확장만.
+#
+# 2026-09-11 (B01 보완, 민우님/GPT 지적): run_baseline.csv 기록이
+# 실패해도(app/main.py의 try/except) 그 사실이 daily bundle 어디에도
+# 남지 않으면, 나중에 "그날 실행-거래 조인이 왜 안 맞는지"를 알 방법이
+# 없음(같은 유형의 "0건이 정상인지 누락인지 구분 안 됨" 문제).
+# [RUN_BASELINE] 태그를 추가 — 성공/실패 라인 모두 이 태그로 시작하며
+# symbol/order_id 등 민감 필드는 포함하지 않음(git_sha/config_hash만).
 LOG_TAGS: tuple[str, ...] = (
     "[COND_STATUS]", "[COND_TRUNCATE]", "[COND]",
     "[WS]", "[SESSION_SHADOW]", "[EXPERIMENTAL]",
@@ -130,6 +144,7 @@ LOG_TAGS: tuple[str, ...] = (
     "[LIFECYCLE_ORPHAN]",
     "[TRACKED_ORDER_JOURNAL_ERROR]", "[ORDER_ID_MISSING]",
     "[ORDER_PLACEMENT_AMBIGUOUS]",
+    "[RUN_BASELINE]", "[CONFIG_SNAPSHOT_MISSING]",
 )
 
 # ── 민감정보 마스킹 ─────────────────────────────────────────────
@@ -630,6 +645,129 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
             raw_files.append(dst.name)
             size_kb = dst.stat().st_size / 1024
             manifest.append(f"  {name:30s} | OK | {kept:,}행 / 전체 {total:,}행 | {size_kb:,.0f} KB")
+
+        # 2026-09-11 (B01 보완, 민우님/GPT 지적): run_baseline.csv가
+        # daily bundle에 전혀 실리지 않아 "이 날짜 거래가 어떤 실행/
+        # 설정으로 나왔는지"를 번들만으로 알 수 없었음. 당일 시작한
+        # 실행 + 전날(혹은 그 이전)에 시작해 이 날짜까지 이어지고
+        # 있을 수 있는 가장 최근 실행 1건("이월 추정")을 포함한다.
+        # 이 조인은 어디까지나 최선 추정이며(run_baseline.py의
+        # resolve_run_id_for_timestamp() docstring 참고), 이 섹션은
+        # 그 한계를 번들 안에서 분석자가 바로 알 수 있게 명시한다.
+        manifest.append("")
+        manifest.append("[ RAW — 실행 기준선 (run_baseline.csv, B01) ]")
+        baseline_src = LOGS_DIR / "run_baseline.csv"
+        if not baseline_src.exists():
+            manifest.append(f"  {'run_baseline.csv':30s} | MISSING | 원본 없음 | excluded")
+            manifest.append("  ⚠ 이 날짜의 거래/신호를 실행(run_id)에 연결할 근거가 없습니다.")
+        else:
+            all_baselines = load_run_baselines(str(baseline_src))
+            day_start = datetime.combine(target, datetime.min.time(), tzinfo=KST_TZ)
+            day_end = datetime.combine(target, datetime.max.time(), tzinfo=KST_TZ)
+
+            parsed: list[tuple[dict, object]] = []
+            unparseable = 0
+            for b in all_baselines:
+                dt = parse_run_timestamp(b.get("started_at"))
+                if dt is None:
+                    unparseable += 1
+                else:
+                    parsed.append((b, dt))
+
+            same_day = [(b, dt) for b, dt in parsed if day_start <= dt <= day_end]
+            before_day = [(b, dt) for b, dt in parsed if dt < day_start]
+            # 재부팅 스케줄이 없다는 전제 하의 best-effort — 자정을
+            # 넘겨 재시작 없이 계속 도는 실행이 있다면 그 실행이 이
+            # 날짜 새벽 거래를 만들었을 수 있음. 확정 아님.
+            carried_over = max(before_day, key=lambda pair: pair[1]) if before_day else None
+
+            included = [b for b, _dt in same_day]
+            if carried_over is not None:
+                included.append(carried_over[0])
+
+            if not included:
+                manifest.append(f"  {'run_baseline.csv':30s} | OK | 이 날짜에 해당하는 실행 없음 | excluded")
+                # 2026-09-11 (B01 v2 재검토, GPT 재지적): 연결 가능한
+                # 실행이 하나도 없을 때(run_baseline.csv가 비어있거나
+                # 모든 started_at이 파싱 불가) 이 날짜에 실제 거래/
+                # 신호가 있으면 "실행 없음"이 아니라 "연결 불가"임을
+                # 명시해야 함 — 이전 구현은 이 경우 UNRESOLVED 표시
+                # 자체를 건너뛰어(아래 earliest_included_dt 계산이
+                # included가 비면 None이 되므로) 조용히 "정상, 그냥
+                # 실행이 없었다"로 읽힐 위험이 있었음.
+                for label, fname in (
+                    ("signal_log", f"signal_log_{day_compact}.csv"),
+                    ("trades", f"trades_{day_compact}.csv"),
+                ):
+                    rows_probe = _read_csv(work / fname)
+                    if rows_probe:
+                        manifest.append(
+                            f"    ⚠ {label}에 이 날짜 행이 {len(rows_probe)}건 있지만"
+                            " 연결 가능한 실행 기록이 전혀 없습니다 — 이 날짜 전체가"
+                            " run_id로 연결할 근거가 없습니다(UNRESOLVED)."
+                        )
+            else:
+                dst = work / f"run_baseline_{day_compact}.csv"
+                with dst.open("w", newline="", encoding="utf-8") as fp:
+                    writer = csv.DictWriter(fp, fieldnames=RUN_BASELINE_FIELDS)
+                    writer.writeheader()
+                    for b in included:
+                        writer.writerow({k: b.get(k, "") for k in RUN_BASELINE_FIELDS})
+                raw_files.append(dst.name)
+                manifest.append(
+                    f"  {'run_baseline.csv':30s} | OK | 당일 시작 {len(same_day)}건"
+                    f" + 전날 이월 추정 {1 if carried_over else 0}건"
+                    f" | {dst.stat().st_size / 1024:,.1f} KB"
+                )
+                if carried_over is not None:
+                    manifest.append(
+                        f"    ⚠ 이월 추정 실행(run_id={carried_over[0].get('run_id', '')})은"
+                        " 확정된 연결이 아닙니다(best-effort, 재시작 로그 없음을 가정)."
+                    )
+
+                # config snapshot (redacted) — 존재하면 함께 포함.
+                # 없어도(예: 이 실행 시점엔 아직 해당 기능이 없었음)
+                # 실패로 취급하지 않고 조용히 생략한다.
+                config_dir = LOGS_DIR / "run_baseline_configs"
+                snap_included = 0
+                for b in included:
+                    run_id = b.get("run_id", "")
+                    src = config_dir / f"{run_id}.json"
+                    if src.exists():
+                        shutil.copy2(src, work / f"run_baseline_config_{run_id}.json")
+                        raw_files.append(f"run_baseline_config_{run_id}.json")
+                        snap_included += 1
+                manifest.append(
+                    f"    config snapshot(redacted) 포함: {snap_included}/{len(included)}건"
+                )
+
+            if unparseable:
+                manifest.append(f"    ⚠ started_at 파싱 실패 {unparseable}건 — 조인에서 제외")
+
+            # "구분할 수 있음" 요구사항 — 이 날짜의 거래/신호 첫 기록이
+            # 포함된 실행의 시작 시각보다 앞서면(=조인 근거 자체가
+            # 없으면) 자동 보정하지 않고 명시적으로 표시만 한다.
+            earliest_included_dt = min(
+                (dt for _b, dt in same_day + ([carried_over] if carried_over else [])),
+                default=None,
+            )
+            if earliest_included_dt is not None:
+                for label, fname in (
+                    ("signal_log", f"signal_log_{day_compact}.csv"),
+                    ("trades", f"trades_{day_compact}.csv"),
+                ):
+                    rows_probe = _read_csv(work / fname)
+                    first_ts, _last_ts = _first_last_ts(rows_probe, "timestamp")
+                    if not first_ts:
+                        continue
+                    first_dt = parse_run_timestamp(first_ts)
+                    if first_dt is not None and first_dt < earliest_included_dt:
+                        manifest.append(
+                            f"    ⚠ {label}의 첫 기록({first_ts})이 포함된 실행의 시작 시각보다"
+                            " 앞섭니다 — 이 구간은 run_id로 연결할 근거가 없습니다(UNRESOLVED)."
+                        )
+        manifest.append("  ※ run_id 연결은 시간범위 최선 추정입니다(암호학적 확정 아님) —")
+        manifest.append("    기록 실패 여부는 app.log의 [RUN_BASELINE] 태그 라인을 참고하세요.")
 
         manifest.append("")
         manifest.append("[ RAW — 로그 (allowlist 태그 줄만, 마스킹 적용) ]")

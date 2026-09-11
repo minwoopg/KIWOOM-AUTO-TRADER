@@ -28,6 +28,7 @@ from domain.strategy.strategy_router import StrategyRouter
 from infra.broker.kiwoom_broker import KiwoomBroker
 from infra.broker.mock_broker import MockBroker
 from infra.storage.logger import TradeCsvLogger, SignalCsvLogger, build_app_logger
+from infra.storage.run_baseline import perform_run_baseline_startup
 from infra.storage.state_reconciler import StateReconciler
 from infra.storage.state_store import JsonStateStore
 from infra.storage.process_lock import single_instance_lock
@@ -153,6 +154,20 @@ async def _run_application(settings: Settings) -> None:
     print("  키움 자동매매 시스템 (단타) 시작")
     print(f"  app.log: {settings.storage.app_log_file}")
     print("=" * 50)
+
+    # ── B01 (2026-09-11, 개선 체크리스트 0단계): 실행 기준선 기록 ──────
+    # run_id/git_sha/git_dirty/effective_config_hash/모의·실전 구분과
+    # redacted 설정 스냅샷을 시작 시각에 한 번 기록합니다. 실패해도
+    # (git 없음, 디스크 오류 등) 시작을 절대 막지 않도록 전체를
+    # best-effort로 처리합니다 — 순수 관측 기능이 매매 시작 자체를
+    # 막는 건 본말전도이기 때문입니다. 2026-09-11 (B01 v2 재검토):
+    # 원래 이 블록이 여기 그대로 있었는데, 단위 테스트가 가능하도록
+    # infra/storage/run_baseline.py의 perform_run_baseline_startup()으로
+    # 옮겼습니다(로직 변경 없음, 위치만 이동 — 그 함수의 docstring에
+    # config snapshot 저장 실패 시 [CONFIG_SNAPSHOT_MISSING] 경고를
+    # 남기는 보완 내용이 있습니다).
+    perform_run_baseline_startup(settings, app_logger)
+
     trade_logger  = TradeCsvLogger(settings.storage.trade_log_file)
     signal_logger = SignalCsvLogger(settings.storage.signal_log_file)
     state_store  = JsonStateStore(settings.storage.state_file)
