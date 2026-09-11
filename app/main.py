@@ -51,7 +51,7 @@ def build_broker(settings: Settings):
     return KiwoomBroker(settings.broker)
 
 
-def build_trading_service(settings, broker, app_logger, trade_logger, signal_logger, state_store):
+def build_trading_service(settings, broker, app_logger, trade_logger, signal_logger, state_store, notifier=None):
     strategy_router   = StrategyRouter(settings.strategy)
     regime_classifier = MarketRegimeClassifier(settings.market_regime)
     risk_manager      = RiskManager(settings.trading, settings.risk, settings.storage.trade_log_file)
@@ -65,6 +65,13 @@ def build_trading_service(settings, broker, app_logger, trade_logger, signal_log
         trade_logger=trade_logger,
         signal_logger=signal_logger,
         state_store=state_store,
+        # 2026-09-11 (GPT reclosure): 시작 알림/계정 자체 점검에 쓰는
+        # notifier와 매수/매도 알림에 쓰는 notifier가 서로 다른
+        # KakaoNotifier 인스턴스면, 한쪽이 토큰을 갱신해도 다른 쪽은
+        # 예전 토큰(카카오가 회전 시 폐기하는 refresh_token 포함)을
+        # 그대로 들고 있다가 나중에 갱신 실패할 수 있음. 호출부(main.py)가
+        # 하나의 notifier를 만들어 여기로 주입해 공유하게 함.
+        notifier=notifier,
     )
 
 
@@ -201,20 +208,35 @@ async def _run_application(settings: Settings) -> None:
                 "의도적으로 중단합니다."
             ) from e
 
+    # 2026-09-11 (GPT reclosure): notifier를 여기서 한 번만 만들어
+    # TradingService(매수/매도 알림)와 시작 알림/계정 자체 점검이
+    # 반드시 같은 KakaoNotifier 인스턴스(=같은 토큰 상태)를 공유하게
+    # 합니다. 두 인스턴스로 나뉘면 한쪽이 토큰을 갱신해도 다른 쪽은
+    # 예전 토큰(카카오가 회전 시 폐기하는 refresh_token 포함)을 그대로
+    # 들고 있다가 나중에 갱신 실패할 수 있습니다.
+    from infra.notify.kakao_notifier import build_notifier, send_startup_notification_async
+    _notifier = build_notifier(settings)
+
     trading_service = build_trading_service(
-        settings, broker, app_logger, trade_logger, signal_logger, state_store
+        settings, broker, app_logger, trade_logger, signal_logger, state_store,
+        notifier=_notifier,
     )
 
     # ── 시작 알림 ────────────────────────────────────────────────
-    from infra.notify.kakao_notifier import build_notifier
     from datetime import datetime as _dt_notify
-    _notifier = build_notifier(settings)
     _now_str  = _dt_notify.now().strftime('%H:%M')
     _mode     = '모의투자' if settings.broker.is_paper_trading else '실전투자'
-    _notifier.send(
-        f"🚀 자동매매 시작\n"
-        f"시각: {_now_str} | 모드: {_mode}\n"
-        f"감시 종목: 조건검색식 {settings.websocket.condition_seqs}"
+
+    # 2026-09-11 (GPT reclosure): 카카오 알림 대상 계정 자체 점검(여러
+    # 사람이 각자 컴퓨터에서 각자 토큰으로 돌리는 상황 대비)을 매매/
+    # WebSocket 시작과 완전히 분리된 백그라운드 스레드로 실행합니다.
+    # 원래는 여기서 동기식으로 verify_account()를 호출했는데, 그 HTTP
+    # 호출(최악 401→refresh→재조회 시 최대 약 15초)이 trading startup
+    # critical path를 지연시킬 수 있다는 지적을 받아 분리했습니다 —
+    # 이 프로젝트는 장중 재시작이 실제로 종종 발생하므로 이론상
+    # 문제가 아닙니다. 실패해도 fail-open, 매매 루프에는 영향 없음.
+    send_startup_notification_async(
+        _notifier, app_logger, _mode, _now_str, settings.websocket.condition_seqs
     )
 
     # ── WebSocket 조건검색 활성화 여부 ───────────────────────────

@@ -67,6 +67,7 @@ class TradingService:
         tracked_order_journal: "TrackedOrderJournalStore | None" = None,
         low_upside_shadow_logger: "LowUpsideShadowLogger | None" = None,
         min_profit_extension_shadow_logger: "MinProfitExtensionShadowLogger | None" = None,
+        notifier: "KakaoNotifier | None" = None,
     ) -> None:
         self.settings = settings
         self.broker = broker
@@ -241,7 +242,13 @@ class TradingService:
         # MAX_ENTRIES_PER_DAY가 203회 차단되는 버그 발생. 프로세스 재시작
         # 타이밍에 의존하지 않도록, 폴링마다 날짜변경을 직접 체크하도록 변경.
         self._last_reset_date = None
-        self._notifier: KakaoNotifier = build_notifier(settings)  # 카카오 알림
+        # 2026-09-11 (GPT reclosure): 선택적 인자 — 기존 생성 코드(main.py,
+        # 테스트)를 안 건드리고 도입하기 위해 None이면 기존처럼 자체 생성.
+        # main.py는 이제 시작 알림/계정 자체 점검에 쓰는 notifier와 반드시
+        # 같은 인스턴스를 여기로 주입합니다 — 두 인스턴스로 나뉘면 한쪽이
+        # 토큰을 갱신해도(카카오는 회전 시 기존 refresh_token을 폐기) 다른
+        # 쪽은 예전 토큰 그대로 남아 있다가 나중에 갱신 실패할 수 있습니다.
+        self._notifier: KakaoNotifier = notifier or build_notifier(settings)  # 카카오 알림
         # ATR/볼린저 계산용 일봉 캐시 (종목별 60개 유지)
         self._daily_bars_cache: dict[str, dict] = {}  # (미사용 — _update_indicators가 cached_daily_bars 재사용)
         self._last_indicators: dict[str, dict] = {}   # {symbol: {atr, bb}}

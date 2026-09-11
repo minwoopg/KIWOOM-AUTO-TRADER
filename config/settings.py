@@ -237,6 +237,13 @@ class KakaoConfig:
     access_token:  str = ""   # 카카오 액세스 토큰
     refresh_token: str = ""   # 리프레시 토큰 (자동 갱신용)
     rest_api_key:  str = ""   # REST API 키 (토큰 갱신용)
+    # 2026-09-11: 카카오 앱의 "Client Secret 사용함"이 켜진 경우에만
+    # 필요. 기존처럼 꺼져 있으면 빈 문자열로 두면 됨(하위호환).
+    client_secret: str = ""
+    # 2026-09-11: refresh로 새로 발급된 토큰을 재시작 후에도 이어 쓸 수
+    # 있게 저장하는 경로. .env는 코드가 직접 고치지 않고, 이 파일(이미
+    # .gitignore의 data/ 아래)에 원자적으로 저장·우선 로드함.
+    token_state_file: str = "data/kakao_token_state.json"
 
 
 @dataclass(frozen=True)

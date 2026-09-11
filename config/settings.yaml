@@ -224,6 +224,12 @@ kakao:
   access_token:  "${KAKAO_ACCESS_TOKEN}"
   refresh_token: "${KAKAO_REFRESH_TOKEN}"
   rest_api_key:  "${KAKAO_REST_API_KEY}"
+  # 2026-09-11: 카카오 앱의 "Client Secret 사용함"이 켜져 있을 때만
+  # 필요합니다. 기존 앱처럼 꺼져 있으면 .env에 이 줄을 아예 안 써도
+  # 되고(빈 문자열로 처리되어 기존과 동일하게 동작), 새로 만드는 앱은
+  # 카카오디벨로퍼스 콘솔에서 이 설정을 켰다면 값을 넣어주세요.
+  client_secret: "${KAKAO_CLIENT_SECRET}"
+  # token_state_file: data/kakao_token_state.json  # 기본값 — 여러 인스턴스를 한 컴퓨터에서 돌리면 인스턴스별로 다른 경로로 바꿔주세요.
 
 # ── 실험적 기능 플래그 (2026-07-27) ──────────────────────────
 # 단계적 리팩터링(트레이딩 판단 구조 개편)을 위한 플래그.
