@@ -276,6 +276,12 @@ class StorageConfig:
     # (5분 시점) 판단 순간의 feature snapshot 전용 로그 — VWAP이탈청산/
     # 급락청산과 섞이지 않도록 별도 파일로 분리.
     min_profit_extension_shadow_log_file: str = "logs/min_profit_extension_shadow.csv"
+    # B01 (2026-09-11, 개선 체크리스트 0단계): 실행 기준선(run_id/git_sha/
+    # git_dirty/effective_config_hash/모의·실전 구분/시작시각) 기록 전용
+    # 신규 파일. trades.csv/signal_log.csv와는 완전히 분리된 새 파일이라
+    # (infra/storage/run_baseline.py 참고) 기존 CSV 스키마에는 영향이
+    # 전혀 없습니다 — 연결은 timestamp 시간범위 조인으로 처리합니다.
+    run_baseline_log_file: str = "logs/run_baseline.csv"
 
 
 @dataclass(frozen=True)
