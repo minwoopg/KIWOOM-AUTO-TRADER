@@ -1,31 +1,33 @@
 # -*- coding: utf-8 -*-
-"""2026-09-11 (P0-1, GPT 종합검토 20260911 반영): 잔고 조회 429 완화 테스트.
+"""2026-09-11 (P0-1) → 2026-09-14 (안전 복구, GPT 재검토 20260914 반영):
+잔고 조회 429 처리 테스트.
 
-배경: 이전엔 TradingService._get_balance_with_cache()가
-broker.get_account_balance()를 아무 보호 없이 호출해서, HTTP 429가
-나면 그 예외가 run_once() 밖까지 전파됐습니다. run_once()는 이 호출
-직후에 보유 종목 손절/트레일링 감시를 하므로, 이 예외가
-app/main.py의 trading_loop()까지 올라가면 거기서 180초 전체 루프
-백오프가 걸려 그 동안 이미 보유 중인 포지션의 리스크 감시까지
-전부 멈췄습니다(재현 확인, GPT 종합검토 P0-1).
+배경: P0-1은 broker.get_account_balance()가 HTTP 429로 실패하면 예외를
+삼키고 직전 캐시 잔고로 이번 사이클을 계속 진행하게 했습니다(트레일링/
+손절 감시가 180초 동안 멈추는 것을 막기 위함). 그런데 재검토(GPT
+20260914)에서, 미해결 주문(BUY_PENDING 등)이 있어 "반드시 최신 잔고가
+필요한" 바로 그 분기에서 429가 나면, 이 캐시 대체값이 run_once() →
+_sync_position_state_machine_shadow()로 그대로 전달되고
+confirm_buy_from_broker()에 임의로 오래된 캐시 기준 수량(예: 0주)이
+"이번 체결 확인 결과"처럼 들어가는 경로가 실제로 재현됐습니다.
 
-이 테스트는 다음을 검증합니다.
-1. 캐시된 잔고가 있는 상태에서 429가 나면 예외를 삼키고 캐시로 대체.
-2. 캐시가 전혀 없는 상태(예: 프로세스 시작 직후)에서 429가 나면
-   대체할 안전한 값이 없으므로 기존과 동일하게 예외를 그대로 올림.
-3. 429가 아닌 다른 예외(전송 실패, 인증 오류 등)는 캐시가 있어도
-   조용히 삼키지 않고 그대로 올림 — "429만 좁게" 처리한다는 계약을
-   깨지 않는지 확인.
-4. run_once() 레벨 통합 테스트: 캐시가 있는 상태에서 두 번째
-   run_once() 호출이 잔고 429를 만나도 run_once() 자체는 예외 없이
-   끝까지 돌고(=trading_loop()의 180초 백오프를 유발하지 않음),
-   그 사이클의 보유 종목 처리(_process_symbol)도 정상적으로
-   호출됨을 확인합니다 — "리스크 감시가 멈추지 않는다"는 실제
-   효과를 회귀로 고정.
+이 테스트는 그 위험을 제거하기 위해 캐시 대체를 되돌린(2026-08-10
+이전과 동일한 동작으로 복귀) 다음 내용을 검증합니다.
+
+1. 캐시된 잔고가 있어도 429가 나면 캐시로 대체하지 않고 예외를 그대로
+   올린다 — 미해결 주문 유무와 무관하게.
+2. 캐시가 전혀 없는 상태(예: 프로세스 시작 직후)에서 429가 나도
+   (대체할 값이 원래 없었으므로) 마찬가지로 예외를 그대로 올린다.
+3. 429가 아닌 다른 예외(전송 실패, 인증 오류 등)도 캐시가 있어도
+   조용히 삼키지 않고 그대로 올린다 — 기존과 동일.
+4. run_once() 레벨: 429가 나면 run_once() 자체가 예외를 그대로
+   전파한다 — 즉 trading_loop()의 180초 전체 백오프가 다시 걸릴 수
+   있는 상태로 돌아갔음을 회귀로 고정한다(이 되돌림이 180초 공백
+   문제를 해결하는 것이 아니라는 사실 자체를 테스트로 남김).
 
 매수/매도/보유 판단 기준(전략 파라미터, RSI/MACD/진입점수 등)은
 전혀 건드리지 않았습니다 — 잔고 조회 실패 시 어떤 잔고 값을 쓸지에
-대한 순수 인프라 복원력 처리입니다.
+대한 순수 인프라 처리입니다.
 """
 from __future__ import annotations
 
@@ -78,27 +80,46 @@ def _make_429_error() -> KiwoomHttpError:
     )
 
 
-class TestBalanceRateLimitFallback(unittest.TestCase):
+class TestBalanceRateLimitFallbackDisabled(unittest.TestCase):
 
-    def test_429_with_existing_cache_falls_back_without_raising(self):
+    def test_429_with_existing_cache_still_raises(self):
+        """2026-09-14 안전 복구: 캐시가 있어도 429는 캐시로 대체하지
+        않고 예외를 그대로 올려야 합니다(P0-1의 캐시 대체 동작을
+        되돌림 — confirm_buy_from_broker() 등에 스테일 수량이 흘러드는
+        경로를 재현한 뒤 제거한 조치)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             service = _make_service(tmpdir)
 
             good_balance = AccountBalance(cash=1_000_000, total_asset=1_000_000, positions=[])
             service.cached_balance = good_balance
             # balance_refresh_seconds(180초)를 넘겨서 "캐시가 있지만
-            # 갱신 시점이 됨" 분기를 타게 만듦 — 이 분기에서 429가
-            # 나는 경로를 재현하려는 것.
+            # 갱신 시점이 됨" 분기를 타게 만듦.
             service.cached_balance_loaded_at = datetime.now() - timedelta(seconds=999)
 
             service.broker.get_account_balance = lambda: (_ for _ in ()).throw(_make_429_error())
 
-            result = service._get_balance_with_cache()
+            with self.assertRaises(KiwoomHttpError):
+                service._get_balance_with_cache()
 
-            self.assertIs(
-                result, good_balance,
-                "429가 나면 직전 캐시 잔고를 그대로 반환해야 합니다(예외를 올리면 안 됨).",
-            )
+    def test_429_with_unresolved_orders_still_raises(self):
+        """미해결 주문이 있어 반드시 최신 잔고가 필요한 분기 — 이
+        경우에도 캐시로 대체하지 않고 예외를 그대로 올려야 합니다.
+        (재검토에서 재현된 문제: 여기서 캐시로 대체하면 스테일 수량이
+        confirm_buy_from_broker()에 "체결 확인 결과"처럼 들어갈 수
+        있었습니다.)"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = _make_service(tmpdir)
+
+            good_balance = AccountBalance(cash=1_000_000, total_asset=1_000_000, positions=[])
+            service.cached_balance = good_balance
+            service.cached_balance_loaded_at = datetime.now()  # 방금 갱신 — routine refresh 아님
+            service.state.unresolved_order_intents = ["dummy-order-id"]
+            self.assertTrue(service._has_unresolved_orders())
+
+            service.broker.get_account_balance = lambda: (_ for _ in ()).throw(_make_429_error())
+
+            with self.assertRaises(KiwoomHttpError):
+                service._get_balance_with_cache()
 
     def test_429_without_any_cache_still_raises(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -124,17 +145,18 @@ class TestBalanceRateLimitFallback(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 service._get_balance_with_cache()
 
-    def test_run_once_survives_balance_429_and_still_monitors_holdings(self):
-        """run_once() 레벨: 429가 나도 예외 없이 끝까지 돌고, 보유종목 처리도 계속됨."""
+    def test_run_once_propagates_balance_429(self):
+        """run_once() 레벨: 429가 나면 예외가 그대로 전파돼야 합니다
+        — 이는 trading_loop()의 180초 전체 백오프가 다시 걸릴 수 있는
+        상태로 돌아갔음을 뜻합니다(이번 되돌림이 해결하는 문제가
+        아니라는 점을 회귀로 고정)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             service = _make_service(tmpdir)
             service.broker._positions["000660"] = Position(
                 symbol="000660", quantity=10, average_price=180000,
             )
 
-            # 1회차: 정상 호출로 캐시를 채움 (첫 호출은 캐시가 없어
-            # 무조건 fresh fetch가 필요한 분기라 429 fallback을
-            # 검증하는 게 아니라 그냥 정상 시나리오로 캐시를 확보).
+            # 1회차: 정상 호출로 캐시를 채움.
             asyncio.run(service.run_once())
             self.assertIsNotNone(service.cached_balance)
 
@@ -143,24 +165,8 @@ class TestBalanceRateLimitFallback(unittest.TestCase):
             service.cached_balance_loaded_at = datetime.now() - timedelta(seconds=999)
             service.broker.get_account_balance = lambda: (_ for _ in ()).throw(_make_429_error())
 
-            processed: list[str] = []
-            original_process_symbol = service._process_symbol
-
-            async def tracking_process_symbol(symbol, balance):
-                processed.append(symbol)
-                return await original_process_symbol(symbol, balance)
-
-            service._process_symbol = tracking_process_symbol
-
-            # 429가 여기서 예외로 올라오면 이 테스트가 바로 실패함 —
-            # 곧 app/main.py의 trading_loop()까지 전파돼 180초 전체
-            # 백오프를 유발했을 상황과 동일.
-            asyncio.run(service.run_once())
-
-            self.assertIn(
-                "000660", processed,
-                "잔고 조회가 429여도 보유 종목(000660) 손절/트레일링 감시는 계속 수행돼야 합니다.",
-            )
+            with self.assertRaises(KiwoomHttpError):
+                asyncio.run(service.run_once())
 
 
 if __name__ == "__main__":

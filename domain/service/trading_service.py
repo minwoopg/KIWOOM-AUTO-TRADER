@@ -469,22 +469,32 @@ class TradingService:
     def _get_balance_with_cache(self) -> AccountBalance:
         """Cache settled accounts; unresolved orders always need a fresh read.
 
-        2026-09-11 (P0-1, GPT 종합검토 20260911 반영): 이전엔
-        broker.get_account_balance()가 HTTP 429로 실패하면 그 예외가
-        run_once() 밖까지 그대로 전파되어 app/main.py의 trading_loop()가
-        루프 전체를 180초 동안 멈췄습니다. run_once()는 이 호출 직후에
-        보유 종목 손절/트레일링 감시를 수행하므로, 그 180초 동안은
-        "API 과호출을 피하려던 백오프"가 오히려 이미 보유 중인 포지션의
-        리스크 감시 공백을 만드는 역효과가 있었습니다(재현 확인, GPT
-        종합검토 P0-1).
-        main.py의 trading_loop()/_retry_on_429()와 동일한 429 판별
-        시그니처로 이 호출만 좁게 감싸서, 429가 나면 직전에 확보해둔
-        잔고 캐시로 이번 사이클을 계속 진행합니다 — 매수/매도/보유
-        판단 기준 자체는 전혀 바뀌지 않고(코드 경로도 캐시를 그대로
-        쓰는 기존 elif 분기와 동일), 최신 잔고 대신 직전 사이클의
-        잔고를 한 번 더 재사용할 뿐입니다. 캐시가 아직 없으면(예:
-        프로세스 시작 직후 첫 호출) 대체할 안전한 값 자체가 없으므로
-        기존과 동일하게 예외를 그대로 올립니다.
+        2026-09-11 (P0-1, GPT 종합검토 20260911 반영) → 2026-09-14
+        (안전 복구, GPT 재검토 20260914 반영): P0-1은 429 발생 시
+        직전 캐시 잔고로 대체해 trading_loop()의 180초 전체 백오프를
+        피하려 했습니다. 그런데 재검토에서, 미해결 주문(BUY_PENDING
+        등)이 있어 "반드시 최신 잔고가 필요한" 바로 그 분기에서 429가
+        나면, 이 캐시 대체값이 `run_once()` → `_sync_position_state_
+        machine_shadow()`로 그대로 전달되고 `confirm_buy_from_broker()`
+        에 임의로 오래된(예: 프로세스 재시작 전) 캐시 기준 수량이
+        "이번 체결 확인 결과"처럼 들어가는 경로가 실제로 재현됐습니다
+        — 즉 429 백오프를 피하려던 조치가 주문 체결 확정 자체를
+        틀리게 만들 수 있는 위험을 새로 만들었습니다.
+
+        이 위험을 즉시 제거하기 위해 캐시 대체(폴백) 자체를 되돌립니다
+        — 429든 다른 예외든, 캐시 존재 여부와 무관하게 예외를 그대로
+        올립니다(2026-08-10 이전, P0-1 이전과 동일한 동작). 즉
+        trading_loop()의 180초 감시 공백 문제는 다시 열린 채로
+        남습니다 — 이 되돌림은 그 문제를 해결하는 것이 아니라, P0-1이
+        새로 만든 "스테일 수량이 체결 확인으로 오인되는" 위험만 제거
+        하는 임시 조치입니다. 폴백 재도입은 잔고 신선도(S01 관측
+        로그)·상태 대조·주문 허용 경로를 함께 검증한 뒤 별도로
+        진행합니다. 매수/매도/보유 판단 기준(전략 파라미터)은 이번에도
+        전혀 건드리지 않았습니다 — 잔고 조회 실패 시 어떤 값을 쓸지에
+        대한 순수 인프라 처리입니다. `_log_balance_freshness()` 관측
+        기록(S01)은 그대로 유지합니다 — 이 로그가 앞으로 폴백을 다시
+        설계할 때 필요한 실측 데이터(429 빈도·트리거 사유·그 시점
+        캐시 나이)를 제공합니다.
         """
         now = datetime.now()
         # 2026-09-11 (S01 관측 1단계, GPT 5차 검토 반영): 아래 두 값은
@@ -509,19 +519,18 @@ class TradingService:
             try:
                 balance = self.broker.get_account_balance()
             except Exception as exc:
-                if self._is_rate_limit_error(exc) and self.cached_balance is not None:
-                    self.app_logger.warning(
-                        f"[BALANCE] get_account_balance() 429 — 직전 캐시 잔고로 "
-                        f"이번 사이클 진행(보유종목 감시 유지): {exc}"
-                    )
-                    self._log_balance_freshness(
-                        now=now, outcome="fallback_stale_cache", trigger_reason=trigger_reason,
-                        prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
-                        error_type=type(exc).__name__,
-                    )
-                    return self.cached_balance
+                # 2026-09-14 (안전 복구, GPT 재검토 20260914): 429여도
+                # 캐시로 대체하지 않고 그대로 올립니다 — 클래스독스트링
+                # 참고. 관측 로그에는 429였는지, 그 시점에 대체 가능한
+                # 캐시가 있었는지(cache_age_seconds로 확인 가능)는
+                # 계속 남겨 추후 재설계 근거로 씁니다.
+                outcome = (
+                    "fetch_failed_429_fallback_disabled"
+                    if self._is_rate_limit_error(exc)
+                    else "fetch_failed_no_fallback"
+                )
                 self._log_balance_freshness(
-                    now=now, outcome="fetch_failed_no_fallback", trigger_reason=trigger_reason,
+                    now=now, outcome=outcome, trigger_reason=trigger_reason,
                     prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
                     error_type=type(exc).__name__,
                 )
@@ -548,19 +557,15 @@ class TradingService:
             try:
                 balance = self.broker.get_account_balance()
             except Exception as exc:
-                if self._is_rate_limit_error(exc):
-                    self.app_logger.warning(
-                        f"[BALANCE] get_account_balance() 429 — 직전 캐시 잔고로 "
-                        f"이번 사이클 진행(보유종목 감시 유지): {exc}"
-                    )
-                    self._log_balance_freshness(
-                        now=now, outcome="fallback_stale_cache", trigger_reason="routine_refresh_due",
-                        prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
-                        error_type=type(exc).__name__,
-                    )
-                    return self.cached_balance
+                # 2026-09-14 (안전 복구): 위와 동일 — 429여도 캐시로
+                # 대체하지 않고 그대로 올립니다.
+                outcome = (
+                    "fetch_failed_429_fallback_disabled"
+                    if self._is_rate_limit_error(exc)
+                    else "fetch_failed_no_fallback"
+                )
                 self._log_balance_freshness(
-                    now=now, outcome="fetch_failed_no_fallback", trigger_reason="routine_refresh_due",
+                    now=now, outcome=outcome, trigger_reason="routine_refresh_due",
                     prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
                     error_type=type(exc).__name__,
                 )
@@ -2035,6 +2040,39 @@ class TradingService:
             )
             await asyncio.sleep(0.5)
 
+    @staticmethod
+    def _parse_normal_eval_seen(raw_value) -> tuple:
+        """S02 관측 필드(entry_watch_normal_eval_seen_by_symbol)의 저장값을
+        안전하게 해석합니다. `(entry_time 또는 None, 형식 태그)`를
+        반환하며 형식 태그는 다음 중 하나입니다.
+
+        - "none": 저장값 자체가 없음(키가 없거나 None)
+        - "current": "{entry_time}|{기록시각}" 신형식 — entry_time 추출됨
+        - "legacy": 2026-09-14 이전 구형식(bare ISO timestamp만 저장,
+          entry_time 정보가 없어 현재 진입과 대조 불가)
+        - "invalid": 문자열이 아니거나 그 밖에 예상치 못한 값(예: state.json
+          손상, 수동 편집 실수)
+
+        2026-09-14 (GPT 재검토 3차 반영, 재현된 결함): 이 필드는 순수
+        관측용인데 파싱 실패(예: 값이 None)가 `_check_entry_watch()`
+        전체를 AttributeError로 죽여, 그 폴링에서 이 종목의 실제 SELL
+        판정(급락/VWAP/최소수익)까지 함께 막는 경로가 재현됐습니다 —
+        "관측 실패가 매매 판단을 막으면 안 된다"는 설계 원칙을 어기고
+        있었습니다. 이 함수는 어떤 입력에도 절대 예외를 내보내지
+        않습니다.
+        """
+        if raw_value is None:
+            return None, "none"
+        if not isinstance(raw_value, str) or not raw_value:
+            return None, "invalid"
+        try:
+            if "|" in raw_value:
+                entry_time, _, _ = raw_value.partition("|")
+                return (entry_time or None), "current"
+            return None, "legacy"
+        except Exception:
+            return None, "invalid"
+
     def _check_entry_watch(
         self,
         symbol: str,
@@ -2099,14 +2137,6 @@ class TradingService:
             return None
         pnl_pct = (current_price - avg) / avg * 100
 
-        # 2026-09-11 (S02 관측 1단계): 정상 창 안에서 avg>0인 유효한
-        # 평가가 실제로 일어난 이 순간을, 이 진입 건의 최초 시각으로만
-        # 기록합니다(setdefault — 이미 기록돼 있으면 덮어쓰지 않음).
-        # 이 판정(1/2/3번 분기) 자체와 반환값에는 전혀 영향이 없습니다.
-        self.state.entry_watch_normal_eval_seen_by_symbol.setdefault(
-            symbol, datetime.now().isoformat()
-        )
-
         # 1) 급락 즉시 청산
         if pnl_pct <= ew.fail_cut_pct:
             # 2026-08-21 (1P0.8-OBS.2-A): shadow 추적 시작 지점을
@@ -2164,6 +2194,45 @@ class TradingService:
                         requires_fresh_minute_data=True,
                     )
 
+        # 2026-09-11 (S02 관측 1단계) → 2026-09-14 (GPT 재검토 20260914,
+        # 1차 반영) → 2026-09-14 (GPT 재검토 2차 반영): 1차 반영은 기록
+        # 조건을 watch_minutes<=elapsed_min<=watch_minutes+1로 좁혔지만,
+        # 기록 위치가 여전히 1)/2) 분기보다 앞이라 급락·VWAP 조건으로
+        # 먼저 SELL을 반환해도(그 SELL이 실제로 체결되는지와 무관하게)
+        # "최소수익 평가 완료"로 잘못 기록되는 문제가 남아 있었습니다
+        # — 이 아래 3번 분기(최소수익 비교) 자체는 아직 실행되지 않은
+        # 시점인데도 기록되는 것이 핵심 문제였습니다. 1)/2) 분기를 모두
+        # 통과해 실제로 이 최소수익 비교에 도달했을 때만 기록하도록
+        # 이 지점으로 옮겼습니다 — 비교 결과(충족/미달)와 무관하게
+        # "비교 자체를 실제로 했다"는 사실만 기록합니다. 1/2/3번 분기의
+        # 판정 로직과 반환값에는 전혀 영향이 없습니다.
+        #
+        # 값에는 entry_time을 함께 실어(setdefault 대신 entry_time
+        # 일치 여부로 직접 판단) 이 진입 건의 이력만 취급합니다 —
+        # 혹시 청산 정리가 어떤 이유로 지연되더라도, 새 진입(entry_time
+        # 다름)의 관측이 이전 진입의 이력에 가려지지 않도록 하는
+        # 이중 안전장치입니다(1차 안전장치는 _apply_deferred_sell_
+        # side_effects()의 정리 호출).
+        # 2026-09-14 (GPT 재검토 3차 반영): 저장값 해석을 _parse_normal_
+        # eval_seen()에 위임하고 전체를 try/except로 감쌉니다 — 손상된
+        # state.json 등으로 이 필드에 예상치 못한 값(None, 숫자 등)이
+        # 들어와도 이 관측 기록 실패가 위 1/2/3번 SELL 판정에 영향을
+        # 주면 안 됩니다(재현된 결함, 아래 except가 최종 안전망).
+        if elapsed_min >= ew.watch_minutes:
+            try:
+                _existing_entry_time, _ = self._parse_normal_eval_seen(
+                    self.state.entry_watch_normal_eval_seen_by_symbol.get(symbol)
+                )
+                if _existing_entry_time != entry_time_str:
+                    self.state.entry_watch_normal_eval_seen_by_symbol[symbol] = (
+                        f"{entry_time_str}|{datetime.now().isoformat()}"
+                    )
+            except Exception as exc:
+                self.app_logger.warning(
+                    f"[ENTRY_WATCH_OBS] {symbol} | 평가 이력 기록 실패 — 무시하고 계속 진행"
+                    f"(SELL 판정에는 영향 없음): {type(exc).__name__}: {exc}"
+                )
+
         # 3) watch_minutes 경과 시점에 최소수익 미달 청산
         if elapsed_min >= ew.watch_minutes and pnl_pct < ew.min_profit_pct:
             self._log_min_profit_extension_shadow(
@@ -2198,28 +2267,69 @@ class TradingService:
         current_price: int,
         minute_analysis,
     ) -> None:
-        """S02 관측 1단계 — 정상 창(elapsed_min <= watch_minutes+1)을 넘긴
-        이 진입 건이, 그 창 안에서 avg>0인 유효한 평가를 단 한 번도 받지
-        못했다면 "지연 평가 후보"로 (symbol, entry_time)당 최초 1건만
-        기록합니다.
+        """S02 관측 1단계 — 이 진입 건이 entry_watch의 실제 최소수익
+        판정 시점 근방(watch_minutes<=elapsed_min<=watch_minutes+1)에서
+        avg>0인 유효한 평가를 단 한 번도 받지 못했다면 "지연 평가
+        후보"로 (symbol, entry_time)당 최초 1건만 기록합니다.
 
         2026-09-11: `_log_min_profit_extension_shadow()`와 동일한
         fail-open 계약 — 이 메서드는 어떤 예외도 밖으로 내보내지
         않습니다. `_check_entry_watch()`는 이 호출과 무관하게 항상
         None을 반환해 정규 전략에 판단을 위임합니다(이 라운드는
         지연 청산 SELL을 만들지 않습니다).
+
+        2026-09-14 (GPT 재검토 20260914 반영): "이미 평가함" 판단을
+        entry_time이 현재 진입 건과 일치할 때만 인정합니다 — 정리가
+        지연된 이전 진입의 이력이 새 진입의 관측을 가리지 않도록
+        합니다.
+
+        2026-09-14 (GPT 재검토 3차 반영):
+        - 저장값 해석에 `_parse_normal_eval_seen()`을 써서, 손상되거나
+          예상치 못한 값이 들어와도 절대 예외를 내지 않습니다. 구형식
+          (entry_time 결합 이전, "legacy") 저장값은 대조 근거가 없으므로
+          안전하게 "아직 못 봄"으로 처리하되, 기록 시 `prior_seen_format`
+          필드에 남겨 실제 누락과 구분할 수 있게 합니다.
+        - current_price/avg_price가 0 이하이거나 무한/NaN이면(시세
+          글리치 등) `price_valid=False`로 `append()`(dedup 없이 매번
+          기록)만 하고 `append_if_new()`를 호출하지 않습니다 — 무효
+          관측이 (symbol, entry_time)당 1건뿐인 dedup 슬롯을 먼저
+          차지해, 이후 정상 가격이 들어와도 다시 기록되지 않는 결함이
+          재현됐기 때문입니다.
         """
         if getattr(self, "delayed_eval_candidate_logger", None) is None:
             return
-        # 정상 창 안에서 유효 평가가 이미 있었으면 "놓친 창"이 아니므로
-        # 후보가 아닙니다 — 이 판단(정상 창 유효 평가 이력)은 지연 평가
-        # 진입 자격의 첫 조건입니다(2026-09-11 5차 설계 문서 참고).
-        if symbol in self.state.entry_watch_normal_eval_seen_by_symbol:
+        # 판정 시점 근방에서 유효 평가가 이미 있었으면 "놓친 판정
+        # 시점"이 아니므로 후보가 아닙니다 — 이 판단(정상 창 유효 평가
+        # 이력)은 지연 평가 진입 자격의 첫 조건입니다(2026-09-11 5차
+        # 설계 문서 참고). entry_time이 다르면(정리 지연 등으로 남은
+        # 이전 진입의 이력이거나 구형식이면) "아직 못 봄"으로 취급합니다.
+        _seen_entry_time, _seen_format = self._parse_normal_eval_seen(
+            self.state.entry_watch_normal_eval_seen_by_symbol.get(symbol)
+        )
+        if _seen_entry_time is not None and _seen_entry_time == entry_time_str:
             return
         try:
             avg = getattr(position, "average_price", 0) or 0
-            pnl_pct = ((current_price - avg) / avg * 100) if avg > 0 else ""
-            self.delayed_eval_candidate_logger.append_if_new({
+            price_valid = (
+                isinstance(current_price, (int, float))
+                and isinstance(avg, (int, float))
+                and current_price > 0
+                and avg > 0
+                and current_price == current_price  # NaN 방어(NaN != NaN)
+                and avg == avg
+                and current_price not in (float("inf"), float("-inf"))
+                and avg not in (float("inf"), float("-inf"))
+            )
+            pnl_pct = ((current_price - avg) / avg * 100) if price_valid else ""
+
+            _loaded_at = getattr(self, "cached_market_price_loaded_at", {}).get(symbol)
+            price_observed_at = _loaded_at.isoformat() if _loaded_at is not None else ""
+            price_age_seconds = (
+                round((datetime.now() - _loaded_at).total_seconds(), 1)
+                if _loaded_at is not None else ""
+            )
+
+            row = {
                 "detected_at": datetime.now().isoformat(),
                 "symbol": symbol,
                 "entry_time": entry_time_str,
@@ -2229,7 +2339,18 @@ class TradingService:
                 "current_price": current_price,
                 "pnl_pct": round(pnl_pct, 3) if pnl_pct != "" else "",
                 "minute_analysis_available": minute_analysis is not None,
-            })
+                "price_valid": price_valid,
+                "price_observed_at": price_observed_at,
+                "price_age_seconds": price_age_seconds,
+                "prior_seen_format": _seen_format,
+            }
+            if price_valid:
+                self.delayed_eval_candidate_logger.append_if_new(row)
+            else:
+                # dedup 슬롯을 소모하지 않고 매번 기록 — 다음 폴링에
+                # 유효한 가격이 들어오면 append_if_new()가 정상적으로
+                # 기록할 수 있어야 합니다.
+                self.delayed_eval_candidate_logger.append(row)
         except Exception as exc:
             self.app_logger.warning(
                 f"[DELAYED_EVAL_CANDIDATE] 기록 실패 — 무시하고 계속 진행"
@@ -4288,6 +4409,15 @@ class TradingService:
         now_iso = datetime.now().isoformat()
         self.state.last_sold_at_by_symbol[symbol] = now_iso
         self.state.entry_time_by_symbol.pop(symbol, None)
+        # 2026-09-14 (S02 관측, GPT 재검토 20260914 반영): 청산 확정의
+        # 단일 공식 지점인 여기서도 함께 정리합니다 — 이전엔
+        # _process_symbol()의 무보유 분기(잔고 기준 position is None)
+        # 정리에만 의존했는데, 그 판단이 스테일 잔고 때문에 늦어지면
+        # (예: 429 폴백 시나리오) 이전 진입의 이력이 다음 진입까지
+        # 남을 수 있었습니다. 이제 여기서도 정리하고, _process_symbol
+        # 쪽 정리는 이중 안전장치로 유지합니다(entry_time 불일치 검사도
+        # 별도의 안전장치).
+        self.state.entry_watch_normal_eval_seen_by_symbol.pop(symbol, None)
 
         # ── 재진입 제한 state 업데이트 ──────────────
         avg_p = avg_buy_price if avg_buy_price > 0 else 0

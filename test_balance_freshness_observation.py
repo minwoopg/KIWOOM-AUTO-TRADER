@@ -1,23 +1,32 @@
 # -*- coding: utf-8 -*-
-"""2026-09-11 (S01 관측 1단계, GPT 5차 검토 반영) — 잔고 조회 신선도 관측 로그.
+"""2026-09-11 (S01 관측 1단계, GPT 5차 검토 반영)
+→ 2026-09-14 (안전 복구, GPT 재검토 20260914 반영) — 잔고 조회 신선도
+관측 로그.
 
-배경: 5차 설계 문서에서, 429 캐시 폴백을 얼마나 자주/얼마나 오래 쓰게
-되는지 실측 없이 캐시 유효기간(360/540초) 연장이나 재시도 간격 정책을
-정할 수 없다고 정리했습니다. 이 라운드는 그 실측을 위한 순수 관측
-로그(BalanceFreshnessLogger)만 추가합니다.
+배경: 5차 설계 문서에서, 429를 얼마나 자주/어떤 사유로 만나는지
+실측 없이 캐시 유효기간(360/540초) 연장이나 폴백 재도입 여부를 정할
+수 없다고 정리했습니다. 이 라운드는 그 실측을 위한 순수 관측 로그
+(BalanceFreshnessLogger)를 추가합니다.
+
+2026-09-14 갱신: P0-1의 429 캐시 대체(폴백) 동작 자체가, 미해결 주문이
+있어 최신 잔고가 필요한 분기에서 스테일 수량을 confirm_buy_from_
+broker()에 흘려보내는 위험이 재현되어 되돌려졌습니다(test_balance_429_
+fallback.py 참고). 이 파일의 관측 로그 자체(기록 항목·필드)는 그대로
+유지하되, 429 발생 시 실제로 어떤 값이 기록되는지를 되돌려진 동작
+기준으로 갱신합니다.
 
 이 테스트가 확인하는 것:
-1. `_get_balance_with_cache()`의 각 분기(fetch_success/
-   fallback_stale_cache/cache_reuse/fetch_failed_no_fallback)에서 로그
+1. `_get_balance_with_cache()`의 각 분기(fetch_success/cache_reuse/
+   fetch_failed_429_fallback_disabled/fetch_failed_no_fallback)에서 로그
    행이 정확한 필드로 기록됩니다.
 2. 로거가 없거나(None) append 자체가 예외를 던져도 `_get_balance_with_
    cache()`의 반환값·예외 전파는 test_balance_429_fallback.py가 이미
    고정한 계약과 완전히 동일하게 유지됩니다(fail-open, 회귀 없음).
 3. 로거 생성 자체가 실패해도 TradingService 생성이 막히지 않습니다.
 
-매수/매도/보유 판단 기준, 잔고 조회 주기(balance_refresh_seconds), 429
-폴백 여부는 이 라운드에서 단 한 줄도 바뀌지 않았습니다 — 이 테스트는
-그 사실을 회귀로 고정하는 목적도 겸합니다.
+매수/매도/보유 판단 기준, 잔고 조회 주기(balance_refresh_seconds)는 이
+라운드에서 단 한 줄도 바뀌지 않았습니다 — 이 테스트는 그 사실을
+회귀로 고정하는 목적도 겸합니다.
 """
 from __future__ import annotations
 
@@ -152,7 +161,11 @@ class TestBalanceFreshnessLogging(unittest.TestCase):
             self.assertEqual(rows[0]["cache_age_seconds"], "")
             self.assertEqual(rows[0]["error_type"], "")
 
-    def test_429_with_cache_logs_fallback_stale_cache(self):
+    def test_429_with_cache_logs_fallback_disabled_and_raises(self):
+        """2026-09-14 안전 복구: 캐시가 있어도 429는 더 이상 캐시로
+        대체되지 않고 예외가 그대로 전파됩니다. 관측 로그에는 그
+        시점에 캐시가 있었다는 사실(cache_age_seconds)과 함께
+        outcome=fetch_failed_429_fallback_disabled로 기록됩니다."""
         with tempfile.TemporaryDirectory() as tmpdir:
             service = _make_service(tmpdir)
             good_balance = AccountBalance(cash=1_000_000, total_asset=1_000_000, positions=[])
@@ -161,12 +174,12 @@ class TestBalanceFreshnessLogging(unittest.TestCase):
             service.cached_balance_loaded_at = loaded_at
             service.broker.get_account_balance = lambda: (_ for _ in ()).throw(_make_429_error())
 
-            result = service._get_balance_with_cache()
+            with self.assertRaises(KiwoomHttpError):
+                service._get_balance_with_cache()
 
-            self.assertIs(result, good_balance, "기존 429 폴백 계약이 그대로 유지돼야 합니다.")
             rows = _read_rows(service.settings.storage.balance_freshness_log_file)
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["outcome"], "fallback_stale_cache")
+            self.assertEqual(rows[0]["outcome"], "fetch_failed_429_fallback_disabled")
             self.assertEqual(rows[0]["trigger_reason"], "routine_refresh_due")
             self.assertEqual(rows[0]["prior_loaded_at"], loaded_at.isoformat())
             self.assertNotEqual(rows[0]["cache_age_seconds"], "")
@@ -183,7 +196,7 @@ class TestBalanceFreshnessLogging(unittest.TestCase):
 
             rows = _read_rows(service.settings.storage.balance_freshness_log_file)
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["outcome"], "fetch_failed_no_fallback")
+            self.assertEqual(rows[0]["outcome"], "fetch_failed_429_fallback_disabled")
             self.assertEqual(rows[0]["trigger_reason"], "no_cache_yet")
 
     def test_non_rate_limit_error_still_propagates_and_logs(self):
@@ -238,6 +251,30 @@ class TestBalanceFreshnessLogging(unittest.TestCase):
             self.assertIs(result, new_balance, "미해결 주문이 있으면 캐시 나이와 무관하게 강제 재조회해야 합니다(기존 계약).")
             rows = _read_rows(service.settings.storage.balance_freshness_log_file)
             self.assertEqual(rows[0]["outcome"], "fetch_success")
+            self.assertEqual(rows[0]["trigger_reason"], "unresolved_orders")
+            self.assertEqual(rows[0]["has_unresolved_orders"], "True")
+
+    def test_unresolved_orders_429_still_raises_no_fallback(self):
+        """2026-09-14 안전 복구 — 가장 위험했던 조합: 미해결 주문이
+        있어 최신 잔고가 반드시 필요한 상황에서 429가 나면, 캐시가
+        있어도 대체하지 않고 예외를 그대로 올려야 합니다(스테일
+        수량이 confirm_buy_from_broker()에 흘러들지 않도록). 관측
+        로그에는 trigger_reason=unresolved_orders +
+        outcome=fetch_failed_429_fallback_disabled가 함께 남습니다."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = _make_service(tmpdir)
+            good_balance = AccountBalance(cash=1_000_000, total_asset=1_000_000, positions=[])
+            service.cached_balance = good_balance
+            service.cached_balance_loaded_at = datetime.now()
+            service.broker.get_account_balance = lambda: (_ for _ in ()).throw(_make_429_error())
+            service._has_unresolved_orders = lambda: True
+
+            with self.assertRaises(KiwoomHttpError):
+                service._get_balance_with_cache()
+
+            rows = _read_rows(service.settings.storage.balance_freshness_log_file)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["outcome"], "fetch_failed_429_fallback_disabled")
             self.assertEqual(rows[0]["trigger_reason"], "unresolved_orders")
             self.assertEqual(rows[0]["has_unresolved_orders"], "True")
 

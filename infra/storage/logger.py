@@ -963,14 +963,26 @@ class MinProfitExtensionShadowLogger:
 # 않습니다. append 실패는 항상 fail-open이며 app_logger에 WARNING만
 # 남깁니다(호출부 docstring 참고).
 #
-# 이 로그의 목적은 "429 폴백 잔고를 실제로 얼마나 자주, 얼마나 오래
-# 쓰게 되는지"를 실측하는 것입니다 — S01의 캐시 유효기간 연장(360/540초)
-# 여부나 재시도 간격 정책은 이 실측 없이 결정하지 않기로 했습니다
-# (2026-09-11 5차 설계 문서, N값 미승인 항목 참고).
+# 이 로그의 목적은 "429가 실제로 얼마나 자주, 어떤 트리거 사유로,
+# 그 시점 캐시가 얼마나 오래됐을 때 발생하는지"를 실측하는 것입니다
+# — S01의 캐시 유효기간 연장(360/540초)이나 폴백 재도입 여부는 이
+# 실측 없이 결정하지 않기로 했습니다(2026-09-11 5차 설계 문서, N값
+# 미승인 항목 참고).
+#
+# 2026-09-14 (안전 복구, GPT 재검토 20260914): 429 시 캐시로 대체하던
+# 동작(fallback_stale_cache)을 되돌렸습니다 — 미해결 주문 때문에
+# 최신 잔고가 필요한 분기에서 스테일 캐시가 confirm_buy_from_broker()
+# 등에 "체결 확인 결과"처럼 흘러드는 경로가 재현됐기 때문입니다.
+# 이제 429는 항상 fetch_failed_429_fallback_disabled로 기록되고
+# 예외가 그대로 전파됩니다 — fallback_stale_cache 값은 더 이상
+# 새로 기록되지 않지만(과거 로그에는 남아있을 수 있음), 분석 코드는
+# 하위호환을 위해 이 값도 계속 인식해야 합니다.
 BALANCE_FRESHNESS_FIELDS = [
     "timestamp",                # 이 _get_balance_with_cache() 호출 시각
-    "outcome",                  # fetch_success | fallback_stale_cache |
-                                 # cache_reuse | fetch_failed_no_fallback
+    "outcome",                  # fetch_success | cache_reuse |
+                                 # fetch_failed_429_fallback_disabled |
+                                 # fetch_failed_no_fallback |
+                                 # (과거 로그 전용) fallback_stale_cache
     "trigger_reason",           # no_cache_yet | unresolved_orders |
                                  # routine_refresh_due | cache_still_fresh
     "prior_loaded_at",          # 이 호출 이전에 마지막으로 성공 조회한
@@ -1021,32 +1033,73 @@ class BalanceFreshnessLogger:
 
 
 # ── delayed_eval_candidate.csv ───────────────────────────────────────────────
-# S02 관측 1단계 (2026-09-11, GPT 5차 검토 반영). entry_watch 정상 창
-# (elapsed_min <= watch_minutes+1)을 넘어갈 때, 그 창 안에서 avg>0인
-# 유효한 평가가 단 한 번도 없었던 진입 건을 "지연 평가 후보"로만
-# 기록합니다 — 이 로거는 SELL Signal을 만들지도, 반환하지도 않습니다
-# (_check_entry_watch()는 이 로깅과 무관하게 여전히 None을 반환하고
-# 정규 전략에 판단을 위임합니다). 지연 청산 자체의 활성화는 이번
-# 단계의 범위가 아닙니다.
+# S02 관측 1단계 (2026-09-11, GPT 5차 검토 반영) → 2026-09-14 (GPT
+# 재검토 20260914 반영). entry_watch의 실제 최소수익 판정 시점 근방
+# (watch_minutes<=elapsed_min<=watch_minutes+1)을 넘어갈 때, 그 구간
+# 안에서 avg>0인 유효한 평가가 단 한 번도 없었던 진입 건을 "지연 평가
+# 후보"로만 기록합니다 — 이 로거는 SELL Signal을 만들지도, 반환하지도
+# 않습니다(_check_entry_watch()는 이 로깅과 무관하게 여전히 None을
+# 반환하고 정규 전략에 판단을 위임합니다). 지연 청산 자체의 활성화는
+# 이번 단계의 범위가 아닙니다.
+#
+# 2026-09-14 갱신: 최초 구현은 판정 구간이 아니라 진입 후 아무
+# 시점에서든(0분째 폴링 포함) avg>0 평가가 있으면 "봄"으로 기록해,
+# 정작 판정 시점 근방을 놓친 진입 건까지 후보에서 빠지는 결함이
+# 있었음(재현 확인) — 판정 구간으로 좁혔습니다.
 #
 # (symbol, entry_time) 기준 최초 1건만 기록합니다 — 창을 넘긴 뒤에도
 # 그 포지션이 청산될 때까지 매 폴링 `_check_entry_watch()`가 계속
 # 호출되므로, dedup이 없으면 보유 기간 내내 같은 후보가 반복 기록됩니다.
+#
+# 2026-09-14 (GPT 재검토 3차 반영) 갱신 — 두 가지를 보강:
+# 1. current_price/avg_price가 0 이하이거나 무한/NaN이면(시세 조회
+#    글리치 등) price_valid=False로 append()(dedup 없이 매번 기록)만
+#    하고, append_if_new()로 (symbol, entry_time) 중복방지 슬롯을
+#    소모하지 않습니다 — 그 슬롯을 먼저 차지하면 이후 정상 가격이
+#    들어와도 dedup 때문에 다시 기록되지 않아, "지연 시점 수익률"
+#    분석에 -100% 같은 무의미한 값만 남는 결함이 재현됐습니다.
+# 2. price_observed_at/price_age_seconds를 추가해 이 관측이 실제로
+#    최신 시세였는지, 캐시 재사용이었는지 나중에 판단할 수 있게 함
+#    (price_age_seconds를 그 시점 settings.trading.price_refresh_
+#    seconds와 비교하면 "가격 출처(fresh/재사용)"를 판단할 수 있음 —
+#    별도 필드로 근사 추정하는 대신 이 값을 직접 비교하도록 함).
 DELAYED_EVAL_CANDIDATE_FIELDS = [
     "detected_at",           # 창을 넘긴 것을 처음 관측한 시각(이 판정이
                               # 나온 폴링 시각)
     "symbol",
     "entry_time",             # state.entry_time_by_symbol의 진입 시각 —
                               # (symbol, entry_time)이 중복 방지 키
+                              # (price_valid=True로 append_if_new()된
+                              # 행에만 적용 — price_valid=False 행은
+                              # append()로 dedup 없이 기록됨)
     "elapsed_min",            # 진입 후 경과 시간(분), 창(watch_minutes+1)을
                               # 얼마나 넘겼는지
     "watch_minutes",          # 그 시점 entry_watch.watch_minutes 설정값
     "avg_price",              # 평균 매수단가
     "current_price",          # 관측 시점 현재가
-    "pnl_pct",                # (current_price-avg_price)/avg_price*100
+    "pnl_pct",                # (current_price-avg_price)/avg_price*100 —
+                              # price_valid=False면 공백
     "minute_analysis_available",  # 이 호출에 fresh한 minute_analysis가
                               # 전달됐는지(True/False) — "유효한 시세"
                               # 판단의 참고 신호 중 하나(전체는 아님)
+    "price_valid",            # current_price>0, avg_price>0이고 둘 다
+                              # 유한값인지(True/False). False면 pnl_pct는
+                              # 의미 없는 값이므로 분석에서 제외할 것
+    "price_observed_at",      # 이 current_price가 캐시에 적재된 시각
+                              # (ISO). 조회 자체가 안 됐으면 공백
+    "price_age_seconds",      # detected_at 기준 price_observed_at의
+                              # 나이(초). price_refresh_seconds보다 many
+                              # 크면 재조회 실패로 오래된 캐시를 재사용
+                              # 중이었다는 뜻
+    "prior_seen_format",      # 이 시점 entry_watch_normal_eval_seen_by_
+                              # symbol[symbol] 저장값의 형식 — "none"(값
+                              # 없음)/"current"(entry_time 결합 신형식,
+                              # entry_time 불일치)/"legacy"(2026-09-14
+                              # 이전 구형식, bare timestamp만 저장돼
+                              # entry_time 대조 불가)/"invalid"(문자열이
+                              # 아니거나 손상됨). "legacy"/"invalid"는
+                              # 실제 누락과 구분해서 집계할 것 —
+                              # 배포 경계에서만 일시적으로 나타남
 ]
 
 
@@ -1103,4 +1156,19 @@ class DelayedEvalCandidateLogger:
 
         self._seen_keys.add(key)
         return True
-        return True
+
+    def append(self, row: dict[str, Any]) -> None:
+        """2026-09-14 (GPT 재검토 3차 반영) — dedup 없이 매번 기록합니다.
+
+        무효 가격(current_price<=0 등) 관측을 기록할 때 씁니다.
+        `append_if_new()`처럼 `_seen_keys`에 등록하지 않으므로, 이후
+        같은 (symbol, entry_time)에 대해 유효한 가격이 들어오면
+        `append_if_new()`가 정상적으로 그 행을 기록할 수 있습니다 —
+        무효 관측이 (symbol, entry_time)당 1건뿐인 중복방지 슬롯을
+        먼저 소모해 정상 관측 기회를 없애는 것을 방지합니다.
+        """
+        with self.file_path.open("a", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=DELAYED_EVAL_CANDIDATE_FIELDS, extrasaction="ignore")
+            for field in DELAYED_EVAL_CANDIDATE_FIELDS:
+                row.setdefault(field, "")
+            writer.writerow(row)
