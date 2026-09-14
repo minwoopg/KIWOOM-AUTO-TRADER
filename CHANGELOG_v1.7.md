@@ -354,4 +354,107 @@ settings.py`의 모든 전략 파라미터, `domain/market_regime/` 분류기 �
 
 ---
 
+## 🛟 GPT 재검토 3라운드 반영 — 잔고 429 폴백 안전 복구 + S02 관측 견고성 보강 (2026-09-14)
+
+### 배경
+
+민우님이 커밋 `68aef3a`(잔고 429 폴백(P0-1) + 잔고 신선도·지연평가
+후보 관측 로그)를 GPT에 재검토 요청. 3라운드에 걸쳐 총 7건의 결함이
+확인·수정됐습니다. 전략 로직(RSI·MACD·진입점수·predicate)은 이번
+라운드에서 전혀 건드리지 않았습니다 — 전부 잔고 조회/관측 인프라
+범위입니다.
+
+### 1라운드 — 429 폴백이 스테일 잔고를 체결 확인으로 오인시키는 위험
+
+`_get_balance_with_cache()`의 P0-1 폴백(429 시 직전 캐시 잔고 반환)이,
+미해결 주문(BUY_PENDING 등)이 있어 반드시 최신 잔고가 필요한 바로 그
+분기에서 429가 나면 그 캐시값이 `_sync_position_state_machine_shadow()`
+→ `confirm_buy_from_broker()`로 그대로 흘러가 **오래된 수량을 "이번
+체결 확인 결과"로 오인**시키는 경로가 재현됨.
+
+**수정**: 폴백 자체를 되돌림 — 429든 다른 예외든 캐시 존재 여부와
+무관하게 예외를 그대로 전파(2026-08-10 이전과 동일 동작). 관측 로그
+(`balance_freshness.csv`)는 유지하되 새 outcome 값
+`fetch_failed_429_fallback_disabled` 추가. **이로 인해 180초 감시
+공백 문제가 다시 열린 채로 남으며, 이는 별도 과제로 처리합니다**
+(아래 "다음 작업" 참고).
+
+### 1라운드(계속) — S02 지연평가 후보 관측 결함 2건
+
+- entry_watch의 "평가 이력" 기록이 `elapsed_min ≤ watch_minutes+1`인
+  아무 시점에서나 발생해, 매수 1~2분 뒤에도 "5분 시점 최소수익 평가
+  완료"로 잘못 기록되던 문제 → `elapsed_min >= watch_minutes`로만
+  기록하도록 좁힘.
+- 이전 진입의 기록이 청산·정리 안 된 채 남아 있으면 재진입 시 새
+  진입의 관측을 가려버리는 문제 → 저장값을 `entry_time|기록시각`
+  형식으로 바꿔 현재 진입 건과 일치할 때만 "이미 평가함"으로 인정,
+  공식 청산 처리(`_apply_deferred_sell_side_effects()`)에서 정리
+  로직 추가.
+
+### 2라운드 — 평가 이력 기록 위치가 급락·VWAP 조기반환보다 앞에 있음
+
+급락(fail_cut)이나 VWAP 이탈로 먼저 SELL을 반환하는 경우에도 평가
+이력 기록 블록이 그보다 먼저 실행돼, 실제로는 최소수익 비교 자체에
+도달하지 않았는데 "평가 완료"로 기록되던 문제.
+
+**수정**: 기록 블록을 두 분기 뒤, 실제 최소수익 조건 비교 직전으로
+이동. 급락·VWAP 조기반환 시 평가 이력을 남기지 않고, 실제 비교에
+도달한 경우(수익 충족/미달 무관)에만 기록하도록 테스트로 고정. 기존
+SELL 판단 순서·반환값은 변경 없음.
+
+### 3라운드 — S02 관측 필드 자체의 견고성 결함 3건
+
+1. **(최우선) 손상된 관측값이 SELL 판단 자체를 막을 수 있는 결함** —
+   저장값 파싱(`.partition("|")`)에 타입 검증·예외 처리가 없어, 상태
+   파일에 `null`/숫자 등이 들어오면 `_check_entry_watch()`가
+   `AttributeError`로 죽어 SELL 판정 자체에 도달하지 못하는 경로가
+   `JsonStateStore.load()`부터 실제로 재현됨. → 어떤 입력에도 예외를
+   던지지 않는 `_parse_normal_eval_seen()` 헬퍼로 통일, 기록 블록
+   try/except 격리, `JsonStateStore.load()`에서도 문자열이 아닌 값은
+   걸러내는 이중 방어 추가.
+2. **무효 가격(0 등)이 dedup 슬롯을 소모하는 결함** — 지연 후보 로거가
+   `current_price=0` 같은 무효 가격도 `(symbol, entry_time)`당 1회뿐인
+   dedup 슬롯으로 기록해, 이후 도착하는 유효 가격 관측이 조용히
+   버려짐. → `price_valid` 판정을 추가해 무효 가격은 dedup 없는
+   `append()`로, 유효 가격만 `append_if_new()`로 분리. `price_
+   observed_at`/`price_age_seconds` 필드도 추가.
+3. **구형식(entry_time 미결합) 값이 "진짜 누락"과 섞이는 문제** —
+   업그레이드 이전 값은 안전하게 "아직 못 봄"으로 처리되지만, 배포
+   경계에서 지연 후보 통계에 "진짜 누락"과 섞여 부풀려질 수 있음. →
+   `prior_seen_format`(`none`/`current`/`legacy`/`invalid`) 필드로
+   구분해 기록.
+
+### 테스트 및 검증
+
+`test_delayed_eval_candidate_observation.py` 36개(신규 3그룹 포함),
+`test_balance_429_fallback.py`/`test_balance_freshness_observation.py`
+갱신. 매 라운드 GitHub main 새 클론에 순서대로 `git am` 적용해 독립
+검증 — 최종 4-패치 체인 적용 후 `run_regression_tests.py` **37개 중
+36 PASS**(무관한 기존 실패 1건 동일), `legacy_tests/test_entry_watch.py`
+**11/11 PASS**, `git status --short` 클린.
+
+### 변경하지 않은 것
+
+RSI·MACD·진입점수·predicate·Candidate A/G/M1/MIN_PROFIT_5M/CRASH_CUT
+등 모든 매매 판단 로직은 전혀 건드리지 않았습니다. 이번 라운드는
+잔고 조회 실패 처리와 순수 관측 필드의 방어 로직에 한정됩니다.
+
+### 다음 작업
+
+**180초 감시 공백 해소**가 다음 최우선 과제로 남아 있습니다. 429
+폴백을 되돌리면서 다시 열린 문제로, (1) 잔고 조회 재시도 대기를 전체
+감시 루프에서 분리, (2) 과거 잔고로 체결·주문 종결을 확정하지 않기,
+(3) 시세 감시 지속과 실제 청산 가능 여부를 구분해 검증 — 이 세 목표로
+설계를 진행 중이며, 매도 주문 제출 경로에 직접 영향을 주는 변경이라
+구현 전 별도 확인을 거칩니다.
+
+### 전달 파일
+
+`0001-fix-risk-429-fallback-revert.patch` ~
+`0004-fix-obs-S02-defensive-validation.patch` (4개, 순서대로 `git am`),
+각 라운드별 diff zip. 상세 배경은 프로젝트 문서 `2026-09-14-gpt-review-
+fixes.md`/`-v2.md`/`-v3.md` 참고.
+
+---
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
