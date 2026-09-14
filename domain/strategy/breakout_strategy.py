@@ -28,13 +28,32 @@ from __future__ import annotations
 from config.settings import StrategyConfig
 from domain.models import MarketPrice, Position, Signal, SignalType
 from domain.strategy.base import Strategy
+from domain.strategy.exit_calc import TrailingParams, calc_stop_loss, calc_trailing_stop
 
 
 class BreakoutStrategy(Strategy):
     """분봉 2차 필터 + 일봉 타이밍 기반 단타 전략입니다."""
 
+    # 2026-09-14 (구현 지시서 §2.5): 트레일링 시작 배율·구간표를 여기
+    # 한 곳에만 적어두고, generate_signal()과 trailing_params()(잔고
+    # 장애 관측 경로가 읽음)가 둘 다 이 상수를 참조합니다 — 숫자를
+    # 두 곳에 복사하지 않기 위함.
+    # 2026-09-14 (GPT 재검토, 2단계 완료 처리 전 수정): 튜플(불변)로
+    # 바꿨다 — 리스트였을 때는 trailing_params()가 이 객체를 그대로
+    # 반환해서, 호출자가 반환받은 리스트를 수정하면 이 클래스 상수
+    # 자체가 바뀌어 다른 BreakoutStrategy 인스턴스의 실제 SELL/HOLD
+    # 판정까지 달라지는 경로가 재현됐다(exit_calc.py의 TrailingParams
+    # docstring 참고).
+    _TRAILING_START_MULTIPLIER = 1.012  # +1.2% 이상 시 시작
+    _TRAILING_TIERS: tuple[tuple[float, float], ...] = (
+        (5.0, 2.8), (3.5, 2.2), (2.0, 1.8), (float("-inf"), 1.5),  # +1.2~2.0%는 마지막 항목
+    )
+
     def __init__(self, config: StrategyConfig) -> None:
         self.config = config
+
+    def trailing_params(self) -> TrailingParams:
+        return TrailingParams(start_multiplier=self._TRAILING_START_MULTIPLIER, tiers=self._TRAILING_TIERS)
 
     def generate_signal(
         self,
@@ -342,16 +361,25 @@ class BreakoutStrategy(Strategy):
 
         # ── 보유 중 → 매도 판단 ──────────────────────────────────
         average_price = position.average_price
-        stop_loss_price = int(average_price * (1 - self.config.stop_loss_pct / 100))
         safety_net_price = int(average_price * (1 + self.config.take_profit_pct / 100))
 
+        # 2026-09-14 (180초 감시 공백 대응 — 구현 지시서 1번, GPT 재검토
+        # 반영): 손절·트레일링 계산을 exit_calc.py의 순수 함수로 추출해
+        # 잔고 장애 관측 경로와 공유합니다. 임계값·반올림·분기 조건은
+        # 아래와 완전히 동일 — reason 문자열 조립만 이 파일이 그대로
+        # 담당합니다(문구가 전략마다 달라 공용 함수에서 만들지 않음).
+        stop_loss = calc_stop_loss(average_price, current_price, self.config.stop_loss_pct)
+        # 2026-09-14 (GPT 재검토, 완료 처리 전 수정): 원본처럼 이 파일이
+        # 직접 계산합니다 — calc_stop_loss()가 대신 계산해주면
+        # HoldStrategy처럼 이 값이 필요 없는 곳까지 나눗셈을 강제하게
+        # 되어 exit_calc.py 쪽에서 뺐습니다(모듈 docstring 참고).
         current_pnl_pct = (current_price - average_price) / average_price * 100
 
         # ① 손절 (최우선)
-        if current_price <= stop_loss_price:
+        if stop_loss.triggered:
             return Signal(
                 type=SignalType.SELL,
-                reason=f"손절 — 평균단가 대비 {current_pnl_pct:+.1f}% ({stop_loss_price:,}원 하회)",
+                reason=f"손절 — 평균단가 대비 {current_pnl_pct:+.1f}% ({stop_loss.stop_loss_price:,}원 하회)",
             )
 
         # ② 구간형 트레일링 스탑
@@ -359,27 +387,22 @@ class BreakoutStrategy(Strategy):
         # 2026-06-22 개편: 손익비 개선 — 시작점을 +1.2%로 늦추고 전 구간 폭 확대.
         #   (기존엔 +0.5%부터 -1.0%로 추적해서 본전 근처 조기청산이 빈번,
         #    이길 때 평균 +0.23% vs 질 때 -1.14%로 손익비가 1:4.9로 거꾸로였음)
-        trailing_start_price = int(average_price * 1.012)  # +1.2% 이상 시 시작
-        if highest_price >= trailing_start_price and highest_price > 0:
-            high_pnl_pct = (highest_price - average_price) / average_price * 100
-            if high_pnl_pct >= 5.0:
-                trail_pct = 2.8
-            elif high_pnl_pct >= 3.5:
-                trail_pct = 2.2
-            elif high_pnl_pct >= 2.0:
-                trail_pct = 1.8
-            else:  # +1.2~2.0%
-                trail_pct = 1.5
-            trailing_stop_price = int(highest_price * (1 - trail_pct / 100))
-            from_high_pct = (current_price - highest_price) / highest_price * 100
-            if current_price <= trailing_stop_price:
-                return Signal(
-                    type=SignalType.SELL,
-                    reason=(
-                        f"트레일링 스탑 — 최고가 {highest_price:,}원 대비 {from_high_pct:.1f}% 하락 "
-                        f"(트레일링 폭 -{trail_pct:.1f}% / 보유 수익 {current_pnl_pct:+.1f}%)"
-                    ),
-                )
+        trailing_params = self.trailing_params()
+        trailing = calc_trailing_stop(
+            average_price=average_price,
+            current_price=current_price,
+            highest_price=highest_price,
+            trailing_start_multiplier=trailing_params.start_multiplier,
+            tiers=trailing_params.tiers,
+        )
+        if trailing.active and trailing.triggered:
+            return Signal(
+                type=SignalType.SELL,
+                reason=(
+                    f"트레일링 스탑 — 최고가 {highest_price:,}원 대비 {trailing.from_high_pct:.1f}% 하락 "
+                    f"(트레일링 폭 -{trailing.trail_pct:.1f}% / 보유 수익 {current_pnl_pct:+.1f}%)"
+                ),
+            )
 
         # ③ 추세 꺾임 — 점수제 (보유 수익 +0.5% 이상일 때만 활성화)
         if has_indicators and rsi is not None and current_pnl_pct >= 0.5:
@@ -429,19 +452,15 @@ class BreakoutStrategy(Strategy):
                 reason=f"안전망 익절 — 평균단가 대비 +{self.config.take_profit_pct:.0f}% 도달",
             )
 
-        # 트레일링 스탑 진행 상황 표시 (② 실제 청산 로직과 동일한 구간 유지)
-        if highest_price >= trailing_start_price and highest_price > 0:
-            high_pnl_pct2 = (highest_price - average_price) / average_price * 100
-            if high_pnl_pct2 >= 5.0:   trail_pct2 = 2.8
-            elif high_pnl_pct2 >= 3.5: trail_pct2 = 2.2
-            elif high_pnl_pct2 >= 2.0: trail_pct2 = 1.8
-            else:                       trail_pct2 = 1.5
-            trailing_stop_price = int(highest_price * (1 - trail_pct2 / 100))
+        # 트레일링 스탑 진행 상황 표시 (② 실제 청산 로직과 동일한 계산 재사용 —
+        # 여기 도달했다는 것은 ②에서 이미 active=False이거나 active=True인데
+        # triggered=False였다는 뜻이므로, active만 다시 확인하면 됩니다.)
+        if trailing.active:
             return Signal(
                 type=SignalType.HOLD,
                 reason=(
                     f"트레일링 추적 중 — 최고가 {highest_price:,}원 / "
-                    f"스탑 {trailing_stop_price:,}원 (폭 -{trail_pct2:.1f}%) / 현재 {current_pnl_pct:+.1f}%"
+                    f"스탑 {trailing.trailing_stop_price:,}원 (폭 -{trailing.trail_pct:.1f}%) / 현재 {current_pnl_pct:+.1f}%"
                 ),
             )
 
@@ -450,6 +469,6 @@ class BreakoutStrategy(Strategy):
             reason=(
                 f"보유 유지 {current_pnl_pct:+.1f}% — "
                 f"트레일링 시작까지 +{self.config.trailing_start_pct:.0f}% 필요 / "
-                f"손절 {stop_loss_price:,}원"
+                f"손절 {stop_loss.stop_loss_price:,}원"
             ),
         )

@@ -11,6 +11,7 @@ from __future__ import annotations
 from config.settings import StrategyConfig
 from domain.models import MarketPrice, Position, Signal, SignalType
 from domain.strategy.base import Strategy
+from domain.strategy.exit_calc import TrailingParams, calc_stop_loss
 
 
 class HoldStrategy(Strategy):
@@ -25,6 +26,13 @@ class HoldStrategy(Strategy):
         """
         self.config = config
         self.regime_label = regime_label
+
+    def trailing_params(self) -> TrailingParams | None:
+        # 2026-09-14 (구현 지시서 §2.5): HoldStrategy는 원본부터 트레일링이
+        # 없습니다(highest_price 미사용, 익절/손절만 판단) — Strategy
+        # 기본값(None)과 동일하지만, "트레일링이 없다"는 사실을 이
+        # 파일만 보고도 알 수 있도록 명시적으로 오버라이드합니다.
+        return None
 
     def generate_signal(self, market_price: MarketPrice, position: Position | None, minute_analysis=None, highest_price: int = 0, **kwargs) -> Signal:
         """보유 중이면 익절/손절 판단, 미보유면 무조건 HOLD."""
@@ -41,7 +49,11 @@ class HoldStrategy(Strategy):
         # 보유 중 → 익절/손절은 장세와 무관하게 항상 판단
         average_price = position.average_price
         take_profit_price = int(average_price * (1 + self.config.take_profit_pct / 100))
-        stop_loss_price = int(average_price * (1 - self.config.stop_loss_pct / 100))
+        # 2026-09-14 (180초 감시 공백 대응 — 구현 지시서 1번): 손절
+        # 계산을 exit_calc.py의 순수 함수로 추출 — HoldStrategy는
+        # 트레일링이 없으므로(highest_price 미사용) calc_trailing_stop()은
+        # 쓰지 않습니다. 기존 평가 순서(익절 먼저, 손절 나중)는 그대로.
+        stop_loss = calc_stop_loss(average_price, current_price, self.config.stop_loss_pct)
 
         if current_price >= take_profit_price:
             return Signal(
@@ -51,18 +63,18 @@ class HoldStrategy(Strategy):
                 ),
             )
 
-        if current_price <= stop_loss_price:
+        if stop_loss.triggered:
             return Signal(
                 type=SignalType.SELL,
                 reason=(
-                    f"{self.regime_label} + 손절 기준 {stop_loss_price:,}원 하회 — 손절합니다"
+                    f"{self.regime_label} + 손절 기준 {stop_loss.stop_loss_price:,}원 하회 — 손절합니다"
                 ),
             )
 
         return Signal(
             type=SignalType.HOLD,
             reason=(
-                f"{self.regime_label} — 익절 {take_profit_price:,}원 / 손절 {stop_loss_price:,}원 "
+                f"{self.regime_label} — 익절 {take_profit_price:,}원 / 손절 {stop_loss.stop_loss_price:,}원 "
                 f"사이에서 유지합니다"
             ),
         )

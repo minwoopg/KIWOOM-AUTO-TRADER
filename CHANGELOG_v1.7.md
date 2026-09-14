@@ -458,3 +458,330 @@ fixes.md`/`-v2.md`/`-v3.md` 참고.
 ---
 
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 180초 감시 공백 대응 1단계 — 손절·트레일링 계산 추출 (2026-09-14, GPT 재검토 2회 반영, 매매 판단 로직 무변경)
+
+### 배경
+
+앞서 예고된 "180초 감시 공백 해소" 작업의 설계 문서(v1/v2)와 구현
+지시서를 GPT 재검토와 함께 확정하는 과정에서, 잔고 장애 중 관측
+전용 경로가 "고정 손절"과 "트레일링"만 평가하려면 `Strategy.
+generate_signal()` 전체를 재사용할 수 없다는 지적을 받았습니다 —
+그 함수는 VWAP 이탈·추세 꺾임·안전망 익절까지 함께 계산해서
+반환하므로, 반환된 SELL을 그대로 기록하면 정한 범위를 넘어섭니다.
+`reason` 문자열에 "손절"/"트레일링"이 들어있는지 검사해 걸러내는
+방식도 문구 변경에 취약해 채택하지 않았습니다. 실제 관측 경로를
+구현하기 전에 이 선행 리팩터를 먼저 해결했습니다.
+
+### 변경 내용
+
+1. `domain/strategy/exit_calc.py` 신설 — `calc_stop_loss()`/
+   `calc_trailing_stop()` 순수 함수. 판정에 필요한 수치(트리거 여부,
+   손절가/트레일링 스탑가, 적용된 트레일링 폭 등)만 반환하고
+   `reason` 문자열·수익률(`current_pnl_pct`)은 계산하지 않습니다 —
+   문구는 전략마다 달라 각 전략 파일이 계속 담당하고, 수익률은
+   reason 조립에만 쓰이는 값이라 필요한 전략이 직접 계산합니다
+   (아래 1차 검토 지적 1번 참고).
+2. `BreakoutStrategy`/`BottomStrategy`/`NeutralStrategy`/
+   `HoldStrategy` 4개 파일이 기존에 각자 갖고 있던 손절·트레일링
+   계산을 이 공용 함수 호출로 교체. 임계값·반올림·평가 순서·reason
+   문자열은 전부 기존과 동일 — 전략별 트레일링 방식 차이(Breakout
+   4단계 구간/Neutral 4단계지만 다른 경계값/Bottom 단일 폭/Hold는
+   트레일링 없음)도 그대로 유지했습니다.
+
+### 1차 검토(GPT) 지적 반영 — 완료 처리 전 수정 2건
+
+1. **HoldStrategy에 새로 생긴 ZeroDivisionError**: 초기 버전의
+   `calc_stop_loss()`가 손절 판정에 쓰지도 않는 수익률
+   (`current_pnl_pct`)까지 계산했는데, 원본 `HoldStrategy`는 이
+   값을 아예 계산하지 않았습니다(익절/손절 가격만 비교). 평균단가
+   0인 입력에서 원본은 크래시 없이 SELL(익절)을 반환했지만, 리팩터
+   버전은 이 나눗셈 때문에 `ZeroDivisionError`로 죽는 회귀가
+   생겼습니다 — `calc_stop_loss()`에서 수익률 계산을 제거하고 필요한
+   3개 전략(Breakout/Bottom/Neutral)이 원본처럼 직접 계산하도록
+   되돌려 수정했습니다. 이 3개 전략은 원본도 손절 검사 전에 수익률을
+   무조건 계산했으므로 평균단가 0 크래시가 그대로 남아있는데, 이는
+   새 회귀가 아니라 리팩터 이전부터 있던 동작이라 이번 범위에서
+   손대지 않았습니다(무효 평균단가 처리 정책은 별도 항목).
+2. **신규 테스트가 전체 회귀에서 실행되지 않던 문제**:
+   `run_regression_tests.py`는 pytest가 아니라 각 `test_*.py`를
+   `subprocess`로 그대로 실행하는 방식인데, 처음 작성한 pytest 스타일
+   클래스(직접 실행 진입점 없음)는 아무 것도 실행하지 않고 조용히
+   종료 코드 0으로 끝나 "PASS"로 오인될 수 있었습니다. 프로젝트 관례
+   (`unittest.TestCase` + `if __name__ == "__main__": unittest.main()`)에
+   맞춰 다시 작성 — 이제 직접 실행 시 "Ran N tests"가 출력되고,
+   assertion을 인위로 실패시키면 `run_regression_tests.py`도 해당
+   파일을 FAIL로 표시함을 확인했습니다. 손절·트레일링 참조 함수의
+   HOLD 경로(트레일링 추적 중/보유 유지) 일부가 비교 대상에서 빠져
+   있던 것도 채웠고, 평균단가를 2가지 값(정수 배 아닌 값 포함)으로
+   확장했습니다.
+
+### 테스트 및 검증
+
+`test_exit_calc_equivalence.py`(10건) — 4개 전략 모두 손절가·
+트레일링 시작가·구간 경계(수익률 0.5/1.0/1.2/2.0/3.0/3.5/5.0%) 근방을
+촘촘히 스캔하며, 리팩터 이전 공식을 exit_calc.py와 무관하게 손으로
+다시 옮겨 적은 참조 구현과 SELL/HOLD 타입·reason 문자열이 정확히
+일치하는지 검증(순환 검증 아님, HOLD 경로 포함). 트레일링 스탑가
+바로 아래/동일/바로 위 경계, HoldStrategy 평균단가 0 회귀 고정
+테스트 포함. `python test_exit_calc_equivalence.py` 직접 실행으로
+"Ran 10 tests / OK" 출력 확인.
+
+`run_regression_tests.py` 38개 중 37 PASS(`test_broker_order_status.py`
+fixture 누락은 변경 전 main에서도 동일하게 실패 — `git stash`로
+확인, 무관). `legacy_tests/test_entry_watch.py` 11/11 PASS.
+
+### 변경하지 않은 것
+
+RSI·MACD·진입점수·predicate 등 매수 판단 로직과, 각 전략의 손절·
+트레일링 임계값·구간 경계·평가 순서는 전혀 바꾸지 않았습니다 —
+순수하게 같은 계산을 공용 함수로 옮긴 것입니다. 잔고 장애 중 관측
+경로 자체(재시도 스케줄러, 조회/확정 분리, 주문 증거 저장, 최고가
+후보 병합 등)는 이번 커밋에 포함하지 않았습니다.
+
+### 별개 발견 — 정정: 운영 크래시 아님 (이번 작업 범위 밖, 손대지 않음)
+
+`BottomStrategy.generate_signal()`이 `domain/models.py`의
+`MarketPrice`에 더 이상 존재하지 않는 필드(`indicator_rsi_signal_
+cross`/`indicator_volume_exhaustion`/`indicator_volume_buying`)를
+position 분기보다 앞에서 무조건 참조합니다 — **직접 호출하면**
+`AttributeError`가 재현됩니다. git blame으로 확인: 2026-05-21 커밋
+`8093acd`("NEUTRAL 장세 추가")에서 관련 없는 `models.py` 정리 작업
+중 실수로 삭제된 것으로 보입니다.
+
+**정정(1차 검토에서 지적)**: 처음에는 "REBOUND 장세가 분류되면
+운영 중 즉시 크래시한다"고 적었는데, 이는 부정확했습니다.
+`StrategyRouter.select()`를 직접 확인한 결과 REBOUND는 이미
+`BottomStrategy`가 아니라 `NeutralStrategy`로 우회되어 있습니다
+(`# BottomStrategy는 MarketPrice 필드 미완성 — 임시로 NeutralStrategy
+사용`). 즉 현재 운영 경로에서는 이 크래시가 발생하지 않고, **비활성
+상태인 BottomStrategy를 직접 호출할 때만** 재현되는 결함입니다.
+이번 작업 범위 밖이라 손대지 않았고(누락 필드에 임의 기본값을
+채우거나 라우터를 바꾸지 않음), 테스트에서는 `object.__setattr__`로
+임시 우회만 했습니다. `BottomStrategy`를 실제 활성화하려면 지표
+생성 경로까지 함께 검토가 필요합니다 — 다음 관측 경로 구현에서도
+REBOUND를 이름만 보고 BottomStrategy 설정에 연결하지 않아야 합니다.
+
+### 다음 작업
+
+이 추출이 승인되면 구현 지시서 §2.5(장애 중 청산 후보 계산)를 이
+`calc_stop_loss()`/`calc_trailing_stop()`을 직접 호출하는 관측 전용
+평가 함수로 구현합니다. 이때 계산 함수뿐 아니라 전략별 트레일링
+시작 배율·구간표(tiers)도 `StrategyRouter`가 실제로 선택하는 전략을
+따라 한 곳에서 공유해야 합니다 — 관측 코드에 구간표를 별도로
+복사하면 나중에 정상 전략과 관측 결과가 어긋날 수 있습니다.
+재시도 스케줄러(단조 시계 기반)·주문 증거의 주문번호 연결·최고가
+후보의 진입 건 식별 병합 비교는 계속 별도의 작은 커밋으로 나눠
+진행합니다.
+
+### 전달 파일
+
+`0001-refactor-strategy-exit_calc.py.patch`,
+`0002-docs-CHANGELOG-v1.7.patch`, 관련 파일 전체가 담긴 diff zip.
+상세 배경은 프로젝트 문서 `2026-09-14-180s-gap-design-doc.md`/
+`-v2.md`, `2026-09-14-180s-gap-implementation-directive.md`,
+`2026-09-14-180s-gap-step1-exit-calc-extraction.md` 참고.
+
+---
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 180초 감시 공백 대응 2단계 — 전략별 트레일링 설정 공유 + 청산 후보 계산 (2026-09-14, 매매 판단 로직 무변경)
+
+### 배경
+
+1단계(손절·트레일링 계산 추출)는 개발 검증 완료로 승인됐습니다.
+승인과 함께 받은 다음 단계 지시는 두 가지였습니다: (1) 전략별
+트레일링 시작 배율·구간표(tiers)를 잔고 장애 관측 코드에 다시
+복사하지 말고 계산 함수와 함께 한 곳에서 공유할 것, (2) 실제
+`StrategyRouter`가 선택하는 전략을 기준으로 청산 후보를 계산할 것
+(REBOUND를 이름만 보고 BottomStrategy로 임의 연결하지 않을 것).
+이번 커밋은 이 두 가지만 구현합니다 — 잔고 장애 중 실제 주문 제출과
+최고가 후보의 운영 상태 병합은 이전과 동일하게 비활성 상태입니다.
+
+### 변경 내용
+
+`domain/strategy/base.py`의 `Strategy` 추상 클래스에
+`trailing_params() -> TrailingParams | None` 메서드를 추가했습니다
+(기본값 `None` = 트레일링 없음). `domain/strategy/exit_calc.py`에
+`TrailingParams`(시작 배율 + 구간표)와 `ExitCandidate`(kind +
+StopLossResult + TrailingResult|None) 데이터클래스, 그리고
+`evaluate_exit_candidate(strategy, average_price, current_price,
+highest_price, stop_loss_pct)` 함수를 추가했습니다 — 손절을 먼저
+평가하고(모든 전략의 원본 순서와 동일), 트리거되지 않으면
+`strategy.trailing_params()`로 그 전략이 실제 쓰는 값을 꺼내
+`calc_trailing_stop()`에 그대로 넘깁니다. `strategy.generate_signal()`
+은 호출하지 않습니다 — VWAP 이탈·추세 꺾임·안전망 익절까지 함께
+평가되면 "손절·트레일링만 본다"는 범위를 넘어서기 때문입니다.
+
+`BreakoutStrategy`/`NeutralStrategy`는 트레일링 시작 배율·구간표를
+클래스 상수(`_TRAILING_START_MULTIPLIER`/`_TRAILING_TIERS`)로 한
+곳에만 두고, `trailing_params()`와 `generate_signal()`의
+`calc_trailing_stop()` 호출부가 둘 다 이 상수를 읽도록 했습니다.
+`BottomStrategy`는 트레일링 폭이 `config.trailing_stop_pct`에 달려
+있어 고정 상수로 둘 수 없으므로, `trailing_params()`가 매 호출마다
+`self.config`에서 값을 읽어 `TrailingParams`를 만듭니다(시작 배율
+`1.03`만 상수). `HoldStrategy`는 원래 트레일링이 없으므로
+`trailing_params()`를 명시적으로 오버라이드해 `None`을 반환합니다
+(기본값과 동작은 같지만, 파일만 보고도 "트레일링 없음"을 알 수
+있도록 명시).
+
+### 테스트 및 검증
+
+`test_exit_calc_equivalence.py`에 9건을 추가했습니다(총 19건).
+`TestTrailingParamsSingleSource`(4건): `BreakoutStrategy`/
+`NeutralStrategy`의 `trailing_params()`가 기존 하드코딩 값과 정확히
+일치하는지, `BottomStrategy`는 서로 다른 `config.trailing_stop_pct`로
+만든 두 인스턴스가 서로 다른 tiers를 반환하는지(고정 상수가 아님을
+확인), `HoldStrategy`는 `None`을 반환하는지 확인. `TestEvaluate
+ExitCandidate`(5건): `StrategyRouter.select(REBOUND)`가 반환하는
+객체가 실제로 `NeutralStrategy`인지 확인하고 그 파라미터(1.005배)로
+계산되는지, 손절이 트레일링보다 우선하는지, 트레일링 후보가
+정상적으로 나오는지, 아무 조건도 없으면 `None`인지, `HoldStrategy`가
+선택된 장세(SIDEWAYS/BEARISH/UNKNOWN)에서는 `highest_price`를
+극단적으로 줘도 `TRAILING` 후보가 절대 나오지 않는지(STOP_LOSS 또는
+None만 가능) 확인.
+
+기존 10건(1단계 동등성 테스트)은 이번 리팩터(트레일링 호출부를
+클래스 상수/메서드 참조로 변경) 이후에도 전부 그대로 통과함을
+확인했습니다 — `generate_signal()`의 실제 출력이 바뀌지 않았다는
+뜻입니다. `python test_exit_calc_equivalence.py -v` 직접 실행으로
+"Ran 19 tests / OK" 확인. 인위로 `NeutralStrategy`의 시작 배율
+상수를 틀린 값으로 바꿔 2건(동등성 1건 + 신규 trailing_params 1건)이
+FAIL로 표시되고 종료 코드 1이 나오는 것, `run_regression_tests.py`도
+`test_exit_calc_equivalence.py`를 FAIL로 표시하는 것을 확인한 뒤
+원복했습니다. `run_regression_tests.py` 38개 중 37 PASS(1단계와
+동일한 `test_broker_order_status.py` fixture 누락, 무관).
+`legacy_tests/test_entry_watch.py` 11/11 PASS.
+
+### 변경하지 않은 것
+
+각 전략의 손절·트레일링 임계값·구간 경계·시작 배율·평가 순서는
+전혀 바꾸지 않았습니다 — 기존에 파일마다 흩어져 있던 리터럴을
+클래스 상수/메서드 하나로 모았을 뿐입니다. 매수 판단 로직(RSI·
+MACD·진입점수 등)도 손대지 않았습니다. `BottomStrategy`의
+`MarketPrice` 필드 누락 문제(1단계에서 발견·정정)는 이번에도
+그대로 두었습니다 — REBOUND는 여전히 `StrategyRouter`가
+`NeutralStrategy`로 우회합니다. **실제 주문 제출과 최고가 후보의
+운영 상태(트레일링 기준선) 병합은 이번에도 활성화하지 않았습니다**
+— `evaluate_exit_candidate()`는 순수 계산 결과만 반환하고, 어디에도
+연결되어 있지 않습니다. 재시도 스케줄러(단조 시계 기반)·주문 증거의
+주문번호 연결도 별도 작업으로 남아 있습니다.
+
+### 다음 작업
+
+이번 계산 함수를 실제 잔고 장애 관측 루프에 연결해 로그·기록만
+남기는 단계로 진행합니다(주문 제출 없음). 이후 구현 지시서 §2의
+나머지 항목(재시도 스케줄러 독립 백오프, 주문 상태 조회/확정
+분리, 최고가 후보의 진입 건 식별 병합 — 이건 여전히 "관측 전용"이며
+운영 트레일링 기준선에 병합하는 것은 별도 정책 승인 대상)을 계속
+작은 커밋으로 나눠 진행합니다. 이번 작업명은 "잔고 장애 중 관측
+지속 및 복구 처리 — 부분 완료 단계"를 유지합니다(청산 공백 해소
+완료 아님).
+
+### 전달 파일
+
+`0003-refactor-strategy-trailing_params-share.py.patch`,
+`0004-docs-CHANGELOG-v1.7-2.patch`, 관련 파일 전체가 담긴 diff zip.
+상세 배경은 프로젝트 문서 `2026-09-14-180s-gap-implementation-
+directive.md`, `2026-09-14-180s-gap-step1-exit-calc-extraction.md`
+참고.
+
+---
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 180초 감시 공백 대응 2단계 보완 — 공유 구간표 불변화 + REBOUND 판별 테스트 보강 (2026-09-14, GPT 재검토 반영, 매매 판단 로직 무변경)
+
+### 배경
+
+2단계(전략별 트레일링 설정 공유) 방향은 승인됐지만, 완료 처리 전에
+두 가지를 보완하라는 지적을 받았습니다: (1) `TrailingParams.tiers`가
+가변 리스트라 `frozen=True`에도 불구하고 반환값을 수정하면 클래스
+상수 자체가 바뀌는 경로가 있었고, (2) `REBOUND` 관련 테스트가
+실제로 `NeutralStrategy` 파라미터가 쓰였는지 구별하지 못하는
+입력을 쓰고 있었습니다. 이번 커밋은 이 두 가지만 고칩니다.
+
+### 지적 반영 — 완료 처리 전 수정 2건
+
+**1) 공유 구간표가 외부에서 변경 가능했습니다.** `TrailingParams`는
+`frozen=True`였지만 `tiers` 필드가 가리키는 리스트 자체는 여전히
+가변이었고, `BreakoutStrategy`/`NeutralStrategy`의 `trailing_params()`
+가 클래스 상수 리스트를 그대로(복사 없이) 반환했습니다. 직접
+재현한 결과: 어떤 `BreakoutStrategy` 인스턴스에서 받은
+`trailing_params().tiers[0]`을 수정하자, **다른 인스턴스**의
+`generate_signal()` 결과가 평균단가 10,000원·최고가 10,600원·
+현재가 10,200원 입력에서 SELL → HOLD로 바뀌었습니다 — 읽기 전용
+설정 조회가 실제 운영 전략까지 바꿀 수 있는 경로였습니다.
+
+**수정**: `TrailingParams.tiers`와 `calc_trailing_stop()`/
+`_pick_trail_pct()`의 `tiers` 매개변수 타입을 `tuple[tuple[float,
+float], ...]`(불변)로 바꾸고, `Breakout`/`NeutralStrategy`의 클래스
+상수도 리스트 리터럴(`[...]`)에서 튜플 리터럴(`(...)`)로 바꿨습니다
+(`BottomStrategy`는 매 호출 새 값을 만들어 반환해 원래 공유 문제는
+없었지만, 타입 일관성을 위해 튜플로 통일). 이제 `params.tiers[0] =
+...`는 `TypeError`로 즉시 막힙니다.
+
+**2) REBOUND 판별 테스트가 실제 연결을 구별하지 못했습니다.**
+기존 테스트 입력(평균단가 10,000원·최고가 10,100원·현재가=최고가)
+에서는 올바른 연결(`NeutralStrategy`, 트레일링 활성이지만 미트리거
+→ `None`)과 잘못된 연결(이름만 보고 `BottomStrategy`, 트레일링
+시작가 미달 → `None`)이 **둘 다 `None`을 반환**해, 어느 전략
+파라미터가 실제로 쓰였는지 결과로는 구별할 수 없었습니다.
+
+**수정**: 같은 평균단가·최고가에서 현재가를 9,950원으로 바꿔,
+`NeutralStrategy` 파라미터(시작 1.005배)로는 트레일링이 활성·
+트리거(`TRAILING` 후보)되지만 `BottomStrategy` 파라미터(시작
+1.03배)로는 시작가에도 못 미쳐 항상 `None`이 되도록 했습니다.
+같은 테스트에서 `BottomStrategy`로 직접 계산한 대조군도 함께
+확인해, 결과가 실제로 갈라지는지 검증합니다.
+
+### 테스트 및 검증
+
+`test_exit_calc_equivalence.py`에 1건을 추가했습니다(총 20건):
+`test_returned_tiers_are_immutable_and_shared_safely` — 반환된
+`tiers`에 항목 대입 시 `TypeError`가 발생하는지, 서로 다른
+`BreakoutStrategy` 인스턴스가 트레일링 파라미터를 읽기만 한 뒤에도
+여전히 정확히 같은 SELL 판정을 내는지 확인합니다. 기존 REBOUND
+테스트(`test_rebound_regime_uses_router_selected_strategy_not_
+bottom_by_name`)는 위 설명대로 입력을 바꿔 실제 판별력을 갖도록
+보강했습니다.
+
+수정 전 상태(리스트 공유 + 구별 안 되는 REBOUND 입력)로 되돌려
+`python test_exit_calc_equivalence.py`를 실행한 결과 2건(신규
+불변성 테스트 + `test_breakout_trailing_params`의 타입 불일치)이
+FAIL로 표시됨을 확인한 뒤 원복했습니다. `run_regression_tests.py`
+38개 중 37 PASS(이전과 동일한 `test_broker_order_status.py`
+fixture 누락, 무관). `legacy_tests/test_entry_watch.py` 11/11 PASS.
+
+### 변경하지 않은 것
+
+손절·트레일링 임계값·구간 경계·시작 배율·평가 순서는 전혀
+바꾸지 않았습니다 — 값을 담는 컨테이너 타입(list→tuple)만
+바꿨습니다. 무효 입력(현재가 0, 평균단가 0인데 최고가는 양수,
+NaN 등) 처리는 이번에도 다루지 않습니다 — `evaluate_exit_
+candidate()`를 실제 관측 루프에 연결하는 다음 단계에서, 관측
+경계에 현재가·평균단가 양수·유한값 검증과 시세 신선도 검증을
+추가해 "무효 입력(평가 보류)"과 "유효한 입력인데 후보 없음
+(`None`)"을 구분하기로 했습니다 — 기존 정상 전략들의 무효 입력
+처리 정책 자체는 바꾸지 않습니다. 실제 주문 제출과 최고가 후보의
+운영 상태 병합은 이번에도 비활성 상태입니다.
+
+### 다음 작업
+
+`evaluate_exit_candidate()`를 실제 잔고 장애 관측 루프에 연결하되,
+연결 지점에서 입력 검증(현재가·평균단가 유효성, 시세 신선도)을
+먼저 두고 "평가 보류"와 "후보 없음"을 구분해 기록합니다. 이후
+구현 지시서 §2 나머지 항목은 계속 별도 커밋으로 진행합니다. 작업명은
+"잔고 장애 중 관측 지속 및 복구 처리 — 부분 완료 단계"를 유지합니다.
+
+### 전달 파일
+
+`0005-fix-strategy-trailing_params-immutable-tiers.patch`,
+`0006-docs-CHANGELOG-v1.7-3.patch`, 관련 파일 전체가 담긴 diff zip.
+상세 배경은 프로젝트 문서 `2026-09-14-180s-gap-step2-trailing-
+params-share.md` 참고.
+
+---
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->

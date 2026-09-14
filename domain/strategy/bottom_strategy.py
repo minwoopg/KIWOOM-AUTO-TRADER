@@ -23,13 +23,31 @@ REBOUND 장세에서 작동합니다.
 from config.settings import StrategyConfig
 from domain.models import MarketPrice, Position, Signal, SignalType
 from domain.strategy.base import Strategy
+from domain.strategy.exit_calc import TrailingParams, calc_stop_loss, calc_trailing_stop
 
 
 class BottomStrategy(Strategy):
     """바닥권 안전 매수 전략입니다."""
 
+    # 2026-09-14 (구현 지시서 §2.5): 트레일링 시작 배율은 여기 한 곳에만
+    # 적어두고, generate_signal()과 trailing_params()(잔고 장애 관측
+    # 경로가 읽음)가 둘 다 이 상수를 참조합니다. 트레일링 폭은
+    # config.trailing_stop_pct에 달려 있어 클래스 상수로 고정할 수
+    # 없으므로 trailing_params()가 self.config에서 매번 읽어 만듭니다.
+    _TRAILING_START_MULTIPLIER = 1.03  # +3% 이상 시 시작
+
     def __init__(self, config: StrategyConfig) -> None:
         self.config = config
+
+    def trailing_params(self) -> TrailingParams:
+        # 2026-09-14 (GPT 재검토, 2단계 완료 처리 전 수정): 여기는 매
+        # 호출마다 새로 만들어 반환하므로 Breakout/Neutral 같은 클래스
+        # 상수 공유 문제는 없었지만, TrailingParams.tiers의 타입이
+        # 튜플(불변)로 바뀌었으므로 여기서도 일관되게 튜플로 만든다.
+        return TrailingParams(
+            start_multiplier=self._TRAILING_START_MULTIPLIER,
+            tiers=((float("-inf"), self.config.trailing_stop_pct),),
+        )
 
     def generate_signal(
         self,
@@ -99,27 +117,38 @@ class BottomStrategy(Strategy):
 
         # ── 보유 중 → 매도 판단 ──────────────────────────────────
         average_price    = position.average_price
-        stop_loss_price  = int(average_price * (1 - self.config.stop_loss_pct / 100))
         safety_net_price = int(average_price * (1 + self.config.take_profit_pct / 100))
-        current_pnl_pct  = (current_price - average_price) / average_price * 100
+
+        # 2026-09-14 (180초 감시 공백 대응 — 구현 지시서 1번): 손절·
+        # 트레일링 계산을 exit_calc.py의 순수 함수로 추출 — 기존
+        # 임계값·반올림·분기 조건 동일, reason 문자열만 이 파일이 유지.
+        stop_loss = calc_stop_loss(average_price, current_price, self.config.stop_loss_pct)
+        # 2026-09-14 (GPT 재검토, 완료 처리 전 수정): 원본처럼 이 파일이
+        # 직접 계산 — 이유는 exit_calc.py 모듈 docstring 참고.
+        current_pnl_pct = (current_price - average_price) / average_price * 100
 
         # ① 손절
-        if current_price <= stop_loss_price:
+        if stop_loss.triggered:
             return Signal(
                 type=SignalType.SELL,
-                reason=f"[바닥] 손절 — 평균단가 대비 {current_pnl_pct:+.1f}% ({stop_loss_price:,}원 하회)",
+                reason=f"[바닥] 손절 — 평균단가 대비 {current_pnl_pct:+.1f}% ({stop_loss.stop_loss_price:,}원 하회)",
             )
 
-        # ② 트레일링 스탑 (+3% 이상부터 작동)
-        trailing_start = int(average_price * 1.03)
-        if highest_price >= trailing_start and highest_price > 0:
-            trailing_stop = int(highest_price * (1 - self.config.trailing_stop_pct / 100))
-            from_high = (current_price - highest_price) / highest_price * 100
-            if current_price <= trailing_stop:
+        # ② 트레일링 스탑 (+3% 이상부터 작동, 폭은 항상 config.trailing_stop_pct 단일값)
+        trailing_params = self.trailing_params()
+        trailing = calc_trailing_stop(
+            average_price=average_price,
+            current_price=current_price,
+            highest_price=highest_price,
+            trailing_start_multiplier=trailing_params.start_multiplier,
+            tiers=trailing_params.tiers,
+        )
+        if trailing.active:
+            if trailing.triggered:
                 return Signal(
                     type=SignalType.SELL,
                     reason=(
-                        f"[바닥] 트레일링 스탑 — 최고가 {highest_price:,}원 대비 {from_high:.1f}% "
+                        f"[바닥] 트레일링 스탑 — 최고가 {highest_price:,}원 대비 {trailing.from_high_pct:.1f}% "
                         f"(보유 {current_pnl_pct:+.1f}%)"
                     ),
                 )
@@ -127,7 +156,7 @@ class BottomStrategy(Strategy):
                 type=SignalType.HOLD,
                 reason=(
                     f"[바닥] 트레일링 추적 중 — 최고가 {highest_price:,}원 / "
-                    f"스탑 {trailing_stop:,}원 / 현재 {current_pnl_pct:+.1f}%"
+                    f"스탑 {trailing.trailing_stop_price:,}원 / 현재 {current_pnl_pct:+.1f}%"
                 ),
             )
 
@@ -140,5 +169,5 @@ class BottomStrategy(Strategy):
 
         return Signal(
             type=SignalType.HOLD,
-            reason=f"[바닥] 보유 유지 {current_pnl_pct:+.1f}% — 트레일링 시작까지 +3% 필요 / 손절 {stop_loss_price:,}원",
+            reason=f"[바닥] 보유 유지 {current_pnl_pct:+.1f}% — 트레일링 시작까지 +3% 필요 / 손절 {stop_loss.stop_loss_price:,}원",
         )

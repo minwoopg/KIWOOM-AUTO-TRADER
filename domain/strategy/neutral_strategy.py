@@ -19,13 +19,32 @@ A(상승 돌파)는 추세 불명확 구간에서 고가 추격이 위험하므�
 from config.settings import StrategyConfig
 from domain.models import MarketPrice, Position, Signal, SignalType
 from domain.strategy.base import Strategy
+from domain.strategy.exit_calc import TrailingParams, calc_stop_loss, calc_trailing_stop
 
 
 class NeutralStrategy(Strategy):
     """NEUTRAL 장세 전략 — 반등/눌림목 매수만 허용합니다."""
 
+    # 2026-09-14 (구현 지시서 §2.5): 트레일링 시작 배율·구간표를 여기
+    # 한 곳에만 적어두고, generate_signal()과 trailing_params()(잔고
+    # 장애 관측 경로가 읽음)가 둘 다 이 상수를 참조합니다 — 숫자를
+    # 두 곳에 복사하지 않기 위함.
+    # 2026-09-14 (GPT 재검토, 2단계 완료 처리 전 수정): 튜플(불변)로
+    # 바꿨다 — 리스트였을 때는 trailing_params()가 이 객체를 그대로
+    # 반환해서, 호출자가 반환받은 리스트를 수정하면 이 클래스 상수
+    # 자체가 바뀌어 다른 NeutralStrategy 인스턴스의 실제 SELL/HOLD
+    # 판정까지 달라지는 경로가 재현됐다(exit_calc.py의 TrailingParams
+    # docstring 참고).
+    _TRAILING_START_MULTIPLIER = 1.005  # +0.5% 이상 시 시작
+    _TRAILING_TIERS: tuple[tuple[float, float], ...] = (
+        (3.0, 2.0), (2.0, 1.5), (1.0, 1.2), (float("-inf"), 0.8),
+    )
+
     def __init__(self, config: StrategyConfig) -> None:
         self.config = config
+
+    def trailing_params(self) -> TrailingParams:
+        return TrailingParams(start_multiplier=self._TRAILING_START_MULTIPLIER, tiers=self._TRAILING_TIERS)
 
     def generate_signal(
         self,
@@ -172,44 +191,46 @@ class NeutralStrategy(Strategy):
 
         # ── 보유 중 → 매도 판단 (BULLISH와 동일) ─────────────────
         average_price    = position.average_price
-        stop_loss_price  = int(average_price * (1 - self.config.stop_loss_pct / 100))
         safety_net_price = int(average_price * (1 + self.config.take_profit_pct / 100))
-        current_pnl_pct  = (current_price - average_price) / average_price * 100
+
+        # 2026-09-14 (180초 감시 공백 대응 — 구현 지시서 1번): 손절·
+        # 트레일링 계산을 exit_calc.py의 순수 함수로 추출 — 기존
+        # 임계값·반올림·분기 조건 동일, reason 문자열만 이 파일이 유지.
+        stop_loss = calc_stop_loss(average_price, current_price, self.config.stop_loss_pct)
+        # 2026-09-14 (GPT 재검토, 완료 처리 전 수정): 원본처럼 이 파일이
+        # 직접 계산 — 이유는 exit_calc.py 모듈 docstring 참고.
+        current_pnl_pct = (current_price - average_price) / average_price * 100
 
         # ① 손절
-        if current_price <= stop_loss_price:
+        if stop_loss.triggered:
             return Signal(
                 type=SignalType.SELL,
-                reason=f"[중립] 손절 — 평균단가 대비 {current_pnl_pct:+.1f}% ({stop_loss_price:,}원 하회)",
+                reason=f"[중립] 손절 — 평균단가 대비 {current_pnl_pct:+.1f}% ({stop_loss.stop_loss_price:,}원 하회)",
             )
 
         # ② 구간형 트레일링 스탑
-        trailing_start_price = int(average_price * 1.005)  # +0.5% 이상 시 시작
-        if highest_price >= trailing_start_price and highest_price > 0:
-            high_pnl_pct = (highest_price - average_price) / average_price * 100
-            if high_pnl_pct >= 3.0:
-                trail_pct = 2.0
-            elif high_pnl_pct >= 2.0:
-                trail_pct = 1.5
-            elif high_pnl_pct >= 1.0:
-                trail_pct = 1.2
-            else:
-                trail_pct = 0.8
-            trailing_stop = int(highest_price * (1 - trail_pct / 100))
-            from_high_pct = (current_price - highest_price) / highest_price * 100
-            if current_price <= trailing_stop:
+        trailing_params = self.trailing_params()
+        trailing = calc_trailing_stop(
+            average_price=average_price,
+            current_price=current_price,
+            highest_price=highest_price,
+            trailing_start_multiplier=trailing_params.start_multiplier,
+            tiers=trailing_params.tiers,
+        )
+        if trailing.active:
+            if trailing.triggered:
                 return Signal(
                     type=SignalType.SELL,
                     reason=(
-                        f"[중립] 트레일링 스탑 — 최고가 {highest_price:,}원 대비 {from_high_pct:.1f}% 하락 "
-                        f"(트레일링 폭 -{trail_pct:.1f}% / 보유 수익 {current_pnl_pct:+.1f}%)"
+                        f"[중립] 트레일링 스탑 — 최고가 {highest_price:,}원 대비 {trailing.from_high_pct:.1f}% 하락 "
+                        f"(트레일링 폭 -{trailing.trail_pct:.1f}% / 보유 수익 {current_pnl_pct:+.1f}%)"
                     ),
                 )
             return Signal(
                 type=SignalType.HOLD,
                 reason=(
                     f"[중립] 트레일링 추적 중 — 최고가 {highest_price:,}원 / "
-                    f"스탑 {trailing_stop:,}원 (폭 -{trail_pct:.1f}%) / 현재 {current_pnl_pct:+.1f}%"
+                    f"스탑 {trailing.trailing_stop_price:,}원 (폭 -{trailing.trail_pct:.1f}%) / 현재 {current_pnl_pct:+.1f}%"
                 ),
             )
 
@@ -266,6 +287,6 @@ class NeutralStrategy(Strategy):
             reason=(
                 f"[중립] 보유 유지 {current_pnl_pct:+.1f}% — "
                 f"트레일링 시작까지 +{self.config.trailing_start_pct:.0f}% 필요 / "
-                f"손절 {stop_loss_price:,}원"
+                f"손절 {stop_loss.stop_loss_price:,}원"
             ),
         )

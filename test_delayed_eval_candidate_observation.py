@@ -766,6 +766,104 @@ class TestDelayedCandidatePriceValidity(unittest.TestCase):
             self.assertEqual(rows[0]["price_valid"], "False")
 
 
+class TestDelayedCandidateRestartDedupRestore(unittest.TestCase):
+    """2026-09-14 (GPT 재검토 4차 반영) — 재현된 결함: 위 price_valid
+    분리(3차 반영)는 같은 프로세스 안에서는 무효 가격이 dedup 슬롯을
+    소모하지 않도록 막았지만, DelayedEvalCandidateLogger.__init__()이
+    재시작 시 기존 CSV의 "모든" 행을 dedup 키로 복원하고 있었습니다 —
+    price_valid=False로 기록된(dedup 없이 append()된) 행까지 포함해서.
+    그 결과 무효 가격 관측 → 재시작 → 유효 가격 관측 순서에서, 재시작
+    직후 복원된 무효 행의 키가 그 (symbol, entry_time) 슬롯을 영구히
+    차지해 뒤이은 유효 가격 관측이 다시 조용히 버려지는 것이 실제
+    재현됐습니다."""
+
+    def test_invalid_price_then_restart_then_valid_price_still_logs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/delayed_eval_candidate.csv"
+            symbol = "005930"
+            entry_time = (datetime.now() - timedelta(minutes=10)).isoformat()
+
+            # 1) 무효 가격(0) 관측 — dedup 없이 기록됨.
+            logger1 = DelayedEvalCandidateLogger(path)
+            svc1 = make_service(delayed_eval_candidate_logger=logger1)
+            svc1.state.entry_time_by_symbol[symbol] = entry_time
+            pos = Position(symbol=symbol, quantity=10, average_price=10000)
+            svc1._check_entry_watch(symbol, pos, current_price=0, minute_analysis=None)
+            self.assertEqual(logger1._seen_keys, set())
+
+            # 2) "재시작" — 같은 파일 경로로 로거를 새로 생성. 무효
+            #    행까지 dedup 키로 복원되면 안 됨.
+            logger2 = DelayedEvalCandidateLogger(path)
+            self.assertEqual(
+                logger2._seen_keys, set(),
+                "재시작 시 price_valid=False 행이 dedup 키로 복원되면 안 됩니다.",
+            )
+
+            # 3) 재시작 후 같은 진입 건에 유효 가격 관측 — 정상적으로
+            #    새 행이 기록돼야 함(이전엔 여기서 조용히 버려졌음).
+            svc2 = make_service(delayed_eval_candidate_logger=logger2)
+            svc2.state.entry_time_by_symbol[symbol] = entry_time
+            svc2._check_entry_watch(symbol, pos, current_price=9700, minute_analysis=None)
+            self.assertEqual(logger2._seen_keys, {(symbol, entry_time)})
+
+            rows = list(csv.DictReader(open(path, encoding="utf-8")))
+            self.assertEqual(len(rows), 2, "무효 관측 1건 + 재시작 후 유효 관측 1건, 총 2행")
+            self.assertEqual(rows[0]["price_valid"], "False")
+            self.assertEqual(rows[1]["price_valid"], "True")
+
+            # 4) 다시 한번 재시작 — 이제는 유효 행이 있으므로 정상적으로
+            #    dedup 키가 복원되고, 같은 진입 건에 대한 추가 유효 관측은
+            #    새로 기록되지 않아야 함(이미 평가됨). 무효 관측(price_
+            #    valid=False)은 애초에 dedup 대상이 아니라 append()로
+            #    매번 기록되므로 이 케이스에는 해당하지 않음 — 여기서는
+            #    유효 관측만 재현.
+            logger3 = DelayedEvalCandidateLogger(path)
+            self.assertEqual(logger3._seen_keys, {(symbol, entry_time)})
+            svc3 = make_service(delayed_eval_candidate_logger=logger3)
+            svc3.state.entry_time_by_symbol[symbol] = entry_time
+            svc3._check_entry_watch(symbol, pos, current_price=9600, minute_analysis=None)
+            rows_after = list(csv.DictReader(open(path, encoding="utf-8")))
+            self.assertEqual(
+                len(rows_after), 2,
+                "유효 관측이 이미 기록된 진입 건은 재시작 후에도 다시 기록되면 안 됩니다.",
+            )
+
+    def test_legacy_csv_without_price_valid_column_restores_only_genuinely_valid_rows(self):
+        """price_valid 필드 자체가 없던(2026-09-14 이전) 구형식 CSV를
+        직접 만들어, 그 안의 0원 행은 dedup 키로 복원되지 않고 정상
+        가격 행만 복원되는지 확인합니다. 컬럼 부재를 "전부 유효"로
+        간주하면 구형식 시절의 0원 행이 다시 문제를 만듭니다."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/delayed_eval_candidate.csv"
+            legacy_fields = [
+                "detected_at", "symbol", "entry_time", "elapsed_min",
+                "watch_minutes", "avg_price", "current_price", "pnl_pct",
+                "minute_analysis_available",
+            ]
+            with open(path, "w", newline="", encoding="utf-8") as fp:
+                writer = csv.DictWriter(fp, fieldnames=legacy_fields)
+                writer.writeheader()
+                writer.writerow({
+                    "detected_at": datetime.now().isoformat(), "symbol": "005930",
+                    "entry_time": "2026-09-01T09:05:00", "elapsed_min": 6,
+                    "watch_minutes": 5, "avg_price": 10000, "current_price": 10200,
+                    "pnl_pct": 2.0, "minute_analysis_available": True,
+                })
+                writer.writerow({
+                    "detected_at": datetime.now().isoformat(), "symbol": "000660",
+                    "entry_time": "2026-09-01T09:10:00", "elapsed_min": 6,
+                    "watch_minutes": 5, "avg_price": 10000, "current_price": 0,
+                    "pnl_pct": -100.0, "minute_analysis_available": True,
+                })
+
+            logger = DelayedEvalCandidateLogger(path)
+            self.assertEqual(
+                logger._seen_keys, {("005930", "2026-09-01T09:05:00")},
+                "구형식 CSV에서도 진짜 유효했던 행만 dedup 키로 복원되고, "
+                "0원 행은 제외돼야 합니다.",
+            )
+
+
 class TestLegacyFormatObservationState(unittest.TestCase):
     """2026-09-14 (GPT 재검토 3차 반영) — 배포 경계: 2026-09-14 이전
     구형식(entry_time 결합 이전, bare timestamp)으로 저장된 관측값이

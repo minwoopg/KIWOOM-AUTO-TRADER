@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import logging
 import logging.handlers
+import math
 import os
 import shutil
 from pathlib import Path
@@ -1123,6 +1124,20 @@ class DelayedEvalCandidateLogger:
                     reader = csv.DictReader(fp)
                     for row in reader:
                         try:
+                            # 2026-09-14 (GPT 재검토 4차 반영): append()로
+                            # (dedup 없이) 기록된 price_valid=False 행까지
+                            # 재시작 시 여기서 전부 dedup 키로 복원해버리면,
+                            # 같은 프로세스 안에서는 막았던 "무효 가격이
+                            # 유효 가격의 기록 기회를 소모하는" 문제가
+                            # 재시작 경로로 되살아남 — 무효 가격으로
+                            # 기록된 행 하나가 재시작 후 그 (symbol,
+                            # entry_time)의 dedup 슬롯을 영구히 차지해,
+                            # 이후 들어오는 유효 가격 관측이 조용히
+                            # 버려지는 것을 실제 재현으로 확인함. 이
+                            # 로거가 유효한 관측에 대해서만 dedup 슬롯을
+                            # 채우도록, 무효 행은 복원에서 제외한다.
+                            if not self._row_counts_for_dedup(row):
+                                continue
                             self._seen_keys.add(self._key(row))
                         except Exception:
                             continue
@@ -1139,6 +1154,41 @@ class DelayedEvalCandidateLogger:
     @staticmethod
     def _key(row: dict[str, Any]) -> tuple:
         return (str(row.get("symbol", "")), str(row.get("entry_time", "")))
+
+    @staticmethod
+    def _row_counts_for_dedup(row: dict[str, Any]) -> bool:
+        """이 CSV 행이 dedup 슬롯을 채워도 되는 "유효한 관측"인지 판단합니다.
+
+        2026-09-14 (GPT 재검토 4차 반영): `price_valid` 컬럼이 있으면
+        그 값을 그대로 신뢰합니다("True"만 유효 — 그 외 값은 전부
+        무효로 취급, 즉 fail-safe 기본값은 "무효"). `price_valid`
+        컬럼이 없거나 빈 문자열이면(2026-09-14 이전 구형식 CSV — 이
+        필드 자체가 생기기 전에 기록된 행) 컬럼 부재를 곧바로 "유효"로
+        간주하지 않습니다 — 그러면 구형식 시절의 0원 행이 다시 dedup
+        슬롯을 차지하는 문제가 재발합니다. 대신 그 행 자신의 current_
+        price/avg_price 값으로 같은 유효성 기준(양수·유한값)을 다시
+        계산해, 구형식 CSV에서도 진짜 유효했던 관측만 dedup 대상으로
+        인정합니다. 파싱 자체가 실패하면(손상된 값 등) "무효"로
+        처리합니다 — 판단이 애매할 때는 슬롯을 채우지 않는 쪽이
+        안전합니다(최악의 경우 중복 행이 하나 더 남을 뿐, 유효한
+        미래 관측이 영구히 막히지는 않음).
+        """
+        raw_price_valid = row.get("price_valid")
+        if raw_price_valid not in (None, ""):
+            return str(raw_price_valid).strip() == "True"
+
+        try:
+            current_price = float(row.get("current_price", ""))
+            avg_price = float(row.get("avg_price", ""))
+        except (TypeError, ValueError):
+            return False
+
+        return (
+            current_price > 0
+            and avg_price > 0
+            and math.isfinite(current_price)
+            and math.isfinite(avg_price)
+        )
 
     def append_if_new(self, row: dict[str, Any]) -> bool:
         """같은 (symbol, entry_time) episode에 대해 최초 1건만 기록하고
