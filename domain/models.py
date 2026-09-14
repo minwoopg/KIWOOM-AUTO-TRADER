@@ -295,6 +295,15 @@ class RuntimeState:
     # entry_watch VWAP 연속 이탈 카운터 (히스테리시스용, 2026-07-22)
     # 종목이 VWAP 위로 회복하면 이 값은 0으로 리셋됨
     vwap_break_streak_by_symbol: dict[str, int] = field(default_factory=dict)
+    # 2026-09-11 (S02 관측 1단계, 순수 기록 — SELL/재평가 판정에는 관여하지
+    # 않음): 이 진입 건(symbol)에 대해 entry_watch 정상 창(elapsed_min <=
+    # watch_minutes+1) 안에서 avg>0인 유효한 평가가 실제로 최소 1회
+    # 있었는지를, 그 최초 시각(ISO 문자열)으로 기록합니다. 값이 없으면
+    # "정상 창 전체를 놓쳤을 가능성" 판단의 근거가 됩니다(지연 평가 진입
+    # 자격 조건 중 하나 — 이번 라운드는 기록만 하고 그 자격으로 실제
+    # 지연 청산을 내보내지는 않습니다). entry_time_by_symbol과 동일하게
+    # symbol을 키로 쓰고, 같은 지점(포지션 청산 확인)에서 함께 정리합니다.
+    entry_watch_normal_eval_seen_by_symbol: dict[str, str] = field(default_factory=dict)
 
     # Persist the trading date: process startup is not a new trading day.
     _last_run_date: str | None = None

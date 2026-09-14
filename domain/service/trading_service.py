@@ -35,6 +35,7 @@ from infra.storage.daily_reporter import DailyReporter
 from infra.storage.logger import (
     AppLogger, TradeCsvLogger, SignalCsvLogger, EntryWatchShadowLogger, PositionLifecycleLogger,
     EntryQualityShadowLogger, LowUpsideShadowLogger, MinProfitExtensionShadowLogger,
+    BalanceFreshnessLogger, DelayedEvalCandidateLogger,
 )
 from infra.storage.minute_bar_saver import MinuteBarSaver
 from infra.storage.skip_reason import classify_skip_reason, SkipReason
@@ -68,6 +69,8 @@ class TradingService:
         low_upside_shadow_logger: "LowUpsideShadowLogger | None" = None,
         min_profit_extension_shadow_logger: "MinProfitExtensionShadowLogger | None" = None,
         notifier: "KakaoNotifier | None" = None,
+        balance_freshness_logger: "BalanceFreshnessLogger | None" = None,
+        delayed_eval_candidate_logger: "DelayedEvalCandidateLogger | None" = None,
     ) -> None:
         self.settings = settings
         self.broker = broker
@@ -142,6 +145,33 @@ class TradingService:
                 f"(BUY/SELL 판단에는 영향 없음): {type(exc).__name__}: {exc}"
             )
             self.min_profit_extension_shadow_logger = None
+
+        # 2026-09-11 (S01/S02 관측 1단계, GPT 5차 검토 반영): 동일한
+        # fail-open 생성 패턴 — 로거 생성 자체가 실패해도(디스크 문제 등)
+        # 프로그램 기동을 막지 않고 None으로 남겨 관측만 건너뜁니다.
+        # 두 로거 모두 BUY/SELL/재평가 판정에 전혀 관여하지 않습니다.
+        try:
+            self.balance_freshness_logger = balance_freshness_logger or BalanceFreshnessLogger(
+                settings.storage.balance_freshness_log_file
+            )
+        except Exception as exc:
+            self.app_logger.warning(
+                f"[BALANCE_FRESHNESS] 로거 생성 실패 — 이번 실행에서는 관측을 건너뜁니다"
+                f"(잔고 조회 동작에는 영향 없음): {type(exc).__name__}: {exc}"
+            )
+            self.balance_freshness_logger = None
+        try:
+            self.delayed_eval_candidate_logger = (
+                delayed_eval_candidate_logger or DelayedEvalCandidateLogger(
+                    settings.storage.delayed_eval_candidate_log_file
+                )
+            )
+        except Exception as exc:
+            self.app_logger.warning(
+                f"[DELAYED_EVAL_CANDIDATE] 로거 생성 실패 — 이번 실행에서는 관측을 건너뜁니다"
+                f"(entry_watch 판정에는 영향 없음): {type(exc).__name__}: {exc}"
+            )
+            self.delayed_eval_candidate_logger = None
 
         self.state, loaded_highest = self.state_store.load()
 
@@ -437,10 +467,65 @@ class TradingService:
             self.state_store.save(self.state, self._highest_price)
 
     def _get_balance_with_cache(self) -> AccountBalance:
-        """Cache settled accounts; unresolved orders always need a fresh read."""
+        """Cache settled accounts; unresolved orders always need a fresh read.
+
+        2026-09-11 (P0-1, GPT 종합검토 20260911 반영): 이전엔
+        broker.get_account_balance()가 HTTP 429로 실패하면 그 예외가
+        run_once() 밖까지 그대로 전파되어 app/main.py의 trading_loop()가
+        루프 전체를 180초 동안 멈췄습니다. run_once()는 이 호출 직후에
+        보유 종목 손절/트레일링 감시를 수행하므로, 그 180초 동안은
+        "API 과호출을 피하려던 백오프"가 오히려 이미 보유 중인 포지션의
+        리스크 감시 공백을 만드는 역효과가 있었습니다(재현 확인, GPT
+        종합검토 P0-1).
+        main.py의 trading_loop()/_retry_on_429()와 동일한 429 판별
+        시그니처로 이 호출만 좁게 감싸서, 429가 나면 직전에 확보해둔
+        잔고 캐시로 이번 사이클을 계속 진행합니다 — 매수/매도/보유
+        판단 기준 자체는 전혀 바뀌지 않고(코드 경로도 캐시를 그대로
+        쓰는 기존 elif 분기와 동일), 최신 잔고 대신 직전 사이클의
+        잔고를 한 번 더 재사용할 뿐입니다. 캐시가 아직 없으면(예:
+        프로세스 시작 직후 첫 호출) 대체할 안전한 값 자체가 없으므로
+        기존과 동일하게 예외를 그대로 올립니다.
+        """
         now = datetime.now()
+        # 2026-09-11 (S01 관측 1단계, GPT 5차 검토 반영): 아래 두 값은
+        # 오직 관측 로그(_log_balance_freshness)에만 쓰입니다 — 이후의
+        # if/elif 분기 판정문(490/512/514행)은 이전과 완전히 동일한
+        # self.cached_balance/self.cached_balance_loaded_at/elapsed
+        # 비교를 그대로 씁니다. 여기서 스냅샷을 미리 떠 두는 이유는,
+        # fetch 성공 분기가 이 두 속성을 곧바로 덮어쓰기 때문에 "이번
+        # 호출 이전에 마지막으로 성공 조회한 시각"을 로그에 남기려면
+        # 덮어쓰기 전에 값을 확보해야 하기 때문입니다.
+        prior_loaded_at = self.cached_balance_loaded_at
+        prior_cache_age_seconds = (
+            (now - prior_loaded_at).total_seconds() if prior_loaded_at is not None else None
+        )
+
         if self.cached_balance is None or self.cached_balance_loaded_at is None or self._has_unresolved_orders():
-            balance = self.broker.get_account_balance()
+            trigger_reason = (
+                "no_cache_yet"
+                if (self.cached_balance is None or self.cached_balance_loaded_at is None)
+                else "unresolved_orders"
+            )
+            try:
+                balance = self.broker.get_account_balance()
+            except Exception as exc:
+                if self._is_rate_limit_error(exc) and self.cached_balance is not None:
+                    self.app_logger.warning(
+                        f"[BALANCE] get_account_balance() 429 — 직전 캐시 잔고로 "
+                        f"이번 사이클 진행(보유종목 감시 유지): {exc}"
+                    )
+                    self._log_balance_freshness(
+                        now=now, outcome="fallback_stale_cache", trigger_reason=trigger_reason,
+                        prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
+                        error_type=type(exc).__name__,
+                    )
+                    return self.cached_balance
+                self._log_balance_freshness(
+                    now=now, outcome="fetch_failed_no_fallback", trigger_reason=trigger_reason,
+                    prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
+                    error_type=type(exc).__name__,
+                )
+                raise
             self.cached_balance = balance
             self.cached_balance_loaded_at = now
 
@@ -449,13 +534,37 @@ class TradingService:
                 f"account balance loaded from api | "
                 f"cash={balance.cash:,} | positions={len(balance.positions)} | "
                 f"held={held}"
+            )
+            self._log_balance_freshness(
+                now=now, outcome="fetch_success", trigger_reason=trigger_reason,
+                prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
+                error_type="",
             )
             return balance
 
         elapsed = (now - self.cached_balance_loaded_at).total_seconds()
 
         if elapsed >= self.settings.trading.balance_refresh_seconds:
-            balance = self.broker.get_account_balance()
+            try:
+                balance = self.broker.get_account_balance()
+            except Exception as exc:
+                if self._is_rate_limit_error(exc):
+                    self.app_logger.warning(
+                        f"[BALANCE] get_account_balance() 429 — 직전 캐시 잔고로 "
+                        f"이번 사이클 진행(보유종목 감시 유지): {exc}"
+                    )
+                    self._log_balance_freshness(
+                        now=now, outcome="fallback_stale_cache", trigger_reason="routine_refresh_due",
+                        prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
+                        error_type=type(exc).__name__,
+                    )
+                    return self.cached_balance
+                self._log_balance_freshness(
+                    now=now, outcome="fetch_failed_no_fallback", trigger_reason="routine_refresh_due",
+                    prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
+                    error_type=type(exc).__name__,
+                )
+                raise
             self.cached_balance = balance
             self.cached_balance_loaded_at = now
 
@@ -465,12 +574,75 @@ class TradingService:
                 f"cash={balance.cash:,} | positions={len(balance.positions)} | "
                 f"held={held}"
             )
+            self._log_balance_freshness(
+                now=now, outcome="fetch_success", trigger_reason="routine_refresh_due",
+                prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
+                error_type="",
+            )
             return balance
 
         self.app_logger.debug(
             "account balance loaded from cache",
         )
+        self._log_balance_freshness(
+            now=now, outcome="cache_reuse", trigger_reason="cache_still_fresh",
+            prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
+            error_type="",
+        )
         return self.cached_balance
+
+    def _log_balance_freshness(
+        self,
+        *,
+        now: datetime,
+        outcome: str,
+        trigger_reason: str,
+        prior_loaded_at: "datetime | None",
+        cache_age_seconds: "float | None",
+        error_type: str,
+    ) -> None:
+        """S01 관측 1단계 — `_get_balance_with_cache()`가 실제로 어느
+        분기를 탔는지 있는 그대로 기록합니다.
+
+        2026-09-11: 이 메서드는 어떤 예외도 밖으로 내보내지 않습니다
+        (fail-open) — `_log_min_profit_extension_shadow()`와 동일한
+        계약입니다. 이 로그는 관측 전용이므로, 기록이 실패했다고
+        해서 잔고 조회·캐시 폴백·429 처리 중 어느 하나라도 막히면
+        안 됩니다. `_has_unresolved_orders()`는 여기서 다시 호출할
+        뿐 그 정의를 바꾸지 않습니다(기존 함수 그대로).
+        """
+        if getattr(self, "balance_freshness_logger", None) is None:
+            return
+        try:
+            self.balance_freshness_logger.append({
+                "timestamp": now.isoformat(),
+                "outcome": outcome,
+                "trigger_reason": trigger_reason,
+                "prior_loaded_at": prior_loaded_at.isoformat() if prior_loaded_at is not None else "",
+                "cache_age_seconds": (
+                    round(cache_age_seconds, 1) if cache_age_seconds is not None else ""
+                ),
+                "balance_refresh_seconds": self.settings.trading.balance_refresh_seconds,
+                "has_unresolved_orders": self._has_unresolved_orders(),
+                "error_type": error_type,
+            })
+        except Exception as exc:
+            self.app_logger.warning(
+                f"[BALANCE_FRESHNESS] 기록 실패 — 무시하고 계속 진행"
+                f"(잔고 조회 동작에는 영향 없음): {type(exc).__name__}: {exc}"
+            )
+
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        """app/main.py의 trading_loop()/_retry_on_429()와 동일한 429 판별.
+
+        2026-09-11 (P0-1): 판정 시그니처를 두 곳에 흩어두면 한쪽만
+        고쳐서 서로 어긋날 위험이 있어, 문자열 자체는 각자 유지하되
+        (기존 컨벤션 — main.py도 이미 두 곳에서 동일 리터럴을 중복
+        보유) 이 서비스 내부에서 재사용할 지점을 하나로 모아둡니다.
+        """
+        msg = str(exc)
+        return "http=429" in msg or "허용된 요청 개수를 초과" in msg
 
     def _get_market_price_with_cache(self, symbol: str):
         """현재가 조회를 종목별로 일정 시간 동안 캐시 재사용하도록 처리합니다.
@@ -1548,6 +1720,11 @@ class TradingService:
                 self._highest_price.pop(symbol, None)
                 # 청산 후 다음 진입에 옛 카운터가 이어지지 않도록 리셋
                 self.state.vwap_break_streak_by_symbol.pop(symbol, None)
+                # 2026-09-11 (S02 관측 1단계): entry_time_by_symbol과 같은
+                # episode 수명이므로 같은 시점(포지션 소진 확인)에 함께
+                # 리셋 — 다음 진입이 이전 진입의 "평가 이력"을 이어받지
+                # 않도록 함(순수 관측 필드, SELL/재평가 판정과 무관).
+                self.state.entry_watch_normal_eval_seen_by_symbol.pop(symbol, None)
 
             highest_price = self._highest_price.get(symbol, 0)
             # 볼린저 %B — 상단 돌파 시 진입 문턱 상향에 사용 (2026-07-02)
@@ -1904,12 +2081,31 @@ class TradingService:
         elapsed_min = (datetime.now() - entry_dt).total_seconds() / 60
         # 관찰 윈도우(+1분 버퍼) 초과 시 정규 전략에 위임
         if elapsed_min > ew.watch_minutes + 1:
+            # 2026-09-11 (S02 관측 1단계, GPT 5차 검토 반영): 이 진입
+            # 건(symbol, entry_time)이 정상 창 안에서 단 한 번도 유효
+            # 평가(avg>0)를 받지 못한 채 창을 넘겼는지 관측만 기록합니다.
+            # 판정 로직은 그대로 None을 반환해 정규 전략에 위임하고,
+            # 이 관측이 SELL Signal을 만들거나 반환값을 바꾸지 않습니다
+            # — 지연 청산 활성화는 이번 단계의 범위가 아닙니다.
+            self._log_delayed_eval_candidate_if_missed(
+                symbol=symbol, entry_time_str=entry_time_str, elapsed_min=elapsed_min,
+                watch_minutes=ew.watch_minutes, position=position,
+                current_price=current_price, minute_analysis=minute_analysis,
+            )
             return None
 
         avg = position.average_price
         if avg <= 0:
             return None
         pnl_pct = (current_price - avg) / avg * 100
+
+        # 2026-09-11 (S02 관측 1단계): 정상 창 안에서 avg>0인 유효한
+        # 평가가 실제로 일어난 이 순간을, 이 진입 건의 최초 시각으로만
+        # 기록합니다(setdefault — 이미 기록돼 있으면 덮어쓰지 않음).
+        # 이 판정(1/2/3번 분기) 자체와 반환값에는 전혀 영향이 없습니다.
+        self.state.entry_watch_normal_eval_seen_by_symbol.setdefault(
+            symbol, datetime.now().isoformat()
+        )
 
         # 1) 급락 즉시 청산
         if pnl_pct <= ew.fail_cut_pct:
@@ -1990,6 +2186,55 @@ class TradingService:
             )
 
         return None
+
+    def _log_delayed_eval_candidate_if_missed(
+        self,
+        *,
+        symbol: str,
+        entry_time_str: str,
+        elapsed_min: float,
+        watch_minutes: float,
+        position,
+        current_price: int,
+        minute_analysis,
+    ) -> None:
+        """S02 관측 1단계 — 정상 창(elapsed_min <= watch_minutes+1)을 넘긴
+        이 진입 건이, 그 창 안에서 avg>0인 유효한 평가를 단 한 번도 받지
+        못했다면 "지연 평가 후보"로 (symbol, entry_time)당 최초 1건만
+        기록합니다.
+
+        2026-09-11: `_log_min_profit_extension_shadow()`와 동일한
+        fail-open 계약 — 이 메서드는 어떤 예외도 밖으로 내보내지
+        않습니다. `_check_entry_watch()`는 이 호출과 무관하게 항상
+        None을 반환해 정규 전략에 판단을 위임합니다(이 라운드는
+        지연 청산 SELL을 만들지 않습니다).
+        """
+        if getattr(self, "delayed_eval_candidate_logger", None) is None:
+            return
+        # 정상 창 안에서 유효 평가가 이미 있었으면 "놓친 창"이 아니므로
+        # 후보가 아닙니다 — 이 판단(정상 창 유효 평가 이력)은 지연 평가
+        # 진입 자격의 첫 조건입니다(2026-09-11 5차 설계 문서 참고).
+        if symbol in self.state.entry_watch_normal_eval_seen_by_symbol:
+            return
+        try:
+            avg = getattr(position, "average_price", 0) or 0
+            pnl_pct = ((current_price - avg) / avg * 100) if avg > 0 else ""
+            self.delayed_eval_candidate_logger.append_if_new({
+                "detected_at": datetime.now().isoformat(),
+                "symbol": symbol,
+                "entry_time": entry_time_str,
+                "elapsed_min": round(elapsed_min, 2),
+                "watch_minutes": watch_minutes,
+                "avg_price": avg,
+                "current_price": current_price,
+                "pnl_pct": round(pnl_pct, 3) if pnl_pct != "" else "",
+                "minute_analysis_available": minute_analysis is not None,
+            })
+        except Exception as exc:
+            self.app_logger.warning(
+                f"[DELAYED_EVAL_CANDIDATE] 기록 실패 — 무시하고 계속 진행"
+                f"(entry_watch 판정에는 영향 없음): {type(exc).__name__}: {exc}"
+            )
 
     def _log_min_profit_extension_shadow(
         self,

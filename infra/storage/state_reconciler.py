@@ -65,6 +65,14 @@ class StateReconciler:
             sym: v for sym, v in state.entry_time_by_symbol.items()
             if sym in holding_symbols
         }
+        # 2026-09-11 (S02 관측 1단계): entry_time_by_symbol과 동일한
+        # episode 수명을 가지므로 같은 기준(보유 종목만 유지)으로 정리.
+        # 순수 관측 필드라 이 정리가 없어도 판정에는 영향 없지만, 청산
+        # 후에도 이전 진입의 "평가 이력"이 무기한 남는 것을 방지합니다.
+        state.entry_watch_normal_eval_seen_by_symbol = {
+            sym: v for sym, v in state.entry_watch_normal_eval_seen_by_symbol.items()
+            if sym in holding_symbols
+        }
 
         # ── 3. 보유 종목인데 peak_price 없으면 현재가로 초기화 ──
         for position in balance.positions:

@@ -39,6 +39,9 @@ class JsonStateStore:
             symbol_block_today          = set(raw.get("symbol_block_today", [])),
             _last_run_date              = raw.get("_last_run_date"),
             unresolved_order_intents    = raw.get("unresolved_order_intents", {}),
+            entry_watch_normal_eval_seen_by_symbol = raw.get(
+                "entry_watch_normal_eval_seen_by_symbol", {}
+            ),
         )
         highest_price = {k: int(v) for k, v in raw.get("highest_price", {}).items()}
         return state, highest_price
@@ -60,6 +63,7 @@ class JsonStateStore:
             "symbol_trail_loss_at":     state.symbol_trail_loss_at,
             "symbol_block_today":       sorted(state.symbol_block_today),
             "highest_price":            highest_price or {},
+            "entry_watch_normal_eval_seen_by_symbol": state.entry_watch_normal_eval_seen_by_symbol,
         }
         # A crash must not truncate the last valid risk state.
         tmp_path = None

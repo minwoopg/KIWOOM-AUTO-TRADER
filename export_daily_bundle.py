@@ -101,6 +101,12 @@ CSV_SOURCES: list[tuple[str, tuple[str, ...]]] = [
     # 수 없습니다.
     ("low_upside_shadow.csv", ("timestamp",)),
     ("min_profit_extension_shadow.csv", ("timestamp",)),
+    # 2026-09-11 (S01/S02 관측 1단계, GPT 5차 검토 반영): 위와 동일한
+    # 이유로 명시 추가하지 않으면 실시간 로그는 쌓여도 daily bundle에는
+    # 실리지 않습니다. 두 파일 모두 순수 관측이며 BUY/SELL 판정에는
+    # 관여하지 않습니다.
+    ("balance_freshness.csv", ("timestamp",)),
+    ("delayed_eval_candidate.csv", ("detected_at",)),
 ]
 
 # app.log에서 뽑아낼 태그 — **allowlist 전용**.

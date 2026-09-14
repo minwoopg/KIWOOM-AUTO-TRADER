@@ -282,6 +282,16 @@ class StorageConfig:
     # (infra/storage/run_baseline.py 참고) 기존 CSV 스키마에는 영향이
     # 전혀 없습니다 — 연결은 timestamp 시간범위 조인으로 처리합니다.
     run_baseline_log_file: str = "logs/run_baseline.csv"
+    # S01 관측 1단계 (2026-09-11, GPT 5차 검토 반영): 잔고 조회
+    # 성공/실패·캐시 나이 관측 전용 로그. 순수 관측이며 조회 주기/폴백
+    # 판정에는 영향 없음 (infra/storage/logger.py의 BalanceFreshnessLogger
+    # 참고).
+    balance_freshness_log_file: str = "logs/balance_freshness.csv"
+    # S02 관측 1단계 (2026-09-11, GPT 5차 검토 반영): entry_watch 정상
+    # 창을 통째로 놓친 진입 건의 후보 관측 전용 로그. 이 로그 존재가
+    # SELL 판정을 만들지 않음 (infra/storage/logger.py의
+    # DelayedEvalCandidateLogger 참고).
+    delayed_eval_candidate_log_file: str = "logs/delayed_eval_candidate.csv"
 
 
 @dataclass(frozen=True)

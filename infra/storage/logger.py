@@ -948,3 +948,159 @@ class MinProfitExtensionShadowLogger:
 
         self._seen_keys.add(key)
         return True
+
+
+# ── balance_freshness.csv ────────────────────────────────────────────────────
+# S01 관측 1단계 (2026-09-11, GPT 5차 검토 반영). `TradingService.
+# _get_balance_with_cache()`가 매 호출마다 실제로 어느 분기를 탔는지
+# (신규 조회 성공 / 429로 캐시 폴백 / 조회 자체 실패 후 예외 재전파 /
+# 아직 갱신 주기 전이라 캐시 재사용)와, 그 시점의 캐시 나이·미해결
+# 주문 존재 여부를 있는 그대로 기록합니다.
+#
+# 이번 단계는 순수 관측입니다 — 이 로거의 존재나 실패 여부가
+# _get_balance_with_cache()의 반환값, 조회 주기(balance_refresh_seconds),
+# 429 폴백 여부, `_has_unresolved_orders()`의 판정 중 단 하나도 바꾸지
+# 않습니다. append 실패는 항상 fail-open이며 app_logger에 WARNING만
+# 남깁니다(호출부 docstring 참고).
+#
+# 이 로그의 목적은 "429 폴백 잔고를 실제로 얼마나 자주, 얼마나 오래
+# 쓰게 되는지"를 실측하는 것입니다 — S01의 캐시 유효기간 연장(360/540초)
+# 여부나 재시도 간격 정책은 이 실측 없이 결정하지 않기로 했습니다
+# (2026-09-11 5차 설계 문서, N값 미승인 항목 참고).
+BALANCE_FRESHNESS_FIELDS = [
+    "timestamp",                # 이 _get_balance_with_cache() 호출 시각
+    "outcome",                  # fetch_success | fallback_stale_cache |
+                                 # cache_reuse | fetch_failed_no_fallback
+    "trigger_reason",           # no_cache_yet | unresolved_orders |
+                                 # routine_refresh_due | cache_still_fresh
+    "prior_loaded_at",          # 이 호출 이전에 마지막으로 성공 조회한
+                                 # 시각(ISO, 없으면 공백) — "마지막 잔고
+                                 # 조회 성공 시각"
+    "cache_age_seconds",        # 이 호출 시점, prior_loaded_at 기준 캐시
+                                 # 나이(초). prior_loaded_at 없으면 공백
+    "balance_refresh_seconds",  # 그 시점 settings.trading.balance_
+                                 # refresh_seconds 값(참고용, 실행 중 값이
+                                 # 바뀌지 않는 한 매 행 동일)
+    "has_unresolved_orders",    # 그 시점 _has_unresolved_orders()의 값
+                                 # (기존 함수 그대로 호출한 결과 — 이
+                                 # 로거가 그 판정을 바꾸지 않음)
+    "error_type",                # 조회를 시도했다가 실패한 경우 예외
+                                 # 클래스명(예: "Exception"), 조회 자체를
+                                 # 시도하지 않았으면 공백
+]
+
+
+class BalanceFreshnessLogger:
+    """S01 관측 1단계 — 잔고 조회 신선도(성공/실패/캐시 나이)를 있는 그대로
+    append-only로 기록하는 로거입니다.
+
+    다른 shadow 로거들(LowUpsideShadowLogger 등)과 달리 "같은 판단이
+    반복 기록되는 오염"을 걱정할 필요가 없습니다 — 이 로그의 각 행은
+    서로 다른 폴링 시점의 서로 다른 관측치이므로, 같은 값이 반복돼도
+    그 자체가 유의미한 관측(예: "폴백이 몇 분간 이어졌는가")입니다.
+    그래서 append_if_new() 대신 단순 append()만 제공합니다.
+    """
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.file_path.exists():
+            _migrate_csv_header_if_needed(self.file_path, BALANCE_FRESHNESS_FIELDS, "BALANCE_FRESHNESS")
+        else:
+            with self.file_path.open("w", newline="", encoding="utf-8") as fp:
+                writer = csv.DictWriter(fp, fieldnames=BALANCE_FRESHNESS_FIELDS)
+                writer.writeheader()
+
+    def append(self, row: dict[str, Any]) -> None:
+        with self.file_path.open("a", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=BALANCE_FRESHNESS_FIELDS, extrasaction="ignore")
+            for field in BALANCE_FRESHNESS_FIELDS:
+                row.setdefault(field, "")
+            writer.writerow(row)
+
+
+# ── delayed_eval_candidate.csv ───────────────────────────────────────────────
+# S02 관측 1단계 (2026-09-11, GPT 5차 검토 반영). entry_watch 정상 창
+# (elapsed_min <= watch_minutes+1)을 넘어갈 때, 그 창 안에서 avg>0인
+# 유효한 평가가 단 한 번도 없었던 진입 건을 "지연 평가 후보"로만
+# 기록합니다 — 이 로거는 SELL Signal을 만들지도, 반환하지도 않습니다
+# (_check_entry_watch()는 이 로깅과 무관하게 여전히 None을 반환하고
+# 정규 전략에 판단을 위임합니다). 지연 청산 자체의 활성화는 이번
+# 단계의 범위가 아닙니다.
+#
+# (symbol, entry_time) 기준 최초 1건만 기록합니다 — 창을 넘긴 뒤에도
+# 그 포지션이 청산될 때까지 매 폴링 `_check_entry_watch()`가 계속
+# 호출되므로, dedup이 없으면 보유 기간 내내 같은 후보가 반복 기록됩니다.
+DELAYED_EVAL_CANDIDATE_FIELDS = [
+    "detected_at",           # 창을 넘긴 것을 처음 관측한 시각(이 판정이
+                              # 나온 폴링 시각)
+    "symbol",
+    "entry_time",             # state.entry_time_by_symbol의 진입 시각 —
+                              # (symbol, entry_time)이 중복 방지 키
+    "elapsed_min",            # 진입 후 경과 시간(분), 창(watch_minutes+1)을
+                              # 얼마나 넘겼는지
+    "watch_minutes",          # 그 시점 entry_watch.watch_minutes 설정값
+    "avg_price",              # 평균 매수단가
+    "current_price",          # 관측 시점 현재가
+    "pnl_pct",                # (current_price-avg_price)/avg_price*100
+    "minute_analysis_available",  # 이 호출에 fresh한 minute_analysis가
+                              # 전달됐는지(True/False) — "유효한 시세"
+                              # 판단의 참고 신호 중 하나(전체는 아님)
+]
+
+
+class DelayedEvalCandidateLogger:
+    """S02 관측 1단계 — 정상 창을 통째로 놓친 진입 건을 (symbol, entry_time)당
+    최초 1건만 기록하는 로거입니다. LowUpsideShadowLogger와 동일한
+    dedup 패턴(재시작 시 기존 파일에서 키 복원)을 씁니다.
+    """
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._seen_keys: set[tuple] = set()
+
+        if self.file_path.exists():
+            _migrate_csv_header_if_needed(
+                self.file_path, DELAYED_EVAL_CANDIDATE_FIELDS, "DELAYED_EVAL_CANDIDATE"
+            )
+            try:
+                with self.file_path.open("r", newline="", encoding="utf-8") as fp:
+                    reader = csv.DictReader(fp)
+                    for row in reader:
+                        try:
+                            self._seen_keys.add(self._key(row))
+                        except Exception:
+                            continue
+            except Exception as exc:
+                logger.warning(
+                    f"[DELAYED_EVAL_CANDIDATE] 기존 파일에서 중복방지 키 복원 실패"
+                    f"(무시하고 빈 상태로 계속 진행): {exc}"
+                )
+        else:
+            with self.file_path.open("w", newline="", encoding="utf-8") as fp:
+                writer = csv.DictWriter(fp, fieldnames=DELAYED_EVAL_CANDIDATE_FIELDS)
+                writer.writeheader()
+
+    @staticmethod
+    def _key(row: dict[str, Any]) -> tuple:
+        return (str(row.get("symbol", "")), str(row.get("entry_time", "")))
+
+    def append_if_new(self, row: dict[str, Any]) -> bool:
+        """같은 (symbol, entry_time) episode에 대해 최초 1건만 기록하고
+        True를 반환합니다. 이미 기록된 episode면 아무것도 안 하고
+        False를 반환합니다."""
+        key = self._key(row)
+        if key in self._seen_keys:
+            return False
+
+        with self.file_path.open("a", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=DELAYED_EVAL_CANDIDATE_FIELDS, extrasaction="ignore")
+            for field in DELAYED_EVAL_CANDIDATE_FIELDS:
+                row.setdefault(field, "")
+            writer.writerow(row)
+
+        self._seen_keys.add(key)
+        return True
+        return True

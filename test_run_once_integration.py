@@ -128,6 +128,14 @@ def build_minimal_settings(tmpdir: str) -> Settings:
             # CSV를 새게 됩니다(0.5단계 CSV 누출 사고와 동일 클래스).
             low_upside_shadow_log_file=f"{tmpdir}/low_upside_shadow.csv",
             min_profit_extension_shadow_log_file=f"{tmpdir}/min_profit_extension_shadow.csv",
+            # 2026-09-11 (S01/S02 관측 1단계): 위와 동일한 이유로 반드시
+            # tmpdir 기준 경로 명시 — 안 하면 StorageConfig 기본값
+            # ("logs/balance_freshness.csv" 등)이 그대로 쓰여서 이 헬퍼를
+            # 재사용하는 모든 테스트가 프로젝트 루트의 실제 logs/ 에 CSV를
+            # 새게 됩니다(0.5단계 CSV 누출 사고와 동일 클래스 — 실제로
+            # 이번에도 재현 확인 후 수정).
+            balance_freshness_log_file=f"{tmpdir}/balance_freshness.csv",
+            delayed_eval_candidate_log_file=f"{tmpdir}/delayed_eval_candidate.csv",
         ),
         websocket=WebSocketConfig(
             enabled=False, url="", condition_seqs=[], max_symbols=10,
