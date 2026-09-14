@@ -295,14 +295,26 @@ class RuntimeState:
     # entry_watch VWAP 연속 이탈 카운터 (히스테리시스용, 2026-07-22)
     # 종목이 VWAP 위로 회복하면 이 값은 0으로 리셋됨
     vwap_break_streak_by_symbol: dict[str, int] = field(default_factory=dict)
-    # 2026-09-11 (S02 관측 1단계, 순수 기록 — SELL/재평가 판정에는 관여하지
-    # 않음): 이 진입 건(symbol)에 대해 entry_watch 정상 창(elapsed_min <=
-    # watch_minutes+1) 안에서 avg>0인 유효한 평가가 실제로 최소 1회
-    # 있었는지를, 그 최초 시각(ISO 문자열)으로 기록합니다. 값이 없으면
-    # "정상 창 전체를 놓쳤을 가능성" 판단의 근거가 됩니다(지연 평가 진입
-    # 자격 조건 중 하나 — 이번 라운드는 기록만 하고 그 자격으로 실제
-    # 지연 청산을 내보내지는 않습니다). entry_time_by_symbol과 동일하게
-    # symbol을 키로 쓰고, 같은 지점(포지션 청산 확인)에서 함께 정리합니다.
+    # 2026-09-11 (S02 관측 1단계) → 2026-09-14 (GPT 재검토 20260914
+    # 반영, 순수 기록 — SELL/재평가 판정에는 관여하지 않음): 이 진입
+    # 건(symbol)에 대해 entry_watch의 실제 최소수익 판정 시점 근방
+    # (watch_minutes <= elapsed_min <= watch_minutes+1, 즉 3번 분기가
+    # 실제로 평가되는 구간)에서 avg>0인 유효한 평가가 있었는지를
+    # 기록합니다. 값이 없으면 "그 판정 시점을 놓쳤을 가능성" 판단의
+    # 근거가 됩니다(지연 평가 진입 자격 조건 중 하나 — 이번 라운드는
+    # 기록만 하고 그 자격으로 실제 지연 청산을 내보내지는 않습니다).
+    # 2026-09-14: 초기 구현은 elapsed_min<=watch_minutes+1이기만 하면
+    # (0분째 폴링도 포함) 기록해, 정작 판정 시점 근방을 놓친 진입
+    # 건도 "평가함"으로 잘못 처리되는 결함이 있었음(GPT 재검토로
+    # 재현·확인) — 판정 구간으로 좁혔습니다.
+    # 값 형식은 "{entry_time_str}|{최초 기록 시각 ISO}" — entry_time을
+    # 함께 실어, 이 진입 건이 청산 확인(_apply_deferred_sell_side_
+    # effects()) 전에 어떤 이유로든 정리되지 않은 채 같은 symbol에
+    # 새 진입이 발생해도 이전 진입의 이력이 새 진입을 잘못 가리지
+    # 않도록 합니다(entry_time 불일치 시 "이 진입 건은 아직 안 봄"으로
+    # 취급). entry_time_by_symbol과 같은 지점(포지션 청산 확인,
+    # _apply_deferred_sell_side_effects())에서 함께 정리하며,
+    # _process_symbol()의 무보유 분기 정리도 이중 안전장치로 유지합니다.
     entry_watch_normal_eval_seen_by_symbol: dict[str, str] = field(default_factory=dict)
 
     # Persist the trading date: process startup is not a new trading day.
