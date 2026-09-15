@@ -311,6 +311,23 @@ def classify_exit_observation_readiness(
       `None`이면(캐시된 시세 자체가 없음) "가격을 알 수 없음"으로,
       `max_price_age_seconds`를 넘으면 "너무 오래된 시세"로 보류합니다.
 
+    2026-09-15 보완 (GPT 재검토 3번 지적 반영): `price_age_seconds`도
+    `current_price`/`average_price`와 동일하게 bool·NaN·inf를 걸러내고,
+    **음수와 `-inf`도 명시적으로 무효 처리**합니다. 최초 구현은 이
+    나이가 항상 `(now - loaded_at).total_seconds()`로 계산되어 0 이상
+    이라고 암묵적으로 가정했는데, 시스템 시계가 뒤로 보정되면(NTP
+    보정, 수동 변경) `now`가 `loaded_at`보다 앞설 수 있어 음수가 나올
+    수 있습니다 — 이때 이전 구현은 `음수 > max_price_age_seconds`가
+    항상 거짓이라 "유효"로 통과시켰습니다(재현 확인: `-60`, `-inf`,
+    `True`가 모두 빈 문자열을 반환했음). 미래 시각의 가격을 "신선하다"
+    고 인정하는 것은 명백히 잘못이므로, 이제 0 미만이면 무효로
+    처리합니다. 재시도 스케줄 자체(백오프 타이머)는 이 문제를 피하기
+    위해 여전히 `datetime.now()`가 아닌 별도의 단조 시계 기반이어야
+    한다는 설계 문서 v2 §2의 원칙과는 별개입니다 — 이 함수가 다루는
+    "캐시된 시세가 언제 적재됐는가"는 시각 자체가 의미 있는 정보라
+    벽시계 기준을 유지하되, 여기서는 방어적으로 음수/비정상값만
+    추가로 걸러냅니다.
+
     이 함수는 순수 계산입니다 — `datetime.now()` 등 시계를 직접
     조회하지 않고, 나이(초)를 호출자로부터 미리 계산해 받습니다.
     기존 정상 전략(`generate_signal()`)들의 무효 입력 처리 정책은
@@ -327,14 +344,23 @@ def classify_exit_observation_readiness(
             and value > 0
         )
 
+    def _is_valid_age(value) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value == value  # NaN 방어
+            and value not in (float("inf"), float("-inf"))
+            and value >= 0
+        )
+
     if not _is_positive_finite(current_price):
         return "invalid_current_price"
     if not _is_positive_finite(average_price):
         return "invalid_average_price"
     if price_age_seconds is None:
         return "price_age_unknown"
-    if not isinstance(price_age_seconds, (int, float)) or price_age_seconds != price_age_seconds:
-        return "price_age_unknown"
+    if not _is_valid_age(price_age_seconds):
+        return "invalid_price_age"
     if price_age_seconds > max_price_age_seconds:
         return "stale_price"
     return ""
