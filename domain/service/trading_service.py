@@ -198,6 +198,22 @@ class TradingService:
         self.cached_balance_loaded_at: datetime | None = None
         self.cached_market_prices: dict[str, object] = {}
         self.cached_market_price_loaded_at: dict[str, datetime] = {}
+        # 2026-09-15 (180초 감시 공백 대응 3단계 보완 — GPT 재검토 2번
+        # 지적 반영): self.cached_balance는 주문 접수 직후(매수/매도
+        # accepted) 곧바로 None으로 비워집니다(다음 조회에서 최신값을
+        # 강제하기 위함, 4199행/4435행 참고) — 정상 경로에서는 바로 다음
+        # 폴링이 곧 새 잔고를 받아오므로 문제가 없지만, 그 직후에 잔고
+        # API 장애가 겹치면 observe_exit_candidates_during_outage()가
+        # cached_balance만 보고 "보유 종목 정보 없음"으로 오판해 실제로
+        # 보유 중인 종목의 관측이 통째로 빠지는 결함이 재현됐습니다.
+        # 이 스냅샷은 성공적으로 잔고를 확인할 때마다(_get_balance_
+        # with_cache()의 세 반환 지점 모두, fresh 조회든 캐시 재사용이든)
+        # 갱신되지만, 주문 접수로 인한 cached_balance 무효화로는 절대
+        # 지워지지 않습니다 — 순수 관측 전용이며 체결 확정 등 판정에는
+        # 쓰이지 않습니다(그러면 스테일 수량이 체결 확인으로 오인되는,
+        # 이미 한 번 재현·제거했던 위험을 다시 들여오게 됩니다).
+        self._last_observed_positions: dict[str, "Position"] = {}
+        self._last_observed_positions_loaded_at: datetime | None = None
 
         # 일봉 히스토리 캐시
         self.cached_daily_bars: dict[str, list] = {}
@@ -567,6 +583,7 @@ class TradingService:
                 prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
                 error_type="",
             )
+            self._update_last_observed_positions(balance, now)
             return balance
 
         elapsed = (now - self.cached_balance_loaded_at).total_seconds()
@@ -602,6 +619,7 @@ class TradingService:
                 prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
                 error_type="",
             )
+            self._update_last_observed_positions(balance, now)
             return balance
 
         self.app_logger.debug(
@@ -612,7 +630,30 @@ class TradingService:
             prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
             error_type="",
         )
+        self._update_last_observed_positions(self.cached_balance, now)
         return self.cached_balance
+
+    def _update_last_observed_positions(self, balance: "AccountBalance", now: datetime) -> None:
+        """`_get_balance_with_cache()`가 성공적으로 반환하는(fresh 조회든
+        캐시 재사용이든) 모든 경로에서 호출됩니다 — 2026-09-15 (180초
+        감시 공백 대응 3단계 보완, GPT 재검토 2번 지적 반영).
+
+        `self.cached_balance`는 매수/매도 주문이 접수되는 즉시(체결
+        확정 전) `None`으로 비워집니다(다음 폴링에 최신 잔고를 강제
+        받기 위함, 기존 정책 — 이 메서드가 바꾸지 않습니다). 그런데
+        바로 그 직후에 잔고 API 장애가 겹치면, 관측 경로가
+        `self.cached_balance`만 보고 "보유 종목 정보 자체가 없음"으로
+        오판해 실제로는 알고 있던 종목의 관측이 통째로 빠지는 결함이
+        재현됐습니다. 이 스냅샷(`self._last_observed_positions`)은
+        그 무효화의 영향을 받지 않는 별도 저장소로, 관측 전용입니다 —
+        체결 확정이나 수량 판정 등 실제 매매 로직에는 전혀 쓰이지
+        않습니다(그러면 스테일 수량이 체결 확인으로 오인되는, 이미
+        한 번 재현·제거했던 위험을 다시 들여오게 됩니다).
+        """
+        self._last_observed_positions = {
+            p.symbol: p for p in balance.positions if getattr(p, "quantity", 0) > 0
+        }
+        self._last_observed_positions_loaded_at = now
 
     def _log_balance_freshness(
         self,
@@ -706,14 +747,25 @@ class TradingService:
             elapsed += chunk
 
     def observe_exit_candidates_during_outage(self) -> None:
-        """잔고 API 장애 재시도 대기 중, 캐시된 잔고·시세만으로 보유
-        종목별 청산 후보(손절·트레일링)를 관측 전용으로 계산·기록합니다.
+        """잔고 API 장애 재시도 대기 중, 보유 종목별 청산 후보(손절·
+        트레일링)를 관측 전용으로 계산·기록합니다.
 
-        2026-09-15 (180초 감시 공백 대응 3단계 — 관측 경로 연결):
-        - 브로커 API를 전혀 호출하지 않습니다(추가 429 유발 위험 없음).
-          `self.cached_balance`(마지막으로 성공 조회된 잔고)와
-          `self.cached_market_prices`/`self.cached_regime`(마지막으로
-          캐시된 값)만 읽습니다.
+        2026-09-15 (180초 감시 공백 대응 3단계) → 2026-09-15 보완
+        (GPT 재검토 1·2번 지적 반영):
+        - **잔고 API는 호출하지 않습니다**(추가 429 유발 위험 없음) —
+          감시 대상 종목은 `self._last_observed_positions`(마지막으로
+          성공 조회된 잔고 스냅샷 — 주문 접수로 인한 `cached_balance`
+          무효화의 영향을 받지 않음, `_update_last_observed_positions()`
+          참고)와 로컬 상태(`entry_time_by_symbol`,
+          `unresolved_order_intents`, PositionStateMachine)를 합칩니다.
+        - **시세는 매번 갱신을 시도합니다** — `_get_market_price_with_
+          cache()`를 그대로 재사용해 `price_refresh_seconds`(정상
+          경로와 동일한 주기) 이상 지났으면 실제로 `broker.
+          get_market_price()`를 호출합니다. 이 API는 잔고 API와
+          독립적인 실패·429 상태를 가지므로(구현 지시서 §2 정정),
+          잔고 장애 중에도 계속 새 가격을 확보하려 시도합니다 — 실패
+          하면 그 메서드가 이미 캐시 유지+경고 로그(또는 캐시조차
+          없으면 예외)로 처리합니다.
         - 주문을 제출하지 않습니다(place_order 호출 없음).
         - `self._highest_price`를 읽기만 하고 갱신·병합하지 않습니다 —
           "장애 중 최고가 후보의 운영 병합"은 별도 승인 대상으로 아직
@@ -724,15 +776,11 @@ class TradingService:
         """
         if getattr(self, "exit_candidate_outage_logger", None) is None:
             return
-        balance = self.cached_balance
-        if balance is None:
-            # 프로세스 시작 직후 등, 성공 조회된 잔고가 아직 한 번도
-            # 없으면 관측할 보유 종목 정보 자체가 없습니다.
+        symbols = self._symbols_needing_outage_observation()
+        if not symbols:
             return
-        for position in balance.positions:
-            if getattr(position, "quantity", 0) <= 0:
-                continue
-            symbol = position.symbol
+        for symbol in symbols:
+            position = self._last_observed_positions.get(symbol)
             try:
                 self._observe_exit_candidate_for_symbol(symbol, position)
             except Exception as exc:
@@ -741,34 +789,105 @@ class TradingService:
                     f"(재시도 대기·주문 판단에는 영향 없음): {type(exc).__name__}: {exc}"
                 )
 
+    def _symbols_needing_outage_observation(self) -> set:
+        """장애 중 관측해야 할 종목 집합 — 2026-09-15 보완 (GPT 재검토
+        2번 지적 반영).
+
+        `self._last_observed_positions`(마지막 성공 조회 스냅샷)만
+        쓰면, 주문 접수 직후 `cached_balance`가 비워진 상태에서 장애가
+        겹칠 때 "이 프로세스가 로컬에서 이미 알고 있는" 종목까지 관측
+        대상에서 빠질 수 있습니다. `entry_time_by_symbol`(진입
+        시각이 남아있는 종목), `unresolved_order_intents`(미해결 주문
+        종목), `PositionStateMachine`의 OPEN/BUY_PENDING/SELL_PENDING
+        상태 종목을 합쳐 "관측이 필요한 종목"을 스냅샷보다 넓게
+        잡습니다 — 스냅샷에 없는 종목은 평단을 알 수 없으므로
+        `_observe_exit_candidate_for_symbol()`이 "평가 보류
+        (position_unconfirmed)"로만 기록합니다(계산을 지어내지 않음).
+        """
+        symbols = set(self._last_observed_positions.keys())
+        symbols |= set(self.state.entry_time_by_symbol.keys())
+        symbols |= set(self.state.unresolved_order_intents.keys())
+        for symbol, psm_state in self._position_state_machine._states.items():
+            if psm_state.lifecycle in (
+                PositionLifecycle.OPEN, PositionLifecycle.BUY_PENDING, PositionLifecycle.SELL_PENDING,
+            ):
+                symbols.add(symbol)
+        return symbols
+
     def _observe_exit_candidate_for_symbol(self, symbol: str, position) -> None:
         """`observe_exit_candidates_during_outage()`가 종목 하나에 대해
-        호출하는 내부 헬퍼 — 입력 검증(`classify_exit_observation_
-        readiness()`) → regime 확인 → `evaluate_exit_candidate()` 순서로
-        평가하고, 각 단계에서 멈추면 그 사유를 "평가 보류"로 기록합니다.
+        호출하는 내부 헬퍼 — 보유 확인(스냅샷) → 시세 갱신 시도 →
+        입력 검증(`classify_exit_observation_readiness()`) → regime
+        확인 → `evaluate_exit_candidate()` 순서로 평가하고, 각 단계에서
+        멈추면 그 사유를 "평가 보류"로 기록합니다.
+
+        `position`은 `self._last_observed_positions.get(symbol)`의
+        결과입니다 — `None`이면 이 종목이 로컬에서는 "관심 대상"이지만
+        평단을 알 수 있는 마지막 성공 스냅샷이 아직 없다는 뜻입니다
+        (예: 프로세스 시작 직후 첫 매수가 접수된 직후 장애가 겹친 경우).
+        이때는 계산을 지어내지 않고 "평가 보류(position_unconfirmed)"로만
+        기록합니다.
         """
         now = datetime.now()
         entry_time = self.state.entry_time_by_symbol.get(symbol, "")
-        cached_price = self.cached_market_prices.get(symbol)
-        loaded_at = self.cached_market_price_loaded_at.get(symbol)
-        current_price = getattr(cached_price, "current_price", None) if cached_price is not None else None
-        average_price = getattr(position, "average_price", None)
-        price_age_seconds = (
-            (now - loaded_at).total_seconds() if loaded_at is not None else None
-        )
-        max_price_age_seconds = self.settings.trading.exit_candidate_outage_max_price_age_seconds
 
         row: dict = {
             "detected_at": now.isoformat(),
             "symbol": symbol,
             "entry_time": entry_time,
-            "avg_price": average_price if average_price is not None else "",
-            "current_price": current_price if current_price is not None else "",
-            "price_observed_at": loaded_at.isoformat() if loaded_at is not None else "",
-            "price_age_seconds": (
-                round(price_age_seconds, 1) if price_age_seconds is not None else ""
-            ),
         }
+
+        if position is None or getattr(position, "quantity", 0) <= 0:
+            row["status"] = "deferred"
+            row["reason"] = "position_unconfirmed"
+            self.exit_candidate_outage_logger.append(row)
+            return
+
+        average_price = getattr(position, "average_price", None)
+        row["avg_price"] = average_price if average_price is not None else ""
+
+        # 2026-09-15 보완 (GPT 재검토 1번 지적 반영): 캐시를 그냥 읽지
+        # 않고 _get_market_price_with_cache()로 실제 갱신을 시도합니다
+        # — 이 메서드는 price_refresh_seconds가 지났을 때만 실제로
+        # broker.get_market_price()를 호출하고(잔고 API와 독립된 별도
+        # 호출 한도), 실패해도 기존 캐시로 안전하게 대체하며 그 자체를
+        # 경고 로그로 남깁니다(정상 경로와 동일한 계약, 새로 만들지
+        # 않음). 캐시가 아예 없고 이 첫 시도마저 실패하면 예외를
+        # 올리므로 여기서 받아 "평가 보류"로 남깁니다.
+        try:
+            market_price = self._get_market_price_with_cache(symbol)
+        except Exception as exc:
+            row["status"] = "deferred"
+            row["reason"] = "price_fetch_failed"
+            row["current_price"] = ""
+            row["price_observed_at"] = ""
+            row["price_age_seconds"] = ""
+            self.exit_candidate_outage_logger.append(row)
+            return
+
+        current_price = getattr(market_price, "current_price", None)
+        loaded_at = self.cached_market_price_loaded_at.get(symbol)
+        # 2026-09-15 보완 (GPT 재검토 3번 지적 검증 중 발견): 이 함수
+        # 맨 위에서 미리 떠 둔 `now`를 그대로 쓰면, 방금 이 호출 안에서
+        # _get_market_price_with_cache()가 실제로 새로 조회해
+        # cached_market_price_loaded_at를 그 이후 시각으로 갱신한
+        # 경우 `now`(조회 전 시각)가 `loaded_at`(조회 후 시각)보다
+        # 앞서서 나이가 항상 음수(대개 수십 마이크로초)로 계산됩니다.
+        # invalid_price_age 검증을 엄격히 만든 뒤 이 함수 자체의 테스트
+        # (test_missing_cached_price_is_deferred_not_none)에서 바로
+        # 이 결함이 재현됐다 — 나이는 반드시 "시세를 실제로 확보한
+        # 이후" 시각을 기준으로 다시 계산해야 한다.
+        now_for_age = datetime.now()
+        price_age_seconds = (
+            (now_for_age - loaded_at).total_seconds() if loaded_at is not None else None
+        )
+        max_price_age_seconds = self.settings.trading.exit_candidate_outage_max_price_age_seconds
+
+        row["current_price"] = current_price if current_price is not None else ""
+        row["price_observed_at"] = loaded_at.isoformat() if loaded_at is not None else ""
+        row["price_age_seconds"] = (
+            round(price_age_seconds, 1) if price_age_seconds is not None else ""
+        )
 
         reason = classify_exit_observation_readiness(
             current_price=current_price,
