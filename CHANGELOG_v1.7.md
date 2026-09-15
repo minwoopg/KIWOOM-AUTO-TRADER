@@ -784,4 +784,152 @@ params-share.md` 참고.
 
 ---
 
+## 🔧 180초 감시 공백 대응 3단계 — 관측 경로 연결 (2026-09-15, 매매 판단 로직 무변경)
+
+### 배경
+
+1~2단계로 손절·트레일링 계산이 `exit_calc.py`의 순수 함수로 추출되고
+전략별 `trailing_params()`가 정상 경로·관측 경로에서 공유되도록
+정리됐지만, `evaluate_exit_candidate()`는 정의와 테스트만 있을 뿐
+실제 운영 경로 어디에서도 호출되지 않았습니다. 잔고 API 장애(429
+등)로 `_get_balance_with_cache()`가 예외를 올리면 `run_once()`가
+그 사이클을 진행하지 못하고, `app/main.py`의 `trading_loop()`는
+`await asyncio.sleep(180)`으로 180초를 통째로 잤습니다 — 그동안
+보유 종목의 손절·트레일링 관측이 완전히 멈췄습니다("180초 감시
+공백"). 이번 커밋은 GPT 재검토가 지시한 세 가지를 연결합니다: (1)
+관측 입력 검증, (2) 장애 재시도 대기 중 관측 지속(주문 제출·
+`highest_price` 병합은 계속 비활성), (3) `run_once()` 통합 검증.
+
+### 변경 내용
+
+**1) 입력 검증 — `domain/strategy/exit_calc.py`**
+
+`classify_exit_observation_readiness()`를 추가했습니다. 잔고 장애
+관측 경로는 `evaluate_exit_candidate()`를 직접 부르기 전에 반드시
+이 함수를 먼저 호출합니다. 현재가·평균단가가 양수·유한값(bool·
+NaN·inf 제외)인지, 캐시된 시세 나이(`price_age_seconds`)가
+`max_price_age_seconds`를 넘지 않는지를 검증하고, 빈 문자열이 아닌
+사유(`invalid_current_price`/`invalid_average_price`/
+`price_age_unknown`/`stale_price`)를 반환하면 "평가 보류 + 그
+사유"로만 기록하고 `evaluate_exit_candidate()`를 호출하지 않습니다
+— 이 함수가 반환하는 `None`("유효한 입력을 평가했지만 후보 없음")과
+"평가 보류"를 절대 같은 값으로 기록하지 않습니다. 순수 계산이며
+시각 조회는 호출자가 미리 계산해 넘깁니다.
+
+**2) 장애 경로 연결 — `domain/service/trading_service.py`, `app/main.py`**
+
+- `TradingService.observe_exit_candidates_during_outage()`: 브로커
+  API를 전혀 호출하지 않고(추가 429 유발 방지), 마지막으로 성공
+  조회된 `cached_balance`와 캐시된 시세·장세(`cached_market_prices`/
+  `cached_regime`)만으로 보유 종목별 청산 후보를 계산·기록합니다.
+  `strategy_router.select(regime)`으로 정상 경로와 동일하게 전략을
+  고른 뒤 `evaluate_exit_candidate()`를 호출합니다 — regime이 아직
+  캐시된 적 없으면(`UNKNOWN`) 새로 판정을 시도(=브로커 호출)하지
+  않고 "평가 보류(`regime_not_cached`)"로만 기록합니다.
+  `self._highest_price`는 읽기만 하고 갱신·병합하지 않습니다. 이
+  메서드 자체의 예외는 종목 단위로 흡수합니다(fail-open) — 한 종목의
+  관측 실패가 다른 종목 관측이나 재시도 대기를 방해하지 않습니다.
+- `TradingService.wait_out_balance_outage()`: `trading_loop()`가
+  기존에 하던 `await asyncio.sleep(180)`을 대체합니다. **총 대기
+  시간(기본 180초)은 바꾸지 않았습니다** — 잔고 API 자체의 독립적
+  지수 백오프 재설계(설계문서 v2 §3 전체, `order_attempt_seq` 등)는
+  이번 범위가 아닙니다. 바뀐 것은 하나, 이 180초를 한 번에 다 자지
+  않고 `balance_outage_observe_interval_seconds`(기본 15초) 간격으로
+  쪼개 매 구간 시작마다 `observe_exit_candidates_during_outage()`를
+  호출해 관측 기회를 유지한다는 것입니다. 잔고 API를 다시 호출하지
+  않습니다(재유발 방지).
+- `app/main.py`의 `trading_loop()` 429 분기가 `asyncio.sleep(180)`
+  대신 `await trading_service.wait_out_balance_outage()`를 호출하도록
+  바꿨습니다. 그 외 분기(429가 아닌 예외)는 그대로입니다.
+- 새 관측 전용 로그 `logs/exit_candidate_outage.csv`
+  (`infra/storage/logger.py`의 `ExitCandidateOutageLogger`,
+  `config/settings.py`의 `StorageConfig.exit_candidate_outage_log_file`)
+  — `status`(`deferred`/`no_candidate`/`STOP_LOSS`/`TRAILING`)와
+  `reason`을 분리된 컬럼으로 기록해 "평가 보류"와 "후보 없음"이
+  뒤섞이지 않게 했습니다. `BalanceFreshnessLogger`와 동일하게
+  dedup 없는 append-only입니다(각 행이 서로 다른 시점의 관측치).
+- 새 설정값 2개(`config/settings.py`의 `TradingConfig`,
+  `config/settings.yaml`): `exit_candidate_outage_max_price_age_seconds`
+  (기본 120초), `balance_outage_observe_interval_seconds`(기본 15초).
+  둘 다 초기 설정값이며 실측 후 조정 대상으로 주석에 명시했습니다.
+
+**3) `run_once()` 통합 검증 — `test_balance_outage_exit_observation.py`(신규)**
+
+`trading_loop()`의 except 분기가 실제로 하는 일(429 실패 → 관측을
+유지하며 대기 → 복구)을 그대로 재현하는 통합 테스트를 추가했습니다:
+잔고 API가 429로 실패하도록 모킹한 상태에서 `run_once()`를 호출해
+예외가 그대로 전파되는지 확인(1~2단계 회귀 유지) → `asyncio.sleep`을
+모킹한 채 `wait_out_balance_outage()`를 호출해 관측이 여러 번(구간
+수만큼) 기록되고 그동안 `place_order`가 전혀 호출되지 않는지 확인 →
+잔고 API를 복구한 뒤 `run_once()`를 다시 호출해 정상 경로가 예외
+없이 완료되고, 이 새 관측 로그에 추가 행이 쌓이지 않는지(정상 경로는
+이 로거를 건드리지 않음, 중복 없음) 확인합니다.
+
+### 테스트 및 검증
+
+`test_balance_outage_exit_observation.py`(신규, 24건): 순수 함수
+`classify_exit_observation_readiness()` 단위 테스트(유효 입력·
+현재가/평균단가 무효·NaN·inf·bool·시세 없음·오래된 시세·경계값
+등 11건), `observe_exit_candidates_during_outage()` 단위 테스트
+(캐시 없음/로거 없음/수량 0 스킵/시세 없음/오래된 시세/regime
+미확보/손절 트리거/후보 없음-평가보류 구분/주문 미제출·highest_price
+불변/종목별 fail-open 9건), `wait_out_balance_outage()` 단위 테스트
+(총 대기시간 보존+반복 관측, 대기 중 브로커 미호출 2건), `run_once()`
+통합 테스트 2건.
+
+전체 회귀(`run_regression_tests.py`) 39개 파일 중 38 PASS — 유일한
+실패는 기존 `test_broker_order_status.py`의 주문 fixture 파일 부재로,
+이번 변경과 무관합니다(이전 단계부터 동일). `legacy_tests/
+test_entry_watch.py` 11/11 PASS. `test_delayed_eval_candidate_
+observation.py`의 `ResourceWarning`(아래 4번 참고)도 함께 제거해
+`python3 -W error::ResourceWarning`로도 경고 없이 통과합니다.
+
+수정 전 상태로 되돌려(`no_candidate`와 `deferred`를 같은 값으로
+합침) 테스트를 실행한 결과, "평가 보류"와 "후보 없음"을 구분하는
+테스트가 정확히 FAIL로 표시됨을 확인한 뒤 원복했습니다.
+
+### 4) 테스트 정리 — `test_delayed_eval_candidate_observation.py`
+
+`csv.DictReader(open(...))`가 파일 핸들을 명시적으로 닫지 않아
+`ResourceWarning`을 유발하던 6곳을 `with open(...)`으로 감싼 작은
+헬퍼(`_read_csv_rows()`)로 교체했습니다. 판정 로직과 무관한 테스트
+정리이며, 이 파일의 38개 테스트는 모두 그대로 통과합니다.
+
+### 변경하지 않은 것
+
+- 손절·트레일링·안전망·VWAP이탈·급락청산 등 기존 정상 전략의 판단
+  기준·임계값·평가 순서는 전혀 바꾸지 않았습니다.
+- 기존 정상 전략(`generate_signal()`)들의 무효 입력(현재가 0 등)
+  처리 정책은 바꾸지 않았습니다 — `classify_exit_observation_
+  readiness()`는 오직 잔고 장애 관측 경로 호출부에서만 쓰입니다.
+- 장애 중 주문 제출(BUY/SELL/강제청산)은 여전히 비활성입니다 —
+  `observe_exit_candidates_during_outage()`는 `place_order`를
+  호출하지 않습니다.
+- 장애 중 최고가 후보의 `highest_price` 운영 병합은 여전히
+  비활성입니다 — 관측 메서드는 `self._highest_price`를 읽기만
+  합니다.
+- 잔고 API 자체의 독립적 지수 백오프 재설계(설계문서 v2 §3의
+  30→60→120→180초 단계 조정, `order_attempt_seq` 기반 판정, 주문
+  상태 조회/확정 분리 §1.5)는 이번 범위가 아닙니다 — 총 대기시간
+  (180초)은 그대로 유지했습니다.
+- 잔고 재시도 스케줄 자체(30/60/120/180초 백오프 계산)는 바꾸지
+  않았습니다 — 바뀐 것은 그 대기를 "한 번에 다 자는지, 쪼개서
+  관측하며 자는지"뿐입니다.
+
+### 다음 작업
+
+작업명 "잔고 장애 중 관측 지속 및 복구 처리 — 부분 완료 단계"를
+유지합니다. 구현 지시서 §2 나머지 항목(잔고 API 독립 지수 백오프,
+주문 상태 조회/확정 분리, `order_attempt_seq` 기반 SELL 수량 신뢰
+게이트, 복구 시 최고가 후보 entry_time 기반 병합)은 별도 승인 후
+계속 진행합니다. 이번 단계는 "계산·기록"까지이며, 실제 청산 대응
+능력(자동 제출 활성화)은 포함하지 않습니다.
+
+### 전달 파일
+
+`0007-feat-exit-candidate-outage-observation.patch`,
+`0008-docs-CHANGELOG-v1.7-4.patch`, 관련 파일 전체가 담긴 diff zip.
+
+---
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
