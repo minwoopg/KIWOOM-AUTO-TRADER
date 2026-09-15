@@ -74,6 +74,15 @@ EW = EntryWatchConfig(
 )
 
 
+def _read_csv_rows(path: str) -> list[dict]:
+    """2026-09-15 (180초 감시 공백 대응 3단계 GPT 재검토 지적 — 테스트
+    정리): `csv.DictReader(open(path))`는 파일 핸들을 명시적으로 닫지
+    않아 ResourceWarning을 유발합니다. `with open(...)`으로 감싸는
+    작은 헬퍼로 교체 — 판정 로직과 무관한 테스트 정리입니다."""
+    with open(path, encoding="utf-8") as fp:
+        return list(csv.DictReader(fp))
+
+
 def make_service(entry_watch=EW, delayed_eval_candidate_logger=None) -> TradingService:
     """legacy_tests/test_entry_watch.py와 동일한 최소 생성 패턴 —
     __init__을 건너뛰고 _check_entry_watch()/신규 헬퍼가 참조하는
@@ -744,7 +753,7 @@ class TestDelayedCandidatePriceValidity(unittest.TestCase):
                 "무효 가격 관측 다음의 유효 가격 관측은 정상적으로 기록돼야 합니다.",
             )
 
-            rows = list(csv.DictReader(open(f"{tmpdir}/delayed_eval_candidate.csv", encoding="utf-8")))
+            rows = _read_csv_rows(f"{tmpdir}/delayed_eval_candidate.csv")
             self.assertEqual(len(rows), 2, "무효 관측 1건 + 유효 관측 1건, 총 2행이 남아야 합니다.")
             self.assertEqual(rows[0]["price_valid"], "False")
             self.assertEqual(rows[1]["price_valid"], "True")
@@ -761,7 +770,7 @@ class TestDelayedCandidatePriceValidity(unittest.TestCase):
             svc._check_entry_watch(symbol, pos, current_price=9700, minute_analysis=None)
 
             self.assertEqual(logger._seen_keys, set())
-            rows = list(csv.DictReader(open(f"{tmpdir}/delayed_eval_candidate.csv", encoding="utf-8")))
+            rows = _read_csv_rows(f"{tmpdir}/delayed_eval_candidate.csv")
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["price_valid"], "False")
 
@@ -806,7 +815,7 @@ class TestDelayedCandidateRestartDedupRestore(unittest.TestCase):
             svc2._check_entry_watch(symbol, pos, current_price=9700, minute_analysis=None)
             self.assertEqual(logger2._seen_keys, {(symbol, entry_time)})
 
-            rows = list(csv.DictReader(open(path, encoding="utf-8")))
+            rows = _read_csv_rows(path)
             self.assertEqual(len(rows), 2, "무효 관측 1건 + 재시작 후 유효 관측 1건, 총 2행")
             self.assertEqual(rows[0]["price_valid"], "False")
             self.assertEqual(rows[1]["price_valid"], "True")
@@ -822,7 +831,7 @@ class TestDelayedCandidateRestartDedupRestore(unittest.TestCase):
             svc3 = make_service(delayed_eval_candidate_logger=logger3)
             svc3.state.entry_time_by_symbol[symbol] = entry_time
             svc3._check_entry_watch(symbol, pos, current_price=9600, minute_analysis=None)
-            rows_after = list(csv.DictReader(open(path, encoding="utf-8")))
+            rows_after = _read_csv_rows(path)
             self.assertEqual(
                 len(rows_after), 2,
                 "유효 관측이 이미 기록된 진입 건은 재시작 후에도 다시 기록되면 안 됩니다.",
@@ -885,7 +894,7 @@ class TestLegacyFormatObservationState(unittest.TestCase):
 
             self.assertIsNone(sig, "이 라운드는 지연 청산 SELL을 만들지 않습니다.")
             self.assertEqual(logger._seen_keys, {(symbol, entry_time)})
-            rows = list(csv.DictReader(open(f"{tmpdir}/delayed_eval_candidate.csv", encoding="utf-8")))
+            rows = _read_csv_rows(f"{tmpdir}/delayed_eval_candidate.csv")
             self.assertEqual(rows[0]["prior_seen_format"], "legacy")
 
     def test_no_prior_record_is_tagged_none_not_legacy(self):
@@ -899,7 +908,7 @@ class TestLegacyFormatObservationState(unittest.TestCase):
 
             svc._check_entry_watch(symbol, pos, current_price=9700, minute_analysis=None)
 
-            rows = list(csv.DictReader(open(f"{tmpdir}/delayed_eval_candidate.csv", encoding="utf-8")))
+            rows = _read_csv_rows(f"{tmpdir}/delayed_eval_candidate.csv")
             self.assertEqual(rows[0]["prior_seen_format"], "none")
 
 
