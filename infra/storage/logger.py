@@ -1250,9 +1250,14 @@ EXIT_CANDIDATE_OUTAGE_FIELDS = [
                               # 미확보로 평가 자체를 시도하지 않음) /
                               # "no_candidate"(유효한 입력을 평가했지만 손절·
                               # 트레일링 모두 미충족) / "STOP_LOSS" / "TRAILING"
-    "reason",                 # status="deferred"일 때만: "invalid_current_price"
-                              # / "invalid_average_price" / "price_age_unknown"
-                              # / "stale_price" / "regime_not_cached". 그 외
+    "reason",                 # status="deferred"일 때만: "position_unconfirmed"
+                              # (로컬에 관심 종목으로는 잡히나 평단을 아는
+                              # 마지막 성공 스냅샷이 없음) / "price_fetch_failed"
+                              # (시세 재조회 시도 자체가 실패하고 대체할 캐시도
+                              # 없음) / "invalid_current_price" /
+                              # "invalid_average_price" / "price_age_unknown" /
+                              # "invalid_price_age"(음수·NaN·inf 등 비정상값) /
+                              # "stale_price" / "regime_not_cached". 그 외
                               # status에서는 빈 문자열
     "regime",                 # 이 관측에 쓰인 캐시된 장세(MarketRegime.value).
                               # status="deferred"이고 regime 확보 전이면 빈 문자열
