@@ -58,6 +58,19 @@ class TradingConfig:
     # 하위호환 유지 — settings.yaml에서 명시적으로 낮춰야 실제로 빨라짐.
     held_symbol_poll_gap_seconds: float = 1.0
     entry_poll_gap_seconds: float = 1.0
+    # 2026-09-15 (180초 감시 공백 대응 3단계 — 관측 경로 연결): 잔고
+    # 장애(429 등) 중 청산 후보를 관측할 때, 캐시된 시세를 얼마나
+    # 오래된 것까지 신뢰하고 evaluate_exit_candidate()를 호출할지의
+    # 상한(초). 이 값을 넘으면 계산 자체를 시도하지 않고 "평가 보류
+    # (stale_price)"로만 기록한다. 초기 설정값이며, 실측 후 조정 대상.
+    exit_candidate_outage_max_price_age_seconds: int = 120
+    # 2026-09-15 (같은 단계): 잔고 재시도 대기(기존 180초 백오프) 중
+    # observe_exit_candidates_during_outage()를 반복 호출하는 간격(초).
+    # 전체 대기 시간(trading_loop()가 넘기는 값, 기본 180초) 자체는
+    # 이번 단계에서 바꾸지 않는다 — 그 180초를 한 번에 자지 않고 이
+    # 간격으로 쪼개 관측 기회를 유지할 뿐이다. 초기 설정값이며, 실측
+    # 후 조정 대상.
+    balance_outage_observe_interval_seconds: float = 15.0
 
     def __post_init__(self):
         # frozen=True dataclass라 self.x = ... 직접 대입은 FrozenInstanceError.
@@ -292,6 +305,12 @@ class StorageConfig:
     # SELL 판정을 만들지 않음 (infra/storage/logger.py의
     # DelayedEvalCandidateLogger 참고).
     delayed_eval_candidate_log_file: str = "logs/delayed_eval_candidate.csv"
+    # 180초 감시 공백 대응 3단계 (2026-09-15, 관측 경로 연결): 잔고
+    # 장애(429 등) 재시도 대기 중 캐시된 시세·잔고만으로 계산한 청산
+    # 후보(손절·트레일링) 관측 전용 로그. 주문 제출·체결 확정·
+    # highest_price 갱신에는 전혀 관여하지 않음 (infra/storage/logger.py의
+    # ExitCandidateOutageLogger, domain/strategy/exit_calc.py 참고).
+    exit_candidate_outage_log_file: str = "logs/exit_candidate_outage.csv"
 
 
 @dataclass(frozen=True)

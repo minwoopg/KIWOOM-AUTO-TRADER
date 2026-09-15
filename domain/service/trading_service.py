@@ -30,12 +30,13 @@ from domain.risk.risk_manager import RiskManager
 from domain.strategy.strategy_router import StrategyRouter
 from domain.strategy.entry_quality_shadow import evaluate_vwap_shadow
 from domain.strategy.candidate_a_guard import evaluate_candidate_a, CANDIDATE_A_UPSIDE_THRESHOLD_PCT
+from domain.strategy.exit_calc import evaluate_exit_candidate, classify_exit_observation_readiness
 from infra.broker.base import Broker
 from infra.storage.daily_reporter import DailyReporter
 from infra.storage.logger import (
     AppLogger, TradeCsvLogger, SignalCsvLogger, EntryWatchShadowLogger, PositionLifecycleLogger,
     EntryQualityShadowLogger, LowUpsideShadowLogger, MinProfitExtensionShadowLogger,
-    BalanceFreshnessLogger, DelayedEvalCandidateLogger,
+    BalanceFreshnessLogger, DelayedEvalCandidateLogger, ExitCandidateOutageLogger,
 )
 from infra.storage.minute_bar_saver import MinuteBarSaver
 from infra.storage.skip_reason import classify_skip_reason, SkipReason
@@ -71,6 +72,7 @@ class TradingService:
         notifier: "KakaoNotifier | None" = None,
         balance_freshness_logger: "BalanceFreshnessLogger | None" = None,
         delayed_eval_candidate_logger: "DelayedEvalCandidateLogger | None" = None,
+        exit_candidate_outage_logger: "ExitCandidateOutageLogger | None" = None,
     ) -> None:
         self.settings = settings
         self.broker = broker
@@ -172,6 +174,22 @@ class TradingService:
                 f"(entry_watch 판정에는 영향 없음): {type(exc).__name__}: {exc}"
             )
             self.delayed_eval_candidate_logger = None
+        # 2026-09-15 (180초 감시 공백 대응 3단계, 관측 경로 연결): 동일한
+        # fail-open 생성 패턴 — 로거 생성 자체가 실패해도 프로그램 기동을
+        # 막지 않고 None으로 남겨 관측만 건너뜁니다. 이 로거는 주문 제출·
+        # 체결 확정·highest_price 갱신 어디에도 관여하지 않습니다.
+        try:
+            self.exit_candidate_outage_logger = (
+                exit_candidate_outage_logger or ExitCandidateOutageLogger(
+                    settings.storage.exit_candidate_outage_log_file
+                )
+            )
+        except Exception as exc:
+            self.app_logger.warning(
+                f"[EXIT_CANDIDATE_OUTAGE] 로거 생성 실패 — 이번 실행에서는 관측을 건너뜁니다"
+                f"(잔고 조회·주문 판단에는 영향 없음): {type(exc).__name__}: {exc}"
+            )
+            self.exit_candidate_outage_logger = None
 
         self.state, loaded_highest = self.state_store.load()
 
@@ -648,6 +666,163 @@ class TradingService:
         """
         msg = str(exc)
         return "http=429" in msg or "허용된 요청 개수를 초과" in msg
+
+    async def wait_out_balance_outage(
+        self,
+        total_seconds: "float | None" = None,
+        observe_interval_seconds: "float | None" = None,
+    ) -> None:
+        """app/main.py의 trading_loop()가 잔고 429 등으로 재시도를
+        기다릴 때 `await asyncio.sleep(180)` 대신 호출합니다.
+
+        2026-09-15 (180초 감시 공백 대응 3단계 — 관측 경로 연결,
+        구현 지시서 §3의 축소 반영): 전체 대기 시간(`total_seconds`,
+        기본값은 기존과 동일하게 180초)은 이번 단계에서 바꾸지
+        않습니다 — 잔고 API 자체의 독립적 지수 백오프 재설계(설계
+        문서 v2 §3의 30→60→120→180초 단계 조정, `order_attempt_seq`
+        기반 판정 등)는 이번 범위가 아닙니다. 바뀌는 것은 단 하나,
+        이 대기를 한 번에 다 자지 않고 `observe_interval_seconds`
+        간격으로 쪼개, 매 구간 시작 시 `observe_exit_candidates_
+        during_outage()`를 호출해 관측 기회를 유지한다는 것입니다.
+
+        이 메서드는 주문을 제출하지 않고, `highest_price` 운영 상태를
+        갱신·병합하지 않으며, 잔고 API를 다시 호출하지 않습니다(그러면
+        429를 다시 유발할 수 있어 본말전도입니다) — 오직 캐시된 값만
+        읽어 관측·기록합니다.
+        """
+        if total_seconds is None:
+            total_seconds = 180.0
+        if observe_interval_seconds is None:
+            observe_interval_seconds = getattr(
+                self.settings.trading, "balance_outage_observe_interval_seconds", 15.0
+            )
+        observe_interval_seconds = max(0.1, float(observe_interval_seconds))
+
+        elapsed = 0.0
+        while elapsed < total_seconds:
+            self.observe_exit_candidates_during_outage()
+            chunk = min(observe_interval_seconds, total_seconds - elapsed)
+            await asyncio.sleep(chunk)
+            elapsed += chunk
+
+    def observe_exit_candidates_during_outage(self) -> None:
+        """잔고 API 장애 재시도 대기 중, 캐시된 잔고·시세만으로 보유
+        종목별 청산 후보(손절·트레일링)를 관측 전용으로 계산·기록합니다.
+
+        2026-09-15 (180초 감시 공백 대응 3단계 — 관측 경로 연결):
+        - 브로커 API를 전혀 호출하지 않습니다(추가 429 유발 위험 없음).
+          `self.cached_balance`(마지막으로 성공 조회된 잔고)와
+          `self.cached_market_prices`/`self.cached_regime`(마지막으로
+          캐시된 값)만 읽습니다.
+        - 주문을 제출하지 않습니다(place_order 호출 없음).
+        - `self._highest_price`를 읽기만 하고 갱신·병합하지 않습니다 —
+          "장애 중 최고가 후보의 운영 병합"은 별도 승인 대상으로 아직
+          비활성입니다(구현 지시서 §1 표 참고).
+        - 이 메서드가 던지는 예외는 내부에서 모두 흡수합니다(fail-open,
+          `_log_balance_freshness()`와 동일한 계약) — 관측 실패가
+          재시도 대기 자체를 방해하면 안 됩니다.
+        """
+        if getattr(self, "exit_candidate_outage_logger", None) is None:
+            return
+        balance = self.cached_balance
+        if balance is None:
+            # 프로세스 시작 직후 등, 성공 조회된 잔고가 아직 한 번도
+            # 없으면 관측할 보유 종목 정보 자체가 없습니다.
+            return
+        for position in balance.positions:
+            if getattr(position, "quantity", 0) <= 0:
+                continue
+            symbol = position.symbol
+            try:
+                self._observe_exit_candidate_for_symbol(symbol, position)
+            except Exception as exc:
+                self.app_logger.warning(
+                    f"[EXIT_CANDIDATE_OUTAGE] {symbol} | 관측 실패 — 무시하고 계속 진행"
+                    f"(재시도 대기·주문 판단에는 영향 없음): {type(exc).__name__}: {exc}"
+                )
+
+    def _observe_exit_candidate_for_symbol(self, symbol: str, position) -> None:
+        """`observe_exit_candidates_during_outage()`가 종목 하나에 대해
+        호출하는 내부 헬퍼 — 입력 검증(`classify_exit_observation_
+        readiness()`) → regime 확인 → `evaluate_exit_candidate()` 순서로
+        평가하고, 각 단계에서 멈추면 그 사유를 "평가 보류"로 기록합니다.
+        """
+        now = datetime.now()
+        entry_time = self.state.entry_time_by_symbol.get(symbol, "")
+        cached_price = self.cached_market_prices.get(symbol)
+        loaded_at = self.cached_market_price_loaded_at.get(symbol)
+        current_price = getattr(cached_price, "current_price", None) if cached_price is not None else None
+        average_price = getattr(position, "average_price", None)
+        price_age_seconds = (
+            (now - loaded_at).total_seconds() if loaded_at is not None else None
+        )
+        max_price_age_seconds = self.settings.trading.exit_candidate_outage_max_price_age_seconds
+
+        row: dict = {
+            "detected_at": now.isoformat(),
+            "symbol": symbol,
+            "entry_time": entry_time,
+            "avg_price": average_price if average_price is not None else "",
+            "current_price": current_price if current_price is not None else "",
+            "price_observed_at": loaded_at.isoformat() if loaded_at is not None else "",
+            "price_age_seconds": (
+                round(price_age_seconds, 1) if price_age_seconds is not None else ""
+            ),
+        }
+
+        reason = classify_exit_observation_readiness(
+            current_price=current_price,
+            average_price=average_price,
+            price_age_seconds=price_age_seconds,
+            max_price_age_seconds=max_price_age_seconds,
+        )
+        if reason:
+            row["status"] = "deferred"
+            row["reason"] = reason
+            self.exit_candidate_outage_logger.append(row)
+            return
+
+        # 2026-09-15: regime은 여기서 새로 판정하지 않고 캐시된 값만
+        # 읽습니다 — _get_regime_with_cache()를 그대로 부르면 일봉
+        # 캐시가 만료된 경우 broker.get_daily_prices()를 새로 호출할 수
+        # 있어(장애 중 추가 API 호출 유발), 구현 지시서 §4 "regime 판정에
+        # 필요한 정보가 장애 중 확보되지 않으면 평가 보류"를 캐시 직접
+        # 조회로 지킵니다.
+        regime = self.cached_regime.get(symbol, MarketRegime.UNKNOWN)
+        if regime == MarketRegime.UNKNOWN:
+            row["status"] = "deferred"
+            row["reason"] = "regime_not_cached"
+            self.exit_candidate_outage_logger.append(row)
+            return
+
+        highest_price = self._highest_price.get(symbol, 0)
+        row["regime"] = regime.value
+        row["highest_price"] = highest_price
+
+        strategy = self.strategy_router.select(regime)
+        candidate = evaluate_exit_candidate(
+            strategy=strategy,
+            average_price=average_price,
+            current_price=current_price,
+            highest_price=highest_price,
+            stop_loss_pct=self.settings.strategy.stop_loss_pct,
+        )
+        if candidate is None:
+            row["status"] = "no_candidate"
+            row["reason"] = ""
+        else:
+            row["status"] = candidate.kind
+            row["reason"] = ""
+            row["stop_loss_price"] = candidate.stop_loss.stop_loss_price
+            row["stop_loss_triggered"] = candidate.stop_loss.triggered
+            if candidate.trailing is not None:
+                row["trailing_active"] = candidate.trailing.active
+                row["trail_pct"] = candidate.trailing.trail_pct
+                row["trailing_stop_price"] = candidate.trailing.trailing_stop_price
+                row["trailing_triggered"] = candidate.trailing.triggered
+                row["from_high_pct"] = candidate.trailing.from_high_pct
+
+        self.exit_candidate_outage_logger.append(row)
 
     def _get_market_price_with_cache(self, symbol: str):
         """현재가 조회를 종목별로 일정 시간 동안 캐시 재사용하도록 처리합니다.

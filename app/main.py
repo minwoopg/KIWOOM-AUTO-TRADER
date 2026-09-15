@@ -128,7 +128,17 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
             msg = str(exc)
             if "http=429" in msg or "허용된 요청 개수를 초과" in msg:
                 app_logger.warning("rate limit detected, backing off for 180 seconds")
-                await asyncio.sleep(180)
+                # 2026-09-15 (180초 감시 공백 대응 3단계 — 관측 경로
+                # 연결): 기존엔 이 180초를 한 번에 통째로 잤습니다 —
+                # 그동안 run_once()가 전혀 호출되지 않아 보유 종목의
+                # 손절·트레일링 판단이 완전히 멈췄습니다("180초 감시
+                # 공백"). wait_out_balance_outage()는 총 대기시간(180초,
+                # 기존과 동일)은 그대로 두되, 짧은 간격으로 쪼개 매
+                # 구간마다 캐시된 잔고·시세만으로 청산 후보를 관측·
+                # 기록합니다(TradingService.observe_exit_candidates_
+                # during_outage() 참고) — 주문 제출·체결 확정·
+                # highest_price 갱신은 여전히 하지 않습니다.
+                await trading_service.wait_out_balance_outage()
             else:
                 await asyncio.sleep(poll)
 

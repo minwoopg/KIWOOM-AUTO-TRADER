@@ -136,6 +136,13 @@ def build_minimal_settings(tmpdir: str) -> Settings:
             # 이번에도 재현 확인 후 수정).
             balance_freshness_log_file=f"{tmpdir}/balance_freshness.csv",
             delayed_eval_candidate_log_file=f"{tmpdir}/delayed_eval_candidate.csv",
+            # 2026-09-15 (180초 감시 공백 대응 3단계): 위와 동일한 이유로
+            # 반드시 tmpdir 기준 경로 명시 — 안 하면 StorageConfig 기본값
+            # ("logs/exit_candidate_outage.csv")이 그대로 쓰여서 이 헬퍼를
+            # 재사용하는 모든 테스트가 프로젝트 루트의 실제 logs/ 에 CSV를
+            # 새게 됩니다(0.5단계 CSV 누출 사고와 동일 클래스 — 이번에는
+            # 미리 반영해 재현 없이 예방).
+            exit_candidate_outage_log_file=f"{tmpdir}/exit_candidate_outage.csv",
         ),
         websocket=WebSocketConfig(
             enabled=False, url="", condition_seqs=[], max_symbols=10,

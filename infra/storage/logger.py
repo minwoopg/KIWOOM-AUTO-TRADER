@@ -1222,3 +1222,79 @@ class DelayedEvalCandidateLogger:
             for field in DELAYED_EVAL_CANDIDATE_FIELDS:
                 row.setdefault(field, "")
             writer.writerow(row)
+
+
+# ── exit_candidate_outage.csv ────────────────────────────────────────────────
+# 180초 감시 공백 대응 3단계 (2026-09-15, 관측 경로 연결). 잔고 API
+# 장애(429 등)로 TradingService._get_balance_with_cache()가 예외를 올려
+# run_once()가 그 사이클을 진행하지 못할 때, 마지막으로 성공 조회된
+# 잔고(cached_balance)와 캐시된 시세만으로 손절·트레일링 청산 후보를
+# 계산해 기록합니다(domain/strategy/exit_calc.py의 evaluate_exit_
+# candidate() 재사용 — 새 계산식을 만들지 않음). BalanceFreshnessLogger와
+# 동일한 이유로 dedup 없이 append-only입니다 — 이 로그의 각 행은 서로
+# 다른 관측 시점의 서로 다른 관측치이고, 장애가 길게 이어질수록 같은
+# 종목이 반복 기록되는 것 자체가 "그동안 장애가 계속됐다"는 유의미한
+# 관측입니다.
+#
+# 이 로그의 존재는 주문 제출·체결 확정·highest_price 갱신 중 어느
+# 것도 만들지 않습니다 — TradingService.observe_exit_candidates_
+# during_outage()는 순수 조회·계산·기록만 수행합니다.
+EXIT_CANDIDATE_OUTAGE_FIELDS = [
+    "detected_at",           # 이 관측을 기록한 시각(ISO)
+    "symbol",
+    "entry_time",             # state.entry_time_by_symbol.get(symbol, "") —
+                              # 다른 관측 로그와 동일하게 진입 건 식별용으로
+                              # 함께 남김(이 로그 자체는 이 값으로 dedup하지
+                              # 않음)
+    "status",                 # "deferred"(무효 입력·시세 없음/오래됨/regime
+                              # 미확보로 평가 자체를 시도하지 않음) /
+                              # "no_candidate"(유효한 입력을 평가했지만 손절·
+                              # 트레일링 모두 미충족) / "STOP_LOSS" / "TRAILING"
+    "reason",                 # status="deferred"일 때만: "invalid_current_price"
+                              # / "invalid_average_price" / "price_age_unknown"
+                              # / "stale_price" / "regime_not_cached". 그 외
+                              # status에서는 빈 문자열
+    "regime",                 # 이 관측에 쓰인 캐시된 장세(MarketRegime.value).
+                              # status="deferred"이고 regime 확보 전이면 빈 문자열
+    "avg_price",
+    "current_price",
+    "highest_price",          # 운영 중인 self._highest_price를 읽기만 함
+                              # (이 로그가 갱신·병합하지 않음)
+    "price_observed_at",      # 이 current_price가 캐시에 적재된 시각(ISO)
+    "price_age_seconds",      # detected_at 기준 price_observed_at의 나이(초)
+    "stop_loss_price",        # status가 STOP_LOSS/TRAILING/no_candidate일 때만
+    "stop_loss_triggered",
+    "trailing_active",        # 이 전략에 트레일링이 있고(trailing_params()가
+                              # None이 아니고) 위 조건을 만족했을 때만 채움
+    "trail_pct",
+    "trailing_stop_price",
+    "trailing_triggered",
+    "from_high_pct",
+]
+
+
+class ExitCandidateOutageLogger:
+    """180초 감시 공백 대응 3단계 — 잔고 장애 중 관측 전용 청산 후보를
+    append-only로 기록하는 로거입니다. BalanceFreshnessLogger와 동일한
+    패턴(dedup 없음)을 씁니다 — 이유는 위 모듈 주석 참고.
+    """
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.file_path.exists():
+            _migrate_csv_header_if_needed(
+                self.file_path, EXIT_CANDIDATE_OUTAGE_FIELDS, "EXIT_CANDIDATE_OUTAGE"
+            )
+        else:
+            with self.file_path.open("w", newline="", encoding="utf-8") as fp:
+                writer = csv.DictWriter(fp, fieldnames=EXIT_CANDIDATE_OUTAGE_FIELDS)
+                writer.writeheader()
+
+    def append(self, row: dict[str, Any]) -> None:
+        with self.file_path.open("a", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=EXIT_CANDIDATE_OUTAGE_FIELDS, extrasaction="ignore")
+            for field in EXIT_CANDIDATE_OUTAGE_FIELDS:
+                row.setdefault(field, "")
+            writer.writerow(row)

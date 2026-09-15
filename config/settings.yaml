@@ -36,6 +36,10 @@ trading:
   entry_poll_gap_seconds: 1.0
   balance_refresh_seconds: 180
   price_refresh_seconds: 60
+  # 180초 감시 공백 대응 3단계 (2026-09-15, 관측 경로 연결) — 초기
+  # 설정값, 실측 후 조정 대상.
+  exit_candidate_outage_max_price_age_seconds: 120
+  balance_outage_observe_interval_seconds: 15
   order_cash_per_trade: 6000000
   max_positions: 5
   allow_multiple_entries_per_symbol_per_day: false  # 2026-07-21: 1일1회로 재전환.
@@ -220,6 +224,7 @@ storage:
   run_baseline_log_file: logs/run_baseline.csv  # B01: 실행 기준선(run_id/git_sha/설정해시) 기록
   balance_freshness_log_file: logs/balance_freshness.csv  # S01 관측 1단계 (순수 관측)
   delayed_eval_candidate_log_file: logs/delayed_eval_candidate.csv  # S02 관측 1단계 (순수 관측)
+  exit_candidate_outage_log_file: logs/exit_candidate_outage.csv  # 180초 감시 공백 대응 3단계 (순수 관측)
 
 # ── 카카오톡 알림 ──────────────────────────────────────────
 # .env 파일에 아래 키를 입력하세요 (.gitignore로 보호됨)
