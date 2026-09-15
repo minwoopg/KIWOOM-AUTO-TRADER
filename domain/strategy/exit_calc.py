@@ -69,12 +69,25 @@ average_price * 100`까지 함께 계산해 반환했는데, 이건 손절 판�
 무효 입력(현재가 0, 평균단가 0인데 최고가는 양수, NaN 등) 처리는
 이번에도 다루지 않는다 — 아래 전략들이 원래부터 이런 입력에
 대한 검증이 없었고(신선한 시세만 들어온다고 가정), 순수 추출 원칙상
-동작을 바꾸지 않았다. 잔고 장애 관측 경로를 실제로 연결하는 다음
-단계에서 관측 경계(이 함수를 부르기 전)에 현재가·평균단가 양수·
-유한값 검증과 시세 신선도 검증을 추가해, 무효 입력은 "평가 보류
-+ 사유"로 별도 기록하고 `None`은 "유효한 입력을 평가했지만 후보
-없음"에만 쓰도록 구분해야 한다 — 기존 정상 전략들의 무효 입력
-처리 정책 자체는 이번 범위에서도, 다음 단계에서도 바꾸지 않는다.
+동작을 바꾸지 않았다. `evaluate_exit_candidate()` 자체도 여전히
+검증하지 않는다 — 아래 `classify_exit_observation_readiness()`가
+그 역할을 대신한다.
+
+2026-09-15 (180초 감시 공백 대응 3단계 — 관측 경로 연결, GPT 재검토
+지시 반영): `classify_exit_observation_readiness()`를 추가했다.
+잔고 장애 관측 경로는 `evaluate_exit_candidate()`를 직접 부르기 전에
+반드시 이 함수를 먼저 호출해, 현재가·평균단가가 양수·유한값인지와
+시세가 너무 오래되지 않았는지를 확인한다. 이 함수가 빈 문자열이
+아닌 사유를 반환하면 "평가 보류 + 그 사유"로만 기록하고
+`evaluate_exit_candidate()`를 호출하지 않는다 — `evaluate_exit_
+candidate()`가 돌려주는 `None`("유효한 입력을 평가했지만 후보 없음")과
+이 "평가 보류"(무효 입력이라 애초에 평가하지 못함)를 절대 같은 값으로
+기록하면 안 된다. 이 함수는 순수 계산이며, `datetime.now()` 같은
+시각 조회는 호출자(`domain/service/trading_service.py`)가 미리 계산해
+`price_age_seconds`로 넘긴다 — 이 모듈은 여전히 시계에 의존하지 않는다.
+기존 정상 전략(`generate_signal()`)들의 무효 입력 처리 정책 자체는
+이 함수 추가와 무관하게 전혀 바뀌지 않는다 — 이 함수는 오직 잔고
+장애 관측 경로 호출부에서만 쓰인다.
 """
 
 from dataclasses import dataclass
@@ -272,3 +285,56 @@ def evaluate_exit_candidate(
             return ExitCandidate(kind="TRAILING", stop_loss=stop_loss, trailing=trailing)
 
     return None
+
+
+def classify_exit_observation_readiness(
+    *,
+    current_price,
+    average_price,
+    price_age_seconds: float | None,
+    max_price_age_seconds: float,
+) -> str:
+    """잔고 장애 관측 경로가 `evaluate_exit_candidate()`를 부르기 전에
+    반드시 먼저 호출해야 하는 입력 검증입니다.
+
+    반환값이 빈 문자열("")이면 입력이 유효하다는 뜻이며, 호출자는
+    이어서 `evaluate_exit_candidate()`를 호출해도 됩니다. 빈 문자열이
+    아니면(무효 사유 문자열) 호출자는 `evaluate_exit_candidate()`를
+    아예 호출하지 말고 "평가 보류 + 이 사유"로만 기록해야 합니다 —
+    `evaluate_exit_candidate()`가 반환하는 `None`("유효한 입력을
+    평가했지만 청산 후보 없음")과 혼동하면 안 됩니다.
+
+    검증 항목(모듈 docstring의 2026-09-15 항목 참고):
+    - `current_price`/`average_price`: 양수이면서 유한값(bool 제외,
+      NaN·inf 제외)이어야 합니다.
+    - `price_age_seconds`: 시세 신선도는 가격 유효성과 별개로 확인합니다.
+      `None`이면(캐시된 시세 자체가 없음) "가격을 알 수 없음"으로,
+      `max_price_age_seconds`를 넘으면 "너무 오래된 시세"로 보류합니다.
+
+    이 함수는 순수 계산입니다 — `datetime.now()` 등 시계를 직접
+    조회하지 않고, 나이(초)를 호출자로부터 미리 계산해 받습니다.
+    기존 정상 전략(`generate_signal()`)들의 무효 입력 처리 정책은
+    이 함수와 무관하게 전혀 바뀌지 않습니다 — 이 함수는 잔고 장애
+    관측 경로에서만 쓰입니다.
+    """
+
+    def _is_positive_finite(value) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value == value  # NaN 방어 (NaN != NaN)
+            and value not in (float("inf"), float("-inf"))
+            and value > 0
+        )
+
+    if not _is_positive_finite(current_price):
+        return "invalid_current_price"
+    if not _is_positive_finite(average_price):
+        return "invalid_average_price"
+    if price_age_seconds is None:
+        return "price_age_unknown"
+    if not isinstance(price_age_seconds, (int, float)) or price_age_seconds != price_age_seconds:
+        return "price_age_unknown"
+    if price_age_seconds > max_price_age_seconds:
+        return "stale_price"
+    return ""
