@@ -107,6 +107,12 @@ CSV_SOURCES: list[tuple[str, tuple[str, ...]]] = [
     # 관여하지 않습니다.
     ("balance_freshness.csv", ("timestamp",)),
     ("delayed_eval_candidate.csv", ("detected_at",)),
+    # 2026-09-15 (180초 감시 공백 대응 3단계, GPT 재검토 5번 지적
+    # 반영): 위와 동일한 이유로 명시 추가하지 않으면 잔고 장애 관측
+    # 로그(exit_candidate_outage.csv)가 실시간으로는 쌓여도 daily
+    # bundle에는 실리지 않아, 장애 발생일 분석에서 핵심 자료가 누락됨.
+    # 순수 관측이며 BUY/SELL/체결 확정 판정에는 관여하지 않음.
+    ("exit_candidate_outage.csv", ("detected_at",)),
 ]
 
 # app.log에서 뽑아낼 태그 — **allowlist 전용**.
