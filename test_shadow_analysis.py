@@ -960,6 +960,45 @@ check("W-6) MANIFEST에 두 파일 모두 OK로 기록됨(SCHEMA_ERROR/MISSING �
       and "SCHEMA_ERROR" not in textsW["MANIFEST.txt"].split("low_upside_shadow.csv")[1].split("\n")[0]
       and "MISSING" not in textsW["MANIFEST.txt"].split("low_upside_shadow.csv")[1].split("\n")[0])
 
+# ══════════════════════════════════════════════════════════════
+# X. exit_candidate_outage.csv가 daily bundle에 포함되는지
+# (2026-09-15, 180초 감시 공백 대응 3단계, GPT 재검토 5번 지적 반영)
+# ══════════════════════════════════════════════════════════════
+# CSV_SOURCES는 명시적 allowlist라 새 CSV를 추가하지 않으면 daily
+# bundle에 실리지 않음 — 최초 3단계 배치본은 이 파일을
+# export_daily_bundle.py에 추가하지 않아, 실시간 관측 로그는 정상
+# 쌓여도 장애 발생일 분석(daily bundle 기준)에서는 핵심 자료가
+# 누락되는 상태였음. end-to-end로 실제 export 경로를 태워 확인한다.
+rootX = Path(tempfile.mkdtemp())
+_mkday(rootX, "exit_candidate_outage.csv",
+       ["detected_at", "symbol", "entry_time", "status", "reason", "regime",
+        "avg_price", "current_price", "highest_price", "price_observed_at",
+        "price_age_seconds", "stop_loss_price", "stop_loss_triggered",
+        "trailing_active", "trail_pct", "trailing_stop_price",
+        "trailing_triggered", "from_high_pct"],
+       [
+           {"detected_at": "2026-08-05T10:00:00", "symbol": "OLDDAY3",
+            "status": "deferred", "reason": "stale_price"},
+           {"detected_at": "2026-08-06T10:00:00", "symbol": "NEWDAY3",
+            "status": "STOP_LOSS", "reason": "", "regime": "NEUTRAL",
+            "avg_price": "10000", "current_price": "9000",
+            "stop_loss_price": "9850", "stop_loss_triggered": "True"},
+       ])
+zX = _run_export(rootX, "2026-08-06")
+textsX = _zip_texts(zX)
+check("X-1) exit_candidate_outage.csv가 raw/에 포함됨",
+      "raw/exit_candidate_outage_20260806.csv" in textsX)
+check("X-2) exit_candidate_outage.csv가 날짜 기준으로 슬라이싱됨(전일 행 제외)",
+      "NEWDAY3" in textsX["raw/exit_candidate_outage_20260806.csv"]
+      and "OLDDAY3" not in textsX["raw/exit_candidate_outage_20260806.csv"])
+check("X-3) exit_candidate_outage.csv에 STOP_LOSS 판정 값이 그대로 보존됨",
+      "STOP_LOSS" in textsX["raw/exit_candidate_outage_20260806.csv"]
+      and "9850" in textsX["raw/exit_candidate_outage_20260806.csv"])
+check("X-4) MANIFEST에 OK로 기록됨(SCHEMA_ERROR/MISSING 아님)",
+      "exit_candidate_outage.csv" in textsX["MANIFEST.txt"]
+      and "SCHEMA_ERROR" not in textsX["MANIFEST.txt"].split("exit_candidate_outage.csv")[1].split("\n")[0]
+      and "MISSING" not in textsX["MANIFEST.txt"].split("exit_candidate_outage.csv")[1].split("\n")[0])
+
 print()
 print(f"[최종] 총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
 if failed:
