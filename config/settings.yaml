@@ -40,6 +40,9 @@ trading:
   # 설정값, 실측 후 조정 대상.
   exit_candidate_outage_max_price_age_seconds: 120
   balance_outage_observe_interval_seconds: 15
+  # 180초 감시 공백 대응 3단계 3차 보완 (2026-09-15) — 초기 설정값,
+  # 실측 후 조정 대상.
+  market_price_retry_backoff_seconds: 60
   order_cash_per_trade: 6000000
   max_positions: 5
   allow_multiple_entries_per_symbol_per_day: false  # 2026-07-21: 1일1회로 재전환.

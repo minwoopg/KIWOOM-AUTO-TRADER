@@ -1033,7 +1033,128 @@ with_cache()` 호출로 스냅샷 확보) → 잔고 429 → 대기 중 가격�
 
 ### 전달 파일
 
-`0009`~`0014` 패치(파일별 세분화 커밋), 관련 파일 전체가 담긴 diff zip.
+`0005`~`0011` 패치(파일별 세분화 커밋 7개 — exit_calc.py 나이 검증,
+trading_service.py 관측 연결 본체, logger.py 주석, export_daily_
+bundle.py CSV 연결, 테스트 2건, 이 CHANGELOG), 관련 파일 전체가
+담긴 diff zip.
+
+---
+
+## 🔧 180초 감시 공백 대응 3단계 2차 보완 — GPT 3차 재검토 3가지 지적 반영 (2026-09-15, 매매 판단 로직 무변경)
+
+### 배경
+
+바로 위 2차 배치(패치 `0005`~`0012`)를 GPT가 세 번째로 재검토했습니다.
+이번엔 "완료 보류" 대신 "핵심 결함은 상당 부분 해결됐으나, 다음 단계로
+넘어가기 전에 다음 세 가지는 보완하는 게 좋겠다"는 판정이었습니다 —
+이 중 1·2번은 "우선 수정"(재현 가능한 실제 결함), 3번은 "검증
+보완"(테스트 문구가 실제 검증 범위보다 넓었던 것)으로 구분해서
+전달받았습니다.
+
+1. **[우선 수정] 시세 조회도 429가 발생하면 계속 재호출** — 관측이
+   재사용하는 `_get_market_price_with_cache()`는 시세 조회 실패에
+   대한 별도 재시도 시각 관리가 없어서, 갱신 주기를 넘긴 캐시는
+   실패 후에도 계속 만료 상태로 남아 다음 관측(예: 15초 뒤)에서 바로
+   다시 조회를 시도했습니다. 재현: 시세 나이 60/75/90초 세 번 모두
+   재호출하며 매번 429. "잔고 API와 시세 API가 독립된 호출 한도를
+   갖는다"는 이전 주석의 주장도 확인된 근거가 없어 삭제 대상으로
+   지적됐습니다.
+2. **[우선 수정] 관측이 느리면 실제 대기시간이 설정값보다 길어짐** —
+   `wait_out_balance_outage()`가 `asyncio.sleep()`한 시간만 `elapsed`
+   에 더하고, 매 구간 시작마다 부르는 동기식 관측(`observe_exit_
+   candidates_during_outage()`) 자체의 소요 시간은 전혀 계산하지
+   않았습니다. 재현: 관측 1회에 20초가 걸리도록 만들면, 설정 45초/
+   간격 15초에서 실제 경과가 105초까지 불어남.
+3. **[검증 보완] 주문 제출 1회는 체결 부수 효과 1회를 증명하지
+   않음** — 3단계 통합 테스트가 "복구 부수 효과의 정확히 1회 적용"을
+   증명했다고 말하는 주석은 실제로는 "복구 직후 SELL 제출 1회
+   확인"까지만 검증한 것이었습니다. 그 이후 체결 확인 과정의 손익·
+   수량 반영, 부분체결/최종체결 처리, 같은 체결 증거가 반복 노출됐을
+   때 중복 반영 방지, 다음 폴링에서 중복 SELL이 없는지는 별도로
+   검증돼야 한다는 지적입니다.
+
+GPT는 "장애 중 주문 제출"과 "운영 최고가 병합 후보"는 계속 비활성으로
+유지하고, 이번 라운드의 상태는 "장애 중 관측 보완"이며 실제 청산
+불가와 잔고 재시도 구조 개선은 여전히 별도 미해결로 남겨 달라고
+명시했습니다 — 이번 배치도 그 범위를 그대로 지킵니다.
+
+### 변경 내용
+
+**1) 시세 조회 실패 백오프 + `price_source` 구분 —
+`domain/service/trading_service.py`, `config/settings.py`/
+`settings.yaml`, `infra/storage/logger.py`**
+
+`_get_market_price_with_cache()`에 종목별 실패 시각(`self._market_
+price_fetch_failed_at`)을 새로 기억시켜, 새 설정
+`market_price_retry_backoff_seconds`(기본 60초, `price_refresh_
+seconds`와 동일한 기본값 — 실패 감지 이후에만 추가로 억제) 동안은
+재조회 주기가 지났어도 재시도 자체를 건너뛰고 기존 캐시를 그대로
+씁니다. 이 백오프는 이 메서드를 부르는 모든 경로(장애 관측·정상
+순회 공통)에 적용됩니다. "잔고 API와 시세 API가 독립된 호출 한도를
+갖는다"던 확인되지 않은 주장은 관련 주석 두 곳에서 모두 삭제했습니다.
+
+호출자가 "새로 조회했는지 / 정상 캐시 재사용인지 / 갱신 실패 후
+대체인지 / 아예 조회 불가인지"를 구분할 수 있도록 `self._market_
+price_fetch_outcome[symbol]`(`fetched`/`cache_fresh`/`cache_after_
+failure`/`unavailable`)을 함께 기록하고, `_observe_exit_candidate_
+for_symbol()`이 이 값을 관측 CSV의 새 컬럼 `price_source`로 그대로
+옮겨 적습니다 — 이전에는 "정상 캐시 재사용"과 "갱신 실패 후 대체"가
+같은 `current_price`로만 보여 CSV만으로 구분이 불가능했습니다.
+
+**2) `wait_out_balance_outage()`의 monotonic 예산 관리 — 동일 파일**
+
+각 관측 호출 앞뒤로 실제 벽시계(`self._monotonic`, 기본은 `time.
+monotonic` — 전역이 아니라 인스턴스 속성으로 감싸, asyncio 이벤트
+루프 내부의 스케줄링 호출까지 테스트의 결정적 시퀀스에 휘말리는 것을
+피했습니다)를 읽어 그 소요 시간을 `elapsed`에 더하고, 다음 sleep
+구간(`chunk`)은 남은 예산(`total_seconds - elapsed`)에서 계산합니다.
+관측이 느려질수록 다음 sleep이 그만큼 줄어들어, 관측 소요시간이
+총 대기 위에 고스란히 얹히지 않습니다. 다만 이미 시작된 동기식 API
+호출 자체를 중간에 취소할 수는 없으므로, "정확히 `total_seconds` 안에
+끝난다"고 보장하지는 않습니다 — 무한정 계속 불어나는 문제만 없앱니다.
+잔고 API 자체의 30/60/120/180초 백오프 재설계는 여전히 이번 범위
+밖입니다(변경 없음).
+
+**3) 통합 테스트 주장 범위 축소 + 반복 폴링 중복 방지 검증 추가 —
+`test_balance_outage_exit_observation.py`**
+
+`TestRunOnceOutageRecoveryIntegration`의 클래스 독스트링과
+`test_429_then_price_drop_during_wait_then_recovers_cleanly`의 인라인
+주석에서 "복구 부수 효과의 정확히 1회 적용을 증명했다"는 표현을
+"복구 직후 SELL 제출 1회 확인까지만 증명한다"로 좁혔습니다(MockBroker
+는 `place_order()` 안에서 즉시·완전 체결시키므로 "체결 확인"이라는
+별도 단계 자체가 없다는 점도 명시). 새 테스트
+`test_recovery_sell_does_not_repeat_on_subsequent_polls`를 추가해,
+이미 손절선 아래인 종목을 복구 경로로 한 번 청산시킨 뒤 `run_once()`
+를 두 번 더 호출해도 같은 SELL이 중복 제출되거나 거래 로그
+(`trade_log.csv`)에 중복 기록되지 않음을 확인합니다(프로덕션 코드는
+바꾸지 않았습니다 — 검증 공백을 메우는 테스트만 추가).
+
+### 검증
+
+- `test_balance_outage_exit_observation.py`: 37/37 통과(신규 8건:
+  백오프 4건, 느린 관측 예산 1건, 반복 폴링 중복방지 1건, `price_
+  source` 구분 1건 — 그리고 기존 `test_total_wait_time_unchanged_
+  and_observes_repeatedly`를 새 monotonic 계약에 맞게 결정적으로
+  갱신).
+- 전체 회귀(`run_regression_tests.py`): 38/39 통과 — 유일한 실패
+  (`test_broker_order_status.py`)는 이전 두 라운드와 동일하게 이번
+  변경과 무관한 기존 fixture 경로 누락(`tests/fixtures/order_
+  reconciliation/`)입니다.
+- `legacy_tests/test_entry_watch.py`: 11/11 통과.
+- 의도적 결함 주입 검증(둘 다 원복 후 재확인 완료): (1) 백오프
+  판정(`in_backoff`)을 항상 `False`로 되돌리면
+  `TestMarketPriceFetchBackoff`의 2건이 즉시 실패(재조회를 억제하지
+  못함), (2) `wait_out_balance_outage()`를 관측 소요시간을 계산에
+  넣지 않던 이전 구현으로 되돌리면
+  `test_slow_observation_shrinks_next_sleep_so_total_wait_does_not_
+  inflate`가 즉시 실패(sleep 3회로 예산 초과).
+
+### 전달 파일
+
+`0013`~`0018` 패치(파일별 세분화 커밋 6개 — settings.py/yaml 새 설정,
+trading_service.py 백오프+monotonic 예산 본체, logger.py 필드 주석,
+테스트 파일, 이 CHANGELOG), 관련 파일 전체가 담긴 diff zip.
 
 ---
 

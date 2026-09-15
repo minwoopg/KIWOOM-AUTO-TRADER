@@ -1267,6 +1267,19 @@ EXIT_CANDIDATE_OUTAGE_FIELDS = [
                               # (이 로그가 갱신·병합하지 않음)
     "price_observed_at",      # 이 current_price가 캐시에 적재된 시각(ISO)
     "price_age_seconds",      # detected_at 기준 price_observed_at의 나이(초)
+    "price_source",           # 2026-09-15 3차 보완(GPT 재검토 1번 지적):
+                              # _get_market_price_with_cache() 호출 직후
+                              # _market_price_fetch_outcome을 그대로 옮긴
+                              # 값 — "fetched"(이번 호출에서 새로 조회
+                              # 성공) / "cache_fresh"(재조회 주기 전, 정상
+                              # 캐시 재사용) / "cache_after_failure"(재조회
+                              # 시도가 실패했거나 백오프 중이라 직전 캐시로
+                              # 대체) / "unavailable"(캐시도 없고 조회도
+                              # 실패, status=deferred/price_fetch_failed와
+                              # 함께 나타남). "정상 캐시 재사용"과 "갱신
+                              # 실패 후 대체"를 CSV만으로 구분하기 위한
+                              # 필드 — 그 전에는 둘 다 같은 current_price로
+                              # 보여 구분이 불가능했다.
     "stop_loss_price",        # status가 STOP_LOSS/TRAILING/no_candidate일 때만
     "stop_loss_triggered",
     "trailing_active",        # 이 전략에 트레일링이 있고(trailing_params()가

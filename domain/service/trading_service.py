@@ -215,6 +215,24 @@ class TradingService:
         self._last_observed_positions: dict[str, "Position"] = {}
         self._last_observed_positions_loaded_at: datetime | None = None
 
+        # 2026-09-15 (180초 감시 공백 대응 3단계 3차 보완 — GPT 재검토
+        # 1번 지적 반영): _get_market_price_with_cache()의 재조회
+        # 실패를 종목별로 기억해, 재조회 주기가 지났다는 이유만으로
+        # 매번 다시 브로커를 호출하지 않도록 합니다(재현: 잔고 장애
+        # 중 15초 관측 간격마다 시세 API도 매번 다시 호출해 429를
+        # 반복 유발). 이 세 딕셔너리는 그 메서드의 모든 호출 경로
+        # (정상 순회 포함)에 공통 적용되는 내부 상태입니다.
+        self._market_price_fetch_failed_at: dict[str, datetime] = {}
+        self._market_price_fetch_last_error: dict[str, str] = {}
+        self._market_price_fetch_outcome: dict[str, str] = {}
+        # wait_out_balance_outage()가 실제 벽시계 경과를 재는 데
+        # 씁니다. 인스턴스 속성으로 감싸 둬야(전역 time.monotonic을
+        # 직접 부르지 않아야) 테스트가 이 인스턴스에만 결정적인 값을
+        # 주입할 수 있고, asyncio 내부(이벤트 루프 스케줄링)가 쓰는
+        # time.monotonic까지 함께 바뀌어 side_effect가 엉뚱하게
+        # 소진되는 사고를 피할 수 있습니다.
+        self._monotonic = time.monotonic
+
         # 일봉 히스토리 캐시
         self.cached_daily_bars: dict[str, list] = {}
         self.cached_daily_bars_loaded_at: dict[str, datetime] = {}
@@ -730,6 +748,21 @@ class TradingService:
         갱신·병합하지 않으며, 잔고 API를 다시 호출하지 않습니다(그러면
         429를 다시 유발할 수 있어 본말전도입니다) — 오직 캐시된 값만
         읽어 관측·기록합니다.
+
+        2026-09-15 3차 보완 (GPT 재검토 2번 지적 반영): 기존 구현은
+        `asyncio.sleep()`한 시간만 `elapsed`에 더했습니다 — 그런데
+        매 구간 시작마다 부르는 `observe_exit_candidates_during_
+        outage()`는 내부에서 `_get_market_price_with_cache()`를 통해
+        동기식으로 실제 브로커 API를 호출할 수 있고, 이게 느려지면
+        (재현: 관측 1회 20초 소요, 설정 45초/간격 15초 → 실제 경과
+        105초) 그 시간이 고스란히 총 대기 위에 더 얹혀 "총 대기시간은
+        `total_seconds`로 보존된다"는 설명이 깨집니다. 이제는
+        `time.monotonic()`으로 각 관측 호출 앞뒤 실제 경과 시간도
+        `elapsed`에 함께 더해, 다음 sleep 구간이 그만큼 줄어들도록
+        합니다. 단, 이미 진행 중인 동기식 API 호출 자체를 중단시킬
+        수는 없으므로(협조적 취소 지점이 없음), "정확히 `total_
+        seconds` 안에 끝난다"고 보장하지는 않습니다 — 관측이 느려질
+        때 대기가 무한정 계속 늘어나며 누적되던 문제를 없앨 뿐입니다.
         """
         if total_seconds is None:
             total_seconds = 180.0
@@ -741,8 +774,14 @@ class TradingService:
 
         elapsed = 0.0
         while elapsed < total_seconds:
+            observe_started_at = self._monotonic()
             self.observe_exit_candidates_during_outage()
-            chunk = min(observe_interval_seconds, total_seconds - elapsed)
+            elapsed += self._monotonic() - observe_started_at
+
+            remaining = total_seconds - elapsed
+            if remaining <= 0:
+                break
+            chunk = min(observe_interval_seconds, remaining)
             await asyncio.sleep(chunk)
             elapsed += chunk
 
@@ -761,11 +800,14 @@ class TradingService:
         - **시세는 매번 갱신을 시도합니다** — `_get_market_price_with_
           cache()`를 그대로 재사용해 `price_refresh_seconds`(정상
           경로와 동일한 주기) 이상 지났으면 실제로 `broker.
-          get_market_price()`를 호출합니다. 이 API는 잔고 API와
-          독립적인 실패·429 상태를 가지므로(구현 지시서 §2 정정),
-          잔고 장애 중에도 계속 새 가격을 확보하려 시도합니다 — 실패
-          하면 그 메서드가 이미 캐시 유지+경고 로그(또는 캐시조차
-          없으면 예외)로 처리합니다.
+          get_market_price()`를 호출합니다. 잔고 API와 시세 API가
+          서로 독립된 호출 한도를 갖는지는 확인된 바 없습니다(이전
+          버전 주석의 그 주장은 근거 없이 삭제) — 다만 시세 API 자체가
+          보이는 실패/429는 그 메서드의 자체 백오프
+          (`market_price_retry_backoff_seconds`, 2026-09-15 3차 보완)로
+          존중하므로, 잔고 장애 중에도 관측 간격마다 무조건 재호출을
+          반복하지는 않습니다 — 실패하면 그 메서드가 이미 캐시
+          유지+경고 로그(또는 캐시조차 없으면 예외)로 처리합니다.
         - 주문을 제출하지 않습니다(place_order 호출 없음).
         - `self._highest_price`를 읽기만 하고 갱신·병합하지 않습니다 —
           "장애 중 최고가 후보의 운영 병합"은 별도 승인 대상으로 아직
@@ -849,11 +891,14 @@ class TradingService:
         # 2026-09-15 보완 (GPT 재검토 1번 지적 반영): 캐시를 그냥 읽지
         # 않고 _get_market_price_with_cache()로 실제 갱신을 시도합니다
         # — 이 메서드는 price_refresh_seconds가 지났을 때만 실제로
-        # broker.get_market_price()를 호출하고(잔고 API와 독립된 별도
-        # 호출 한도), 실패해도 기존 캐시로 안전하게 대체하며 그 자체를
-        # 경고 로그로 남깁니다(정상 경로와 동일한 계약, 새로 만들지
-        # 않음). 캐시가 아예 없고 이 첫 시도마저 실패하면 예외를
-        # 올리므로 여기서 받아 "평가 보류"로 남깁니다.
+        # broker.get_market_price()를 호출하고, 실패해도 기존 캐시로
+        # 안전하게 대체하며 그 자체를 경고 로그로 남깁니다(정상 경로와
+        # 동일한 계약, 새로 만들지 않음). 캐시가 아예 없고 이 첫 시도
+        # 마저 실패하면 예외를 올리므로 여기서 받아 "평가 보류"로
+        # 남깁니다. 3차 보완(GPT 재검토 1번 지적)부터는 이 호출 직후
+        # `_market_price_fetch_outcome[symbol]`을 읽어 "새로 조회함 /
+        # 정상 캐시 재사용 / 갱신 실패 후 캐시 사용 / 조회 불가" 중
+        # 어느 것이었는지를 `price_source`로 함께 기록합니다.
         try:
             market_price = self._get_market_price_with_cache(symbol)
         except Exception as exc:
@@ -862,8 +907,11 @@ class TradingService:
             row["current_price"] = ""
             row["price_observed_at"] = ""
             row["price_age_seconds"] = ""
+            row["price_source"] = self._market_price_fetch_outcome.get(symbol, "unavailable")
             self.exit_candidate_outage_logger.append(row)
             return
+
+        row["price_source"] = self._market_price_fetch_outcome.get(symbol, "")
 
         current_price = getattr(market_price, "current_price", None)
         loaded_at = self.cached_market_price_loaded_at.get(symbol)
@@ -949,25 +997,67 @@ class TradingService:
         추가 개선:
         - API 호출 실패 시, 기존 캐시가 있으면 그 값을 그대로 사용합니다.
         - 기존 캐시도 없을 때만 예외를 다시 올립니다.
+
+        2026-09-15 (180초 감시 공백 대응 3단계 3차 보완, GPT 재검토
+        1번 지적 반영): 재조회 주기(`price_refresh_seconds`)가
+        지났다는 이유만으로 실패한 지 얼마 안 된 상태에서 매번 다시
+        브로커를 호출하면, 429 등 장애 중에는 관측 간격(예: 15초)마다
+        그대로 재호출을 반복하게 됩니다(재현: 시세 나이 60/75/90초
+        세 번 모두 재호출하며 매번 429). 그래서 실패 시각을 별도로
+        기억해 `market_price_retry_backoff_seconds` 동안은 재시도
+        자체를 건너뛰고 캐시를 그대로 씁니다. 이 백오프는 이 메서드를
+        호출하는 모든 경로(장애 관측·정상 순회 공통)에 적용됩니다.
+
+        잔고 API와 시세 API가 정말로 서로 독립된 호출 한도를 갖는지는
+        확인된 바 없습니다 — 이전 버전 주석의 그 주장은 근거 없이
+        삭제합니다. 이 메서드가 하는 일은 시세 API 자체가 보이는
+        실패/429를 존중해 불필요한 재시도를 줄이는 것뿐입니다.
+
+        호출자가 "새로 조회했는지 / 캐시를 재사용했는지 / 실패 후
+        캐시로 대체했는지"를 구분해야 할 때(예: 장애 중 관측 로그)는
+        이 메서드 호출 직후 `self._market_price_fetch_outcome[symbol]`
+        을 읽습니다 — "fetched" / "cache_fresh" / "cache_after_failure"
+        중 하나이며, 예외가 올라간 경우는 "unavailable"로 남습니다.
         """
         now = datetime.now()
 
         cached_price = self.cached_market_prices.get(symbol)
         cached_loaded_at = self.cached_market_price_loaded_at.get(symbol)
+        failed_at = self._market_price_fetch_failed_at.get(symbol)
+        backoff_seconds = self.settings.trading.market_price_retry_backoff_seconds
+        in_backoff = failed_at is not None and (now - failed_at).total_seconds() < backoff_seconds
 
-        # 아직 한 번도 조회하지 않았다면 즉시 API 호출
+        def _fetch_and_record():
+            market_price = self.broker.get_market_price(symbol)
+            self.cached_market_prices[symbol] = market_price
+            self.cached_market_price_loaded_at[symbol] = now
+            self._market_price_fetch_failed_at.pop(symbol, None)
+            self._market_price_fetch_last_error.pop(symbol, None)
+            self._market_price_fetch_outcome[symbol] = "fetched"
+
+            self.app_logger.info(
+                "market price loaded from api",
+                extra={"symbol": symbol, "current_price": market_price.current_price},
+            )
+            return market_price
+
+        # 아직 한 번도 조회하지 않았다면 즉시 API 호출을 시도합니다 —
+        # 단, 직전 실패의 백오프 기간 안이면(대체할 캐시도 없으므로)
+        # 호출 자체를 건너뛰고 "조회 불가"로 처리합니다.
         if cached_price is None or cached_loaded_at is None:
-            try:
-                market_price = self.broker.get_market_price(symbol)
-                self.cached_market_prices[symbol] = market_price
-                self.cached_market_price_loaded_at[symbol] = now
-
-                self.app_logger.info(
-                    "market price loaded from api",
-                    extra={"symbol": symbol, "current_price": market_price.current_price},
+            if in_backoff:
+                self._market_price_fetch_outcome[symbol] = "unavailable"
+                last_error = self._market_price_fetch_last_error.get(symbol, "알 수 없음")
+                raise RuntimeError(
+                    f"{symbol}: 현재가 조회 재시도 대기 중(backoff {backoff_seconds}초) — "
+                    f"대체할 캐시가 없습니다. 직전 실패: {last_error}"
                 )
-                return market_price
+            try:
+                return _fetch_and_record()
             except Exception as exc:
+                self._market_price_fetch_failed_at[symbol] = now
+                self._market_price_fetch_last_error[symbol] = f"{type(exc).__name__}: {exc}"
+                self._market_price_fetch_outcome[symbol] = "unavailable"
                 self.app_logger.warning(
                     f"[WARN ] {symbol} | 현재가 조회에 실패했고 사용할 캐시도 없습니다. 사유: {exc}"
                 )
@@ -975,30 +1065,35 @@ class TradingService:
 
         elapsed = (now - cached_loaded_at).total_seconds()
 
-        # 설정한 주기 이상 지났으면 다시 API 호출 시도
-        if elapsed >= self.settings.trading.price_refresh_seconds:
-            try:
-                market_price = self.broker.get_market_price(symbol)
-                self.cached_market_prices[symbol] = market_price
-                self.cached_market_price_loaded_at[symbol] = now
+        # 아직 주기가 안 지났으면 캐시값 재사용(정상 스로틀 — 실패
+        # 여부와 무관).
+        if elapsed < self.settings.trading.price_refresh_seconds:
+            self.app_logger.debug("market price loaded from cache")
+            self._market_price_fetch_outcome[symbol] = "cache_fresh"
+            return cached_price
 
-                self.app_logger.info(
-                    "market price loaded from api",
-                    extra={"symbol": symbol, "current_price": market_price.current_price},
-                )
-                return market_price
-            except Exception as exc:  
-                # API 실패 시 기존 캐시를 유지하고 판단은 계속 진행
-                self.app_logger.warning(
-                    f"[WARN ] {symbol} | 현재가 재조회에 실패하여 직전 캐시값을 사용합니다. 사유: {exc}"
-                )
-                return cached_price
+        # 재조회 주기는 지났지만 백오프 중이면, 재시도를 건너뛰고
+        # 기존 캐시를 "실패 후 대체" 상태로 재사용합니다.
+        if in_backoff:
+            self.app_logger.debug(
+                f"[WARN ] {symbol} | 현재가 재조회 백오프 중이라 재시도를 건너뛰고 "
+                f"직전 캐시값을 사용합니다({backoff_seconds}초 백오프)."
+            )
+            self._market_price_fetch_outcome[symbol] = "cache_after_failure"
+            return cached_price
 
-        # 아직 주기가 안 지났으면 캐시값 재사용
-        self.app_logger.debug(
-            "market price loaded from cache",
-        )
-        return cached_price
+        # 백오프가 끝났으면 다시 API 호출 시도
+        try:
+            return _fetch_and_record()
+        except Exception as exc:
+            # API 실패 시 기존 캐시를 유지하고 판단은 계속 진행
+            self._market_price_fetch_failed_at[symbol] = now
+            self._market_price_fetch_last_error[symbol] = f"{type(exc).__name__}: {exc}"
+            self._market_price_fetch_outcome[symbol] = "cache_after_failure"
+            self.app_logger.warning(
+                f"[WARN ] {symbol} | 현재가 재조회에 실패하여 직전 캐시값을 사용합니다. 사유: {exc}"
+            )
+            return cached_price
 
     def _log_regime_if_changed(self, symbol: str, label: str, reason: str) -> None:
         """[REGIME] 로그를 라벨 변경 시 + 5분 하트비트로만 남깁니다.

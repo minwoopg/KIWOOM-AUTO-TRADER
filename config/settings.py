@@ -71,6 +71,16 @@ class TradingConfig:
     # 간격으로 쪼개 관측 기회를 유지할 뿐이다. 초기 설정값이며, 실측
     # 후 조정 대상.
     balance_outage_observe_interval_seconds: float = 15.0
+    # 2026-09-15 (180초 감시 공백 대응 3단계 3차 보완 — GPT 재검토
+    # 1번 지적 반영): _get_market_price_with_cache()가 시세 재조회에
+    # 실패한 뒤, 같은 종목에 대해 다시 브로커를 호출하기 전 최소한
+    # 기다리는 시간(초). 이게 없으면 잔고 장애 재시도 대기 중
+    # 관측 간격(예: 15초)마다 시세 API를 계속 재호출해 429를 반복
+    # 유발한다(재현: 60/75/90초 세 번 모두 재호출·429). price_refresh_
+    # seconds(기본 60)와 같은 기본값을 둬 기존 재조회 빈도 자체는
+    # 바꾸지 않되, 실패가 감지된 이후에만 추가로 억제한다. 초기
+    # 설정값이며, 실측 후 조정 대상.
+    market_price_retry_backoff_seconds: float = 60.0
 
     def __post_init__(self):
         # frozen=True dataclass라 self.x = ... 직접 대입은 FrozenInstanceError.
