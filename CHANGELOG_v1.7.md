@@ -1033,7 +1033,10 @@ with_cache()` 호출로 스냅샷 확보) → 잔고 429 → 대기 중 가격�
 
 ### 전달 파일
 
-`0009`~`0014` 패치(파일별 세분화 커밋), 관련 파일 전체가 담긴 diff zip.
+`0005`~`0011` 패치(파일별 세분화 커밋 7개 — exit_calc.py 나이 검증,
+trading_service.py 관측 연결 본체, logger.py 주석, export_daily_
+bundle.py CSV 연결, 테스트 2건, 이 CHANGELOG), 관련 파일 전체가
+담긴 diff zip.
 
 ---
 
