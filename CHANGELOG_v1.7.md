@@ -932,4 +932,109 @@ observation.py`의 `ResourceWarning`(아래 4번 참고)도 함께 제거해
 
 ---
 
+## 🔧 180초 감시 공백 대응 3단계 보완 — GPT 재검토 5가지 지적 반영 (2026-09-15, 매매 판단 로직 무변경)
+
+### 배경
+
+바로 위 3단계 최초 배치본을 GPT가 재검토한 결과, 테스트는 통과했지만
+실제로는 "잔고 장애 중 새로운 시세 관측"이 아니라 "180초 동안 기존
+캐시를 반복 평가"하는 구현으로 범위가 바뀌어 있었습니다. 재현된 5가지
+결함: (1) 대기 중 실제 시세 API 호출이 0건 — 매 구간 같은 캐시값만
+재평가, (2) 주문 접수 직후 `cached_balance`가 `None`으로 비워지면
+관측 기록이 통째로 0건, (3) `price_age_seconds`에 음수·`-inf`·`bool`이
+들어와도 "유효"로 통과, (4) 통합 테스트가 sleep을 무력화만 하고 시간·
+가격 변화를 전혀 검증 못 함, (5) 새 CSV가 daily bundle export 목록에
+빠짐. "이번에는 테스트 통과와 요구사항 충족을 구분해야 한다"는 지적에
+따라 다섯 가지를 모두 프로덕션 코드와 테스트 양쪽에서 고쳤습니다.
+
+### 변경 내용
+
+**1) 잔고 재시도 스케줄과 시세 관측 분리 — `domain/service/trading_service.py`**
+
+`_observe_exit_candidate_for_symbol()`이 캐시를 그냥 읽지 않고
+기존 `_get_market_price_with_cache()`를 그대로 재사용하도록
+바꿨습니다. 이 메서드는 잔고 API와 완전히 독립된 자체 실패·429
+처리를 이미 갖고 있어(주기 경과 시 실제 조회, 실패 시 캐시 폴백 +
+경고 로그, 캐시조차 없으면 예외) 새 코드 없이 "장애 중에도 시세는
+계속 갱신을 시도한다"는 요구사항을 만족합니다. 조회 자체가 실패하고
+대체할 캐시도 없으면 새 사유 `price_fetch_failed`로 평가 보류
+처리합니다. 잔고 API(`get_account_balance`)는 여전히 대기 중 한 번도
+재호출하지 않습니다(429 재유발 방지, 기존 원칙 유지).
+
+**2) 주문 접수 직후 캐시 무효화와 무관한 관측 스냅샷 — 동일 파일**
+
+`self.cached_balance = None`은 매수/매도 주문 접수 시 기존 정책대로
+계속 발생합니다(다음 폴링에 최신 잔고를 강제하기 위함, 변경 없음).
+새로 추가한 `self._last_observed_positions`는 `_get_balance_with_
+cache()`의 세 성공 경로 모두에서 `_update_last_observed_positions()`
+로 채워지는 별도의 "관측 전용" 스냅샷으로, 저 무효화의 영향을 받지
+않습니다. 감시 대상 종목도 이 스냅샷뿐 아니라 `entry_time_by_symbol`
+/`unresolved_order_intents`/`PositionStateMachine`의 OPEN·
+BUY_PENDING·SELL_PENDING 상태까지 합쳐 `_symbols_needing_outage_
+observation()`으로 넓혔습니다. 스냅샷에 없는(평단을 모르는) 종목은
+계산을 지어내지 않고 새 사유 `position_unconfirmed`로만 기록합니다.
+이 스냅샷은 체결 확정이나 수량 판정에는 전혀 쓰이지 않습니다 — 그러면
+2026-09-14에 이미 되돌렸던 "스테일 수량이 체결 확인으로 오인되는"
+위험을 다시 들여오게 되기 때문입니다.
+
+**3) 음수·무한대·bool 시세 나이 검증 — `domain/strategy/exit_calc.py`**
+
+`classify_exit_observation_readiness()`의 나이 검증을 `_is_valid_age()`
+로 강화해, 시스템 시계가 뒤로 보정될 때(NTP 등) 발생할 수 있는 음수
+나이와 `-inf`, `bool`을 새 사유 `invalid_price_age`로 명시 거부합니다
+(재현: 기존 구현은 `-60`/`-inf`/`True`가 모두 "유효"를 반환했습니다).
+이 검증을 엄격히 만드는 과정에서, `_observe_exit_candidate_for_
+symbol()`이 시세 조회 **전**에 미리 떠 둔 시각을 나이 계산에 그대로
+쓰다가 "방금 새로 조회에 성공한" 케이스에서 아주 작은 음수 나이가
+나오는 실제 버그도 함께 발견해 고쳤습니다(나이는 반드시 조회 성공
+**이후** 시각을 기준으로 재계산).
+
+**4) daily bundle export에 새 CSV 연결 — `export_daily_bundle.py`**
+
+`CSV_SOURCES` allowlist에 `("exit_candidate_outage.csv",
+("detected_at",))`를 추가했습니다. 이전과 동일한 이유로, 여기 명시
+추가하지 않으면 실시간 로그는 정상 쌓여도 daily bundle에는 실리지
+않아 장애 발생일 분석에서 핵심 자료가 누락됩니다.
+
+**5) 통합 테스트를 실제 시간 전진·가격 변화로 재작성 —
+`test_balance_outage_exit_observation.py`**
+
+`_FrozenDateTime`(`datetime.now()`만 오버라이드하는 가짜 시계)을
+도입해, `asyncio.sleep` mock이 실제로 시간을 전진시키도록 했습니다.
+`TestRunOnceOutageRecoveryIntegration`을 두 시나리오로 재작성했습니다:
+(a) 정상 보유(실제 `_get_balance_with_cache()`/`_get_market_price_
+with_cache()` 호출로 스냅샷 확보) → 잔고 429 → 대기 중 가격을 손절선
+아래로 하락 → `price_refresh_seconds` 경과 후 세 번째 관측에서 실제로
+새 가격(하락분)을 포착해 STOP_LOSS로 기록 → 대기 중 주문 0건 →
+잔고 복구 → 복구된 정상 경로가 미뤄졌던 손절을 **정확히 한 번**
+매도로 처리(그 결과 `cached_balance`가 기존 정책대로 다시 비워짐)
+까지 하나의 `place_order` 추적 mock으로 전체를 감싸 검증합니다.
+(b) 주문 접수 직후 캐시가 비어도 스냅샷·로컬 상태가 있으면 관측이
+0건이 되지 않는다는 별도 시나리오. 기존 23개 테스트 중 8개는 새
+동작(적극적 시세 재조회, 스냅샷 기반 감시 대상 결정)에 맞게 함께
+고쳤고, `invalid_price_age`/`price_fetch_failed`/`position_unconfirmed`
+각각의 전용 회귀 테스트를 새로 추가했습니다. `export_daily_bundle.py`
+의 CSV 연결도 `test_shadow_analysis.py`에 end-to-end 테스트(X절)로
+확인합니다.
+
+### 검증
+
+- `test_balance_outage_exit_observation.py`: 31/31 통과(신규 7건 포함).
+- `test_shadow_analysis.py`: 189/189 통과(신규 4건 포함, X절).
+- 전체 회귀(`run_regression_tests.py`): 38/39 통과 — 유일한 실패
+  (`test_broker_order_status.py`)는 이번 변경과 무관한 기존 fixture
+  경로 누락(이 스크래치 클론에 `tests/fixtures/order_reconciliation/`
+  디렉터리 자체가 없음)입니다.
+- `legacy_tests/test_entry_watch.py`: 11/11 통과.
+- 의도적 결함 주입 검증: (1) 시세를 능동 재조회하지 않고 캐시만 읽게
+  되돌리면 관련 테스트 2건이 즉시 실패, (2) 감시 대상 결정을 다시
+  `cached_balance` 하나로 좁히면 관련 테스트 9건이 즉시 실패 — 두
+  경우 모두 원복 후 재확인해 정상 통과.
+
+### 전달 파일
+
+`0009`~`0014` 패치(파일별 세분화 커밋), 관련 파일 전체가 담긴 diff zip.
+
+---
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
