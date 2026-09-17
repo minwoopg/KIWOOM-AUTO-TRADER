@@ -568,13 +568,28 @@ class TestMarketPriceFetchBackoff(unittest.TestCase):
     호출했다 — 관측 간격(15초)마다 반복해서 429를 유발(재현: 시세
     나이 60/75/90초 세 번 모두 재호출·429). 이제는 실패 시각을
     기억해 `market_price_retry_backoff_seconds` 동안 재시도 자체를
-    건너뛰어야 한다."""
+    건너뛰어야 한다.
+
+    2026-09-15 4차 보완 (GPT 재검토 2번 지적 반영): 백오프 게이트가
+    monotonic(`svc._monotonic`) 기준으로 바뀌었으므로, 이 클래스의
+    모든 테스트는 `_FrozenDateTime`(캐시 나이·로그 타임스탬프용)과는
+    별도로 `clock` 딕셔너리로 가짜 monotonic 시계를 함께 제어한다 —
+    `_FrozenDateTime.advance(N)`을 호출할 때마다 `clock["t"] += N`도
+    함께 해 두 시계를 같은 속도로 전진시킨다(둘을 일부러 어긋나게
+    만드는 시스템 시계 점프 테스트는 아래 별도 테스트로 분리).
+    """
 
     def test_repeated_failures_within_backoff_do_not_retry_broker(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             svc = _make_service(tmpdir)
             symbol = "005930"
             frozen_start = _FrozenDateTime(2026, 9, 15, 10, 0, 0)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
+
+            def _advance(seconds):
+                _FrozenDateTime.advance(seconds)
+                clock["t"] += seconds
 
             with mock.patch("domain.service.trading_service.datetime", _FrozenDateTime):
                 _FrozenDateTime.set_now(frozen_start)
@@ -604,17 +619,17 @@ class TestMarketPriceFetchBackoff(unittest.TestCase):
                     # (기본 60초) 안이므로, 재조회 주기는 다시 지났어도
                     # 브로커를 또 호출하면 안 된다(재현: 기존엔 매번
                     # 호출·429).
-                    _FrozenDateTime.advance(15)
+                    _advance(15)
                     price2 = svc._get_market_price_with_cache(symbol)
                     self.assertEqual(call_count["n"], 1, "백오프 중에는 재조회를 시도하면 안 됩니다.")
                     self.assertEqual(svc._market_price_fetch_outcome[symbol], "cache_after_failure")
 
-                    _FrozenDateTime.advance(15)
+                    _advance(15)
                     price3 = svc._get_market_price_with_cache(symbol)
                     self.assertEqual(call_count["n"], 1, "백오프 중에는 재조회를 시도하면 안 됩니다.")
 
                     # 백오프(60초)가 지나면 다시 시도해야 한다.
-                    _FrozenDateTime.advance(40)  # 누적 70초 경과
+                    _advance(40)  # 누적 70초 경과
                     svc._get_market_price_with_cache(symbol)
                     self.assertEqual(call_count["n"], 2, "백오프가 끝나면 다시 재시도해야 합니다.")
 
@@ -627,6 +642,8 @@ class TestMarketPriceFetchBackoff(unittest.TestCase):
             svc = _make_service(tmpdir)
             symbol = "005930"
             frozen_start = _FrozenDateTime(2026, 9, 15, 10, 0, 0)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
 
             with mock.patch("domain.service.trading_service.datetime", _FrozenDateTime):
                 _FrozenDateTime.set_now(frozen_start)
@@ -643,6 +660,7 @@ class TestMarketPriceFetchBackoff(unittest.TestCase):
                     self.assertEqual(svc._market_price_fetch_outcome[symbol], "unavailable")
 
                     _FrozenDateTime.advance(15)
+                    clock["t"] += 15
                     with self.assertRaises(Exception):
                         svc._get_market_price_with_cache(symbol)
                     self.assertEqual(call_count["n"], 1, "백오프 중에는 캐시가 없어도 재호출하면 안 됩니다.")
@@ -652,6 +670,8 @@ class TestMarketPriceFetchBackoff(unittest.TestCase):
             svc = _make_service(tmpdir)
             symbol = "005930"
             frozen_start = _FrozenDateTime(2026, 9, 15, 10, 0, 0)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
 
             with mock.patch("domain.service.trading_service.datetime", _FrozenDateTime):
                 _FrozenDateTime.set_now(frozen_start)
@@ -668,9 +688,109 @@ class TestMarketPriceFetchBackoff(unittest.TestCase):
                 _FrozenDateTime.advance(
                     svc.settings.trading.market_price_retry_backoff_seconds + 1
                 )
+                clock["t"] += svc.settings.trading.market_price_retry_backoff_seconds + 1
                 price = svc._get_market_price_with_cache(symbol)
                 self.assertEqual(svc._market_price_fetch_outcome[symbol], "fetched")
                 self.assertNotIn(symbol, svc._market_price_fetch_failed_at)
+                self.assertNotIn(symbol, svc._market_price_fetch_next_retry_at)
+
+    def test_slow_failure_schedules_retry_from_when_failure_was_caught(self):
+        """GPT 4차 재검토 2번 지적("우선 수정") 재현: 조회 자체가
+        느리게(예: 10초) 실패하면, 3차 보완은 그 호출을 "시작한
+        시점"을 실패 시각으로 기록해 백오프가 그만큼 짧아졌다(재현:
+        10초 걸려 실패 → 그 실패 이후 50초만 지나도 재시도 허용,
+        설정 60초보다 짧음). 이제는 실패를 "잡은 시점"(느린 호출이
+        실제로 끝난 뒤) 기준으로 monotonic 재시도 허용 시각을
+        예약해야 한다."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = _make_service(tmpdir)
+            symbol = "005930"
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
+            backoff = svc.settings.trading.market_price_retry_backoff_seconds
+
+            call_count = {"n": 0}
+
+            def _slow_429(_symbol):
+                call_count["n"] += 1
+                clock["t"] += 10  # 조회 자체가 10초 걸림을 재현
+                raise _make_429_error()
+
+            with mock.patch.object(svc.broker, "get_market_price", side_effect=_slow_429):
+                # 호출 시작 시각 t=0, 실패를 "잡는" 시각은 10초 뒤인 t=10.
+                with self.assertRaises(Exception):
+                    svc._get_market_price_with_cache(symbol)
+                self.assertEqual(call_count["n"], 1)
+
+                # 실패를 잡은 시점(10) 기준으로 backoff가 아직 안
+                # 끝난 시각(호출 시작 기준으로는 10+backoff-1) —
+                # 재시도가 허용되면 안 된다. 이전 버그(호출 시작 시점
+                # 기준)라면 여기서 이미 backoff가 끝난 것으로 오판된다
+                # (0+backoff-1 < 10+backoff-1).
+                clock["t"] = 10 + backoff - 1
+                with self.assertRaises(Exception):
+                    svc._get_market_price_with_cache(symbol)
+                self.assertEqual(
+                    call_count["n"], 1,
+                    "실패를 '잡은 시점'(호출 시작이 아니라) 기준으로 아직 백오프가 끝나지 않았습니다.",
+                )
+
+                # 실패를 잡은 시점으로부터 정확히 backoff가 지나면 허용.
+                clock["t"] = 10 + backoff + 1
+                with self.assertRaises(Exception):
+                    svc._get_market_price_with_cache(symbol)
+                self.assertEqual(
+                    call_count["n"], 2,
+                    "실패를 잡은 시점 기준으로 백오프가 끝나면 재시도해야 합니다.",
+                )
+
+    def test_system_clock_jump_does_not_affect_backoff_duration(self):
+        """GPT 4차 재검토 2번 지적("우선 수정") 재현: 시스템 시각
+        (`datetime.now()`)을 5분 뒤로 조정해도(NTP 보정 등), monotonic
+        기준 백오프는 그 영향을 받으면 안 된다 — 3차 보완은 `datetime.
+        now()`로 실패 시각을 기록해 이 재현에서 백오프가 원치 않게
+        끝나거나 반대로 끝나지 않을 수 있었다."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = _make_service(tmpdir)
+            symbol = "005930"
+            frozen_start = _FrozenDateTime(2026, 9, 15, 10, 0, 0)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
+            backoff = svc.settings.trading.market_price_retry_backoff_seconds
+
+            with mock.patch("domain.service.trading_service.datetime", _FrozenDateTime):
+                _FrozenDateTime.set_now(frozen_start)
+                call_count = {"n": 0}
+
+                def _always_429(_symbol):
+                    call_count["n"] += 1
+                    raise _make_429_error()
+
+                with mock.patch.object(svc.broker, "get_market_price", side_effect=_always_429):
+                    with self.assertRaises(Exception):
+                        svc._get_market_price_with_cache(symbol)
+                    self.assertEqual(call_count["n"], 1)
+
+                    # 시스템 시계만 5분 앞으로 훌쩍 이동(NTP 보정 재현)
+                    # — monotonic 시계(clock)는 전혀 흐르지 않았으므로
+                    # 백오프는 여전히 유효해야 한다.
+                    _FrozenDateTime.set_now(frozen_start + timedelta(minutes=5))
+                    with self.assertRaises(Exception):
+                        svc._get_market_price_with_cache(symbol)
+                    self.assertEqual(
+                        call_count["n"], 1,
+                        "시스템 시계가 앞으로 튀어도 monotonic 백오프는 영향받으면 안 됩니다.",
+                    )
+
+                    # monotonic 시계를 실제로 backoff만큼 전진시키면
+                    # (시스템 시계는 그대로 둔 채) 재시도가 허용돼야 한다.
+                    clock["t"] += backoff + 1
+                    with self.assertRaises(Exception):
+                        svc._get_market_price_with_cache(symbol)
+                    self.assertEqual(
+                        call_count["n"], 2,
+                        "monotonic 시계가 충분히 흐르면 시스템 시계와 무관하게 재시도해야 합니다.",
+                    )
 
     def test_price_source_distinguishes_fresh_cache_from_failure_fallback(self):
         """관측 CSV의 `price_source` 필드가 "정상 캐시 재사용
@@ -681,6 +801,8 @@ class TestMarketPriceFetchBackoff(unittest.TestCase):
             svc = _make_service(tmpdir)
             symbol = "005930"
             frozen_start = _FrozenDateTime(2026, 9, 15, 10, 0, 0)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
 
             with mock.patch("domain.service.trading_service.datetime", _FrozenDateTime):
                 _FrozenDateTime.set_now(frozen_start)
@@ -699,6 +821,7 @@ class TestMarketPriceFetchBackoff(unittest.TestCase):
 
                 # 2) 재조회 주기가 지나고 재조회가 실패 — 실패 후 대체.
                 _FrozenDateTime.advance(61)
+                clock["t"] += 61
                 with mock.patch.object(
                     svc.broker, "get_market_price", side_effect=_make_429_error(),
                 ):
@@ -713,138 +836,274 @@ class TestMarketPriceFetchBackoff(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────
 # 3. wait_out_balance_outage() — 반복 관측 + 총 대기시간 보존
 # ─────────────────────────────────────────────────────────────────
-class TestWaitOutBalanceOutage(unittest.TestCase):
+class TestBalanceOutageRetry(unittest.TestCase):
+    """독립 잔고 재시도 설계 (2026-09-15, GPT 재검토 반영) — 잔고 API
+    장애를 하나의 긴 블로킹 함수(구 `wait_out_balance_outage()`, 이번에
+    제거)가 아니라, `trading_loop()`가 매 폴링마다 짧게 호출하는
+    `enter_balance_outage()`/`handle_balance_outage_tick()`으로 독립
+    재시도한다. 구 `wait_out_balance_outage()`의 문제점 — (1) 180초
+    동안 한 번도 반환하지 않아 장 종료·날짜변경 감지를 막았고, (2)
+    잔고 API를 전혀 재시도하지 않아 실제 재시도 간격이 사실상 총
+    대기시간(180초) 그 자체였음 — 은 새 설계의 독스트링(trading_
+    service.py)에 정리돼 있다. 여기서는 새 메커니즘 자체를 검증한다.
+    trading_loop() 레벨(다른 API의 429 구분, 장 종료·취소 처리가
+    막히지 않음)은 test_review_safety_regressions.py가 별도로
+    검증한다.
+    """
 
-    def test_total_wait_time_unchanged_and_observes_repeatedly(self):
-        """총 대기시간(기존 180초 상당)은 그대로 유지하되, 그 안에서
-        여러 번 관측 기회가 있어야 합니다 — "재시도 대기 중 관측은
-        지속한다"는 요구사항의 핵심 검증.
-
-        2026-09-15 보완 (GPT 재검토 4번 지적 반영): `asyncio.sleep`을
-        단순히 무력화만 하지 않고, 그 mock 자체가 `_FrozenDateTime`을
-        실제로 전진시켜 매 구간 관측의 `price_age_seconds`가 진짜
-        경과 시간을 반영하는지까지 확인합니다 — 이전 테스트는 시간이
-        전혀 흐르지 않아 "같은 캐시를 반복 평가"하는 결함도 통과시켰을
-        것입니다.
-
-        2026-09-15 3차 보완 (GPT 재검토 2번 지적 반영): `wait_out_
-        balance_outage()`가 이제 각 관측 호출 앞뒤로 실제 벽시계
-        (`self._monotonic`, 기본은 `time.monotonic`)를 읽어 그 소요
-        시간도 예산에 반영한다 — 이 테스트의 관측 자체는 실제로도
-        매우 빠르지만(메모리 연산 + 파일 I/O 몇 바이트) 0은 아니므로,
-        그 미세한 실제 소요까지 `elapsed`에 더해지면 40.0과의 비교가
-        기존처럼 딱 떨어지지 않는다. 이 테스트가 검증하려는 것은
-        "관측이 사실상 즉시 끝나는 정상적인 경우, 총 sleep은 여전히
-        40초 그대로"이므로 `svc._monotonic`을 항상 같은 값을
-        반환하도록 고정해(관측 소요 0으로 취급) 그 취지를 그대로
-        유지한다(전역 `time.monotonic`이 아니라 이 인스턴스의 속성만
-        바꿔치기 — asyncio 이벤트 루프 내부도 `time.monotonic`을 쓰므로
-        전역을 건드리면 무관한 호출까지 영향을 받는다). "관측이 실제로
-        느릴 때" 시나리오는 바로 아래
-        `test_slow_observation_shrinks_next_sleep_so_total_wait_does_not_inflate`가
-        별도로 검증한다.
-        """
+    def test_enter_balance_outage_schedules_initial_backoff_and_immediate_observe(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             svc = _make_service(tmpdir)
-            symbol = "005930"
-            frozen_start = _FrozenDateTime(2026, 9, 15, 10, 0, 0)
-            svc._monotonic = lambda: 0.0
+            clock = {"t": 100.0}
+            svc._monotonic = lambda: clock["t"]
 
-            with mock.patch("domain.service.trading_service.datetime", _FrozenDateTime):
-                _FrozenDateTime.set_now(frozen_start)
-                svc._last_observed_positions[symbol] = Position(
-                    symbol=symbol, quantity=10, average_price=10000,
-                )
-                svc.cached_market_prices[symbol] = MarketPrice(
-                    symbol=symbol, current_price=10500, reference_price=10000,
-                    previous_close=9800, timestamp=frozen_start,
-                )
-                svc.cached_market_price_loaded_at[symbol] = frozen_start
-                svc.cached_regime[symbol] = MarketRegime.NEUTRAL
+            svc.enter_balance_outage()
 
-                slept_seconds = []
-
-                async def _fake_sleep(seconds):
-                    slept_seconds.append(seconds)
-                    _FrozenDateTime.advance(seconds)
-
-                with mock.patch("asyncio.sleep", side_effect=_fake_sleep):
-                    asyncio.run(
-                        svc.wait_out_balance_outage(total_seconds=40, observe_interval_seconds=15)
-                    )
-
-            self.assertAlmostEqual(sum(slept_seconds), 40.0)
-            self.assertEqual(slept_seconds, [15, 15, 10])
-
-            rows = _read_csv_rows(svc.settings.storage.exit_candidate_outage_log_file)
-            # 15초 간격 x 3구간(15,15,10) = 관측 3회
-            self.assertEqual(len(rows), 3, "매 구간 시작마다 관측이 한 번씩 있어야 합니다.")
-            # price_refresh_seconds(테스트 설정 60초)를 아직 넘지 않았으므로
-            # 캐시 자체는 재사용되지만(정상 스로틀), 나이는 가짜 시계가
-            # 전진한 만큼 0 → 15 → 30으로 실제 경과를 반영해야 합니다 —
-            # 매번 같은 나이라면 "시간이 전혀 흐르지 않은 반복 평가"라는
-            # 이번 재검토의 핵심 결함이 재현된 것입니다.
-            ages = [float(r["price_age_seconds"]) for r in rows]
-            self.assertEqual(ages, [0.0, 15.0, 30.0])
-
-    def test_slow_observation_shrinks_next_sleep_so_total_wait_does_not_inflate(self):
-        """GPT 3차 재검토 2번 지적("우선 수정") 재현: 관측 1회가
-        동기식 시세 재조회 등으로 실제 오래(예: 20초) 걸리면, 기존
-        구현은 그 시간을 전혀 계산에 넣지 않고 매번 관측_interval
-        만큼 그대로 추가로 잤다 — 재현: 설정 45초/간격 15초에서 관측
-        1회당 20초씩 걸리면 실제 총 경과가 105초(45+60)까지 불어남.
-
-        이 테스트는 `svc._monotonic`(기본은 `time.monotonic`)을
-        결정적으로 제어해(각 관측 호출 앞뒤로 20초씩 진행한 것처럼
-        값을 준비) 그 20초가 다음 sleep 구간에서 그대로 차감되는지
-        확인한다 — 관측 소요시간 위에 매번 전체 간격을 또 얹어 자면
-        안 된다. 전역 `time.monotonic`이 아니라 이 인스턴스의 속성만
-        바꿔치기하는 이유는 asyncio 이벤트 루프 내부도 스케줄링에
-        `time.monotonic`을 쓰기 때문 — 전역을 패치하면 그 호출까지
-        같은 side_effect 목록을 소진해 버려 테스트가 무관한 이유로
-        깨진다.
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            svc = _make_service(tmpdir)
-
-            # wait_out_balance_outage()는 관측 호출 앞뒤로 self.
-            # _monotonic()을 한 번씩 읽는다 — 아래 값들은 "관측 1회가
-            # 20초 걸렸다"를 매 반복 결정적으로 재현한다.
-            monotonic_values = iter([0.0, 20.0, 20.0, 40.0, 40.0, 60.0, 60.0, 80.0])
-            svc._monotonic = lambda: next(monotonic_values)
-
-            with mock.patch.object(svc, "observe_exit_candidates_during_outage") as observe_mock, \
-                 mock.patch("asyncio.sleep", new=mock.AsyncMock()) as sleep_mock:
-                asyncio.run(
-                    svc.wait_out_balance_outage(total_seconds=45, observe_interval_seconds=15)
-                )
-
-            slept_chunks = [call.args[0] for call in sleep_mock.await_args_list]
-            self.assertTrue(
-                all(chunk <= 15.0 for chunk in slept_chunks),
-                f"관측 소요시간이 이미 예산을 다 썼다면 그 위에 전체 간격을 또 자면 안 됩니다: {slept_chunks}",
+            self.assertTrue(svc.is_in_balance_outage())
+            self.assertEqual(
+                svc._balance_retry_next_attempt_at,
+                100.0 + svc.settings.trading.balance_retry_backoff_min_seconds,
             )
-            self.assertLessEqual(
-                len(slept_chunks), 2,
-                "관측 1회가 20초씩 걸려 45초 예산을 두 번 만에 넘기므로, "
-                "sleep은 많아야 한두 번(그것도 짧게)만 있어야 합니다.",
+            self.assertEqual(
+                svc._next_balance_outage_observe_at, 100.0,
+                "장애 진입 직후 관측은 지연 없이 1회 즉시 실행돼야 합니다.",
             )
-            self.assertGreaterEqual(observe_mock.call_count, 2)
 
-    def test_never_calls_broker_during_wait(self):
-        """대기 중 잔고 API를 다시 호출하면 429를 재유발할 위험이 있어
-        절대 호출하면 안 됩니다."""
+    def test_enter_balance_outage_is_idempotent_does_not_reset_timer(self):
+        """이미 장애 상태에서 또 호출돼도(trading_loop()가 연속 폴링에서
+        다시 예외를 잡는 경우) 재시도 타이머를 리셋하면 안 됩니다 —
+        그러면 매 폴링마다 백오프가 최솟값으로 계속 초기화돼 절대
+        늘지 않는 버그가 됩니다."""
         with tempfile.TemporaryDirectory() as tmpdir:
             svc = _make_service(tmpdir)
-            svc.cached_balance = AccountBalance(cash=0, total_asset=0, positions=[])
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
+
+            svc.enter_balance_outage()
+            first_deadline = svc._balance_retry_next_attempt_at
+            clock["t"] = 10.0
+            svc.enter_balance_outage()
+            self.assertEqual(svc._balance_retry_next_attempt_at, first_deadline)
+
+    def test_tick_before_retry_time_does_not_call_broker_and_returns_false(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = _make_service(tmpdir)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
+            svc.enter_balance_outage()
+            clock["t"] = svc._balance_retry_next_attempt_at - 1  # 아직 재시도 시각 전
 
             with mock.patch.object(
                 svc.broker, "get_account_balance",
-                side_effect=AssertionError("대기 중 잔고 API를 호출하면 안 됩니다"),
-            ), mock.patch("asyncio.sleep", new=mock.AsyncMock()):
-                asyncio.run(
-                    svc.wait_out_balance_outage(total_seconds=20, observe_interval_seconds=10)
-                )
+                side_effect=AssertionError("재시도 시각 전에는 잔고 API를 호출하면 안 됩니다"),
+            ):
+                recovered = asyncio.run(svc.handle_balance_outage_tick())
+
+            self.assertFalse(recovered)
+            self.assertTrue(svc.is_in_balance_outage())
+
+    def test_observe_runs_on_its_own_cadence_independent_of_retry(self):
+        """시세 관측과 잔고 재시도가 서로 다른 monotonic 타이머로
+        독립 실행돼야 한다는 GPT 지적의 핵심 검증 — 재시도 시각이
+        아직 멀었어도(30초 뒤) 관측은 즉시(0초) 예정돼 있어 이번
+        tick에서 수행돼야 한다."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = _make_service(tmpdir)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
+            svc.enter_balance_outage()
+
+            with mock.patch.object(svc, "observe_exit_candidates_during_outage") as observe_mock, \
+                 mock.patch.object(
+                     svc.broker, "get_account_balance",
+                     side_effect=AssertionError("아직 재시도 시각이 아닙니다"),
+                 ):
+                recovered = asyncio.run(svc.handle_balance_outage_tick())
+
+            self.assertFalse(recovered)
+            observe_mock.assert_called_once()
+            self.assertEqual(
+                svc._next_balance_outage_observe_at,
+                svc.settings.trading.balance_outage_observe_interval_seconds,
+            )
+
+    def test_repeated_failures_double_backoff_up_to_cap(self):
+        """GPT 필수 테스트 항목: "반복 실패와 재시도 간격 유지" —
+        30→60→120→180초로 늘어나고, 180초에서 더 늘지 않아야 한다."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = _make_service(tmpdir)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
+            svc.enter_balance_outage()
+
+            expected_intervals = [60.0, 120.0, 180.0, 180.0]  # 최초(30) 다음 실패부터
+
+            with mock.patch.object(
+                svc.broker, "get_account_balance",
+                side_effect=lambda: (_ for _ in ()).throw(_make_429_error()),
+            ):
+                for expected in expected_intervals:
+                    clock["t"] = svc._balance_retry_next_attempt_at
+                    recovered = asyncio.run(svc.handle_balance_outage_tick())
+                    self.assertFalse(recovered)
+                    self.assertEqual(svc._balance_retry_interval_seconds, expected)
+
+    def test_non_rate_limit_failure_during_retry_reraises_but_still_schedules_backoff(self):
+        """429가 아닌 예상 밖의 실패(예: 인증 만료)는 조용히 삼키지
+        않고 올려야 하지만(trading_loop()의 일반 예외 로그를 태우기
+        위함), 백오프는 이미 예약된 뒤라 재시도 간격 없이 매 폴링마다
+        두드리지 않아야 합니다."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = _make_service(tmpdir)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
+            svc.enter_balance_outage()
+            clock["t"] = svc._balance_retry_next_attempt_at
+
+            other_error = RuntimeError("kiwoom business error: api_id=kt00001, body={'return_code': -1}")
+            with mock.patch.object(svc.broker, "get_account_balance", side_effect=other_error):
+                with self.assertRaises(RuntimeError):
+                    asyncio.run(svc.handle_balance_outage_tick())
+
+            self.assertTrue(svc.is_in_balance_outage(), "예상 밖 실패라도 장애 상태는 유지돼야 합니다.")
+            self.assertEqual(
+                svc._balance_retry_interval_seconds,
+                svc.settings.trading.balance_retry_backoff_min_seconds * 2,
+            )
+
+    def test_tick_detects_date_change_during_outage(self):
+        """GPT 필수 테스트 항목: "장 종료·날짜 변경·취소" 중 날짜변경
+        부분 — 구 `wait_out_balance_outage()`는 180초를 통째로 블로킹해
+        자정을 넘겨도 그 안에서는 날짜변경을 감지하지 못했습니다. 새
+        `handle_balance_outage_tick()`은 매 tick마다 `_check_and_handle_
+        daily_reset()`을 호출하므로, 장애가 자정을 넘겨 이어지더라도
+        (재시도·관측 어느 쪽도 아직 예정 시각이 안 됐어도) 날짜변경
+        자체는 놓치지 않아야 합니다."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = _make_service(tmpdir)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
+
+            with mock.patch(
+                "domain.service.trading_service.now_kst",
+                return_value=datetime(2026, 9, 15, 23, 59),
+            ):
+                svc.enter_balance_outage()
+                svc._check_and_handle_daily_reset()  # enter_balance_outage() 전에 오늘 날짜를 기록해 둠
+            svc.state.consecutive_losses = 3
+
+            # 재시도·관측 어느 쪽도 아직 예정 시각이 안 된 시점에서
+            # tick을 호출해도, 자정을 넘긴 날짜변경은 감지돼야 한다.
+            clock["t"] = 1.0
+            with mock.patch(
+                "domain.service.trading_service.now_kst",
+                return_value=datetime(2026, 9, 16, 0, 0),
+            ), mock.patch.object(
+                svc.broker, "get_account_balance",
+                side_effect=AssertionError("아직 재시도 시각이 아닙니다"),
+            ), mock.patch.object(svc, "observe_exit_candidates_during_outage"):
+                recovered = asyncio.run(svc.handle_balance_outage_tick())
+
+            self.assertFalse(recovered)
+            self.assertEqual(svc._last_reset_date.isoformat(), "2026-09-16")
+            self.assertEqual(
+                svc.state.consecutive_losses, 0,
+                "장애 중이라도 날짜변경이 감지되면 일별 상태가 초기화돼야 합니다.",
+            )
+
+    def test_recovery_success_with_unresolved_orders_processes_without_extra_fetch(self):
+        """GPT 지적 재현: 미해결 주문(BUY_PENDING 등)이 있으면 `_get_
+        balance_with_cache()`는 캐시가 있어도 항상 새로 조회한다 —
+        그래서 "복구된 잔고를 캐시에 넣기만" 하면 다음 `run_once()`가
+        또 잔고를 호출하게 된다(불필요한 재조회). `handle_balance_
+        outage_tick()`은 이 복구 응답을 그대로 `_run_once_with_
+        balance()`에 전달해 이번 폴링 안에서 정상 전략 처리까지
+        마쳐야 하고, `get_account_balance()`는 이 tick 안에서 정확히
+        1회만 호출돼야 한다."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = _make_service(tmpdir)
+            svc.state.unresolved_order_intents = {"dummy": "order"}
+            self.assertTrue(svc._has_unresolved_orders())
+
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
+            svc.enter_balance_outage()
+            clock["t"] = svc._balance_retry_next_attempt_at
+
+            recovered_balance = AccountBalance(cash=1_000_000, total_asset=1_000_000, positions=[])
+            call_count = {"n": 0}
+
+            def _succeed():
+                call_count["n"] += 1
+                return recovered_balance
+
+            with mock.patch.object(svc.broker, "get_account_balance", side_effect=_succeed), \
+                 mock.patch.object(svc, "_run_once_with_balance", new=mock.AsyncMock()) as run_mock:
+                recovered = asyncio.run(svc.handle_balance_outage_tick())
+
+            self.assertTrue(recovered)
+            self.assertEqual(call_count["n"], 1, "잔고 API는 이 tick 안에서 정확히 1회만 호출돼야 합니다.")
+            run_mock.assert_awaited_once_with(recovered_balance)
+            self.assertFalse(svc.is_in_balance_outage(), "복구되면 장애 상태를 벗어나야 합니다.")
+            self.assertIs(svc.cached_balance, recovered_balance)
+
+    def test_recovery_logs_balance_freshness_with_recovery_trigger_reason(self):
+        """복구 시에도 캐시·관측 스냅샷·신선도 로그가 정상 성공
+        경로와 동일한 헬퍼(`_record_balance_fetch_success`)로 갱신돼야
+        한다 — trigger_reason으로 "장애 재시도로 복구됐다"는 사실이
+        구분 가능해야 한다."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = _make_service(tmpdir)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
+            svc.enter_balance_outage()
+            clock["t"] = svc._balance_retry_next_attempt_at
+
+            recovered_balance = AccountBalance(cash=1_000_000, total_asset=1_000_000, positions=[])
+            with mock.patch.object(svc.broker, "get_account_balance", return_value=recovered_balance):
+                asyncio.run(svc.handle_balance_outage_tick())
+
+            rows = _read_csv_rows(svc.settings.storage.balance_freshness_log_file)
+            self.assertEqual(rows[-1]["outcome"], "fetch_success")
+            self.assertEqual(rows[-1]["trigger_reason"], "balance_outage_recovery")
+
+    def test_recovery_resets_backoff_so_next_outage_starts_at_minimum(self):
+        """GPT 필수 테스트 항목: "복구 직후 다시 실패하는 경우" —
+        상한(180초)까지 늘어난 뒤 복구되면, 다음에 다시 장애가 나도
+        그 상한에서 이어지지 않고 최솟값부터 다시 시작해야 한다."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = _make_service(tmpdir)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
+            svc.enter_balance_outage()
+
+            with mock.patch.object(
+                svc.broker, "get_account_balance",
+                side_effect=lambda: (_ for _ in ()).throw(_make_429_error()),
+            ):
+                for _ in range(4):  # 30→60→120→180으로 상한까지 올린다.
+                    clock["t"] = svc._balance_retry_next_attempt_at
+                    asyncio.run(svc.handle_balance_outage_tick())
+            self.assertEqual(
+                svc._balance_retry_interval_seconds,
+                svc.settings.trading.balance_retry_backoff_max_seconds,
+            )
+
+            clock["t"] = svc._balance_retry_next_attempt_at
+            with mock.patch.object(
+                svc.broker, "get_account_balance",
+                return_value=AccountBalance(cash=0, total_asset=0, positions=[]),
+            ), mock.patch.object(svc, "_run_once_with_balance", new=mock.AsyncMock()):
+                recovered = asyncio.run(svc.handle_balance_outage_tick())
+            self.assertTrue(recovered)
+            self.assertFalse(svc.is_in_balance_outage())
+
+            svc.enter_balance_outage()
+            self.assertEqual(
+                svc._balance_retry_interval_seconds,
+                svc.settings.trading.balance_retry_backoff_min_seconds,
+                "이전 장애의 상한에서 이어지지 않고 최솟값부터 다시 시작해야 합니다.",
+            )
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -852,10 +1111,19 @@ class TestWaitOutBalanceOutage(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────
 class TestRunOnceOutageRecoveryIntegration(unittest.TestCase):
     """trading_loop()(app/main.py)의 except 분기가 실제로 하는 일을
-    그대로 재현합니다: run_once()가 429로 실패 → wait_out_balance_
-    outage() 호출(총 시간은 짧은 값으로 대체하되, `asyncio.sleep`
-    mock이 `_FrozenDateTime`을 실제로 전진시킴) → 잔고 복구 후
-    run_once() 재호출 → 정상 경로 복귀, 부수 효과 중복 없음.
+    그대로 재현합니다: run_once()가 429로 실패 → enter_balance_
+    outage() → handle_balance_outage_tick() 반복 호출(관측·재시도
+    각각 독립 monotonic 타이머, `_FrozenDateTime`을 실제로 전진시킴)
+    → 잔고 재시도 성공 시 그 tick 안에서 정상 처리까지 자동 진행 →
+    정상 경로 복귀, 부수 효과 중복 없음.
+
+    2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영): 구
+    `wait_out_balance_outage()`(180초 단일 블로킹, 이번에 제거)를
+    호출하던 부분을 `enter_balance_outage()` + 반복
+    `handle_balance_outage_tick()` 호출로 다시 짰다 — 그 결과 "복구
+    직후 run_once()를 한 번 더 호출"하던 5단계도 사라졌다(잔고 재시도
+    성공 자체가 곧 `_run_once_with_balance()` 호출이므로, 이제 그
+    응답을 다시 조회할 필요가 없다는 것이 이번 설계의 핵심).
 
     2026-09-15 보완 (GPT 재검토 4번 지적 반영, 기존 테스트의 5가지
     결함을 모두 다시 짬):
@@ -907,6 +1175,8 @@ class TestRunOnceOutageRecoveryIntegration(unittest.TestCase):
             svc.cached_regime[symbol] = MarketRegime.NEUTRAL
 
             frozen_start = _FrozenDateTime(2026, 9, 15, 10, 0, 0)
+            clock = {"t": 0.0}
+            svc._monotonic = lambda: clock["t"]
 
             place_order_calls = []
             original_place_order = svc.broker.place_order
@@ -944,67 +1214,131 @@ class TestRunOnceOutageRecoveryIntegration(unittest.TestCase):
                     rows_before = _read_csv_rows(svc.settings.storage.exit_candidate_outage_log_file)
                     self.assertEqual(rows_before, [])
 
+                    # 2026-09-15 (독립 잔고 재시도 설계): trading_loop()의
+                    # except 블록이 하는 일 — enter_balance_outage() 호출.
+                    svc.enter_balance_outage()
+
                     # 3) 대기 중 가격 하락 — 손절선 아래로 떨어뜨린 뒤,
                     #    price_refresh_seconds(테스트 설정 60초)를 가짜
                     #    시계로 실제 통과시켜 재조회가 실제로 발동하는지
                     #    확인한다.
                     svc.broker._prices[symbol] = 9000  # 손절선 아래로 하락
 
-                    async def _fake_sleep(seconds):
-                        _FrozenDateTime.advance(seconds)
+                    real_get_balance = svc.broker.get_account_balance
+                    balance_call_count = {"n": 0}
 
-                    with mock.patch("asyncio.sleep", side_effect=_fake_sleep):
-                        asyncio.run(
-                            svc.wait_out_balance_outage(total_seconds=90, observe_interval_seconds=30)
-                        )
+                    def _balance_side_effect():
+                        # 첫 재시도(잔고 재시도 타이머 30초 시점)는
+                        # 여전히 429 — 두 번째 재시도(백오프가 60초로
+                        # 늘어난 뒤, 90초 시점)에서 실제로 복구된다.
+                        # MockBroker의 실제 get_account_balance()를
+                        # 그대로 위임하므로, 복구 응답은 방금 내려간
+                        # 시세가 아니라 "종목을 여전히 보유 중"이라는
+                        # 실제 상태를 그대로 반영한다.
+                        balance_call_count["n"] += 1
+                        if balance_call_count["n"] == 1:
+                            raise _make_429_error()
+                        return real_get_balance()
+
+                    def _advance_clock_to(t: float) -> None:
+                        delta = t - clock["t"]
+                        clock["t"] = t
+                        if delta > 0:
+                            _FrozenDateTime.advance(delta)
+
+                    with mock.patch.object(
+                        svc.broker, "get_account_balance", side_effect=_balance_side_effect,
+                    ):
+                        # observe_interval=15초(기본값), retry_backoff
+                        # 최솟값=30초(기본값) — 매 15초마다 tick 하나씩
+                        # 흘려보내 관측과 재시도가 각자의 monotonic
+                        # 타이머로 독립 실행되는지 그대로 재현한다(잔고
+                        # 재시도가 우선이라 관측과 겹치는 tick에서는
+                        # 관측이 한 tick 밀린다 — GPT 지적: "동시에
+                        # 예정됐다면 잔고 재시도를 우선"). t=90에서
+                        # 재시도가 성공해 그 tick 안에서 정상 처리까지
+                        # 자동 진행된다.
+                        recovered = False
+                        for t in (0, 15, 30, 45, 60, 75, 90):
+                            _advance_clock_to(t)
+                            recovered = asyncio.run(svc.handle_balance_outage_tick())
+                            if recovered:
+                                break
+
+                    self.assertTrue(recovered, "t=90에서 잔고 재시도가 성공해 정상 처리로 전환됐어야 합니다.")
+                    self.assertFalse(svc.is_in_balance_outage())
 
                     rows_during_outage = _read_csv_rows(svc.settings.storage.exit_candidate_outage_log_file)
-                    self.assertEqual(len(rows_during_outage), 3, "30초 간격 3회 관측이 있어야 합니다.")
+                    # t=0,15(재시도 전),45,60,75(재시도가 30·90을 먼저
+                    # 처리하느라 30·90 시점의 관측은 각각 45·건너뜀 —
+                    # 90은 복구라 관측 없이 곧장 정상 처리로 감)에 5회.
+                    self.assertEqual(len(rows_during_outage), 5, "관측과 재시도가 겹친 tick을 제외하고 5회 관측이 있어야 합니다.")
                     self.assertTrue(all(r["symbol"] == symbol for r in rows_during_outage))
 
-                    # 처음 두 번(0초, 30초 시점)은 아직 60초 재조회
-                    # 주기가 지나지 않아 예전 가격(10500)을 그대로
-                    # 씁니다 — "캐시 재사용"과 "새 관측 안 함"은 다른
-                    # 것임을 함께 보여줍니다.
+                    # 재조회 주기(60초)가 지나지 않은 앞의 관측들은
+                    # 예전 가격(10500)을 그대로 씁니다 — "캐시 재사용"과
+                    # "새 관측 안 함"은 다른 것임을 함께 보여줍니다.
                     self.assertEqual(rows_during_outage[0]["current_price"], "10500")
                     self.assertEqual(rows_during_outage[1]["current_price"], "10500")
-                    # 세 번째(60초 시점)는 주기가 지나 실제로 새 가격을
+                    self.assertEqual(rows_during_outage[2]["current_price"], "10500")
+                    # 네 번째 관측(t=60)은 주기가 지나 실제로 새 가격을
                     # 재조회해 하락을 포착해야 합니다 — 이번 재검토의
                     # 핵심 요구사항입니다.
-                    self.assertEqual(rows_during_outage[2]["current_price"], "9000")
-                    self.assertEqual(rows_during_outage[2]["status"], "STOP_LOSS")
+                    self.assertEqual(rows_during_outage[3]["current_price"], "9000")
+                    self.assertEqual(rows_during_outage[3]["status"], "STOP_LOSS")
                     self.assertNotEqual(
-                        rows_during_outage[2]["status"], rows_during_outage[0]["status"],
+                        rows_during_outage[3]["status"], rows_during_outage[0]["status"],
                         "가격 하락이 실제로 새로운 청산 후보로 이어져야 합니다.",
                     )
+                    # 다섯 번째(t=75)는 재조회 주기가 다시 지나지 않아
+                    # 방금 새로 캐시된 하락 가격을 그대로 재사용합니다.
+                    self.assertEqual(rows_during_outage[4]["current_price"], "9000")
 
                     # 4) 장애 대기 중에는 손절 조건을 만족해도 주문·체결
-                    #    확정이 전혀 없어야 합니다.
-                    self.assertEqual(
-                        place_order_calls, [],
-                        "장애 대기 중에는 손절 조건을 만족해도 주문이 나가면 안 됩니다.",
-                    )
-
-                    # 5) 잔고 복구 — 다음 run_once()는 정상적으로 통과
-                    #    해야 하고, 관측 전용 로그는 중복으로 늘지
-                    #    않아야 합니다. place_order mock은 이 호출까지
-                    #    그대로 유지된다(4번 지적 (d) 요구사항).
+                    #    확정이 전혀 없어야 합니다 — t=90의 재시도 성공
+                    #    직후 정상 처리에서 나가는 SELL만 있어야 합니다
+                    #    (place_order mock은 이 tick까지 그대로 유지된다,
+                    #    4번 지적 (d) 요구사항).
                     #
                     #    실제로 돌려보니 — 장애 중 손절선(9,850원)
-                    #    아래로 내려간 채 대기했던 종목이, 잔고가
-                    #    복구된 이 run_once()에서 정상 전략 경로를
-                    #    통해 "정확히 한 번" 손절 매도가 제출된다(아래
-                    #    place_order_calls 길이 1 확인). 2026-09-15
-                    #    3차 보완(GPT 재검토 3번 지적): 이건 "복구
-                    #    직후 SELL 제출 1회"의 증거일 뿐이다 —
-                    #    MockBroker는 place_order() 안에서 즉시·완전
-                    #    체결시키므로, 이 확인이 곧 "그 이후 체결
-                    #    확인·손익 반영까지 중복 없음"을 뜻하지는
-                    #    않는다(부분체결·재시도 큐가 있는 실제 브로커
-                    #    경로는 별도 검증 대상). 매도가 접수되면서
-                    #    cached_balance가 다시 None으로 비워지는 것도
-                    #    기존에 승인된 정책(체결 확정 전 강제 재조회)
-                    #    그대로이므로 함께 확인한다.
+                    #    아래로 내려간 채 대기했던 종목이, 잔고 재시도가
+                    #    복구된 바로 그 tick 안(handle_balance_outage_
+                    #    tick()이 내부적으로 호출하는 _run_once_with_
+                    #    balance())에서 정상 전략 경로를 통해 "정확히
+                    #    한 번" 손절 매도가 제출된다(아래 place_order_
+                    #    calls 길이 1 확인). 2026-09-15 3차 보완(GPT
+                    #    재검토 3번 지적): 이건 "복구 직후 SELL 제출
+                    #    1회"의 증거일 뿐이다 — MockBroker는 place_
+                    #    order() 안에서 즉시·완전 체결시키므로, 이
+                    #    확인이 곧 "그 이후 체결 확인·손익 반영까지
+                    #    중복 없음"을 뜻하지는 않는다(부분체결·재시도
+                    #    큐가 있는 실제 브로커 경로는 별도 검증 대상).
+                    #    매도가 접수되면서 cached_balance가 다시
+                    #    None으로 비워지는 것도 기존에 승인된 정책
+                    #    (체결 확정 전 강제 재조회) 그대로이므로 함께
+                    #    확인한다.
+                    self.assertEqual(
+                        len(place_order_calls), 1,
+                        "잔고 재시도가 복구된 바로 그 tick 안에서 SELL 제출이 정확히 한 번 있어야 합니다.",
+                    )
+
+                    # 6) 2026-09-15 4차 보완 (GPT 재검토 3번 지적 반영):
+                    #    복구 직후 SELL이 정확히 1회 제출됐다는 확인만으로는
+                    #    "다음 폴링에서 중복 제출이 없다"는 것까지 증명하지
+                    #    못한다 — 기존에는 이를 별도의
+                    #    test_recovery_sell_does_not_repeat_on_subsequent_polls가
+                    #    검증했지만, 그 테스트는 실제 429→관측→복구 경로를
+                    #    거치지 않고 손절 조건을 직접 만들어 run_once()를
+                    #    반복 호출했을 뿐이었다(재현 시나리오와 무관). 이제는
+                    #    바로 이 통합 테스트의 복구 직후에 후속 폴링을 붙여,
+                    #    실제 429→관측→복구를 거친 뒤에도 중복 제출이 없는지
+                    #    확인한다. place_order mock은 계속 유지된다.
+                    #
+                    #    검증 범위는 "SELL 제출·접수 로그 중복 없음"까지다 —
+                    #    손익·수량이 그 SELL을 통해 정확히 한 번만 반영됐는지는
+                    #    관련 상태값(예: 실현손익 누계)을 직접 확인하지
+                    #    않았으므로 이 테스트로는 주장하지 않는다.
+                    asyncio.run(svc.run_once())
                     asyncio.run(svc.run_once())
 
             rows_after_recovery = _read_csv_rows(svc.settings.storage.exit_candidate_outage_log_file)
@@ -1013,18 +1347,31 @@ class TestRunOnceOutageRecoveryIntegration(unittest.TestCase):
                 "정상 복구된 run_once()는 exit_candidate_outage 로그에 아무 것도 추가하지 않아야 합니다"
                 "(이 로거는 장애 관측 전용 — 정상 경로는 기존 손절/트레일링 판정을 그대로 씁니다).",
             )
+            sell_calls = [
+                call for call in place_order_calls
+                if call[0][0].symbol == symbol and call[0][0].side == OrderSide.SELL
+            ]
             self.assertEqual(
-                len(place_order_calls), 1,
+                len(sell_calls), 1,
                 "장애 중 관측만 되고 미뤄졌던 손절 조건이, 복구된 정상 경로에서 SELL 제출 정확히 한 번으로 "
-                "이어져야 합니다(이 확인의 범위는 '제출 1회'까지 — 그 이후 체결·손익 반영의 중복 방지는 "
-                "test_recovery_sell_does_not_repeat_on_subsequent_polls가 별도로 검증한다).",
+                "이어져야 하고, 이미 청산된 뒤의 후속 폴링(2회)에서는 같은 손절이 중복 제출되면 안 됩니다"
+                "(이 확인의 범위는 'SELL 제출·접수 로그 중복 없음'까지 — 손익·수량 반영 자체는 관련 상태값을 "
+                "직접 확인하지 않았으므로 이 테스트로 주장하지 않는다).",
             )
-            self.assertEqual(place_order_calls[0][0][0].symbol, symbol)
-            self.assertEqual(place_order_calls[0][0][0].side, OrderSide.SELL)
-            # 매도가 막 접수되어 기존 정책대로 cached_balance가 다시
-            # 비워진 상태 — 이 자체는 이번 3단계의 범위가 아니므로
-            # (체결 확정 정책은 그대로) 회귀가 아니라 정상입니다.
-            self.assertIsNone(svc.cached_balance)
+
+            trade_rows = _read_csv_rows(svc.settings.storage.trade_log_file)
+            accepted_sell_rows = [
+                r for r in trade_rows
+                if r["symbol"] == symbol and r["side"] == "SELL" and r["accepted"] == "True"
+            ]
+            self.assertEqual(
+                len(accepted_sell_rows), 1,
+                "거래 로그에도 같은 청산이 중복 기록되면 안 됩니다(검증 범위: 접수 로그 중복 없음).",
+            )
+            self.assertNotIn(
+                symbol, svc.broker._positions,
+                "MockBroker 포지션에서도 완전히 청산된 채로 유지돼야 합니다(추가 SELL이 없었다는 방증).",
+            )
 
     def test_observation_continues_when_cache_cleared_right_after_order(self):
         """2026-09-15 보완 (GPT 재검토 2번 지적 반영, 별도 시나리오):
@@ -1065,55 +1412,16 @@ class TestRunOnceOutageRecoveryIntegration(unittest.TestCase):
             self.assertEqual(rows[0]["symbol"], symbol)
             self.assertNotEqual(rows[0]["status"], "")
 
-    def test_recovery_sell_does_not_repeat_on_subsequent_polls(self):
-        """2026-09-15 3차 보완 (GPT 재검토 3번 지적 — "검증 보완",
-        프로덕션 코드 변경 없음): 위
-        `test_429_then_price_drop_during_wait_then_recovers_cleanly`가
-        증명하는 건 "복구 직후 SELL 제출 1회"뿐이다. 그 SELL이
-        MockBroker에서 즉시·완전 체결되어(수량 0, 포지션 dict에서
-        제거) 다음 폴링에서는 더 이상 보유 종목이 아니게 되는데, 그
-        뒤로 이어지는 폴링(run_once() 반복 호출)에서도 같은 손절이
-        중복 제출되거나 거래 로그에 중복 기록되지 않는지는 이 별도
-        테스트로 확인해야 한다 — 그래야 "손익·수량·청산 처리가 중복
-        적용되지 않는다"고 말할 수 있다."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            svc = _make_service(tmpdir)
-            symbol = svc.targets[0]
-            svc.broker._positions[symbol] = Position(symbol=symbol, quantity=10, average_price=10000)
-            svc.broker._prices[symbol] = 9000  # 이미 손절선 아래
-            svc.cached_regime[symbol] = MarketRegime.NEUTRAL
-
-            place_order_calls = []
-            original_place_order = svc.broker.place_order
-
-            def _track_place_order(*args, **kwargs):
-                place_order_calls.append((args, kwargs))
-                return original_place_order(*args, **kwargs)
-
-            with mock.patch.object(svc.broker, "place_order", side_effect=_track_place_order):
-                asyncio.run(svc.run_once())  # 손절 매도 1회 발생 기대
-                asyncio.run(svc.run_once())  # 다음 폴링 — 이미 청산됨
-                asyncio.run(svc.run_once())  # 그 다음 폴링 — 여전히 청산됨
-
-            sell_calls = [
-                call for call in place_order_calls
-                if call[0][0].symbol == symbol and call[0][0].side == OrderSide.SELL
-            ]
-            self.assertEqual(
-                len(sell_calls), 1,
-                "포지션이 이미 청산됐다면 이후 폴링에서 같은 손절이 중복 제출되면 안 됩니다.",
-            )
-
-            trade_rows = _read_csv_rows(svc.settings.storage.trade_log_file)
-            sell_rows = [
-                r for r in trade_rows
-                if r["symbol"] == symbol and r["side"] == "SELL" and r["accepted"] == "True"
-            ]
-            self.assertEqual(
-                len(sell_rows), 1,
-                "거래 로그에도 같은 청산이 중복 기록되면 안 됩니다(손익·수량 중복 반영 방지).",
-            )
-            self.assertNotIn(symbol, svc.broker._positions, "MockBroker 포지션에서도 완전히 청산돼야 합니다.")
+    # 2026-09-15 4차 보완 (GPT 재검토 3번 지적 반영): 이 자리에 있던
+    # `test_recovery_sell_does_not_repeat_on_subsequent_polls`는 실제
+    # 429→관측→복구 경로를 거치지 않고 손절 조건을 직접 만들어
+    # run_once()를 반복 호출했을 뿐이었다 — GPT의 명시적 지적("기존
+    # 장애·복구 통합 테스트의 복구 직후에 후속 폴링을 붙이세요")에 따라
+    # 그 검증은 위 `test_429_then_price_drop_during_wait_then_recovers_
+    # cleanly`의 복구 직후 후속 폴링(2회)으로 옮겨 실제 429→관측→복구
+    # 시나리오에 연결했고, 검증 범위도 "SELL 제출·접수 로그 중복
+    # 없음"으로 명확히 제한했다(손익·리스크 상태값은 직접 확인하지
+    # 않았으므로 주장하지 않음). 별도 테스트로 중복 유지하지 않는다.
 
 
 if __name__ == "__main__":

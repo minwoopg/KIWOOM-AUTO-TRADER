@@ -78,6 +78,17 @@ def build_trading_service(settings, broker, app_logger, trade_logger, signal_log
 
 # ── REST 루프 ────────────────────────────────────────────────────
 
+# 2026-09-16 (GPT 7차 재검토 지적 반영): 잔고 조회가 아닌 다른 API에서
+# 난 429(예: 시세·주문상태 조회)는 잔고 장애로 취급하지 않지만, 그렇다고
+# 완전히 무방비로 poll_interval_seconds(기본 10초)만큼만 쉬고 바로
+# 재시도하면 안 된다 — 개정 전 코드는 예외 메시지에 "http=429"만
+# 있으면 무조건 180초를 통째로 블로킹했으므로(뒤에 남아있던 재진입
+# 제한), 그 보호 자체는 유지하되 "블로킹"이 아니라 아래 while 루프가
+# 매 poll마다 짧게 확인하는 monotonic 쿨다운으로 구현한다(장 종료·
+# 날짜변경·취소 감지를 막지 않기 위함 — 잔고 장애 tick과 동일한 패턴).
+OTHER_API_RATE_LIMIT_COOLDOWN_SECONDS = 180.0
+
+
 async def trading_loop(trading_service: TradingService, settings: Settings, app_logger) -> None:
     """REST API 기반 매매 루프 (asyncio 버전)."""
 
@@ -98,23 +109,141 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
         app_logger.info("application started (장중 실행)")
 
     poll = settings.trading.poll_interval_seconds
+    # 잔고 조회가 아닌 다른 API에서 난 429의 monotonic 쿨다운 마감
+    # 시각 — None이면 쿨다운 중이 아님. OTHER_API_RATE_LIMIT_COOLDOWN_
+    # SECONDS 주석 참고.
+    other_api_rate_limit_until: float | None = None
 
     while True:
         try:
             now = now_local()
             if is_market_open() or settings.broker.use_mock:
-                await trading_service.run_once()
+                # 2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영):
+                # 잔고 API 장애 중에는 정상 run_once() 대신 짧게
+                # 반환하는 handle_balance_outage_tick()을 부릅니다 —
+                # 아래 except 블록의 enter_balance_outage() 참고. 이
+                # 메서드가 없앤 건 "긴 단일 블로킹 대기 루프"이지,
+                # 호출 자체의 소요 시간을 보장하지는 않습니다(동기식
+                # API 호출 지연은 그대로 남아있음 — 자세한 설명은
+                # handle_balance_outage_tick() 독스트링 2026-09-16
+                # 항목 참고). 그래도 이 while 루프는 장애 중에도
+                # 평소 poll 주기로 계속 돌며 아래 장 종료·날짜변경
+                # 분기를 놓치지 않습니다(구 wait_out_balance_outage()는
+                # 180초를 통째로 블로킹해 이 분기 자체를 못 탔습니다).
+                #
+                # 2026-09-16 (GPT 9차 재검토 지적 반영 — 우선순위
+                # 정정): 8차 보완 때는 "잔고 장애를 먼저 확인해도
+                # 다른 API 쿨다운을 우회하지 않는다"고 설명했지만,
+                # 이는 handle_balance_outage_tick()이 관측만 하는
+                # 경우에만 맞는 얘기였다 — 이 함수는 잔고 재시도가
+                # 성공하면 그 안에서 곧바로 _run_once_with_balance()
+                # (신규 주문 제출 가능한 정상 처리)까지 호출한다.
+                # 그 결과 다른 API 쿨다운이 아직 남아 있어도(예:
+                # 180초) 잔고 재시도가 먼저 성공하면(예: 30초) 정상
+                # 처리로 우회 진입할 수 있었다(GPT 실측 재현: 두
+                # 상태를 함께 주입, 다른 API 쿨다운 종료 180초 vs
+                # 잔고 재시도 성공 30초). 게다가 장외 분기는 이미
+                # 다른 API 쿨다운을 먼저 확인하고 있어(아래 else
+                # 블록), 장중·장외의 우선순위가 서로 달랐다.
+                #
+                # 이제 장중·장외 모두 다른 API 쿨다운을 먼저
+                # 확인한다 — 쿨다운 중에는 잔고 재시도 tick 자체를
+                # 이번 폴링에서 건너뛴다(잔고 조회만 먼저 허용하고
+                # "조회 성공"과 "정상 처리 진입"을 분리하려면 별도
+                # 설계가 필요하므로 이번 범위에서는 하지 않는다 —
+                # GPT 지적). 날짜변경 감지는 이 분기에서도 건너뛰지
+                # 않도록 별도로 호출한다(정상 경로에서는 run_once()/
+                # handle_balance_outage_tick()이 각자 호출하므로
+                # 여기서 또 불러도 같은 날짜면 아무 일도 하지
+                # 않는다 — 멱등).
+                if (
+                    other_api_rate_limit_until is not None
+                    and trading_service._monotonic() < other_api_rate_limit_until
+                ):
+                    trading_service._check_and_handle_daily_reset()
+                elif trading_service.is_in_balance_outage():
+                    await trading_service.handle_balance_outage_tick()
+                else:
+                    other_api_rate_limit_until = None
+                    await trading_service.run_once()
             else:
-                # A last order can fill after the order window closes.
-                # Keep its state/side effects current without generating orders.
-                trading_service.reconcile_after_market_close()
+                # 2026-09-16 (GPT 7차 재검토 지적 반영): 장외 시간에도
+                # 잔고 조회 실패(429 등)가 예외로 그대로 올라가면 아래
+                # 날짜변경 확인·마감 리포트 생성까지 도달하지 못했다
+                # (미해결 주문이 있는 상태로 연속 실패가 나면 리포트가
+                # 무기한 생략됨 — 실측 재현: 조회 시각 0·10·20초 반복,
+                # 그동안 마감 리포트·날짜변경 확인 0회). 이제 이 블록
+                # 자체 안에서 실패를 흡수해 잔고 장애 상태로만 전환하고,
+                # 아래 로직은 매 폴링 항상 실행되도록 한다. 이미 장애
+                # 상태라면(장중과 마찬가지로) handle_balance_outage_
+                # tick()에 위임하되, reconcile_only=True를 넘겨 복구
+                # 성공 시에도 정상 매매 판단이 아니라 대조·저장만
+                # 수행하게 한다.
+                #
+                # 2026-09-16 (GPT 8차 재검토 지적 반영): 장외 대조
+                # (reconcile_after_market_close())는 잔고 API뿐 아니라
+                # 미해결 주문이 있으면 order-status 조회(다른 API)도
+                # 함께 호출한다(_sync_position_state_machine_shadow()
+                # 참고) — 그 429는 kiwoom_balance_fetch_failure 태그가
+                # 없으므로, 장중과 같은 other_api_rate_limit_until
+                # 쿨다운을 여기서도 등록·확인해야 한다. 이전에는 이
+                # 블록의 except가 잔고 태그만 확인하고 나머지는 로그만
+                # 남겨, 다른 API의 429가 매 폴링(10초)마다 그대로
+                # 재시도되는 우회가 있었다(실측 재현: 대조 재실행
+                # 0·10·20초). 쿨다운 변수를 장중·장외 공통으로 하나만
+                # 두므로, 장중에 걸린 쿨다운이 장외로 넘어가도(또는
+                # 그 반대도) 그대로 이어진다.
+                #
+                # 2026-09-16 (GPT 9차 재검토 지적 반영): 이 분기는
+                # 원래부터 다른 API 쿨다운을 먼저 확인했다(위 elif
+                # 순서 참고) — 9차 보완에서 위 장중 분기의 순서를
+                # 이와 동일하게(쿨다운 우선) 맞췄으므로, 이제 장중·
+                # 장외가 같은 우선순위를 쓴다.
+                if (
+                    other_api_rate_limit_until is not None
+                    and trading_service._monotonic() < other_api_rate_limit_until
+                ):
+                    pass  # 다른 API 쿨다운 중 — 이번 폴링은 대조를 건너뜀
+                else:
+                    other_api_rate_limit_until = None
+                    try:
+                        if trading_service.is_in_balance_outage():
+                            await trading_service.handle_balance_outage_tick(reconcile_only=True)
+                        else:
+                            # A last order can fill after the order window closes.
+                            # Keep its state/side effects current without generating orders.
+                            trading_service.reconcile_after_market_close()
+                    except Exception as exc:
+                        app_logger.exception("[AFTER_HOURS] 대조 중 오류: %s", exc)
+                        if getattr(exc, "kiwoom_balance_fetch_failure", False) and trading_service._is_rate_limit_error(exc):
+                            trading_service.enter_balance_outage()
+                        elif trading_service._is_rate_limit_error(exc):
+                            other_api_rate_limit_until = trading_service._monotonic() + OTHER_API_RATE_LIMIT_COOLDOWN_SECONDS
+                            app_logger.warning(
+                                f"[RATE_LIMIT] 장외 대조 중 다른 API에서 429 감지 — "
+                                f"{OTHER_API_RATE_LIMIT_COOLDOWN_SECONDS:.0f}초 동안 대조를 "
+                                f"건너뜁니다(장 종료·날짜변경·취소 감지는 계속 정상 동작)."
+                            )
+                        # 그 외 예외는 로그만 남기고 흡수한다 — 이 실패
+                        # 하나 때문에 아래 날짜변경 확인·마감 리포트
+                        # 생성까지 막히면 안 된다(GPT 지적).
+
+                # 날짜변경 감지는 장 상태·위 대조 성공 여부와 무관하게
+                # 항상 실행돼야 한다(GPT 지적) — 장중에는 run_once()/
+                # handle_balance_outage_tick()이 각자 호출하므로 여기서
+                # 또 불러도 같은 날짜면 아무 일도 하지 않는다(멱등).
+                trading_service._check_and_handle_daily_reset()
+
                 # 장 외 시간 — 대기 메시지 (분 단위로 한 번)
                 if now.second < poll:
                     app_logger.info(
                         f"[WAIT] 장 외 시간 ({now.strftime('%H:%M')}) — "
                         f"09:00 장 시작까지 대기 중"
                     )
-                # 리포트는 15:25 이후 생성 (마지막 체결 기록 완료 후)
+                # 리포트는 15:25 이후 생성 (마지막 체결 기록 완료 후) —
+                # 위 대조가 실패했어도(장애 상태 진입 포함) 건너뛰지
+                # 않는다. 미해결 주문이 남아있다면 _run_end_of_day_
+                # tasks() 내부에서 "대조 미완료" 경고를 별도로 남긴다.
                 if now.hour > 15 or (now.hour == 15 and now.minute >= 25):
                     trading_service._run_end_of_day_tasks(now)
             await asyncio.sleep(poll)
@@ -125,22 +254,33 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
 
         except Exception as exc:
             app_logger.exception("unexpected error: %s", exc)
-            msg = str(exc)
-            if "http=429" in msg or "허용된 요청 개수를 초과" in msg:
-                app_logger.warning("rate limit detected, backing off for 180 seconds")
-                # 2026-09-15 (180초 감시 공백 대응 3단계 — 관측 경로
-                # 연결): 기존엔 이 180초를 한 번에 통째로 잤습니다 —
-                # 그동안 run_once()가 전혀 호출되지 않아 보유 종목의
-                # 손절·트레일링 판단이 완전히 멈췄습니다("180초 감시
-                # 공백"). wait_out_balance_outage()는 총 대기시간(180초,
-                # 기존과 동일)은 그대로 두되, 짧은 간격으로 쪼개 매
-                # 구간마다 캐시된 잔고·시세만으로 청산 후보를 관측·
-                # 기록합니다(TradingService.observe_exit_candidates_
-                # during_outage() 참고) — 주문 제출·체결 확정·
-                # highest_price 갱신은 여전히 하지 않습니다.
-                await trading_service.wait_out_balance_outage()
-            else:
-                await asyncio.sleep(poll)
+            # 2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영): 예전엔
+            # 예외 메시지에 "http=429"만 있으면 무조건 잔고 장애로
+            # 취급해 180초를 통째로 블로킹했습니다 — 시세·주문상태 등
+            # 다른 API의 429까지 잔고 장애로 오인해 불필요한 잔고
+            # 재조회를 유발할 수 있었습니다(GPT 지적). 이제는 `_get_
+            # balance_with_cache()`가 실패 시 표시해 두는
+            # `kiwoom_balance_fetch_failure` 속성으로 "잔고 조회에서
+            # 난 429"만 골라 독립 재시도 경로로 보냅니다.
+            #
+            # 2026-09-16 (GPT 7차 재검토 지적 반영): 다른 API의 429나
+            # 429가 아닌 예외까지 poll_interval_seconds(10초)만큼만
+            # 쉬고 바로 재시도하는 건 개정 전 동작(180초 재진입 제한)
+            # 대비 후퇴였습니다 — 잔고 장애로 오인하지는 않되, 다른
+            # API의 429는 별도의 monotonic 쿨다운(OTHER_API_RATE_
+            # LIMIT_COOLDOWN_SECONDS)으로 여전히 180초 동안 재진입을
+            # 막습니다. 429가 아닌 그 외 예외는 예전과 동일하게 poll
+            # 주기만큼만 쉬고 다음 폴링에서 다시 시도합니다.
+            if getattr(exc, "kiwoom_balance_fetch_failure", False) and trading_service._is_rate_limit_error(exc):
+                trading_service.enter_balance_outage()
+            elif trading_service._is_rate_limit_error(exc):
+                other_api_rate_limit_until = trading_service._monotonic() + OTHER_API_RATE_LIMIT_COOLDOWN_SECONDS
+                app_logger.warning(
+                    f"[RATE_LIMIT] 잔고 조회가 아닌 다른 API에서 429 감지 — "
+                    f"{OTHER_API_RATE_LIMIT_COOLDOWN_SECONDS:.0f}초 동안 정상 순회를 "
+                    f"건너뜁니다(장 종료·날짜변경·취소 감지는 계속 정상 동작)."
+                )
+            await asyncio.sleep(poll)
 
 
 # ── 메인 ────────────────────────────────────────────────────────

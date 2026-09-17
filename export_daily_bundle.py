@@ -814,6 +814,20 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
         if not report_files:
             manifest.append("  ⚠ 해당 날짜 리포트 없음 (15:20 이전 종료됐을 수 있음)")
 
+        # 2026-09-16 (GPT 8차 재검토 지적 반영): daily_report가 아직
+        # 잔고 대조가 끝나지 않은 채(미해결 주문 남은 상태) 생성된
+        # 잠정본이면, 리포트 본문(DailyReporter._build_report()가
+        # 남기는 배너)을 그대로 확인해 번들 메타데이터에도 같은
+        # 사실을 남긴다 — 리포트 파일만 보고 잠정 여부를 놓칠 수
+        # 있는 사람이 MANIFEST.txt만 봐도 알 수 있게 하기 위함.
+        is_provisional_report = False
+        daily_report_name = f"daily_report_{day_compact}.txt"
+        if daily_report_name in report_files:
+            try:
+                is_provisional_report = "잠정(대조 미완료)" in (work / daily_report_name).read_text(encoding="utf-8")
+            except OSError:
+                pass
+
         # 수집 품질
         quality = build_collection_quality(
             target, log_lines, counts,
@@ -826,6 +840,11 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
         manifest.append("")
         manifest.append("[ METADATA ]")
         manifest.append("  collection_quality.txt — 수집 완전성·재시작·coverage 요약")
+        if is_provisional_report:
+            manifest.append(
+                "  ⚠ daily_report — 잠정(대조 미완료) 상태로 생성됨. "
+                "잔고 대조 완료 후 재생성된 최종본으로 교체될 수 있습니다."
+            )
         manifest.append("")
         manifest.append("[ 포함하지 않은 것 ]")
         manifest.append("  .env / state.json / runtime_state.json / token 응답 원문")

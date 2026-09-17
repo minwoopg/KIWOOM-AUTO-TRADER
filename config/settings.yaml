@@ -43,6 +43,12 @@ trading:
   # 180초 감시 공백 대응 3단계 3차 보완 (2026-09-15) — 초기 설정값,
   # 실측 후 조정 대상.
   market_price_retry_backoff_seconds: 60
+  # 독립 잔고 재시도 설계 (2026-09-15, GPT 재검토 반영) — 잔고 API
+  # 429 감지 시 30초부터 시작해 실패마다 2배씩 늘어나 180초에서
+  # 상한(성공 시 30초로 리셋)되는 monotonic 백오프. 초기 설정값,
+  # 실측 후 조정 대상.
+  balance_retry_backoff_min_seconds: 30
+  balance_retry_backoff_max_seconds: 180
   order_cash_per_trade: 6000000
   max_positions: 5
   allow_multiple_entries_per_symbol_per_day: false  # 2026-07-21: 1일1회로 재전환.

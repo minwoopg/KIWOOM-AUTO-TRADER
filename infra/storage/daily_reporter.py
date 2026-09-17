@@ -9,7 +9,9 @@ trades.csv를 읽어서 당일 매매 내역을 분석하고
 """
 
 import csv
+import os
 import sys
+import tempfile
 from collections import defaultdict, Counter
 from datetime import date, datetime
 from pathlib import Path
@@ -91,10 +93,34 @@ class DailyReporter:
         self,
         target_date: date | None = None,
         regime_summary: dict[str, str] | None = None,
+        provisional: bool = False,
     ) -> str:
+        """일일 리포트를 생성해 파일로 저장합니다.
+
+        2026-09-16 (GPT 8차 재검토 지적 반영): `provisional=True`는
+        장 마감 시점에 아직 잔고 대조가 끝나지 않은 채(미해결 주문이
+        남은 채) 생성하는 잠정 리포트임을 뜻합니다 — 손익·포지션
+        수치가 최신 확정 상태가 아닐 수 있습니다. 이전에는 이 사실이
+        앱 로그에만 남고 리포트 파일 자체에는 전혀 표시되지 않아,
+        리포트 파일만 열어보는 사람은 잠정 상태임을 알 수 없었습니다
+        — 이제 리포트 본문 최상단에 눈에 띄는 경고 배너를 남깁니다.
+        같은 `target_date`로 다시 호출하면(대조 완료 후 최종 갱신,
+        `TradingService._run_end_of_day_tasks()` 참고) 같은 파일 경로에
+        덮어써 최종본으로 대체됩니다.
+
+        2026-09-17 (GPT 10차 재검토 지적 반영 — 원자적 저장): 예전엔
+        `Path.write_text()`로 기존 파일에 직접 덮어썼다 — 디스크
+        공간 부족 등으로 쓰는 도중 실패하면 기존 파일이 이미 부분적
+        으로 훼손된 뒤였다(`TradingService._run_end_of_day_tasks()`가
+        "저장 실패 시 기존 파일 보존"을 전제로 재시도 로직을 짜도
+        실제로는 보장되지 않았음). 이제 같은 디렉터리에 임시 파일로
+        전체 내용을 쓰고 성공했을 때만 `os.replace()`로 원자적으로
+        교체한다 — 쓰는 도중 예외가 나도 기존 파일은 전혀 건드려지지
+        않는다.
+        """
         target_date = target_date or date.today()
         trades = self._load_trades(target_date)
-        report = self._build_report(target_date, trades, regime_summary or {})
+        report = self._build_report(target_date, trades, regime_summary or {}, provisional=provisional)
 
         # ── 분석 섹션 추가 ─────────────────────────────────
         signal_section = self._build_signal_analysis(target_date)
@@ -102,8 +128,36 @@ class DailyReporter:
         full_report = report + "\n\n" + signal_section + "\n\n" + trade_section
 
         report_file = self.report_dir / f"daily_report_{target_date.strftime('%Y%m%d')}.txt"
-        report_file.write_text(full_report, encoding="utf-8")
+        self._atomic_write_text(report_file, full_report)
         return full_report
+
+    @staticmethod
+    def _atomic_write_text(path: Path, content: str) -> None:
+        """`path`와 같은 디렉터리에 임시 파일로 전체 내용을 쓰고,
+        성공했을 때만 `os.replace()`로 원자적으로 교체합니다.
+
+        2026-09-17 (GPT 10차 재검토 지적 반영): 쓰는 도중(또는 flush/
+        fsync 도중) 예외가 발생해도 `path`의 기존 내용은 전혀
+        건드려지지 않습니다 — 임시 파일만 만들어졌다 지워질 뿐입니다.
+        `tempfile.mkstemp()`를 같은 디렉터리에 만들어야
+        `os.replace()`가 같은 파일시스템 내 원자적 rename이 됩니다
+        (다른 디렉터리/파일시스템이면 원자성이 깨질 수 있음).
+        """
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
     # ── 내부 메서드 ──────────────────────────────────────────────
 
@@ -127,6 +181,7 @@ class DailyReporter:
         target_date: date,
         trades: list[dict],
         regime_summary: dict[str, str],
+        provisional: bool = False,
     ) -> str:
         day_str = DAYS_KO[target_date.weekday()]
         date_str = target_date.strftime(f"%Y-%m-%d ({day_str})")
@@ -135,6 +190,15 @@ class DailyReporter:
         lines = []
         lines.append(sep)
         lines.append(f"  📊 일일 매매 리포트  {date_str}")
+        if provisional:
+            # 2026-09-16 (GPT 8차 재검토 지적 반영): 잔고 대조가 아직
+            # 끝나지 않은 채(미해결 주문 남음) 생성된 리포트임을 파일
+            # 본문에도 남긴다 — 대조가 끝나면 같은 경로로 최종본이
+            # 다시 저장돼 이 배너는 사라진다.
+            lines.append(sep)
+            lines.append("  ⚠️  잠정(대조 미완료) — 미해결 주문이 남은 상태에서 생성된 리포트입니다.")
+            lines.append("      아래 손익·포지션 수치가 최신 확정 상태가 아닐 수 있습니다.")
+            lines.append("      잔고 대조가 끝나면 자동으로 최종본으로 다시 저장됩니다.")
         lines.append(sep)
 
         if not trades:

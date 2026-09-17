@@ -127,7 +127,13 @@ A.SIGNAL_LOG, A.SHADOW_LOG, A.REPORTS_DIR = orig_sig, orig_sh, orig_rep
 # ── 장 마감 파이프라인 연결 확인 ────────────────────────────────
 ts_src = open("domain/service/trading_service.py", encoding="utf-8").read()
 check("5-1) _run_end_of_day_tasks가 shadow 분석을 호출함",
-      "self._run_shadow_analysis_today(now.date())" in ts_src)
+      # 2026-09-16 (GPT 9차 재검토 지적 반영): now.date()를 그대로
+      # 넘기면 자정을 넘겨 최종화가 일어날 때 엉뚱한 거래일로
+      # 분석이 실행될 수 있어(장외 로직이 전제하는 연속 실행
+      # 시나리오), _run_end_of_day_tasks()가 결정한 대상 거래일
+      # (target_date)을 명시적으로 넘기도록 바뀌었다 — 호출 자체가
+      # 있는지만 확인한다.
+      "self._run_shadow_analysis_today(target_date)" in ts_src)
 check("5-2) _run_shadow_analysis_today가 정의돼 있음",
       "def _run_shadow_analysis_today" in ts_src)
 check("5-3) analyze_shadow.py를 subprocess로 실행함",
@@ -465,10 +471,12 @@ check("E-8) 예외 후 임시 작업 디렉터리가 남지 않음",
 
 # ── F. 파이프라인 연결 ─────────────────────────────────────────
 check("F-1) 파이프라인이 번들 export를 호출함",
-      "self._export_daily_bundle_today(now.date())" in ts_src)
+      # 2026-09-16 (GPT 9차 재검토 지적 반영): 위 5-1과 동일한 이유로
+      # target_date를 넘긴다.
+      "self._export_daily_bundle_today(target_date)" in ts_src)
 check("F-2) 번들 export가 모든 리포트 생성 뒤에 실행됨",
-      ts_src.index("_export_daily_bundle_today(now.date())")
-      > ts_src.index("_run_shadow_analysis_today(now.date())"))
+      ts_src.index("_export_daily_bundle_today(target_date)")
+      > ts_src.index("_run_shadow_analysis_today(target_date)"))
 
 # ══════════════════════════════════════════════════════════════
 # 1I.2: 로거 상태 전이 보존 · 로테이션 통합 · 판정 기준 (GPT 리뷰)

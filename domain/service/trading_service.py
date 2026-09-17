@@ -223,6 +223,17 @@ class TradingService:
         # 반복 유발). 이 세 딕셔너리는 그 메서드의 모든 호출 경로
         # (정상 순회 포함)에 공통 적용되는 내부 상태입니다.
         self._market_price_fetch_failed_at: dict[str, datetime] = {}
+        # 2026-09-15 (180초 감시 공백 대응 3단계 4차 보완 — GPT 재검토
+        # 2번 지적 반영): 재시도 허용 여부는 이 monotonic 절대 시각
+        # (`self._monotonic()` 기준)으로만 판단합니다. 위 `_market_
+        # price_fetch_failed_at`(datetime)은 로그·디버깅용으로만
+        # 남겨두고 백오프 게이트에는 더 이상 쓰지 않습니다 —
+        # `datetime.now()`는 시스템 시계가 보정되면(NTP 등) 어긋나고,
+        # "실패를 잡은 시점"이 아니라 "이 호출을 시작한 시점"을
+        # 저장하면 느린 실패일수록 백오프가 그만큼 짧아지는 버그가
+        # 됩니다(재현: 조회가 10초 걸려 실패하면 그 실패 이후 50초만
+        # 지나도 재시도가 허용됨 — 설정한 60초보다 짧음).
+        self._market_price_fetch_next_retry_at: dict[str, float] = {}
         self._market_price_fetch_last_error: dict[str, str] = {}
         self._market_price_fetch_outcome: dict[str, str] = {}
         # wait_out_balance_outage()가 실제 벽시계 경과를 재는 데
@@ -232,6 +243,19 @@ class TradingService:
         # time.monotonic까지 함께 바뀌어 side_effect가 엉뚱하게
         # 소진되는 사고를 피할 수 있습니다.
         self._monotonic = time.monotonic
+
+        # 2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영): 잔고
+        # API 장애를 trading_loop() 전체를 막는 단일 블로킹 함수
+        # (구 wait_out_balance_outage())가 아니라, 매 폴링마다 짧게
+        # 반환하는 handle_balance_outage_tick()이 관리합니다 — 상위
+        # 루프(app/main.py의 trading_loop())가 장 종료 감지·날짜변경·
+        # 취소 처리를 계속 수행할 수 있게 하기 위함입니다(GPT 재검토
+        # 2번 지적). 잔고 재시도와 시세 관측은 각자 독립된 monotonic
+        # 절대시각(아래 두 값)으로 실행 시점을 판단합니다.
+        self._balance_outage_active: bool = False
+        self._balance_retry_next_attempt_at: float | None = None
+        self._balance_retry_interval_seconds: float | None = None
+        self._next_balance_outage_observe_at: float | None = None
 
         # 일봉 히스토리 캐시
         self.cached_daily_bars: dict[str, list] = {}
@@ -405,8 +429,63 @@ class TradingService:
         )
         # 장세 판단 요약 (리포트용)
         self._regime_summary: dict[str, str] = {}
-        # 장 마감 리포트가 이미 생성됐는지 여부 (중복 방지)
-        self._report_generated_today: bool = False
+        # 2026-09-16 (GPT 9차 재검토 지적 반영 — 거래일 연결):
+        # 예전엔 "오늘 이미 생성했는지"를 bool 하나(`_report_generated_
+        # today`)로만 추적해, 대상 거래일 정보가 상태에 전혀 없었다.
+        # 이 값은 프로세스가 자정을 넘겨 계속 떠 있어도(이 프로젝트의
+        # 장외 로직은 그런 연속 실행을 전제로 설계됨) 어느 것도 직접
+        # 리셋하지 않으므로(`_check_and_handle_daily_reset()`은 손실
+        # 카운트 등만 리셋), 전날 리포트가 잠정으로 남아 있는 채로
+        # 다음날 최종화가 일어나면 `now.date()`가 이미 다음날로
+        # 바뀐 상태라 리포트·분석·번들이 전부 엉뚱한(다음날) 거래일을
+        # 대상으로 재생성되는 문제가 있었다(GPT 실측 재현: 9/16 잠정
+        # 생성 → 9/17에 대조 완료 → 번들 대상이 9/16이 아니라 9/17로
+        # 바뀜).
+        #
+        # 2026-09-17 (GPT 10차 재검토 지적 반영 — 거래일별 다중 추적):
+        # 9차 구현은 "최종화를 기다리는 잠정 리포트의 대상 거래일"을
+        # `_pending_provisional_date` 스칼라 하나로만 추적해, 두 거래일
+        # 연속으로 잠정 상태가 되면(장외 장애가 이틀 넘게 이어지는
+        # 경우) 두 번째 거래일이 그 값을 덮어써 첫 번째 거래일의
+        # 최종화 기록이 사라졌다(GPT 실측 재현: 9/16 잠정 → 9/17도
+        # 잠정 → 이후 미해결 주문 해소돼도 9/16만 최종화되고 9/17은
+        # 영원히 잠정으로 남음). 또한 "최초 생성" 조건 자체가
+        # `now.hour == 15`를 요구해, 15:59대에 최초 저장이 실패하면
+        # 16시가 지난 뒤에는 등록조차 되지 않아 영원히 재시도하지
+        # 않는 문제도 있었다.
+        #
+        # 이제 "오늘 마감 작업을 이미 등록했는지"(`_report_generated_
+        # date`, 새 거래일이 시작될 때 딱 한 번만 시각 조건으로 등록)와
+        # "저장이 아직 끝나지 않은 거래일들"(`_eod_pending_dates`,
+        # 거래일 → 잠정 대기 여부의 dict)을 분리한다. 시각 조건은
+        # 새 거래일 작업을 등록할 때만 적용하고, 이미 등록된 거래일의
+        # 재시도·최종화는 시각과 무관하게(등록된 원래 거래일 그대로)
+        # 처리한다.
+        self._report_generated_date: date | None = None
+        self._eod_pending_dates: dict[date, bool] = {}
+        # 키: 아직 "완료"(최종 저장 성공)되지 않은 거래일.
+        # 값: True  → 이미 잠정으로 저장은 성공했고, 미해결 주문이
+        #             풀리면(대조 완료) 최종본으로 다시 저장해야 함.
+        #     False → 아직 단 한 번도 저장에 성공한 적 없음(최초 시도
+        #             자체가 실패해 재시도를 기다리는 중).
+        # 저장(잠정이든 최종이든)이 성공적으로 끝나면 그 거래일의
+        # 후속 분석/번들 단계도 전부 다시 시도하도록 리셋한다 —
+        # 리포트 내용이 바뀌었으니(특히 잠정→최종 전환) 번들 등도
+        # 최신 리포트를 반영해 다시 만들어야 한다(GPT 10차 재검토
+        # 지적).
+        self._eod_followups_pending: dict[date, set[str]] = {}
+        # 2026-09-16 (GPT 9차 재검토 지적 반영 — 저장 실패 재시도):
+        # `_generate_daily_report()`가 저장에 실패해도 위 상태를
+        # 성공한 것처럼 확정해버리던 문제의 재시도 간격 — 매 폴링
+        # (기본 10초)마다 곧바로 재시도해 파일 I/O를 반복하지 않도록
+        # 고정 30초 간격을 둔다(잔고 재시도처럼 지수 백오프를 쓸
+        # 만큼 반복적으로 실패할 가능성이 크지 않다고 보고 단순하게
+        # 고정값으로 함 — 필요해지면 나중에 조정). 2026-09-17
+        # (GPT 10차 재검토 지적 반영): 거래일별로 독립 추적하도록
+        # 스칼라에서 dict로 바꿨다 — 서로 다른 거래일의 재시도가
+        # 서로를 밀어내지 않는다.
+        self._eod_report_retry_backoff_seconds: float = 30.0
+        self._eod_retry_at: dict[date, float] = {}
 
         # 1분봉 저장기
         self._minute_saver: MinuteBarSaver | None = (
@@ -518,6 +597,41 @@ class TradingService:
             self._sync_position_state_machine_shadow(self._get_balance_with_cache())
             self.state_store.save(self.state, self._highest_price)
 
+    def _record_balance_fetch_success(
+        self,
+        balance: "AccountBalance",
+        now: datetime,
+        *,
+        trigger_reason: str,
+        prior_loaded_at: "datetime | None",
+        prior_cache_age_seconds: "float | None",
+    ) -> None:
+        """잔고 조회 성공 시의 캐시·로그 갱신을 한 곳에 모읍니다.
+
+        2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영): 이전에는
+        `_get_balance_with_cache()`의 두 성공 분기(최초/캐시만료)에
+        똑같은 코드가 중복돼 있었습니다. 이제 `handle_balance_outage_
+        tick()`의 잔고 재시도 성공 경로도 이 메서드를 그대로 호출해,
+        "복구된 잔고를 캐시에 넣기만 하고 관측 스냅샷·신선도 로그는
+        갱신 안 됨" 같은 불일치가 생기지 않게 합니다 — 정상 성공과
+        완전히 동일한 부수 효과를 남깁니다.
+        """
+        self.cached_balance = balance
+        self.cached_balance_loaded_at = now
+
+        held = [f"{p.symbol}({p.quantity}주)" for p in balance.positions]
+        self.app_logger.info(
+            f"account balance loaded from api | "
+            f"cash={balance.cash:,} | positions={len(balance.positions)} | "
+            f"held={held}"
+        )
+        self._log_balance_freshness(
+            now=now, outcome="fetch_success", trigger_reason=trigger_reason,
+            prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
+            error_type="",
+        )
+        self._update_last_observed_positions(balance, now)
+
     def _get_balance_with_cache(self) -> AccountBalance:
         """Cache settled accounts; unresolved orders always need a fresh read.
 
@@ -547,6 +661,16 @@ class TradingService:
         기록(S01)은 그대로 유지합니다 — 이 로그가 앞으로 폴백을 다시
         설계할 때 필요한 실측 데이터(429 빈도·트리거 사유·그 시점
         캐시 나이)를 제공합니다.
+
+        2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영): 이 메서드가
+        실패로 올리는 예외에는 `kiwoom_balance_fetch_failure = True`
+        속성을 표시에 남깁니다(예외 타입·메시지는 전혀 바꾸지 않음 —
+        기존에 `KiwoomHttpError`를 직접 검사하는 여러 테스트를 그대로
+        통과시키기 위함). `app/main.py`의 `trading_loop()`는 이 표시로
+        "이 429가 잔고 조회에서 난 것"만 골라 독립 재시도 경로
+        (`enter_balance_outage()`)로 보냅니다 — 문자열에 "http=429"가
+        있다는 이유만으로 다른 API(시세·주문상태 등)의 429까지 잔고
+        장애로 오인해 불필요한 잔고 재조회를 유발하던 문제를 막습니다.
         """
         now = datetime.now()
         # 2026-09-11 (S01 관측 1단계, GPT 5차 검토 반영): 아래 두 값은
@@ -586,22 +710,12 @@ class TradingService:
                     prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
                     error_type=type(exc).__name__,
                 )
+                exc.kiwoom_balance_fetch_failure = True
                 raise
-            self.cached_balance = balance
-            self.cached_balance_loaded_at = now
-
-            held = [f"{p.symbol}({p.quantity}주)" for p in balance.positions]
-            self.app_logger.info(
-                f"account balance loaded from api | "
-                f"cash={balance.cash:,} | positions={len(balance.positions)} | "
-                f"held={held}"
+            self._record_balance_fetch_success(
+                balance, now, trigger_reason=trigger_reason,
+                prior_loaded_at=prior_loaded_at, prior_cache_age_seconds=prior_cache_age_seconds,
             )
-            self._log_balance_freshness(
-                now=now, outcome="fetch_success", trigger_reason=trigger_reason,
-                prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
-                error_type="",
-            )
-            self._update_last_observed_positions(balance, now)
             return balance
 
         elapsed = (now - self.cached_balance_loaded_at).total_seconds()
@@ -622,22 +736,12 @@ class TradingService:
                     prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
                     error_type=type(exc).__name__,
                 )
+                exc.kiwoom_balance_fetch_failure = True
                 raise
-            self.cached_balance = balance
-            self.cached_balance_loaded_at = now
-
-            held = [f"{p.symbol}({p.quantity}주)" for p in balance.positions]
-            self.app_logger.info(
-                f"account balance loaded from api | "
-                f"cash={balance.cash:,} | positions={len(balance.positions)} | "
-                f"held={held}"
+            self._record_balance_fetch_success(
+                balance, now, trigger_reason="routine_refresh_due",
+                prior_loaded_at=prior_loaded_at, prior_cache_age_seconds=prior_cache_age_seconds,
             )
-            self._log_balance_freshness(
-                now=now, outcome="fetch_success", trigger_reason="routine_refresh_due",
-                prior_loaded_at=prior_loaded_at, cache_age_seconds=prior_cache_age_seconds,
-                error_type="",
-            )
-            self._update_last_observed_positions(balance, now)
             return balance
 
         self.app_logger.debug(
@@ -726,64 +830,180 @@ class TradingService:
         msg = str(exc)
         return "http=429" in msg or "허용된 요청 개수를 초과" in msg
 
-    async def wait_out_balance_outage(
-        self,
-        total_seconds: "float | None" = None,
-        observe_interval_seconds: "float | None" = None,
-    ) -> None:
-        """app/main.py의 trading_loop()가 잔고 429 등으로 재시도를
-        기다릴 때 `await asyncio.sleep(180)` 대신 호출합니다.
+    def is_in_balance_outage(self) -> bool:
+        """`app/main.py`의 `trading_loop()`가 이번 폴링에서 정상
+        `run_once()` 대신 `handle_balance_outage_tick()`을 호출해야
+        하는지 판단하는 데 씁니다."""
+        return self._balance_outage_active
 
-        2026-09-15 (180초 감시 공백 대응 3단계 — 관측 경로 연결,
-        구현 지시서 §3의 축소 반영): 전체 대기 시간(`total_seconds`,
-        기본값은 기존과 동일하게 180초)은 이번 단계에서 바꾸지
-        않습니다 — 잔고 API 자체의 독립적 지수 백오프 재설계(설계
-        문서 v2 §3의 30→60→120→180초 단계 조정, `order_attempt_seq`
-        기반 판정 등)는 이번 범위가 아닙니다. 바뀌는 것은 단 하나,
-        이 대기를 한 번에 다 자지 않고 `observe_interval_seconds`
-        간격으로 쪼개, 매 구간 시작 시 `observe_exit_candidates_
-        during_outage()`를 호출해 관측 기회를 유지한다는 것입니다.
+    def enter_balance_outage(self) -> None:
+        """잔고 조회가 429로 실패한 직후 `trading_loop()`가 호출합니다.
 
-        이 메서드는 주문을 제출하지 않고, `highest_price` 운영 상태를
-        갱신·병합하지 않으며, 잔고 API를 다시 호출하지 않습니다(그러면
-        429를 다시 유발할 수 있어 본말전도입니다) — 오직 캐시된 값만
-        읽어 관측·기록합니다.
+        2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영): 예전
+        `wait_out_balance_outage()`는 이 시점에 180초를 통째로
+        블로킹했습니다(§ 구 버전 참고, 아래 `handle_balance_outage_
+        tick()` 독스트링에 문제점 정리). 이제는 여기서 재시도 타이머만
+        세팅하고 즉시 반환합니다 — 실제 재시도·관측은 `trading_loop()`
+        가 매 폴링(`poll_interval_seconds`)마다 `handle_balance_outage_
+        tick()`을 짧게 호출해 진행합니다.
 
-        2026-09-15 3차 보완 (GPT 재검토 2번 지적 반영): 기존 구현은
-        `asyncio.sleep()`한 시간만 `elapsed`에 더했습니다 — 그런데
-        매 구간 시작마다 부르는 `observe_exit_candidates_during_
-        outage()`는 내부에서 `_get_market_price_with_cache()`를 통해
-        동기식으로 실제 브로커 API를 호출할 수 있고, 이게 느려지면
-        (재현: 관측 1회 20초 소요, 설정 45초/간격 15초 → 실제 경과
-        105초) 그 시간이 고스란히 총 대기 위에 더 얹혀 "총 대기시간은
-        `total_seconds`로 보존된다"는 설명이 깨집니다. 이제는
-        `time.monotonic()`으로 각 관측 호출 앞뒤 실제 경과 시간도
-        `elapsed`에 함께 더해, 다음 sleep 구간이 그만큼 줄어들도록
-        합니다. 단, 이미 진행 중인 동기식 API 호출 자체를 중단시킬
-        수는 없으므로(협조적 취소 지점이 없음), "정확히 `total_
-        seconds` 안에 끝난다"고 보장하지는 않습니다 — 관측이 느려질
-        때 대기가 무한정 계속 늘어나며 누적되던 문제를 없앨 뿐입니다.
+        이미 장애 상태라면(연속으로 다른 예외가 한 번 더 잡혔더라도)
+        타이머를 초기화하지 않습니다 — 그렇지 않으면 매 폴링마다
+        타이머가 리셋돼 백오프가 전혀 늘지 않는 버그가 됩니다.
         """
-        if total_seconds is None:
-            total_seconds = 180.0
-        if observe_interval_seconds is None:
-            observe_interval_seconds = getattr(
-                self.settings.trading, "balance_outage_observe_interval_seconds", 15.0
+        if self._balance_outage_active:
+            return
+        self._balance_outage_active = True
+        initial = self.settings.trading.balance_retry_backoff_min_seconds
+        self._balance_retry_interval_seconds = initial
+        self._balance_retry_next_attempt_at = self._monotonic() + initial
+        self._next_balance_outage_observe_at = self._monotonic()
+        self.app_logger.warning(
+            f"[BALANCE_OUTAGE] 잔고 조회 실패 감지 — 독립 재시도 시작 "
+            f"(최초 재시도까지 {initial:.0f}초, 그 사이 {self.settings.trading.balance_outage_observe_interval_seconds:.0f}초마다 관측)"
+        )
+
+    def _exit_balance_outage(self) -> None:
+        self._balance_outage_active = False
+        self._balance_retry_next_attempt_at = None
+        self._balance_retry_interval_seconds = None
+        self._next_balance_outage_observe_at = None
+
+    async def handle_balance_outage_tick(self, *, reconcile_only: bool = False) -> bool:
+        """잔고 장애 중 `trading_loop()`가 매 폴링마다 짧게 호출합니다.
+
+        2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영): 이전
+        `wait_out_balance_outage()`(구 버전, 이번에 제거)의 문제점 —
+        (1) 총 대기시간(180초) 동안 한 번도 반환하지 않아, 그 사이
+        장이 마감돼도 `trading_loop()`의 장 종료 분기(`reconcile_
+        after_market_close()`/`_run_end_of_day_tasks()`)로 돌아가지
+        못했고, 날짜변경 감지(`run_once()` 안에 있었음)도 멈췄습니다.
+        (2) 잔고 API를 아예 재시도하지 않고 관측만 반복하다 반환해,
+        실제 잔고 재시도는 `trading_loop()`가 이 함수 완료 후 한 바퀴
+        더 돌아 `run_once()`를 호출할 때 비로소 일어났습니다 — 즉
+        재시도 간격이 사실상 총 대기시간(180초) 그 자체였습니다.
+
+        이 메서드는 그 두 문제 중 "긴 단일 블로킹 대기 루프"를
+        없앱니다: 매 호출마다 관측 1회 또는 잔고 재시도 1회 중
+        많아야 하나만 수행하고, 어느 쪽도 시각이 안 됐으면 즉시
+        반환합니다 — 그래서 `trading_loop()`의 바깥 while 루프가
+        평소 폴링 주기(`poll_interval_seconds`)로 계속 돌며 장
+        상태·날짜변경·취소를 놓치지 않습니다. 잔고 재시도는 이
+        메서드 자신이 monotonic 백오프(30→60→...→180초, 성공 시
+        30초로 리셋)로 직접 수행합니다 — 더 이상 `trading_loop()`의
+        전체 순회 주기에 얹혀가지 않습니다.
+
+        2026-09-16 (GPT 7차 재검토 지적 반영 — 설명 정정): **"절대
+        여러 초 이상 블로킹하지 않는다"는 이전 설명은 부정확해
+        삭제합니다.** 이 메서드가 없앤 것은 "내부에서 여러 번
+        반복하며 총 180초를 도는 루프" 뿐입니다 — 잔고 재시도 자체
+        (`self.broker.get_account_balance()`)는 여전히 동기식 HTTP
+        호출이고, 복구에 성공하면 그 안에서 `_run_once_with_balance()`
+        (시장가 조회 등 종목별 동기식 API 호출을 순차로 수행)까지
+        같은 tick 안에서 실행합니다. 즉 이 tick 하나의 실제 소요
+        시간은 네트워크 지연·종목 수에 비례해 늘어날 수 있고, 이
+        설계로 그 지연 자체를 없애지는 않았습니다(비동기 재설계는
+        이번 범위 밖 — 미해결로 남겨둡니다).
+
+        `reconcile_only=True`(장외 시간 전용, `trading_loop()`가
+        `is_market_open()`이 거짓일 때 전달)는 복구 성공 시 정상
+        전략 처리(`_run_once_with_balance`, 신규 주문 제출 가능)
+        대신 `reconcile_after_market_close()`와 동일한 "대조·저장만"
+        수행합니다 — 장외 대조 경로에서 잔고가 복구됐다고 해서
+        장중과 같은 매매 판단까지 이어지면 안 되기 때문입니다(GPT
+        지적: "복구 후 처리는 구분해야 합니다. 장중에는 정상 처리,
+        장외에는 주문 제출 없는 대조·저장만 수행해야 합니다").
+
+        반환값 `True`는 "이번 tick에 잔고가 복구돼(정상 처리든
+        대조·저장뿐이든) 이미 처리를 마쳤다"는 뜻입니다 — 호출자는
+        이 경우 이번 폴링에서 추가로 `run_once()`/`reconcile_after_
+        market_close()`를 부를 필요가 없습니다(그러면 방금 성공한
+        응답을 무시하고 `_has_unresolved_orders()` 때문에 또 잔고를
+        재조회하게 됩니다 — GPT 지적). `False`는 "아직 복구되지
+        않음, 평소처럼 `poll_interval_seconds`만큼 자고 다음 tick에
+        다시 부르라"는 뜻입니다.
+        """
+        if not self._balance_outage_active:
+            return False
+
+        # 장애가 길어져도 자정 감지는 계속돼야 합니다(위 독스트링 (1)).
+        self._check_and_handle_daily_reset()
+
+        now_mono = self._monotonic()
+
+        if (
+            self._balance_retry_next_attempt_at is not None
+            and now_mono >= self._balance_retry_next_attempt_at
+        ):
+            try:
+                balance = self.broker.get_account_balance()
+            except Exception as exc:
+                # 성공/실패와 무관하게 다음 재시도 시각을 먼저 예약합니다
+                # — 429가 아닌 예상 밖의 사유(예: 인증 만료)로 계속
+                # 실패해도, 아래에서 이 예외를 다시 올리기 전에 백오프가
+                # 이미 늘어나 있으므로 재시도 간격 없이 매 폴링마다
+                # 두드리는 일이 없습니다.
+                next_interval = min(
+                    (self._balance_retry_interval_seconds or self.settings.trading.balance_retry_backoff_min_seconds) * 2,
+                    self.settings.trading.balance_retry_backoff_max_seconds,
+                )
+                self._balance_retry_interval_seconds = next_interval
+                self._balance_retry_next_attempt_at = self._monotonic() + next_interval
+                if self._is_rate_limit_error(exc):
+                    self.app_logger.warning(
+                        f"[BALANCE_OUTAGE] 재시도 실패(429) — {next_interval:.0f}초 후 재시도"
+                    )
+                    return False
+                # 429가 아닌 예상 밖의 실패는 조용히 삼키지 않고
+                # trading_loop()의 일반 예외 로그(app_logger.exception)를
+                # 태우도록 올립니다 — 재시도 자체는 이미 예약했으므로
+                # 장애 상태는 그대로 유지됩니다.
+                self.app_logger.warning(
+                    f"[BALANCE_OUTAGE] 재시도 실패(예상 밖 사유, 계속 재시도) — "
+                    f"{next_interval:.0f}초 후 재시도. 사유: {exc}"
+                )
+                raise
+
+            # 성공 — 정상 성공 경로와 동일한 캐시·관측 스냅샷·신선도
+            # 로그 갱신(_record_balance_fetch_success) 후, 이 응답을
+            # 그대로 정상 전략 처리에 흘려보냅니다. 잔고를 다시
+            # 조회하지 않습니다.
+            now = datetime.now()
+            prior_loaded_at = self.cached_balance_loaded_at
+            prior_cache_age_seconds = (
+                (now - prior_loaded_at).total_seconds() if prior_loaded_at is not None else None
             )
-        observe_interval_seconds = max(0.1, float(observe_interval_seconds))
+            self._record_balance_fetch_success(
+                balance, now, trigger_reason="balance_outage_recovery",
+                prior_loaded_at=prior_loaded_at, prior_cache_age_seconds=prior_cache_age_seconds,
+            )
+            self._exit_balance_outage()
+            if reconcile_only:
+                # 2026-09-16 (GPT 7차 재검토 지적 반영): 장외 시간에는
+                # 잔고가 복구돼도 신규 매매 판단(_run_once_with_
+                # balance())으로 이어지면 안 됩니다 — reconcile_after_
+                # market_close()와 동일하게 PSM 대조·상태 저장만
+                # 수행합니다(주문 제출 없음).
+                self.app_logger.warning(
+                    "[BALANCE_OUTAGE] 잔고 조회 복구(장외) — 대조·저장만 수행(주문 제출 없음)"
+                )
+                self._sync_position_state_machine_shadow(balance)
+                self.state_store.save(self.state, self._highest_price)
+            else:
+                self.app_logger.warning("[BALANCE_OUTAGE] 잔고 조회 복구 — 정상 처리로 전환")
+                await self._run_once_with_balance(balance)
+            return True
 
-        elapsed = 0.0
-        while elapsed < total_seconds:
-            observe_started_at = self._monotonic()
+        if (
+            self._next_balance_outage_observe_at is not None
+            and now_mono >= self._next_balance_outage_observe_at
+        ):
             self.observe_exit_candidates_during_outage()
-            elapsed += self._monotonic() - observe_started_at
+            self._next_balance_outage_observe_at = (
+                now_mono + self.settings.trading.balance_outage_observe_interval_seconds
+            )
 
-            remaining = total_seconds - elapsed
-            if remaining <= 0:
-                break
-            chunk = min(observe_interval_seconds, remaining)
-            await asyncio.sleep(chunk)
-            elapsed += chunk
+        return False
 
     def observe_exit_candidates_during_outage(self) -> None:
         """잔고 API 장애 재시도 대기 중, 보유 종목별 청산 후보(손절·
@@ -1003,10 +1223,34 @@ class TradingService:
         지났다는 이유만으로 실패한 지 얼마 안 된 상태에서 매번 다시
         브로커를 호출하면, 429 등 장애 중에는 관측 간격(예: 15초)마다
         그대로 재호출을 반복하게 됩니다(재현: 시세 나이 60/75/90초
-        세 번 모두 재호출하며 매번 429). 그래서 실패 시각을 별도로
-        기억해 `market_price_retry_backoff_seconds` 동안은 재시도
-        자체를 건너뛰고 캐시를 그대로 씁니다. 이 백오프는 이 메서드를
-        호출하는 모든 경로(장애 관측·정상 순회 공통)에 적용됩니다.
+        세 번 모두 재호출하며 매번 429). 그래서 `market_price_retry_
+        backoff_seconds` 동안은 재시도 자체를 건너뛰고 캐시를 그대로
+        씁니다.
+
+        2026-09-15 4차 보완 (GPT 재검토 2번 지적 반영, "우선 수정"):
+        3차 보완은 백오프 판정에 `datetime.now()`(시스템 시계)와
+        "호출을 시작한 시점"을 썼는데, 둘 다 문제가 있었습니다 —
+        (1) 시스템 시계가 NTP 등으로 보정되면 60초가 실제로 지나도
+        백오프가 안 끝나거나 반대로 즉시 끝날 수 있고, (2) 조회
+        자체가 느리게(예: 10초) 실패하면 "호출 시작 시점"을 실패
+        시각으로 기록해 그만큼 백오프가 짧아집니다(재현: 10초 걸려
+        실패 → 그 실패 이후 50초만 지나도 재시도 허용, 설정 60초보다
+        짧음). 이제는 실패를 "잡은 시점"(즉, 그 느린 호출이 실제로
+        끝난 뒤)에 `self._monotonic()` 기준 절대 재시도 허용 시각
+        (`self._market_price_fetch_next_retry_at[symbol]`)을 예약하고,
+        백오프 판정도 그 monotonic 값으로만 합니다. 사람이 읽는 실패
+        시각(`self._market_price_fetch_failed_at`, datetime)은 로그용
+        으로만 남기고 게이트 판단에는 쓰지 않습니다.
+
+        이 백오프는 이 메서드를 호출하는 모든 경로에 적용됩니다 —
+        장애 관측(`observe_exit_candidates_during_outage()`)뿐 아니라
+        보유 종목 정상 순회 중 이 메서드를 거치는 경로도 함께
+        영향을 받으므로 "순수 관측 전용 변경"은 아닙니다. 다만 보유
+        종목 정상 처리 경로 중에는 이 메서드를 거치지 않고 `self.
+        broker.get_market_price()`를 직접 호출하는 지점도 있어(실패
+        시에만 이 메서드로 폴백) "모든 시세 호출을 공통 제어한다"도
+        아닙니다 — 이 백오프가 실제로 통제하는 범위는 이 메서드
+        자신의 호출 경로로 한정됩니다.
 
         잔고 API와 시세 API가 정말로 서로 독립된 호출 한도를 갖는지는
         확인된 바 없습니다 — 이전 버전 주석의 그 주장은 근거 없이
@@ -1023,15 +1267,16 @@ class TradingService:
 
         cached_price = self.cached_market_prices.get(symbol)
         cached_loaded_at = self.cached_market_price_loaded_at.get(symbol)
-        failed_at = self._market_price_fetch_failed_at.get(symbol)
         backoff_seconds = self.settings.trading.market_price_retry_backoff_seconds
-        in_backoff = failed_at is not None and (now - failed_at).total_seconds() < backoff_seconds
+        next_retry_at = self._market_price_fetch_next_retry_at.get(symbol)
+        in_backoff = next_retry_at is not None and self._monotonic() < next_retry_at
 
         def _fetch_and_record():
             market_price = self.broker.get_market_price(symbol)
             self.cached_market_prices[symbol] = market_price
             self.cached_market_price_loaded_at[symbol] = now
             self._market_price_fetch_failed_at.pop(symbol, None)
+            self._market_price_fetch_next_retry_at.pop(symbol, None)
             self._market_price_fetch_last_error.pop(symbol, None)
             self._market_price_fetch_outcome[symbol] = "fetched"
 
@@ -1040,6 +1285,16 @@ class TradingService:
                 extra={"symbol": symbol, "current_price": market_price.current_price},
             )
             return market_price
+
+        def _schedule_retry_after_failure(exc: Exception) -> None:
+            # 이 시점은 (느렸을 수 있는) self.broker.get_market_price()
+            # 호출이 실제로 실패를 반환한 "이후"입니다 — 여기서 읽는
+            # self._monotonic()이 곧 "실패를 잡은 시점"이므로, 이
+            # 값을 기준으로 다음 허용 시각을 예약해야 느린 실패일수록
+            # 백오프가 짧아지는 버그가 생기지 않습니다.
+            self._market_price_fetch_failed_at[symbol] = datetime.now()
+            self._market_price_fetch_next_retry_at[symbol] = self._monotonic() + backoff_seconds
+            self._market_price_fetch_last_error[symbol] = f"{type(exc).__name__}: {exc}"
 
         # 아직 한 번도 조회하지 않았다면 즉시 API 호출을 시도합니다 —
         # 단, 직전 실패의 백오프 기간 안이면(대체할 캐시도 없으므로)
@@ -1055,8 +1310,7 @@ class TradingService:
             try:
                 return _fetch_and_record()
             except Exception as exc:
-                self._market_price_fetch_failed_at[symbol] = now
-                self._market_price_fetch_last_error[symbol] = f"{type(exc).__name__}: {exc}"
+                _schedule_retry_after_failure(exc)
                 self._market_price_fetch_outcome[symbol] = "unavailable"
                 self.app_logger.warning(
                     f"[WARN ] {symbol} | 현재가 조회에 실패했고 사용할 캐시도 없습니다. 사유: {exc}"
@@ -1087,8 +1341,7 @@ class TradingService:
             return _fetch_and_record()
         except Exception as exc:
             # API 실패 시 기존 캐시를 유지하고 판단은 계속 진행
-            self._market_price_fetch_failed_at[symbol] = now
-            self._market_price_fetch_last_error[symbol] = f"{type(exc).__name__}: {exc}"
+            _schedule_retry_after_failure(exc)
             self._market_price_fetch_outcome[symbol] = "cache_after_failure"
             self.app_logger.warning(
                 f"[WARN ] {symbol} | 현재가 재조회에 실패하여 직전 캐시값을 사용합니다. 사유: {exc}"
@@ -1865,11 +2118,23 @@ class TradingService:
                 )
                 self.last_hold_log_at_by_symbol[symbol] = now
 
-    async def run_once(self) -> None:
-        """자동매매 루프를 한 번 실행합니다."""
-        # 2026-07-20: 프로세스 재시작 타이밍에 의존하지 않는 날짜변경 감지.
-        # main.py의 조건부 reset_daily_loss_counts() 호출과 별개로, 여기서
-        # 매 폴링마다 직접 오늘 날짜를 확인해 확실하게 리셋되도록 보강.
+    def _check_and_handle_daily_reset(self) -> None:
+        """날짜변경을 감지해 일별 상태를 초기화합니다.
+
+        2026-07-20: 프로세스 재시작 타이밍에 의존하지 않는 날짜변경 감지.
+        main.py의 조건부 reset_daily_loss_counts() 호출과 별개로, 여기서
+        매 폴링마다 직접 오늘 날짜를 확인해 확실하게 리셋되도록 보강.
+
+        2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영): 원래
+        `run_once()` 맨 앞에 있던 코드를 그대로 추출한 것입니다 —
+        `run_once()`의 동작은 전혀 바뀌지 않습니다. 별도 메서드로 뺀
+        이유는, 잔고 API 장애 중에는 `run_once()`가 전혀 호출되지
+        않는데(정상 잔고 확보 전이므로) 날짜변경 감지까지 함께 멈추면
+        안 되기 때문입니다(GPT 지적 — "날짜 변경 처리도 run_once()에
+        있습니다") — `handle_balance_outage_tick()`도 매 tick마다 이
+        메서드를 호출해, 장애가 길어져도 자정을 넘기면 정상적으로
+        감지되게 합니다.
+        """
         today = now_kst().date()
         if self._last_reset_date != today:
             if self._last_reset_date is not None:
@@ -1880,8 +2145,28 @@ class TradingService:
                 self.reset_daily_loss_counts()
             self._last_reset_date = today
 
+    async def run_once(self) -> None:
+        """자동매매 루프를 한 번 실행합니다."""
+        self._check_and_handle_daily_reset()
         balance = self._get_balance_with_cache()
+        await self._run_once_with_balance(balance)
 
+    async def _run_once_with_balance(self, balance: "AccountBalance") -> None:
+        """`run_once()`의 나머지 본문 — 이미 확보한 잔고로 한 사이클을 처리합니다.
+
+        2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영): `run_once()`
+        에서 "잔고를 어떻게 확보했는지"와 "확보된 잔고로 무엇을 하는지"를
+        분리했습니다(순수 추출 — 로직 변경 없음). `handle_balance_
+        outage_tick()`이 잔고 재시도에 성공했을 때 이 메서드를 그대로
+        호출해, 그 응답을 정상 처리 경로(PSM 대조 → 이월 강제청산 →
+        보유/신규 종목 순회)에 **한 번만** 흘려보냅니다 — "복구된 잔고를
+        캐시에 넣기만 하면 다음 run_once()가 `_has_unresolved_orders()`
+        때문에 또 잔고를 재조회한다"는 지적(GPT)에 대한 대응입니다.
+        여기서 하는 모든 게이팅(PSM 상태, 미해결 주문 차단 등)은
+        정상 호출과 완전히 동일한 코드 경로이므로, 장애 복구 전용
+        예외 처리를 새로 만들지 않았습니다 — 부수 효과 중복 위험도
+        그만큼 없습니다.
+        """
         # Reconcile lifecycle before orders. Despite the historical "shadow"
         # method name, these states actively gate BUY and SELL submissions.
         self._sync_position_state_machine_shadow(balance)
@@ -3765,31 +4050,258 @@ class TradingService:
                 cmd_file.unlink(missing_ok=True)
 
     def _run_end_of_day_tasks(self, now: datetime) -> None:
-        """장 마감 후 작업 (리포트/검증). run_once 밖에서도 호출 가능."""
-        if now.hour == 15 and now.minute >= 20 and not self._report_generated_today:
+        """장 마감 후 작업 (리포트/검증). run_once 밖에서도 호출 가능.
+
+        2026-09-16 (GPT 7차 재검토 지적 반영): 장외 시간에 잔고 API
+        장애가 이어지는 동안에도(`trading_loop()`의 after-hours
+        분기가 재시도 실패를 흡수하도록 바뀌어) 이 메서드는 예전과
+        동일하게 항상 호출됩니다 — 즉 "대조 실패 때문에 마감 리포트
+        자체를 건너뛰는" 일은 없습니다.
+
+        2026-09-16 (GPT 8차 재검토 지적 반영 — 잠정/최종 구분): 리포트
+        생성 시점에도 미해결 주문이 남아 있으면(대조 미완료) 잠정으로
+        생성하고, 대조가 끝나면(더 이상 미해결 주문이 없으면) 시각
+        조건 없이 딱 한 번 최종본으로 다시 생성·모든 분석·번들을
+        갱신합니다.
+
+        2026-09-16 (GPT 9차 재검토 지적 반영 — 저장 실패·거래일 분리):
+        `_generate_daily_report()`가 저장 실패를 삼키고 항상 성공한
+        것처럼 반환하던 문제를 고쳐, 성공했을 때만 상태를 갱신하고
+        실패하면 일정 간격 후 재시도합니다. 또한 "당일 최초 생성
+        여부"와 "최종화를 기다리는 잠정 리포트의 대상 거래일"을
+        분리 추적해, 자정을 넘겨도 전일 잠정본이 원래 거래일로
+        최종화되도록 했습니다.
+
+        2026-09-17 (GPT 10차 재검토 지적 반영 — 거래일별 다중 추적 +
+        시각 조건 분리 + 후속 단계 개별 재시도): 9차 구현은 세 가지
+        문제가 더 있었습니다.
+        (1) "최종화 대기 거래일"을 스칼라 하나(`_pending_provisional_
+            date`)로만 추적해, 이틀 연속 잠정 상태가 되면 두 번째
+            거래일이 첫 번째를 덮어써 최종화 대상에서 누락됐습니다
+            (GPT 실측 재현: 9/16 잠정 → 9/17도 잠정 → 이후 미해결
+            주문 해소돼도 9/16만 최종화됨). 또한 "최초 생성" 조건
+            자체가 `now.hour == 15`를 요구해, 15:59대에 최초 저장이
+            실패하면 16시가 지난 뒤엔 등록조차 되지 않아 영원히
+            재시도하지 않았습니다. 이제 시각 조건은 "새 거래일 작업을
+            등록"할 때만 적용하고(`_report_generated_date`), 등록된
+            거래일들은 `_eod_pending_dates`(거래일 → 잠정 대기 여부)
+            dict로 각각 독립 추적해 재시도·최종화가 시각과 무관하게,
+            그리고 서로를 밀어내지 않고 처리됩니다.
+        (2) 저장 실패 시 "기존 잠정 파일이 보존된다"는 설명이 실제로는
+            보장되지 않았습니다 — `DailyReporter.generate()`가
+            `write_text()`로 기존 파일에 직접 덮어써, 쓰는 도중
+            실패하면 파일이 이미 훼손된 뒤였습니다. 이제
+            `DailyReporter`가 임시 파일에 전체 내용을 쓰고 성공했을
+            때만 `os.replace()`로 원자적으로 교체합니다(아래
+            `infra/storage/daily_reporter.py` 참고) — 쓰는 도중
+            실패해도 기존 파일은 전혀 건드려지지 않습니다.
+        (3) 리포트 저장 직후 실행하는 후속 분석/번들 생성이 실패해도
+            재시도가 전혀 없었습니다(경고만 남기고 그냥 넘어감) —
+            최종 리포트는 갱신됐는데 번들(ZIP)은 예전 잠정본 그대로
+            남거나 아예 생성되지 않을 수 있었습니다(GPT 실측 재현:
+            번들 실행에 실패 코드를 3번 연속 주입해도 시도는 한
+            번뿐). 이제 리포트 저장 완료와 후속 단계 완료를 분리해
+            `_eod_followups_pending`(거래일 → 아직 성공 못한 단계
+            이름 집합)으로 추적하고, 실패한 단계만 다음 폴링에서
+            재시도합니다 — 이미 성공한 단계는 다시 실행하지
+            않습니다. 리포트가 (잠정이든 최종이든) 다시 저장될
+            때마다 이 집합은 전부 리셋됩니다 — 리포트 내용이 바뀌면
+            번들 등도 최신 내용을 반영해 다시 만들어야 하기
+            때문입니다.
+
+        2026-09-17 (GPT 11차 재검토 지적 반영 — 번들 선행 의존 + 재시도
+        시각 계산): 10차 구현은 두 가지 문제가 더 있었습니다.
+        (1) 번들(`_export_daily_bundle_today()`)이 다른 분석 단계의
+            성공 여부와 무관하게 그때그때 독립적으로 실행·재시도돼,
+            앞선 분석이 실패한 채로도 번들이 "예전 분석 결과"를
+            담아 성공해버릴 수 있었습니다 — 이후 분석이 재시도로
+            성공해도 번들은 이미 완료 처리돼 다시 만들어지지
+            않았습니다(GPT 실측 재현: shadow 분석 실패 → 번들은 예전
+            내용으로 성공 → shadow 분석 재시도 성공 → 번들은 재생성
+            안 됨). 이제 번들은 나머지 7개 분석 단계가 모두 성공한
+            뒤에만 실행합니다 — 하나라도 아직 대기 중이면 번들도
+            대기 목록에 남겨둡니다.
+        (2) 실패 후 재시도 대기 시각을 이 메서드 시작 시점에 구한
+            `now_mono`를 기준으로 계산해, 보고서 저장이나 분석·번들
+            실행 자체에 걸린 시간(동기식 subprocess 호출 포함)이
+            대기 간격에서 그대로 깎여나갔습니다(GPT 실측 재현: 작업
+            시작 0초 → 번들 실패 확인 40초 → 재시도 시각이 30초로
+            등록돼 이미 과거 → 다음 폴링 50초에 바로 재실행돼 실제
+            대기는 10초뿐). 이제 실패를 확인한 시점에 `self.
+            _monotonic()`을 다시 읽어 재시도 시각을 계산합니다 —
+            동기식 호출 지연 자체는 이번 범위가 아니므로 그대로
+            두고, 재시도 간격 계산만 바로잡습니다.
+        - 처음부터 미해결 주문이 없었다면(정상 상황) 예전과 동일하게
+          한 번만 생성됩니다.
+        """
+        today = now.date()
+
+        # 1) 새 거래일 작업 등록 — 시각 조건은 여기(등록 시점)에만
+        #    적용한다. 이미 등록된 거래일의 재시도·최종화는 아래
+        #    2)·3)에서 시각과 무관하게 처리한다.
+        if (
+            self._report_generated_date != today
+            and (now.hour > 15 or (now.hour == 15 and now.minute >= 20))
+        ):
+            self._report_generated_date = today
+            self._eod_pending_dates[today] = False  # 아직 저장 성공한 적 없음
             self.app_logger.info("━" * 45)
             self.app_logger.info("  🔔 장 마감 (15:20) — 매매 종료")
             self.app_logger.info("  보유 포지션은 다음날로 이월됩니다.")
             self.app_logger.info("━" * 45)
-            self._generate_daily_report()
-            self._report_generated_today = True
-            self.app_logger.info("[REPORT] 일일 리포트 생성 완료")
-            self._validate_logs_today(now.date())
-            self._run_signal_analysis_today(now.date())
-            self._run_trade_analysis_today(now.date())
-            self._run_indicator_analysis_today(now.date())
-            self._run_replay_today(now.date())
-            self._run_bb_block_impact_today(now.date())
-            self._run_shadow_analysis_today(now.date())
-            self._export_daily_bundle_today(now.date())
 
-    def _export_daily_bundle_today(self, target_date) -> None:
+        now_mono = self._monotonic()
+
+        # 2) 아직 저장이 끝나지 않은 거래일 중 하나를 골라 처리한다
+        #    (오래된 거래일부터). 잠정 대기 중(True)인 거래일은
+        #    미해결 주문이 아직 남아 있으면(대조 미완료) 건너뛴다.
+        report_date = None
+        for d in sorted(self._eod_pending_dates):
+            retry_at = self._eod_retry_at.get(d)
+            if retry_at is not None and now_mono < retry_at:
+                continue  # 직전 저장 실패 후 재시도 간격이 아직 지나지 않음
+            if self._eod_pending_dates[d] and self._has_unresolved_orders():
+                continue  # 잠정 대기 중 — 아직 대조 미완료
+            report_date = d
+            break
+
+        if report_date is not None:
+            was_pending_finalize = self._eod_pending_dates[report_date]
+            is_provisional = False if was_pending_finalize else self._has_unresolved_orders()
+
+            if is_provisional:
+                self.app_logger.warning(
+                    f"[REPORT] 대조 미완료({report_date}) — 미해결 주문이 남은 채로 "
+                    "리포트를 잠정 생성합니다(장외 잔고 재시도가 계속 진행 중일 수 "
+                    "있음, 아래 리포트의 손익·포지션 수치가 최신 확정 상태가 아닐 "
+                    "수 있습니다. 대조가 끝나면 자동으로 최종본으로 다시 생성됩니다)."
+                )
+            elif was_pending_finalize:
+                self.app_logger.info(f"[REPORT] 대조 완료({report_date}) — 리포트를 최종본으로 갱신합니다.")
+
+            saved = self._generate_daily_report(provisional=is_provisional, target_date=report_date)
+            if not saved:
+                # 2026-09-17 (GPT 11차 재검토 지적 반영): 저장 시도
+                # 자체에 걸린 시간이 대기 간격에서 깎이지 않도록,
+                # 실패를 확인한 "지금" 다시 monotonic 시각을 읽는다
+                # (메서드 시작 시점의 now_mono를 재사용하지 않는다).
+                self._eod_retry_at[report_date] = self._monotonic() + self._eod_report_retry_backoff_seconds
+                self.app_logger.warning(
+                    f"[REPORT] 리포트 저장 실패({report_date}) — 상태를 갱신하지 않고 "
+                    f"{self._eod_report_retry_backoff_seconds:.0f}초 후 재시도합니다"
+                    "(기존 파일은 그대로 유지됩니다)."
+                )
+                return
+
+            self._eod_retry_at.pop(report_date, None)
+            if is_provisional:
+                self._eod_pending_dates[report_date] = True
+            else:
+                self._eod_pending_dates.pop(report_date, None)  # 최종 완료 — 더 이상 추적 불필요
+            self.app_logger.info(
+                f"[REPORT] 일일 리포트 생성 완료({report_date}){'(잠정)' if is_provisional else '(최종)'}"
+            )
+            # 리포트가 (다시) 저장됐으니 후속 단계를 전부 다시 시도한다
+            # — 이미 성공했던 이전 버전의 결과는 최신 리포트를
+            # 반영하지 못하므로 무효화한다.
+            self._eod_followups_pending[report_date] = {
+                "validate", "signal", "trade", "indicator",
+                "replay", "bb_block", "shadow", "bundle",
+            }
+            self._run_eod_followups(report_date)
+            return
+
+        # 3) 처리할 리포트 저장은 없지만, 이전에 저장은 끝났으나
+        #    후속 단계 일부가 실패해 남아있는 거래일이 있으면
+        #    그중 하나의 실패한 단계만 재시도한다.
+        for d in sorted(self._eod_followups_pending):
+            if not self._eod_followups_pending[d]:
+                continue
+            retry_at = self._eod_retry_at.get(d)
+            if retry_at is not None and now_mono < retry_at:
+                continue
+            self._run_eod_followups(d)
+            return
+
+    def _run_eod_followups(self, target_date) -> None:
+        """마감 리포트 저장 후 실행하는 분석/번들 단계들을 실행합니다.
+
+        2026-09-17 (GPT 10차 재검토 지적 반영): 예전엔 이 단계들이
+        실패해도(subprocess 실패 코드, 예외 등) 경고만 남기고 그냥
+        넘어가 재시도가 전혀 없었습니다. 이제 각 단계가 성공 여부를
+        반환하도록 하고(각 `_run_..._today()`/`_validate_logs_today()`
+        /`_export_daily_bundle_today()` 참고), 이미 성공한 단계는
+        건너뛰고 실패한 단계만 다음 폴링에서 다시 시도합니다. 모든
+        단계가 성공하면 `_eod_followups_pending`에서 이 거래일을
+        제거합니다.
+
+        2026-09-17 (GPT 11차 재검토 지적 반영 — 번들 선행 의존):
+        `_export_daily_bundle_today()`는 그날의 다른 모든 분석
+        리포트를 묶는 단계이므로, 나머지 7개 분석 단계
+        (검증·시그널·거래·지표·리플레이·볼린저 차단 영향·shadow)가
+        모두 성공한 뒤에만 실행합니다 — 하나라도 아직 대기 중이면
+        번들은 이번 폴링엔 건너뛰고 대기 목록에 남습니다. 예전엔
+        번들이 앞선 분석의 성공 여부와 무관하게 독립적으로 실행돼,
+        분석이 실패한 채로도 번들이 "예전 분석 결과"를 담아 성공해
+        버릴 수 있었고, 이후 분석이 재시도로 성공해도 번들은 이미
+        완료 처리라 다시 만들어지지 않았습니다(GPT 실측 재현: shadow
+        분석 실패 → 번들은 예전 내용으로 생성 성공 → shadow 분석
+        재시도 성공 → 번들은 재생성되지 않음).
+
+        2026-09-17 (GPT 11차 재검토 지적 반영 — 재시도 시각 계산):
+        실패 후 재시도 대기 시각은 이 메서드가 실패를 확인한
+        "지금" `self._monotonic()`을 다시 읽어 계산합니다 — 각
+        단계의 subprocess 실행 자체에 걸린 시간이 대기 간격에서
+        깎이지 않도록 하기 위함입니다.
+        """
+        pending = self._eod_followups_pending.get(target_date)
+        if not pending:
+            return
+
+        if "validate" in pending and self._validate_logs_today(target_date):
+            pending.discard("validate")
+        if "signal" in pending and self._run_signal_analysis_today(target_date):
+            pending.discard("signal")
+        if "trade" in pending and self._run_trade_analysis_today(target_date):
+            pending.discard("trade")
+        if "indicator" in pending and self._run_indicator_analysis_today(target_date):
+            pending.discard("indicator")
+        if "replay" in pending and self._run_replay_today(target_date):
+            pending.discard("replay")
+        if "bb_block" in pending and self._run_bb_block_impact_today(target_date):
+            pending.discard("bb_block")
+        if "shadow" in pending and self._run_shadow_analysis_today(target_date):
+            pending.discard("shadow")
+
+        # 번들은 위 7개 분석 단계가 모두 끝난 뒤에만 실행한다 — 그래야
+        # 번들이 최신 분석 결과를 담는다(GPT 11차 재검토 지적).
+        preceding_steps = {"validate", "signal", "trade", "indicator", "replay", "bb_block", "shadow"}
+        if "bundle" in pending and not (pending & preceding_steps):
+            if self._export_daily_bundle_today(target_date):
+                pending.discard("bundle")
+
+        if pending:
+            self._eod_retry_at[target_date] = self._monotonic() + self._eod_report_retry_backoff_seconds
+            self.app_logger.warning(
+                f"[REPORT] 후속 단계 일부 실패({target_date}, 남은 단계: "
+                f"{sorted(pending)}) — {self._eod_report_retry_backoff_seconds:.0f}초 "
+                "후 실패한 단계만 재시도합니다."
+            )
+        else:
+            self._eod_retry_at.pop(target_date, None)
+            self._eod_followups_pending.pop(target_date, None)
+
+    def _export_daily_bundle_today(self, target_date) -> bool:
         """분석용 일일 번들(exports/bundle_YYYYMMDD.zip)을 생성합니다.
 
         2026-08-06 (1I단계): 분석 때마다 signal_log.csv(65MB,
         22만행)와 app.log(9MB) 전체를 올려야 했음. 해당 거래일
         몫만 잘라내면 실측 74MB → 0.5MB. **모든 리포트가 생성된
         뒤에 실행**해야 그날 리포트까지 함께 담기므로 마지막에 둠.
+
+        2026-09-17 (GPT 10차 재검토 지적 반영): 성공 여부를 bool로
+        반환한다 — 실패해도 그냥 넘어가던 걸 호출자(`_run_eod_
+        followups()`)가 재시도하도록 바꾸기 위함.
         """
         try:
             import subprocess, sys
@@ -3802,12 +4314,14 @@ class TradingService:
             )
             if result.returncode == 0:
                 self.app_logger.info("[EXPORT] 분석용 일일 번들 생성 완료 → exports/ 저장")
-            else:
-                self.app_logger.warning(f"[EXPORT] 번들 생성 실패:\n{result.stderr}")
+                return True
+            self.app_logger.warning(f"[EXPORT] 번들 생성 실패:\n{result.stderr}")
+            return False
         except Exception as exc:
             self.app_logger.warning(f"[EXPORT] 번들 생성 오류: {exc}")
+            return False
 
-    def _run_shadow_analysis_today(self, target_date) -> None:
+    def _run_shadow_analysis_today(self, target_date) -> bool:
         """장 마감 후 shadow 관측 데이터 리포트를 자동 생성합니다.
 
         2026-08-06 (1H단계): 1E(MACD)·1E.5~1E.7(VWAP) shadow가
@@ -3816,6 +4330,8 @@ class TradingService:
         즉석 스크립트를 써야 했음. 다른 분석과 동일하게
         subprocess로 실행하고 reports/에 저장하는 패턴을 따름.
         읽기 전용 후처리라 매매 판단에는 영향이 없음.
+
+        2026-09-17 (GPT 10차 재검토 지적 반영): 성공 여부를 bool로 반환.
         """
         try:
             import subprocess, sys
@@ -3828,13 +4344,18 @@ class TradingService:
             )
             if result.returncode == 0:
                 self.app_logger.info("[ANALYSIS] shadow 관측 분석 완료 → reports/ 저장")
-            else:
-                self.app_logger.warning(f"[ANALYSIS] shadow 관측 분석 실패:\n{result.stderr}")
+                return True
+            self.app_logger.warning(f"[ANALYSIS] shadow 관측 분석 실패:\n{result.stderr}")
+            return False
         except Exception as exc:
             self.app_logger.warning(f"[ANALYSIS] shadow 관측 분석 오류: {exc}")
+            return False
 
-    def _run_signal_analysis_today(self, target_date) -> None:
-        """장 마감 후 시그널 분석을 자동 실행합니다."""
+    def _run_signal_analysis_today(self, target_date) -> bool:
+        """장 마감 후 시그널 분석을 자동 실행합니다.
+
+        2026-09-17 (GPT 10차 재검토 지적 반영): 성공 여부를 bool로 반환.
+        """
         try:
             import subprocess, sys
             date_str = target_date.strftime("%Y-%m-%d")
@@ -3846,13 +4367,18 @@ class TradingService:
             )
             if result.returncode == 0:
                 self.app_logger.info("[ANALYSIS] 시그널 분석 완료 → reports/ 저장")
-            else:
-                self.app_logger.warning(f"[ANALYSIS] 시그널 분석 실패:\n{result.stderr}")
+                return True
+            self.app_logger.warning(f"[ANALYSIS] 시그널 분석 실패:\n{result.stderr}")
+            return False
         except Exception as exc:
             self.app_logger.warning(f"[ANALYSIS] 시그널 분석 오류: {exc}")
+            return False
 
-    def _run_trade_analysis_today(self, target_date) -> None:
-        """장 마감 후 거래 분석을 자동 실행합니다."""
+    def _run_trade_analysis_today(self, target_date) -> bool:
+        """장 마감 후 거래 분석을 자동 실행합니다.
+
+        2026-09-17 (GPT 10차 재검토 지적 반영): 성공 여부를 bool로 반환.
+        """
         try:
             import subprocess, sys
             date_str = target_date.strftime("%Y-%m-%d")
@@ -3864,13 +4390,18 @@ class TradingService:
             )
             if result.returncode == 0:
                 self.app_logger.info("[ANALYSIS] 거래 분석 완료 → reports/ 저장")
-            else:
-                self.app_logger.warning(f"[ANALYSIS] 거래 분석 실패:\n{result.stderr}")
+                return True
+            self.app_logger.warning(f"[ANALYSIS] 거래 분석 실패:\n{result.stderr}")
+            return False
         except Exception as exc:
             self.app_logger.warning(f"[ANALYSIS] 거래 분석 오류: {exc}")
+            return False
 
-    def _run_indicator_analysis_today(self, target_date) -> None:
-        """장 마감 후 ATR/볼린저 지표 분석을 자동 실행합니다."""
+    def _run_indicator_analysis_today(self, target_date) -> bool:
+        """장 마감 후 ATR/볼린저 지표 분석을 자동 실행합니다.
+
+        2026-09-17 (GPT 10차 재검토 지적 반영): 성공 여부를 bool로 반환.
+        """
         try:
             import subprocess, sys
             date_str = target_date.strftime("%Y-%m-%d")
@@ -3882,13 +4413,18 @@ class TradingService:
             )
             if result.returncode == 0:
                 self.app_logger.info("[ANALYSIS] 지표(ATR/볼린저) 분석 완료 → reports/ 저장")
-            else:
-                self.app_logger.warning(f"[ANALYSIS] 지표 분석 실패:\n{result.stderr}")
+                return True
+            self.app_logger.warning(f"[ANALYSIS] 지표 분석 실패:\n{result.stderr}")
+            return False
         except Exception as exc:
             self.app_logger.warning(f"[ANALYSIS] 지표 분석 오류: {exc}")
+            return False
 
-    def _run_bb_block_impact_today(self, target_date) -> None:
-        """장 마감 후 볼린저 상단돌파 차단 가상 성과 분석을 자동 실행합니다."""
+    def _run_bb_block_impact_today(self, target_date) -> bool:
+        """장 마감 후 볼린저 상단돌파 차단 가상 성과 분석을 자동 실행합니다.
+
+        2026-09-17 (GPT 10차 재검토 지적 반영): 성공 여부를 bool로 반환.
+        """
         try:
             import subprocess, sys
             date_str = target_date.strftime("%Y-%m-%d")
@@ -3900,13 +4436,18 @@ class TradingService:
             )
             if result.returncode == 0:
                 self.app_logger.info("[ANALYSIS] 볼린저 차단 영향 분석 완료 → reports/ 저장")
-            else:
-                self.app_logger.warning(f"[ANALYSIS] 볼린저 차단 영향 분석 실패:\n{result.stderr}")
+                return True
+            self.app_logger.warning(f"[ANALYSIS] 볼린저 차단 영향 분석 실패:\n{result.stderr}")
+            return False
         except Exception as exc:
             self.app_logger.warning(f"[ANALYSIS] 볼린저 차단 영향 분석 오류: {exc}")
+            return False
 
-    def _run_replay_today(self, target_date) -> None:
-        """장 마감 후 리플레이를 자동 실행합니다."""
+    def _run_replay_today(self, target_date) -> bool:
+        """장 마감 후 리플레이를 자동 실행합니다.
+
+        2026-09-17 (GPT 10차 재검토 지적 반영): 성공 여부를 bool로 반환.
+        """
         try:
             import subprocess, sys
             date_str = target_date.strftime("%Y-%m-%d")
@@ -3918,13 +4459,25 @@ class TradingService:
             )
             if result.returncode == 0:
                 self.app_logger.info("[REPLAY] 리플레이 완료 → reports/ 저장")
-            else:
-                self.app_logger.warning(f"[REPLAY] 리플레이 실패:\n{result.stderr}")
+                return True
+            self.app_logger.warning(f"[REPLAY] 리플레이 실패:\n{result.stderr}")
+            return False
         except Exception as exc:
             self.app_logger.warning(f"[REPLAY] 리플레이 실행 오류: {exc}")
+            return False
 
-    def _validate_logs_today(self, target_date) -> None:
-        """장 마감 후 로그 품질을 자동 검증하고 결과를 app.log에 기록합니다."""
+    def _validate_logs_today(self, target_date) -> bool:
+        """장 마감 후 로그 품질을 자동 검증하고 결과를 app.log에 기록합니다.
+
+        2026-09-17 (GPT 10차 재검토 지적 반영): 성공 여부를 bool로
+        반환한다 — 여기서 "성공"은 검사가 예외 없이 끝까지 실행됐다는
+        뜻이지, 검사 결과 오류/경고가 없었다는 뜻이 아니다(데이터
+        품질 문제 자체는 재실행해도 사라지지 않으므로 재시도 대상이
+        아니다). 두 검사(신호/거래 로그, 1분봉) 중 하나라도 실행
+        자체가 예외로 실패하면 False를 반환해 다음 폴링에서 그
+        검사만 다시 시도하게 한다.
+        """
+        ok = True
         # signal_log / trades.csv 검증
         try:
             from validate_logs import check_signal_log, check_trades_log
@@ -3940,6 +4493,7 @@ class TradingService:
                 )
         except Exception as exc:
             self.app_logger.warning(f"[VALIDATE] 로그 품질 검사 실패: {exc}")
+            ok = False
 
         # 1분봉 저장 품질 검증
         try:
@@ -3961,6 +4515,9 @@ class TradingService:
             )
         except Exception as exc:
             self.app_logger.warning(f"[VALIDATE] 1분봉 품질 검사 실패: {exc}")
+            ok = False
+
+        return ok
 
     def _try_buy(
         self,
@@ -4898,16 +5455,43 @@ class TradingService:
             )
 
 
-    def _generate_daily_report(self) -> None:
-        """장 마감 후 일일 리포트를 생성하고 로그에 출력합니다."""
+    def _generate_daily_report(self, *, provisional: bool = False, target_date: date | None = None) -> bool:
+        """장 마감 후 일일 리포트를 생성하고 로그에 출력합니다.
+
+        2026-09-16 (GPT 8차 재검토 지적 반영): `provisional`을 그대로
+        `DailyReporter.generate()`에 전달해, 리포트 파일 본문에도
+        잠정 여부가 남도록 한다(`_run_end_of_day_tasks()`가 호출 시
+        `_has_unresolved_orders()` 기준으로 결정해 넘긴다).
+
+        2026-09-16 (GPT 9차 재검토 지적 반영 — 성공 여부 반환): 예전엔
+        예외를 여기서 삼키고 항상 `None`을 반환해, 호출자(`_run_end_
+        of_day_tasks()`)가 저장 성공 여부를 알 방법이 없었다 — 그
+        결과 저장이 실패해도 `_report_generated_date`/`_pending_
+        provisional_date`가 성공한 것처럼 확정돼 버렸다(GPT 실측
+        재현: 최종 저장 실패를 주입해도 생성 시도가 한 번뿐이고 다음
+        폴링에서 재시도하지 않음). 이제 성공하면 `True`, 실패하면
+        (예외를 로그만 남기고 삼킨 뒤) `False`를 반환해 호출자가
+        상태를 갱신할지 판단하게 한다.
+
+        2026-09-16 (GPT 9차 재검토 지적 반영 — 거래일 명시): `target_
+        date`를 넘기지 않으면 `DailyReporter.generate()`가 내부
+        기본값(`date.today()`, 즉 이 호출 시점의 실제 오늘 날짜)을
+        쓴다 — 자정을 넘겨 다음날 최종화가 일어나면 엉뚱한 날짜의
+        파일을 건드리게 되므로, `_run_end_of_day_tasks()`가 결정한
+        대상 거래일을 명시적으로 전달받아 그대로 넘긴다.
+        """
         try:
-            report = self._reporter.generate(regime_summary=self._regime_summary)
+            report = self._reporter.generate(
+                target_date=target_date, regime_summary=self._regime_summary, provisional=provisional,
+            )
             self.app_logger.info("=" * 45)
             for line in report.splitlines():
                 self.app_logger.info(line)
             self.app_logger.info("=" * 45)
+            return True
         except Exception as exc:
             self.app_logger.warning(f"[REPORT] 리포트 생성 실패: {exc}")
+            return False
 
     def _build_trade_context(
         self,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """설정 파일을 읽어서 파이썬 객체로 변환하는 모듈."""
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -81,6 +82,19 @@ class TradingConfig:
     # 바꾸지 않되, 실패가 감지된 이후에만 추가로 억제한다. 초기
     # 설정값이며, 실측 후 조정 대상.
     market_price_retry_backoff_seconds: float = 60.0
+    # 2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영): trading_loop()가
+    # 잔고 API 429를 감지하면 더 이상 180초를 통째로 자지 않고, 이
+    # 범위(최소~최대) 안에서 실패마다 2배씩 늘어나는(성공 시 최소로
+    # 리셋) monotonic 절대시각 기준 백오프로 독립 재시도한다
+    # (TradingService.enter_balance_outage()/handle_balance_outage_tick()
+    # 참고). 최댓값(180초)은 기존 wait_out_balance_outage()가 쓰던 총
+    # 대기시간과 동일해 "최악의 경우 오늘보다 회복이 느려지지 않는다"는
+    # 조건을 만족한다. 최솟값(30초)은 이 API 계열에 이미 안전하다고
+    # 받아들여진 ORDER_STATUS_QUERY_MIN_INTERVAL_SEC과 같은 값을
+    # 재사용했다(2026-09-14 설계 문서 v2 §3 제안값). 초기 설정값이며,
+    # 실측 후 조정 대상 — "안전성이 입증된 값"이라는 뜻은 아니다.
+    balance_retry_backoff_min_seconds: float = 30.0
+    balance_retry_backoff_max_seconds: float = 180.0
 
     def __post_init__(self):
         # frozen=True dataclass라 self.x = ... 직접 대입은 FrozenInstanceError.
@@ -90,6 +104,24 @@ class TradingConfig:
         # None 케이스가 실제로 발생한 적이 없었을 뿐이었음)
         if self.excluded_symbols is None:
             object.__setattr__(self, "excluded_symbols", [])
+
+        # 2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영): "양수·
+        # 유한값·최솟값≤최댓값 검증 추가" 지적 반영 — 잘못된 설정값이
+        # (예: 음수, 0, inf, min>max) 조용히 통과해 재시도 백오프가
+        # 전혀 늘지 않거나 즉시 무한대가 되는 것을 시작 시점에 막는다.
+        for field_name in ("balance_retry_backoff_min_seconds", "balance_retry_backoff_max_seconds"):
+            value = getattr(self, field_name)
+            if not (isinstance(value, (int, float)) and math.isfinite(value) and value > 0):
+                raise ValueError(
+                    f"TradingConfig.{field_name}는 양의 유한한 숫자여야 합니다 (받은 값: {value!r})"
+                )
+        if self.balance_retry_backoff_min_seconds > self.balance_retry_backoff_max_seconds:
+            raise ValueError(
+                "TradingConfig.balance_retry_backoff_min_seconds는 "
+                "balance_retry_backoff_max_seconds보다 클 수 없습니다 "
+                f"(min={self.balance_retry_backoff_min_seconds}, "
+                f"max={self.balance_retry_backoff_max_seconds})"
+            )
 
 
 @dataclass(frozen=True)
