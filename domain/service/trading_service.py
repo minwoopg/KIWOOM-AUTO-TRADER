@@ -24,7 +24,10 @@ from config.settings import Settings
 from domain.market_regime.classifier import MarketRegimeClassifier
 from domain.market_regime.minute_analyzer import MinuteAnalyzer, MinuteAnalysis, MinuteDataResult
 from domain.market_regime.session_metrics import merge_session_bars, build_session_metrics, format_session_metrics_log_line
-from domain.models import AccountBalance, BrokerOrderStatus, MarketRegime, OrderRequest, OrderResult, OrderSide, Signal, SignalType
+from domain.models import (
+    AccountBalance, BrokerOrderStatus, MarketRegime, OrderRequest,
+    OrderResult, OrderSide, Position, Signal, SignalType,
+)
 from domain.position.lifecycle import PositionLifecycle, PositionStateMachine, is_trackable_order_id
 from domain.risk.risk_manager import RiskManager
 from domain.strategy.strategy_router import StrategyRouter
