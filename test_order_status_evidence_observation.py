@@ -959,7 +959,7 @@ try:
               any(d.get("__marker__") == "shutdown" for d in _parsed_raw_lines))
         check("6-15) 커버리지 요약에 종료 마커 발견 사실이 표시됨"
               "(재검토 지적 2번 — 저장 실패/정상 종료 상태를 번들에서 확인 가능)",
-              "recorder_shutdown_marker_count          = 1" in coverage_text
+              "recorder_shutdown_marker_count(이 날짜)  = 1" in coverage_text
               and "restart_id=r1" in coverage_text)
 finally:
     _os.chdir(_orig_cwd)
@@ -1106,6 +1106,307 @@ except Exception:
 check("8-6) recorder.shutdown() 자체가 예외를 던져도 프로세스 종료를 막지 않음"
       "(best-effort — 관측 기능이 종료 절차를 방해하지 않음)",
       _no_crash_raising)
+
+
+# ══════════════════════════════════════════════════════════════
+# 9. 2026-09-18 재재검토(GPT 2차) 5개 지적 사항 재현
+#    ①truncate 실패·개행 누락 시 후속 기록 보호
+#    ②부분 조회 실패의 성공 오집계
+#    ③익일 조회의 원래 주문일 연결
+#    ④식별자를 보존하는 마스킹과 실제 설정 경로 전달
+#    ⑤실행 중 저장 품질 스냅샷과 실행별 종료 상태 구분
+# ══════════════════════════════════════════════════════════════
+
+# ── 9A. truncate 자체가 실패하는 경우(지적 1번, 재현된 버그) ─────
+# 재현 표의 2번째 행: "w1 부분 쓰기 실패 → truncate 실패" → 예전엔
+# w2도 손상된 파일 위에 이어붙어 함께 파싱 불가가 됐음. 이제
+# truncate 실패 시 손상 파일을 격리하고 같은 경로에 새 파일로
+# 전환해야 하므로, w2/w3는 정상 기록돼야 하고 dropped_count는
+# 실제로 복구 불가능해진 w1 1건만 반영해야 한다.
+_tmpdir9a = tempfile.mkdtemp()
+_tp_path = Path(_tmpdir9a) / "obs.jsonl"
+_tp_recorder = OrderStatusObservationRecorder(str(_tp_path), shutdown_drain_timeout_sec=1.0)
+
+_tp_call_count = {"n": 0}
+
+
+def _flaky_open_truncate_fail(self, *args, **kwargs):
+    _tp_call_count["n"] += 1
+    n = _tp_call_count["n"]
+    if self == _tp_path and n == 1:
+        # 1번째 open: w1의 "a" 모드 쓰기 — 일부 바이트만 쓰고 예외.
+        real_f = _real_path_open(self, *args, **kwargs)
+
+        class _PartialWriteFile:
+            def write(_self, data):
+                partial = data[: max(1, len(data) // 2)]
+                real_f.write(partial)
+                raise OSError("simulated partial write failure(테스트 전용)")
+
+            def flush(_self):
+                real_f.flush()
+
+            def fileno(_self):
+                return real_f.fileno()
+
+            def close(_self):
+                real_f.close()
+
+            def __enter__(_self):
+                return _self
+
+            def __exit__(_self, exc_type, exc, tb):
+                _self.close()
+                return False
+
+        return _PartialWriteFile()
+    if self == _tp_path and n == 2:
+        # 2번째 open: _truncate_partial_write()의 "r+b" 시도 —
+        # truncate 자체가 실패하는 상황을 그대로 재현(디스크 문제 등).
+        raise OSError("simulated truncate failure(테스트 전용)")
+    return _real_path_open(self, *args, **kwargs)
+
+
+with mock.patch.object(Path, "open", _flaky_open_truncate_fail):
+    _tp_recorder._write_one(dataclasses.replace(_dummy, write_id="tp-w1", query_id="tp-w1"))
+# truncate 복구까지 실패했으므로 이 파일에는 더 이상 쓰지 않고
+# 격리+새 파일 전환이 일어나야 한다 — 아래 두 호출은 실제 open()을 씀.
+_tp_recorder._write_one(dataclasses.replace(_dummy, write_id="tp-w2", query_id="tp-w2"))
+_tp_recorder._write_one(dataclasses.replace(_dummy, write_id="tp-w3", query_id="tp-w3"))
+
+_tp_lines = [l for l in _tp_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+_tp_parsed = []
+for _l in _tp_lines:
+    try:
+        _tp_parsed.append(json.loads(_l))
+    except json.JSONDecodeError:
+        pass
+
+check("9-1) truncate 자체가 실패해도(더 이상 그 파일을 믿지 않고 새 파일로 전환) w2/w3는"
+      " 정상 기록됨(재현된 버그: 예전엔 w2까지 함께 파싱 불가였음)",
+      len(_tp_lines) == len(_tp_parsed) == 2
+      and any(d.get("write_id") == "tp-w2" for d in _tp_parsed)
+      and any(d.get("write_id") == "tp-w3" for d in _tp_parsed))
+check("9-2) dropped_count는 실제로 복구 불가능해진 w1 1건만 반영함(재현된 버그: 예전엔"
+      " truncate 실패 시 w2까지 함께 손상돼 실제 유실 건수가 dropped_count보다 컸음)",
+      _tp_recorder.dropped_count == 1)
+_quarantined_files = [p for p in Path(_tmpdir9a).iterdir() if "unrecoverable" in p.name]
+check("9-3) 손상된 원본 파일은 삭제되지 않고 별도 이름으로 격리되어 수동 조사가 가능함",
+      len(_quarantined_files) == 1)
+
+# ── 9B. 기존 파일의 마지막 줄이 유효 JSON이지만 개행 없이 끝나는 경우
+#    (지적 1번의 3번째 재현 행) ─────────────────────────────────
+_tmpdir9b = tempfile.mkdtemp()
+_nnl_path = Path(_tmpdir9b) / "obs.jsonl"
+_nnl_prev_line = json.dumps({"query_id": "prev1", "started_at": "2026-09-18T08:00:00"})
+with _nnl_path.open("w", encoding="utf-8") as f:
+    f.write(_nnl_prev_line)  # 의도적으로 마지막 개행을 쓰지 않음
+_nnl_recorder = OrderStatusObservationRecorder(str(_nnl_path), shutdown_drain_timeout_sec=1.0)
+_nnl_recorder._quarantine_incomplete_tail()
+_nnl_after = _nnl_path.read_bytes()
+check("9-4) 마지막 줄이 유효한 JSON이지만 개행 없이 끝나는 기존 파일을 시작 시 개행으로"
+      " 보정함(재현된 버그: 이전엔 '마지막 줄이 파싱 실패'인 경우만 감지했음)",
+      _nnl_after.endswith(b"\n") and _nnl_prev_line.encode("utf-8") in _nnl_after)
+
+_nnl_recorder._write_one(dataclasses.replace(_dummy, write_id="nnl-w2", query_id="nnl-w2"))
+_nnl_lines = [l for l in _nnl_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+_nnl_parsed = []
+for _l in _nnl_lines:
+    try:
+        _nnl_parsed.append(json.loads(_l))
+    except json.JSONDecodeError:
+        pass
+check("9-5) 개행 보정 후 다음 기록이 이전 줄과 뒤섞이지 않고 별도 줄로 온전히 남음"
+      "(보정하지 않았다면 두 레코드가 한 줄로 뭉개져 둘 다 파싱 불가였을 것)",
+      len(_nnl_lines) == 2 and len(_nnl_parsed) == 2
+      and any(d.get("query_id") == "prev1" for d in _nnl_parsed)
+      and any(d.get("write_id") == "nnl-w2" for d in _nnl_parsed))
+
+# ── 9C. compute_coverage()의 부분 조회 성공 오집계 수정(지적 2번,
+#    재현된 버그) — 재현: 조회 시도 1건, cntr 조회 실패(oso는 성공) →
+#    outcome="partial". 예전엔 api_error가 아니라는 이유만으로
+#    query_success_count에 들어가 주문 관측률이 100%로 나왔음.
+_obs_partial = dataclasses.replace(
+    _obs("30", account="acct-1"), outcome="partial", psm_broker_status=None,
+    filled_price_parsed=None, failure_stage="cntr_fetch",
+)
+_accepted_partial = {("acct-1", "kiwoom_real", "2026-09-18", "30")}
+_cov_partial = compute_coverage(
+    account_scope_id="acct-1", accepted_orders=_accepted_partial,
+    observations=[_obs_partial], order_date_resolver=lambda o: "2026-09-18",
+)
+check("9-6) 부분 조회(outcome=partial)는 query_success_count에 들어가지 않음"
+      "(재현된 버그: 예전엔 api_error가 아니라는 이유만으로 성공으로 집계됐음)",
+      _cov_partial["query_success_count"] == 0)
+check("9-7) 부분 조회는 별도의 query_partial_count로 집계됨(조회 성공과 명시적으로 구분)",
+      _cov_partial["query_partial_count"] == 1 and _cov_partial["query_failed_count"] == 0)
+check("9-8) 부분 조회만으로는 주문 관측률(observed_unique_orders)에 포함되지 않음"
+      "(원문 일부 확보 ≠ 조회 완전 성공 — 새 판정을 만들지 않는다는 서비스 계약과 일치)",
+      _cov_partial["observed_unique_orders"] == 0 and _cov_partial["order_observation_rate"] == 0.0)
+
+# ── 9D. _classify_run_state() 4가지 상태 구분(지적 5번) ──────────
+_now_iso = datetime.now().isoformat()
+_stale_iso = (datetime.now() - timedelta(seconds=999)).isoformat()
+check("9-9) 상태 스냅샷이 아예 없으면 '계측_비활성'(관측 기능이 시작된 적 없음)",
+      _bundle._classify_run_state(None) == "계측_비활성")
+check("9-10) clean_shutdown=True면 '정상_종료'",
+      _bundle._classify_run_state({"clean_shutdown": True, "updated_at": _now_iso}) == "정상_종료")
+check("9-11) clean_shutdown=False면 '종료_확인_불가'(종료 배선은 탔지만 마커 기록 자체가 실패)",
+      _bundle._classify_run_state({"clean_shutdown": False, "updated_at": _now_iso}) == "종료_확인_불가")
+check("9-12) clean_shutdown=None(아직 종료 안 함)이고 최근 갱신이면 '실행_중'"
+      "(이전 안내 정정 대상 — 실행 중인 프로그램의 자동 번들에는 종료 마커가 없는 게 정상)",
+      _bundle._classify_run_state({"clean_shutdown": None, "updated_at": _now_iso}) == "실행_중")
+check("9-13) clean_shutdown=None인데 갱신이 오래됐으면(하트비트 끊김) '종료_확인_불가'"
+      "(정상 종료 배선을 타지 못하고 강제 종료됐을 가능성)",
+      _bundle._classify_run_state({"clean_shutdown": None, "updated_at": _stale_iso}) == "종료_확인_불가")
+
+
+# ── 9E. 실제 서비스/exporter 경로 통합 재현 — 부분조회 오집계·익일
+#    조회 연결·식별자 보존 마스킹·사용자 지정 경로·실행 중 상태를
+#    한 번에 exporter의 build() 경로로 확인 ─────────────────────
+_tmpdir9e = tempfile.mkdtemp()
+try:
+    _os.chdir(_tmpdir9e)
+    Path("logs").mkdir()
+    Path("custom_obs_dir").mkdir()
+    _day917 = datetime(2026, 9, 17).date()
+    _day917_compact = _day917.strftime("%Y%m%d")
+
+    # trades.csv — 9/17 접수된 두 주문(OID2: 정상 관측 대상, OID3: 부분 조회 대상).
+    with (Path("logs") / "trades.csv").open("w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=TRADE_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        w.writerow({
+            "timestamp": "2026-09-17T09:10:00", "symbol": "005930", "side": "BUY",
+            "quantity": 10, "price": 10000, "accepted": "True", "message": "ok",
+            "order_id": "OID2",
+        })
+        w.writerow({
+            "timestamp": "2026-09-17T09:20:00", "symbol": "005930", "side": "BUY",
+            "quantity": 5, "price": 20000, "accepted": "True", "message": "ok",
+            "order_id": "OID3",
+        })
+
+    with (Path("logs") / "run_baseline.csv").open("w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=RUN_BASELINE_FIELDS)
+        w.writeheader()
+        w.writerow({
+            "run_id": "run-9e", "started_at": "2026-09-17T08:30:00+09:00",
+            "git_sha": "abc123", "git_dirty": "False",
+            "effective_config_hash": "hash1", "is_mock": "False",
+            "is_paper_trading": "False", "python_version": "3.11.0",
+            "account_scope_id": "acct-9e",
+        })
+
+    def _obs9e(query_id, started_at, order_id, order_accepted_at, write_id,
+               outcome="success", requested_order_id_raw=None, cntr_pric_raw=None):
+        d = {
+            "query_id": query_id, "started_at": started_at,
+            "finished_at": started_at, "account_scope_id": "acct-9e", "env": "kiwoom_real",
+            "symbol": "005930", "requested_order_id": order_id, "side_context": "BUY_PENDING",
+            "query_kind": "BUY_PENDING", "pending_age_sec_at_query": 31.0,
+            "outcome": outcome, "failure_stage": ("cntr_fetch" if outcome == "partial" else None),
+            "error_repr": None,
+            "psm_broker_status": (None if outcome == "partial" else "FILLED"),
+            "filled_price_parsed": (None if outcome == "partial" else 10000),
+            "cntr_matches": ([{
+                "response_order_id": requested_order_id_raw or order_id,
+                "cntr_pric_raw": cntr_pric_raw or "10000",
+            }] if requested_order_id_raw or cntr_pric_raw else []),
+            "oso_matches": [], "cntr_match_count": 0, "oso_match_count": 0,
+            "base_quantity_before_order": 0, "target_quantity_after_order": 10,
+            "journal_linked": False, "order_accepted_at": order_accepted_at,
+            "write_id": write_id, "restart_id": "r9e", "seq_no": 1, "schema_version": 1,
+        }
+        return d
+
+    obs9e_lines = [
+        # OID2: 9/17에 접수됐지만 9/18에(익일) 조회됨 — 원래 주문일(9/17)의
+        # 관측률에 연결돼야 함(재현: 지적 3번). started_at이 9/18이라
+        # 9/17 raw 슬라이스(조회일 기준)에는 포함되지 않으므로 마스킹
+        # 검증용 식별자 필드는 아래 OID3(9/17 당일 조회)에 둔다.
+        _json.dumps(_obs9e(
+            "q-oid2", "2026-09-18T09:00:00", "OID2", "2026-09-17T09:10:00", "w-oid2",
+        )),
+        # OID3: 9/17 당일 조회했지만 cntr 조회 실패로 outcome=partial —
+        # 조회 성공으로 오집계되면 안 됨(재현: 지적 2번). 동시에 식별자
+        # 필드(response_order_id/cntr_pric_raw)가 마스킹으로 뭉개지지
+        # 않는지도 이 관측(9/17 raw 슬라이스에 포함됨)으로 확인한다
+        # (재현: 지적 4번).
+        _json.dumps(_obs9e(
+            "q-oid3", "2026-09-17T09:21:00", "OID3", "2026-09-17T09:20:00", "w-oid3",
+            outcome="partial",
+            requested_order_id_raw="1234567890", cntr_pric_raw="9876543210",
+        )),
+    ]
+    _custom_obs_path = Path("custom_obs_dir") / "custom_obs.jsonl"
+    with _custom_obs_path.open("w", encoding="utf-8") as f:
+        f.write("\n".join(obs9e_lines) + "\n")
+
+    # 실행 중 상태 스냅샷을 직접 만들어 둠(재현: 지적 5번) — 아직
+    # 종료하지 않았고(clean_shutdown=None) 최근에 갱신된 것으로 표시.
+    _status_path_9e = _bundle.status_path_for(_custom_obs_path)
+    _status_path_9e.write_text(
+        _json.dumps({
+            "restart_id": "r9e", "updated_at": datetime.now().isoformat(),
+            "dropped_count": 0, "fsync_unconfirmed_count": 0,
+            "queue_full_dropped_count": 0, "file_healthy": True, "clean_shutdown": None,
+        }),
+        encoding="utf-8",
+    )
+
+    # 다른 날짜(9/12)의 과거 종료 마커도 같은 원본 로그에 남겨 둔다 —
+    # 9/17 번들에는 나타나면 안 됨(재현: 지적 5번, "과거 종료 마커를
+    # 날짜와 무관하게 모두 포함").
+    with _custom_obs_path.open("a", encoding="utf-8") as f:
+        f.write(_json.dumps({
+            "__marker__": "shutdown", "clean_shutdown": True, "queue_drained": True,
+            "dropped_count": 0, "restart_id": "r-old", "last_seq_no": 1,
+            "shutdown_at": "2026-09-12T15:30:00",
+        }) + "\n")
+
+    _bundle_9e_path = _bundle.build(
+        _day917, quiet=True, obs_log_path=_custom_obs_path,
+    )
+    check("9-14) 사용자 지정 관측 로그 경로(obs_log_path)로도 번들 생성이 성공함",
+          _bundle_9e_path is not None and _bundle_9e_path.exists())
+
+    with _zipfile.ZipFile(_bundle_9e_path) as z:
+        _cov9e_text = z.read("metadata/order_status_coverage.txt").decode("utf-8")
+        _raw9e_name = f"raw/order_status_observations_{_day917_compact}.jsonl"
+        _raw9e_text = z.read(_raw9e_name).decode("utf-8") if _raw9e_name in z.namelist() else ""
+
+    check("9-15) 익일(9/18) 조회한 9/17 접수 주문(OID2)이 9/17 번들의 관측률에 정확히"
+          " 집계됨(재현된 버그: 예전엔 양쪽 날짜 어디에도 반영되지 않았음)",
+          "observed_unique_orders         = 1" in _cov9e_text)
+    check("9-16) 부분 조회(OID3)는 query_partial_count로 집계되고 query_success_count에는"
+          " 포함되지 않음(같은 번들 안에서 지적 2번도 함께 확인)",
+          "query_partial_count              = 1" in _cov9e_text)
+    check("9-17) 커버리지 요약에 '현재 실행 상태 = 실행_중'이 표시됨(지적 5번 — 프로그램이"
+          " 실행 중일 때 생성된 번들은 종료 마커가 없는 게 정상임을 구분해서 보여줌)",
+          "observation_run_state(현재 실행 상태)   = 실행_중" in _cov9e_text)
+    check("9-18) 실행 중 상태이므로 종료 마커가 없다는 사실이 '정상'으로 안내됨"
+          "(이전 안내: '종료 마커가 나타나는지 확인' — 실행 중엔 없는 게 정상이라고 정정)",
+          "정상입니다(아직 종료하지 않았으니 종료 마커가 없는 게 맞습니다)" in _cov9e_text)
+    check("9-19) 다른 날짜(9/12)의 과거 종료 마커는 9/17 번들에 나타나지 않음"
+          "(재현된 버그: 예전엔 날짜와 무관하게 모든 과거 마커를 포함했음)",
+          "r-old" not in _cov9e_text and "r-old" not in _raw9e_text)
+    check("9-20) requested_order_id 원문(1234567890, 10자리)이 마스킹으로 '***'가 되지 않고"
+          " 그대로 보존됨(재현된 버그: 예전엔 자유문자열 mask()가 10~13자리 숫자 문자열을"
+          " 전부 가려 서로 다른 주문번호가 같은 '***'가 됐음)",
+          "1234567890" in _raw9e_text)
+    check("9-21) cntr_pric_raw 원문(9876543210, 10자리)도 마찬가지로 보존됨",
+          "9876543210" in _raw9e_text)
+finally:
+    _os.chdir(_orig_cwd)
+
+# ── 9F. resolve_order_status_observation_log_path() 폴백 동작 확인
+#    (설정 파일이 없는 환경에서도 조용히 죽지 않고 기본값으로 폴백) ──
+_resolved_path, _loaded_from_settings = _bundle.resolve_order_status_observation_log_path(
+    "이런_파일은_존재하지_않음.yaml",
+)
+check("9-22) 설정 파일을 읽을 수 없으면 폴백하고(두 번째 반환값 False), 예외를 던지지 않음",
+      _loaded_from_settings is False and _resolved_path == _bundle._default_order_status_observation_log_path())
 
 
 print(f"\n총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
