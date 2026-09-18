@@ -187,6 +187,37 @@ class BrokerOrder:
 
 
 @dataclass(frozen=True)
+class OrderStatusEvidence:
+    """`Broker.get_order_status_evidence()`의 반환값.
+
+    2026-09-18 (우선순위1 1차: 체결조회 증거 독립 저장): `get_order_status()`가
+    반환하는 `BrokerOrder`(단일 판정)는 그대로 유지하면서, "이 order_id에
+    실제로 몇 개의 cntr/oso 원본 행이 매칭됐는가"를 **판정과 별개로**
+    보존하기 위한 껍데기입니다. `derive_broker_order_status()`는 설계상
+    첫 매칭 행만 남기고 나머지를 버리므로(`infra/broker/kiwoom_order_status.py`
+    참고), 손익 계산 관점에서 "여러 체결가로 나뉘어 체결됐을 가능성"을
+    사후에 조사하려면 이 원본 목록이 별도로 필요합니다.
+
+    이 타입은 손익 판단을 하지 않습니다 — `broker_order`(PSM이 실제로
+    쓰는 값)는 100% 기존과 동일해야 하고, `matched_cntr_entries`/
+    `matched_oso_entries`는 순수 관측 자료일 뿐입니다.
+
+    `evidence_error`: 원본 조회(oso/cntr fetch) 자체는 성공했지만, 이
+    증거 목록을 구성하는 부가 로직(순수 in-memory 가공)에서 예외가
+    발생한 경우에만 채워집니다. 이 필드가 채워져도 `broker_order`는
+    항상 유효한 값(기존 `get_order_status()`가 반환했을 값과 동일)이어야
+    합니다 — 관측 가공 실패가 상태 판정을 절대 오염시키지 않습니다.
+    실제 API/네트워크 오류(oso/cntr 조회 자체의 실패)는 이 타입으로
+    감싸지 않고 기존과 동일하게 예외로 그대로 전파됩니다.
+    """
+
+    broker_order: BrokerOrder
+    matched_cntr_entries: list = field(default_factory=list)
+    matched_oso_entries: list = field(default_factory=list)
+    evidence_error: str | None = None
+
+
+@dataclass(frozen=True)
 class Signal:
     """전략 판단의 결과와 이유를 함께 담습니다."""
 

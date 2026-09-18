@@ -28,8 +28,8 @@ from typing import Any
 import requests
 
 from config.settings import BrokerConfig
-from domain.models import AccountBalance, BrokerOrder, MarketPrice, OrderRequest, OrderResult, OrderSide, Position, PriceBar, WeeklyBar, MinuteBar
-from infra.broker.kiwoom_order_status import derive_broker_order_status, normalize_order_id
+from domain.models import AccountBalance, BrokerOrder, MarketPrice, OrderRequest, OrderResult, OrderSide, OrderStatusEvidence, Position, PriceBar, WeeklyBar, MinuteBar
+from infra.broker.kiwoom_order_status import build_order_status_evidence, derive_broker_order_status, normalize_order_id
 from infra.broker.kiwoom_parsing import parse_abs_int
 from infra.broker.base import Broker
 
@@ -865,6 +865,25 @@ class KiwoomBroker(Broker):
         oso_entries = self._fetch_open_orders_raw(symbol)
         cntr_entries = self._fetch_fill_history_raw(symbol)
         return derive_broker_order_status(order_id, symbol, oso_entries, cntr_entries)
+
+    def get_order_status_evidence(self, order_id: str, symbol: str) -> OrderStatusEvidence:
+        """`get_order_status()`와 동일한 raw fetch를 재사용해, 판정값과
+        함께 매칭된 원본 행 전체를 담은 `OrderStatusEvidence`를
+        반환합니다(우선순위1 1차: 체결조회 증거 독립 저장).
+
+        2026-09-18: `_fetch_open_orders_raw()`/`_fetch_fill_history_raw()`
+        호출 횟수는 `get_order_status()`와 완전히 동일합니다(각각
+        정확히 한 번, 페이지네이션 여부와 무관) — 이 메서드가 추가
+        API 호출을 만들지 않습니다. 두 raw fetch 자체가 던지는
+        예외(HTTP/타임아웃/페이지네이션 오류 등)는 기존과 동일하게
+        그대로 전파됩니다 — 아래에서 감싸지 않습니다. 오직 그 이후,
+        이미 받은 raw 리스트로 증거를 구성하는 순수 가공 단계만
+        `build_order_status_evidence()` 내부에서 격리됩니다.
+        """
+
+        oso_entries = self._fetch_open_orders_raw(symbol)
+        cntr_entries = self._fetch_fill_history_raw(symbol)
+        return build_order_status_evidence(order_id, symbol, oso_entries, cntr_entries)
 
     def place_order(self, order: OrderRequest) -> OrderResult:
         """매수 또는 매도 주문을 키움 REST API로 전송합니다.

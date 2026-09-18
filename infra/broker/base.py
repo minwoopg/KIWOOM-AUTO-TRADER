@@ -8,7 +8,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from domain.models import AccountBalance, BrokerOrder, MarketPrice, OrderRequest, OrderResult, PriceBar, WeeklyBar, MinuteBar
+from domain.models import (
+    AccountBalance, BrokerOrder, MarketPrice, OrderRequest, OrderResult,
+    OrderStatusEvidence, PriceBar, WeeklyBar, MinuteBar,
+)
 
 
 class Broker(ABC):
@@ -45,6 +48,23 @@ class Broker(ABC):
     def get_open_orders(self, symbol: str) -> list[BrokerOrder]:
         """Read outstanding orders. Unsupported is different from empty."""
         raise NotImplementedError
+
+    def get_order_status_evidence(self, order_id: str, symbol: str) -> OrderStatusEvidence:
+        """`get_order_status()`와 같은 판정을 반환하되, 원본 매칭 행
+        전체를 함께 담습니다(우선순위1 1차: 체결조회 증거 독립 저장).
+
+        2026-09-18: 기본 구현은 `get_order_status()`를 그대로 호출해
+        `OrderStatusEvidence(broker_order=..., matched_cntr_entries=[],
+        matched_oso_entries=[])`로 감싸기만 합니다 — 즉 이 메서드를
+        오버라이드하지 않는 모든 `Broker` 구현(`MockBroker`, 테스트용
+        브로커 포함)은 **추가 작업 없이 자동으로 이 메서드를 지원**하며,
+        기존 `get_order_status()`가 예외를 던지면 이 기본 구현도
+        동일하게 그 예외를 그대로 전파합니다(API 오류 처리 방식은
+        전혀 바뀌지 않음). 원본 매칭 행 전체를 실제로 보존하려면
+        `KiwoomBroker`처럼 이 메서드를 오버라이드해야 합니다.
+        """
+
+        return OrderStatusEvidence(broker_order=self.get_order_status(order_id, symbol))
 
     @abstractmethod
     def get_daily_prices(self, symbol: str, days: int) -> list[PriceBar]:

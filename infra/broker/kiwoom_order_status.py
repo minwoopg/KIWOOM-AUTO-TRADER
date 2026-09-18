@@ -29,7 +29,7 @@ import하지 않습니다.
 import math
 from typing import Any, Iterable
 
-from domain.models import BrokerOrder, BrokerOrderStatus, OrderSide
+from domain.models import BrokerOrder, BrokerOrderStatus, OrderSide, OrderStatusEvidence
 from infra.broker.kiwoom_parsing import parse_abs_int
 
 
@@ -57,6 +57,82 @@ def normalize_order_id(order_id: Any) -> str:
     if not raw:
         return ""
     return raw.lstrip("0")
+
+
+def find_all_matching(entries: Iterable[dict], target_normalized: str) -> list[dict]:
+    """`_find_matching()`의 자매 함수 — 첫 행이 아니라 **매칭되는 모든
+    행**을 순서 그대로 반환합니다.
+
+    2026-09-18 (우선순위1 1차): `_find_matching()`은 상태 판정
+    (`derive_broker_order_status()`)에만 쓰이는 "첫 매칭 행" 함수로,
+    이 함수는 그 판정 로직을 절대 바꾸지 않습니다(기존 함수는
+    그대로 둠). 이 함수는 오직 관측 증거 보존(`OrderStatusEvidence`)
+    목적으로만 쓰이며, 반환된 리스트의 길이가 1을 넘으면 "같은
+    order_id로 여러 원본 행이 응답에 존재했다"는 사실 자체가
+    중요한 관측입니다(개별체결/누적평균 여부를 아직 실측하지
+    못했으므로, 여러 행이 실제로 나오는지부터 확인하는 것이 이번
+    조사의 목적).
+    """
+
+    if not target_normalized:
+        return []
+    return [
+        entry for entry in entries
+        if normalize_order_id(entry.get("ord_no", "")) == target_normalized
+    ]
+
+
+def build_order_status_evidence(
+    order_id: Any,
+    symbol: str,
+    oso_entries: Iterable[dict] | None,
+    cntr_entries: Iterable[dict] | None,
+) -> OrderStatusEvidence:
+    """`derive_broker_order_status()`(무변경)로 판정값을 만들고, 그와
+    별개로 `find_all_matching()`으로 전체 매칭 행을 함께 담은
+    `OrderStatusEvidence`를 만듭니다.
+
+    이 함수는 순수 in-memory 가공만 하므로 API 호출을 하지 않습니다
+    — 호출부가 이미 받아온 `oso_entries`/`cntr_entries`(ka10075/
+    ka10076 raw 응답)를 그대로 재사용합니다. `derive_broker_order_status()`
+    호출 자체가 실패할 이유는 사실상 없지만(순수 함수, 이미
+    실측 검증됨), 혹시 모를 예외를 여기서 잡아 `evidence_error`로
+    감싸고 `broker_order`만은 반드시 안전한 UNKNOWN 폴백으로
+    채웁니다 — 관측 가공 실패가 호출부의 상태 판정 흐름을 절대
+    막지 않아야 하기 때문입니다(단, 이 폴백은 이 함수 자신의
+    버그에 대한 방어일 뿐이며, `derive_broker_order_status()`가
+    이미 실측 검증된 순수 함수라는 점은 변하지 않습니다).
+    """
+
+    oso_list = list(oso_entries) if oso_entries else []
+    cntr_list = list(cntr_entries) if cntr_entries else []
+
+    try:
+        broker_order = derive_broker_order_status(order_id, symbol, oso_list, cntr_list)
+    except Exception as exc:  # pragma: no cover - 순수 함수라 사실상 발생 안 함, 방어적 처리
+        return OrderStatusEvidence(
+            broker_order=BrokerOrder(
+                order_id=str(order_id or ""), symbol=symbol, status=BrokerOrderStatus.UNKNOWN,
+            ),
+            evidence_error=f"derive_broker_order_status 실패: {type(exc).__name__}: {exc}",
+        )
+
+    try:
+        target = normalize_order_id(order_id)
+        matched_cntr = find_all_matching(cntr_list, target)
+        matched_oso = find_all_matching(oso_list, target)
+        return OrderStatusEvidence(
+            broker_order=broker_order,
+            matched_cntr_entries=matched_cntr,
+            matched_oso_entries=matched_oso,
+        )
+    except Exception as exc:
+        # broker_order는 이미 정상적으로 계산됐으므로 그대로 반환하고,
+        # 증거 목록 구성 실패만 evidence_error로 별도 표시합니다.
+        return OrderStatusEvidence(
+            broker_order=broker_order,
+            evidence_error=f"증거 목록 구성 실패: {type(exc).__name__}: {exc}",
+        )
 
 
 def _find_matching(entries: Iterable[dict], target_normalized: str) -> dict | None:
