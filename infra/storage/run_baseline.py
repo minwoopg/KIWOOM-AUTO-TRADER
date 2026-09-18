@@ -173,7 +173,7 @@ class RunBaseline:
     __slots__ = (
         "run_id", "started_at", "git_sha", "git_dirty",
         "effective_config_hash", "is_mock", "is_paper_trading",
-        "python_version",
+        "python_version", "account_scope_id",
     )
 
     def __init__(
@@ -186,6 +186,7 @@ class RunBaseline:
         is_mock: bool,
         is_paper_trading: bool,
         python_version: str,
+        account_scope_id: str = "",
     ) -> None:
         self.run_id = run_id
         self.started_at = started_at
@@ -195,6 +196,14 @@ class RunBaseline:
         self.is_mock = is_mock
         self.is_paper_trading = is_paper_trading
         self.python_version = python_version
+        # 2026-09-18 (우선순위1 1차: 체결조회 증거 독립 저장): 계좌 구분용
+        # 비민감 식별자. `BrokerConfig.account_scope_id`를 그대로 옮겨
+        # 담을 뿐이며, 실계좌번호(account_number)는 여기에도 절대 담지
+        # 않습니다(위 _SENSITIVE_DOTTED_PATHS denylist에 이미 별도로
+        # 걸려있음). trades.csv/signal_log.csv에는 이 값이 없으므로,
+        # 그 로그의 timestamp를 이 파일의 started_at 시간범위로 조인해서
+        # (resolve_run_id_for_timestamp) 간접적으로 연결합니다.
+        self.account_scope_id = account_scope_id
 
     def as_dict(self) -> dict:
         return {
@@ -206,12 +215,14 @@ class RunBaseline:
             "is_mock": str(self.is_mock),
             "is_paper_trading": str(self.is_paper_trading),
             "python_version": self.python_version,
+            "account_scope_id": self.account_scope_id,
         }
 
 
 RUN_BASELINE_FIELDS = [
     "run_id", "started_at", "git_sha", "git_dirty",
     "effective_config_hash", "is_mock", "is_paper_trading", "python_version",
+    "account_scope_id",
 ]
 
 
@@ -227,15 +238,51 @@ def capture_run_baseline(settings: Any, repo_root: str = ".") -> RunBaseline:
         is_mock=bool(getattr(settings.broker, "use_mock", False)),
         is_paper_trading=bool(getattr(settings.broker, "is_paper_trading", False)),
         python_version=sys.version.split()[0],
+        account_scope_id=str(getattr(settings.broker, "account_scope_id", "") or ""),
     )
+
+
+def resolve_env_from_baseline_row(row: dict) -> str:
+    """RunBaseline 행(dict, CSV에서 읽었거나 as_dict() 결과)에서 환경
+    3분류를 판정합니다 — `is_mock`/`is_paper_trading`은 이미 이 파일이
+    프로세스 시작 시점에 확정해 기록해둔 값이므로, base_url 문자열을
+    다시 파싱하는 것보다 더 신뢰할 수 있는 근거입니다(2026-09-18,
+    체결조회 증거 저장소의 환경 3분류 지적 반영)."""
+
+    is_mock = str(row.get("is_mock", "")).strip().lower() == "true"
+    if is_mock:
+        return "local_mock"
+    is_paper = str(row.get("is_paper_trading", "")).strip().lower() == "true"
+    return "kiwoom_mock" if is_paper else "kiwoom_real"
+
+
+def resolve_scope_for_trade_timestamp(
+    baselines: list[dict], timestamp_iso: str,
+) -> tuple[str, str] | None:
+    """trades.csv 등 기존 로그의 timestamp 하나에 대해 (account_scope_id,
+    env)를 찾습니다. 내부적으로 기존 `resolve_run_id_for_timestamp()`를
+    그대로 재사용합니다(새 조인 로직을 만들지 않음) — 그 함수와 동일한
+    한계(최선 추정일 뿐, 기록 실패한 실행은 감지 못함)를 그대로 갖습니다.
+    연결되는 run이 없으면 추정하지 않고 `None`을 반환합니다."""
+
+    run_id = resolve_run_id_for_timestamp(baselines, timestamp_iso)
+    if run_id is None:
+        return None
+    for row in baselines:
+        if row.get("run_id") == run_id:
+            return (str(row.get("account_scope_id", "") or ""), resolve_env_from_baseline_row(row))
+    return None
 
 
 class RunBaselineLogger:
     """run_baseline.csv에 실행마다 한 행씩 추가하는 append-only 로거.
 
-    기존 TRADE_FIELDS/SIGNAL_FIELDS와 완전히 분리된 새 파일이라(이번에
-    처음 생기는 파일), 레거시 헤더와의 컬럼 수 불일치 위험이 구조적으로
-    없습니다.
+    2026-09-18: `account_scope_id` 컬럼 추가로 기존 파일에 헤더보다
+    적은 컬럼 수를 가진 과거 행이 남아있을 수 있으므로, 기록 전에
+    `_migrate_csv_header_if_needed()`(다른 CSV 로거들과 동일한 기존
+    마이그레이션 유틸리티, infra/storage/logger.py)로 헤더를 갱신합니다
+    — 새 컬럼 도입 시에도 과거 행을 깨뜨리지 않는 이 프로젝트의 기존
+    관례를 그대로 따릅니다.
     """
 
     def __init__(self, log_file: str) -> None:
@@ -244,8 +291,11 @@ class RunBaselineLogger:
     def log(self, baseline: RunBaseline) -> None:
         import csv
 
+        from infra.storage.logger import _migrate_csv_header_if_needed
+
         path = Path(self.log_file)
         path.parent.mkdir(parents=True, exist_ok=True)
+        _migrate_csv_header_if_needed(path, RUN_BASELINE_FIELDS, "RUN_BASELINE")
         file_exists = path.exists() and path.stat().st_size > 0
 
         with path.open("a", newline="", encoding="utf-8") as fp:
