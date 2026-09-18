@@ -82,6 +82,7 @@ from infra.storage.order_status_observation_store import (
     compute_coverage,
     dedupe_by_write_id,
 )
+from infra.broker.kiwoom_order_status import normalize_order_id
 from utils.time_utils import KST_TZ
 
 LOGS_DIR = Path("logs")
@@ -155,6 +156,14 @@ CSV_SOURCES: list[tuple[str, tuple[str, ...]]] = [
 # 없음(같은 유형의 "0건이 정상인지 누락인지 구분 안 됨" 문제).
 # [RUN_BASELINE] 태그를 추가 — 성공/실패 라인 모두 이 태그로 시작하며
 # symbol/order_id 등 민감 필드는 포함하지 않음(git_sha/config_hash만).
+# 2026-09-18 (재검토 지적 2번): OrderStatusObservationRecorder가 남기는
+# 큐 포화/쓰기 실패/부분쓰기 복구/종료마커 기록 실패 로그 태그가 이
+# allowlist에 없어서, 요약 텍스트는 "app.log 슬라이스에서 확인하라"고
+# 안내하면서도 실제 번들에는 해당 줄이 전혀 포함되지 않았습니다
+# (재현 확인됨). 5개 태그 추가 — 전부 순수 진단/관측 목적이며
+# order_id/restart_id/dropped_count 등 저장 품질 수치만 담고
+# SENSITIVE_KEYS 대상 필드는 담지 않음 — 매매 로직·저장 로직 자체는
+# 무변경.
 LOG_TAGS: tuple[str, ...] = (
     "[COND_STATUS]", "[COND_TRUNCATE]", "[COND]",
     "[WS]", "[SESSION_SHADOW]", "[EXPERIMENTAL]",
@@ -165,6 +174,9 @@ LOG_TAGS: tuple[str, ...] = (
     "[TRACKED_ORDER_JOURNAL_ERROR]", "[ORDER_ID_MISSING]",
     "[ORDER_PLACEMENT_AMBIGUOUS]",
     "[RUN_BASELINE]", "[CONFIG_SNAPSHOT_MISSING]",
+    "[ORDER_STATUS_OBS_QUEUE_FULL]", "[ORDER_STATUS_OBS_WRITE_FAILED]",
+    "[ORDER_STATUS_OBS_RECOVERY]", "[ORDER_STATUS_OBS_SHUTDOWN_MARKER_FAILED]",
+    "[ORDER_STATUS_OBS_FSYNC_FAILED]",
 )
 
 # ── 민감정보 마스킹 ─────────────────────────────────────────────
@@ -236,6 +248,54 @@ def mask(line: str) -> str:
     line = _ACCT_DASH_RE.sub("***", line)
     line = _ACCT_LONG_RE.sub("***", line)
     return line
+
+
+# 2026-09-18 (재검토 지적 6번): mask()는 자유 텍스트 로그 줄을 위해
+# 만들어진 정규식 기반 함수라 "따옴표 없는 10~13자리 숫자"까지
+# 가립니다(_ACCT_LONG_RE). JSON으로 직렬화된 관측 레코드 전체
+# 문자열에 그대로 적용하면, 원래 숫자였던 필드 값(예: order_id를
+# 정수로 담은 필드, 또는 우연히 10~13자리인 다른 숫자 필드)이
+# 따옴표 없는 `***`로 바뀌어 그 줄 전체가 더 이상 유효한 JSON이
+# 아니게 됩니다(재현: 합성 원문에 숫자 필드 1234567890을 넣으면
+# 결과 줄이 파싱 불가).
+#
+# 그래서 JSON 레코드는 파싱된 객체 상태에서 이 함수로 재귀적으로
+# 처리합니다 — 키 이름이 SENSITIVE_KEYS와 "정확히" 일치할 때만
+# (부분 문자열 매칭 아님) 그 값을 "***"로 치환하고, 그 외 문자열
+# 값에는 기존 mask()를 적용해 자유 텍스트 안에 섞여 들어온 토큰 등을
+# 잡습니다. 숫자·불리언·None 값은 (민감 키가 아닌 한) 그대로 두므로
+# JSON 문법이 깨지지 않습니다. 이렇게 하면 "account_scope_id" 같은
+# 필드도 "account"와 정확히 일치하지 않으므로 실수로 가려지지
+# 않습니다.
+_SENSITIVE_KEYS_LOWER = {k.lower() for k in SENSITIVE_KEYS}
+
+
+def _mask_json_value(value):
+    """파싱된 JSON 값(dict/list/스칼라)을 재귀적으로 마스킹합니다.
+
+    - dict: 키 이름이 SENSITIVE_KEYS와 정확히 일치(대소문자 무시)하면
+      값을 통째로 "***"로 치환(하위 구조까지 있어도 더 내려가지
+      않음 — 민감 필드 내부 구조를 부분 노출하지 않기 위함). 그 외
+      키는 값을 재귀 처리.
+    - list: 각 원소를 재귀 처리.
+    - str: 기존 텍스트용 mask()를 적용(자유문자열 안의 토큰/계좌번호
+      등을 잡기 위함).
+    - 그 외(숫자/불리언/None): 그대로 반환 — JSON 구조를 깨뜨리는
+      원인이었던 부분이라 여기서는 절대 문자열 치환을 하지 않음.
+    """
+    if isinstance(value, dict):
+        result = {}
+        for k, v in value.items():
+            if str(k).strip().lower() in _SENSITIVE_KEYS_LOWER:
+                result[k] = "***" if v is not None else None
+            else:
+                result[k] = _mask_json_value(v)
+        return result
+    if isinstance(value, list):
+        return [_mask_json_value(v) for v in value]
+    if isinstance(value, str):
+        return mask(value)
+    return value
 
 
 # ── CSV slicing ─────────────────────────────────────────────────
@@ -350,7 +410,30 @@ def slice_log(sources: list[Path], dst: Path, target: date) -> tuple[int, int, l
 #     한계입니다(1차 지적 3번의 "미래 B의 확정 키를 정하자는 뜻이
 #     아니라 현재 A의 통계부터 서로 다른 주문을 섞지 말자는 조건"과
 #     동일한 원칙 — 확인할 수 없으면 추정하지 않고 미확인으로 둠).
-ORDER_STATUS_OBSERVATION_LOG = LOGS_DIR / "order_status_observations.jsonl"
+def _default_order_status_observation_log_path() -> Path:
+    """`config.settings.StorageConfig.order_status_observation_log_file`의
+    기본값을 그대로 읽어와 이 경로를 exporter에 별도로 하드코딩하지
+    않습니다(2026-09-18 재검토 지적 6번: "설정한 관측 파일 경로도
+    exporter가 현재 고정 경로 대신 일관되게 사용하도록 맞추세요").
+
+    StorageConfig는 state_file/trade_log_file 등 여러 필수(기본값
+    없는) 인자를 요구하는 dataclass라서 인스턴스를 만들 수 없습니다
+    (이 exporter는 독립 실행 스크립트라 실행 중인 Settings 인스턴스에
+    접근할 방법이 없음) — 그래서 `dataclasses.fields()`로 해당 필드의
+    **기본값**만 읽습니다. 필드가 사라지거나 기본값이 없어지는
+    비정상 상황에서는 기존과 동일한 리터럴로 안전하게 폴백합니다.
+    """
+    try:
+        from config.settings import StorageConfig as _StorageConfig
+        for f in dataclasses.fields(_StorageConfig):
+            if f.name == "order_status_observation_log_file" and f.default is not dataclasses.MISSING:
+                return Path(f.default)
+    except Exception:
+        pass
+    return LOGS_DIR / "order_status_observations.jsonl"
+
+
+ORDER_STATUS_OBSERVATION_LOG = _default_order_status_observation_log_path()
 
 _OBS_KNOWN_FIELDS = {f.name for f in dataclasses.fields(OrderStatusObservation)}
 
@@ -362,6 +445,12 @@ def slice_jsonl_observations(
 
     반환: (전체 줄, 해당 날짜로 채택된 줄, 말미 불완전으로 제외된 줄,
     말미가 아닌 위치의 손상 줄, 마스킹이 실제로 값을 바꾼 줄 수)
+
+    2026-09-18 재검토 지적 6번 반영: 마스킹은 문자열 전체가 아니라
+    **파싱된 JSON 객체**에 대해 재귀적으로 적용합니다(`_mask_json_value`)
+    — 그래서 결과 줄은 항상 다시 `json.loads()`로 파싱 가능한 유효한
+    JSON입니다(재현된 버그: 숫자 필드가 따옴표 없는 `***`로 치환돼
+    파싱 불가가 되던 문제).
     """
     day = target.strftime("%Y-%m-%d")
     lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -389,15 +478,16 @@ def slice_jsonl_observations(
             # 그대로 보존합니다(날짜 필터링 대상 아님 — 하루 경계와
             # 무관하게 그 실행이 이 로그 파일에 종료 마커를 남겼다는
             # 사실 자체가 유용한 진단 정보이므로).
-            masked_line = mask(json.dumps(data, ensure_ascii=False, sort_keys=True))
-            out_lines.append(masked_line)
+            masked_data = _mask_json_value(data)
+            out_lines.append(json.dumps(masked_data, ensure_ascii=False, sort_keys=True))
             continue
         started_at = str(data.get("started_at") or "")
         if not started_at.startswith(day):
             continue
         kept += 1
         original = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        masked_line = mask(original)
+        masked_data = _mask_json_value(data)
+        masked_line = json.dumps(masked_data, ensure_ascii=False, sort_keys=True)
         if masked_line != original:
             masked_changed += 1
         out_lines.append(masked_line)
@@ -435,19 +525,49 @@ def _parse_observations_for_coverage(dst: Path) -> tuple[list[OrderStatusObserva
     return observations, parse_errors
 
 
+def _parse_shutdown_markers(dst: Path) -> list[dict]:
+    """슬라이스된 관측 JSONL에서 종료 마커(`__marker__=shutdown`) 줄만
+    골라 반환합니다(2026-09-18 재검토 반영, 지적 2번) — 기록기가
+    실제로 정상 종료됐는지, 그때 유실 건수가 몇 건이었는지를 번들
+    안에서 바로 확인할 수 있게 합니다."""
+    markers: list[dict] = []
+    if not dst.exists():
+        return markers
+    for raw_line in dst.read_text(encoding="utf-8").splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if data.get("__marker__") == "shutdown":
+            markers.append(data)
+    return markers
+
+
 def build_order_status_summary(
     target: date, observations: list[OrderStatusObservation],
     trades_rows: list[dict], all_baselines: list[dict],
+    shutdown_markers: list[dict] | None = None,
 ) -> str:
-    """체결조회 증거 저장·커버리지 요약(2026-09-18 지적 2/3/4번 반영).
+    """체결조회 증거 저장·커버리지 요약(2026-09-18 지적 2/3/4번 반영,
+    2026-09-18 재검토에서 3번/2번 재보완).
 
     - 고유 주문 기준(조회 횟수 아님)으로 집계합니다.
-    - 이 번들(하루 단위)이 확정할 수 있는 order_date는 "오늘 접수된
-      주문"뿐입니다 — trades.csv의 오늘 날짜 슬라이스에서 order_id를
-      뽑아 그 집합에 없으면 order_date를 "미확인"으로 둡니다(추정하지
-      않음).
+    - order_date는 journal 스냅샷에서 확인된 `order_accepted_at`
+      (실제 주문 접수 시각)을 우선 근거로 씁니다. 2026-09-18 재검토
+      지적: "오늘 trades.csv에 같은 order_id가 있으면 오늘 주문"이라는
+      이전 추정은, 키움 주문번호가 날짜마다 재사용될 수 있어(전날
+      주문 "123"과 오늘 주문 "123"이 실제로는 다른 주문일 수 있음)
+      서로 다른 주문을 같은 주문으로 잘못 연결할 위험이 있었습니다 —
+      제거했습니다. `order_accepted_at`이 없으면 추정하지 않고
+      "미확인"으로 남깁니다.
     - account_scope_id가 여럿 섞여 있으면(계정 여러 개를 같은 로그
-      파일에 쓴 경우) 스코프별로 각각 계산합니다.
+      파일에 쓴 경우) 스코프별로 각각 계산합니다 — `compute_coverage()`
+      가 각 호출에서 해당 계좌의 관측만 스스로 걸러내므로(2026-09-18
+      재검토 반영), 여기서 관측 리스트를 스코프별로 미리 나눌 필요는
+      없습니다.
     """
     L: list[str] = []
     day = target.strftime("%Y-%m-%d")
@@ -473,8 +593,24 @@ def build_order_status_summary(
     else:
         L.append("observation_write_id_conflict_count    = 0")
 
-    # 오늘 접수된 주문(BUY/SELL, accepted=True)만 order_date="오늘"로
-    # 확정할 수 있음 — 그 외 관측은 이 번들 범위에서 order_date 미확인.
+    L.append("")
+    markers = shutdown_markers or []
+    L.append(f"recorder_shutdown_marker_count          = {len(markers)}"
+              " (이 날짜 슬라이스 안에 기록된 정상/비정상 종료 마커 수)")
+    for m in markers:
+        L.append(
+            f"    restart_id={m.get('restart_id', '')} clean_shutdown={m.get('clean_shutdown')}"
+            f" dropped_count={m.get('dropped_count')} shutdown_at={m.get('shutdown_at', '')}"
+        )
+    if not markers:
+        L.append("    ⚠ 종료 마커가 없습니다 — 이 날짜에 기록기가 정상 종료 배선을 타지 않고")
+        L.append("      프로세스가 끝났거나(예: 강제 종료), 아직 진행 중인 실행일 수 있습니다.")
+        L.append("      큐 포화/쓰기 실패는 app.log의 [ORDER_STATUS_OBS_QUEUE_FULL]/")
+        L.append("      [ORDER_STATUS_OBS_WRITE_FAILED] 태그로도 확인하세요.")
+
+    # order_id 비교는 compute_coverage()/find_all_matching()과 동일하게
+    # normalize_order_id()로 정규화합니다(0-padding 차이로 같은 주문이
+    # 다른 것으로 갈리지 않도록).
     def _accepted(r: dict) -> bool:
         for k in ("accepted", "order_accepted", "success", "is_success"):
             if k in r:
@@ -482,8 +618,8 @@ def build_order_status_summary(
         return False
 
     today_order_ids = {
-        str(r.get("order_id") or "").strip()
-        for r in trades_rows if _accepted(r) and str(r.get("order_id") or "").strip()
+        normalize_order_id(r.get("order_id") or "")
+        for r in trades_rows if _accepted(r) and normalize_order_id(r.get("order_id") or "")
     }
 
     accepted_orders: set[tuple[str, str, str, str]] = set()
@@ -491,7 +627,7 @@ def build_order_status_summary(
     for r in trades_rows:
         if not _accepted(r):
             continue
-        oid = str(r.get("order_id") or "").strip()
+        oid = normalize_order_id(r.get("order_id") or "")
         if not oid:
             continue
         ts = str(r.get("timestamp") or r.get("time") or "").strip()
@@ -514,13 +650,24 @@ def build_order_status_summary(
                   "account_scope_id 미설정) — 아래 커버리지 분모에서 제외됨")
 
     def _order_date_resolver(obs: OrderStatusObservation) -> str | None:
-        return day if obs.requested_order_id in today_order_ids else None
+        # 2026-09-18 재검토 반영(지적 3번): "오늘 trades.csv에 같은
+        # order_id가 있으면 오늘 주문"이라는 추정을 제거했습니다 —
+        # 키움 주문번호가 날짜마다 재사용될 수 있어(전날 "123"과 오늘
+        # "123"이 다른 주문일 수 있음) 서로 다른 주문을 섞을 위험이
+        # 있었습니다. journal에서 확인된 실제 접수 시각만 근거로 씁니다.
+        if not obs.order_accepted_at:
+            return None
+        candidate = str(obs.order_accepted_at)[:10]
+        return candidate if len(candidate) == 10 and candidate[4] == "-" and candidate[7] == "-" else None
 
-    scopes = sorted({acc for acc, _env, _d, _oid in accepted_orders})
+    scopes = sorted({acc for acc, _env, _d, _oid in accepted_orders} | {
+        obs.account_scope_id for obs in deduped if obs.account_scope_id
+    })
     if not scopes:
         L.append("")
-        L.append("계정/환경 연결이 가능한 오늘 접수 주문이 없어 커버리지를 계산하지 않습니다"
-                  "(run_baseline.csv 참고 — 미설정이면 위 scope_unresolved에 반영됨).")
+        L.append("계정/환경 연결이 가능한 오늘 접수 주문도, 관측 기록도 없어 커버리지를"
+                  " 계산하지 않습니다(run_baseline.csv 참고 — 미설정이면 위"
+                  " scope_unresolved에 반영됨).")
         return "\n".join(L)
 
     for scope_id in scopes:
@@ -548,19 +695,17 @@ def build_order_status_summary(
         L.append(f"  query_success_count             = {cov['query_success_count']}")
         L.append(f"  query_failed_count              = {cov['query_failed_count']}")
         L.append(f"  unresolved_order_date_count      = {cov['unresolved_order_date_count']}"
-                  " (다른 날짜에 접수된 주문에 대한 오늘 조회 — 정상, 하루 단위 번들의 한계)")
+                  " (journal에서 접수 시각을 확인하지 못한 관측 — 저널이 이미 삭제된 경우 등)")
         L.append(f"  orphan_observation_count         = {cov['orphan_observation_count']}"
-                  " (accepted_orders에 없는 조회 — 미수락 주문 조회 시도 등)")
+                  " (order_date는 확인됐지만 accepted_orders에 없는 조회 — 다른 날짜에"
+                  " 접수된 주문에 대한 오늘 조회 포함, 하루 단위 번들의 한계)")
 
     L.append("")
-    L.append("※ 4번째 지표(조회·저장 품질)는 write_id 재시도/충돌 집계(위)와")
-    L.append("  기록기의 shutdown 마커(app_analysis 로그의 종료 마커 줄 또는")
-    L.append("  이 raw 파일 안의 __marker__ 줄)를 함께 참고하세요 — dropped_count는")
-    L.append("  기록기 프로세스 자신만 알 수 있으므로 이 exporter가 사후에")
-    L.append("  재구성할 수 없습니다(큐에서 버려진 레코드는애초에 이 파일에")
-    L.append("  없음 — 그래서 실행 중 [ORDER_STATUS_OBS_QUEUE_FULL]/")
-    L.append("  [ORDER_STATUS_OBS_WRITE_FAILED] 로그 태그를 app.log 슬라이스에서")
-    L.append("  함께 확인해야 완전한 그림이 됩니다).")
+    L.append("※ 4번째 지표(조회·저장 품질)는 write_id 재시도/충돌 집계, 위 종료 마커,")
+    L.append("  app.log의 [ORDER_STATUS_OBS_QUEUE_FULL]/[ORDER_STATUS_OBS_WRITE_FAILED]/")
+    L.append("  [ORDER_STATUS_OBS_FSYNC_FAILED] 태그를 함께 참고하세요 — 큐에서 버려진")
+    L.append("  레코드는 애초에 이 raw 파일에 없으므로 이 exporter가 사후에 재구성할 수")
+    L.append("  없습니다.")
     L.append("=" * 58)
     return "\n".join(L)
 
@@ -1043,6 +1188,7 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
         obs_src = ORDER_STATUS_OBSERVATION_LOG
         obs_dst = work / f"order_status_observations_{day_compact}.jsonl"
         obs_records: list[OrderStatusObservation] = []
+        obs_shutdown_markers: list[dict] = []
         if not obs_src.exists():
             manifest.append(f"  {'order_status_observations.jsonl':30s} | MISSING | 원본 없음 | excluded")
             manifest.append("  ⚠ 관측 기능이 비활성(account_scope_id 미설정)이었거나 아직 기록이 없습니다.")
@@ -1072,6 +1218,9 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
                     f"    ⚠ 커버리지 계산용 레코드 복원 실패 {len(obs_parse_errors)}건"
                     "(알 수 없는 스키마 — 집계에서 제외)"
                 )
+            obs_shutdown_markers = _parse_shutdown_markers(obs_dst)
+            if obs_shutdown_markers:
+                manifest.append(f"    종료 마커 {len(obs_shutdown_markers)}건 발견(상세는 커버리지 요약 참고)")
 
         manifest.append("")
         manifest.append("[ RAW — 로그 (allowlist 태그 줄만, 마스킹 적용) ]")
@@ -1135,6 +1284,7 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
             target, obs_records,
             _read_csv(work / f"trades_{day_compact}.csv"),
             all_baselines,
+            shutdown_markers=obs_shutdown_markers,
         )
         (work / "order_status_coverage.txt").write_text(order_status_summary, encoding="utf-8")
 
