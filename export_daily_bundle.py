@@ -81,6 +81,7 @@ from infra.storage.order_status_observation_store import (
     OrderStatusObservation,
     compute_coverage,
     dedupe_by_write_id,
+    status_path_for,
 )
 from infra.broker.kiwoom_order_status import normalize_order_id
 from utils.time_utils import KST_TZ
@@ -261,25 +262,46 @@ def mask(line: str) -> str:
 #
 # 그래서 JSON 레코드는 파싱된 객체 상태에서 이 함수로 재귀적으로
 # 처리합니다 — 키 이름이 SENSITIVE_KEYS와 "정확히" 일치할 때만
-# (부분 문자열 매칭 아님) 그 값을 "***"로 치환하고, 그 외 문자열
-# 값에는 기존 mask()를 적용해 자유 텍스트 안에 섞여 들어온 토큰 등을
-# 잡습니다. 숫자·불리언·None 값은 (민감 키가 아닌 한) 그대로 두므로
-# JSON 문법이 깨지지 않습니다. 이렇게 하면 "account_scope_id" 같은
-# 필드도 "account"와 정확히 일치하지 않으므로 실수로 가려지지
-# 않습니다.
+# (부분 문자열 매칭 아님) 그 값을 "***"로 치환합니다. 숫자·불리언·
+# None 값은 (민감 키가 아닌 한) 그대로 두므로 JSON 문법이 깨지지
+# 않습니다. 이렇게 하면 "account_scope_id" 같은 필드도 "account"와
+# 정확히 일치하지 않으므로 실수로 가려지지 않습니다.
 _SENSITIVE_KEYS_LOWER = {k.lower() for k in SENSITIVE_KEYS}
 
+# 2026-09-18 재재검토 반영(지적 4번, 재현된 버그): 이전 구현은 민감
+# 키가 아닌 "모든" 문자열 값에도 자유문자열용 mask()를 적용했습니다.
+# mask()의 _ACCT_LONG_RE는 문맥과 무관하게 10~13자리 숫자 문자열을
+# "***"로 가리므로, requested_order_id="1234567890"이나
+# cntr_pric_raw="1234567890"처럼 **의미가 명확한 식별자 필드**(주문
+# 번호·가격·수량 원문)까지 뭉개져 서로 다른 주문번호가 전부 같은
+# "***"가 되고, 후속 연결·집계 근거가 훼손됐습니다(재현 확인).
+#
+# 이제 mask()는 아래 화이트리스트에 명시된, 실제로 "자유 텍스트"인
+# 필드(예외 메시지 등 — 그 안에 무엇이 섞여 들어올지 스키마로 보장할
+# 수 없는 필드)에만 적용합니다. 그 외 필드는 키가 SENSITIVE_KEYS와
+# 정확히 일치하지 않는 한 원문 그대로 보존합니다 — `raw` 딕셔너리
+# 내부의 원본 API 필드들(response_order_id/ord_qty_raw/cntr_pric_raw
+# 등)도 이 모듈의 docstring에 명시된 전제(관측 레코드 자체는
+# 계좌번호/토큰을 담지 않는 필드만 씀)에 따라 식별자로 보존됩니다 —
+# 그 안에 우연히 SENSITIVE_KEYS와 정확히 일치하는 키가 있으면(예:
+# 미래에 원문에 "token" 키가 추가되는 등) 그 값은 여전히 재귀적으로
+# 가려집니다.
+_FREEFORM_TEXT_FIELDS = {"error_repr"}
 
-def _mask_json_value(value):
+
+def _mask_json_value(value, key: str | None = None):
     """파싱된 JSON 값(dict/list/스칼라)을 재귀적으로 마스킹합니다.
 
     - dict: 키 이름이 SENSITIVE_KEYS와 정확히 일치(대소문자 무시)하면
       값을 통째로 "***"로 치환(하위 구조까지 있어도 더 내려가지
       않음 — 민감 필드 내부 구조를 부분 노출하지 않기 위함). 그 외
-      키는 값을 재귀 처리.
-    - list: 각 원소를 재귀 처리.
-    - str: 기존 텍스트용 mask()를 적용(자유문자열 안의 토큰/계좌번호
-      등을 잡기 위함).
+      키는 그 키 이름을 들고 값을 재귀 처리.
+    - list: 각 원소를 재귀 처리(원소 자체는 특정 키에 속하지 않으므로
+      key를 그대로 전달 — 리스트 안의 문자열 원소에 자유문자열
+      마스킹을 적용할지는 리스트를 담고 있던 상위 키로 판단).
+    - str: 이 값을 가리키는 키가 `_FREEFORM_TEXT_FIELDS`에 있을 때만
+      기존 텍스트용 mask()를 적용합니다. 그 외 문자열(주문번호·가격·
+      수량 등 식별자 필드)은 원문 그대로 보존합니다.
     - 그 외(숫자/불리언/None): 그대로 반환 — JSON 구조를 깨뜨리는
       원인이었던 부분이라 여기서는 절대 문자열 치환을 하지 않음.
     """
@@ -289,11 +311,11 @@ def _mask_json_value(value):
             if str(k).strip().lower() in _SENSITIVE_KEYS_LOWER:
                 result[k] = "***" if v is not None else None
             else:
-                result[k] = _mask_json_value(v)
+                result[k] = _mask_json_value(v, key=k)
         return result
     if isinstance(value, list):
-        return [_mask_json_value(v) for v in value]
-    if isinstance(value, str):
+        return [_mask_json_value(v, key=key) for v in value]
+    if isinstance(value, str) and key in _FREEFORM_TEXT_FIELDS:
         return mask(value)
     return value
 
@@ -435,6 +457,42 @@ def _default_order_status_observation_log_path() -> Path:
 
 ORDER_STATUS_OBSERVATION_LOG = _default_order_status_observation_log_path()
 
+
+def resolve_order_status_observation_log_path(
+    settings_path: str | Path = "config/settings.yaml",
+) -> tuple[Path, bool]:
+    """실제 설정 파일(기본: config/settings.yaml)의
+    `storage.order_status_observation_log_file` 값을 읽어옵니다
+    (2026-09-18 재재검토 반영, 지적 4번의 두 번째 재현: "설정 필드의
+    기본값을 읽는 것은 실제 설정값을 읽는 것과 다릅니다" — 사용자가
+    settings.yaml에서 `custom/obs.jsonl`로 지정해도 exporter는
+    `_default_order_status_observation_log_path()`(필드의 **기본값**만
+    읽음)를 계속 써서 항상 `logs/order_status_observations.jsonl`을
+    반환했습니다).
+
+    이제 앱 기동 경로와 동일한 `config.settings.load_settings()`로
+    실제 설정을 로드해 그 값을 씁니다. 이 exporter는 독립 실행
+    스크립트라 실행 중인 앱의 Settings 인스턴스에 접근할 방법이
+    없으므로, 매 호출마다 설정 파일을 다시 읽습니다(자동 실행
+    빈도를 고려하면 비용이 무시할 만한 수준). 지정된 설정 파일이
+    없거나 파싱에 실패하면(예: 테스트 환경, 설정 파일 미배치)
+    조용히 죽지 않고 기존과 동일한 하드코딩 기본값으로 폴백합니다.
+
+    반환값: (경로, 실제 설정에서 읽었는지 여부). 두 번째 값이
+    False면 폴백이 발생했다는 뜻이며, 호출부(`build()`)가 이를
+    MANIFEST에 남겨 "조용히 사용자 설정이 무시되는" 일이 없게
+    합니다.
+    """
+    try:
+        from config.settings import load_settings as _load_settings
+        settings = _load_settings(settings_path)
+        raw = str(settings.storage.order_status_observation_log_file or "").strip()
+        if raw:
+            return Path(raw), True
+    except Exception:
+        pass
+    return _default_order_status_observation_log_path(), False
+
 _OBS_KNOWN_FIELDS = {f.name for f in dataclasses.fields(OrderStatusObservation)}
 
 
@@ -474,10 +532,19 @@ def slice_jsonl_observations(
                 mid_file_corrupt += 1
             continue
         if data.get("__marker__") == "shutdown":
-            # 종료 마커는 그 실행의 clean_shutdown/dropped_count를
-            # 그대로 보존합니다(날짜 필터링 대상 아님 — 하루 경계와
-            # 무관하게 그 실행이 이 로그 파일에 종료 마커를 남겼다는
-            # 사실 자체가 유용한 진단 정보이므로).
+            # 2026-09-18 재재검토 반영(지적 5번, 재현된 버그): 예전엔
+            # 종료 마커를 날짜와 무관하게 전부 포함했습니다 — 그러면
+            # 몇 달 전의 정상 종료 마커가 오늘 번들에도 계속 나타나
+            # "과거에 정상 종료했다"는 사실이 "지금도 정상"이라는
+            # 착시를 줄 위험이 있습니다(지적: "과거 정상 종료 마커가
+            # 있다는 사실로 현재 실행의 저장 상태를 판단할 수는
+            # 없습니다"). 이제 일반 관측과 동일하게 마커도
+            # `shutdown_at`이 이 번들의 날짜인 것만 포함합니다 —
+            # "지금 실행 중"인지는 이 마커가 아니라 별도의 실행 상태
+            # 스냅샷(`_read_running_status()`)으로 판단합니다.
+            marker_at = str(data.get("shutdown_at") or "")
+            if not marker_at.startswith(day):
+                continue
             masked_data = _mask_json_value(data)
             out_lines.append(json.dumps(masked_data, ensure_ascii=False, sort_keys=True))
             continue
@@ -546,10 +613,120 @@ def _parse_shutdown_markers(dst: Path) -> list[dict]:
     return markers
 
 
+def _load_full_observations_for_order_date(
+    src: Path, target: date,
+) -> tuple[list[OrderStatusObservation], list[str]]:
+    """전체(하루로 자르지 않은) 관측 로그 원본에서 `order_accepted_at`이
+    target 날짜인 관측만 골라 반환합니다(2026-09-18 재재검토 반영,
+    지적 3번).
+
+    이 번들은 하루 단위라 지금까지는 "조회일(started_at)로 자른
+    슬라이스"만 커버리지 계산에 썼습니다 — 그러면 전날 접수된 주문을
+    다음날 조회한 경우(키움 조회 지연/재시도로 실제 발생), 그 관측은
+    조회일 슬라이스에는 있지만 주문일(전날) 슬라이스에는 아예 없어서
+    **양쪽 날짜 어디의 관측률에도 반영되지 않았습니다**(재현: 9/17
+    접수 주문을 9/18에 조회 → 9/17 번들 0%, 9/18 번들엔 고아 관측
+    1건). 이제 "주문일별 관측률"은 조회가 언제 일어났는지와 무관하게
+    전체 원본 로그를 다시 훑어 `order_accepted_at`이 target 날짜인
+    관측을 전부 모읍니다 — 그래서 다음날 조회한 관측도 원래 주문이
+    접수된 날짜의 커버리지에 정확히 귀속됩니다.
+
+    이 결과는 번들에 raw로 그대로 저장되지 않고(이미 하루치 raw
+    슬라이스가 별도로 존재함) 이 함수를 호출하는 커버리지 계산에만
+    쓰이므로, 여기서는 마스킹을 다시 적용하지 않습니다(파일 자체를
+    노출하는 경로가 아니라 메모리 내 집계 전용).
+    """
+    observations: list[OrderStatusObservation] = []
+    parse_errors: list[str] = []
+    if not src.exists():
+        return observations, parse_errors
+    day = target.strftime("%Y-%m-%d")
+    try:
+        raw_text = src.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        parse_errors.append(f"{src} 읽기 실패: {exc}")
+        return observations, parse_errors
+    for raw_line in raw_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue  # 손상/불완전 줄 — raw 슬라이스 쪽에서 이미 별도로 표시되므로 여기서는 조용히 건너뜀
+        if data.get("__marker__") == "shutdown":
+            continue
+        accepted_at = str(data.get("order_accepted_at") or "")
+        if not accepted_at.startswith(day):
+            continue
+        filtered = {k: v for k, v in data.items() if k in _OBS_KNOWN_FIELDS}
+        try:
+            observations.append(OrderStatusObservation(**filtered))
+        except TypeError as exc:
+            parse_errors.append(f"필드 불일치: {exc}")
+    return observations, parse_errors
+
+
+def _read_running_status(status_path: Path) -> dict | None:
+    """`OrderStatusObservationRecorder`가 남기는 "현재 실행 상태"
+    스냅샷 파일을 읽습니다(2026-09-18 재재검토 반영, 지적 5번). 파일이
+    없거나(계측 비활성/아직 시작 전) 손상됐으면 `None`을 반환합니다
+    — 이 exporter는 읽기 전용이라 손상돼 있어도 복구를 시도하지
+    않습니다(원본 기록기 쪽 책임)."""
+    if not status_path.exists():
+        return None
+    try:
+        data = json.loads(status_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _classify_run_state(run_status: dict | None, *, stale_after_sec: float = 120.0) -> str:
+    """실행 상태 스냅샷으로부터 4가지 상태 중 하나를 판정합니다
+    (2026-09-18 재재검토 반영, 지적 5번의 "실행 중/정상 종료/종료
+    확인 불가/계측 비활성" 구분을 그대로 반영).
+
+    - 스냅샷 자체가 없음 → "계측_비활성"(관측 기능이 시작된 적 없음
+      — account_scope_id 미설정 등).
+    - `clean_shutdown`이 True/False로 확정돼 있음 → 그 값을 그대로
+      "정상_종료"/"종료_확인_불가"로 반영(종료 배선을 실제로 탄 뒤의
+      결과이므로 가장 신뢰도가 높음).
+    - `clean_shutdown`이 아직 None(종료 배선을 타지 않음)인데
+      `updated_at`이 최근(기본 120초 이내)이면 "실행_중"으로 판단합니다
+      — 기록기 작업자 스레드가 폴링마다(기본 5초 간격) 이 파일을
+      갱신하므로, 최근 갱신은 "그 스레드가 최근까지 살아있었다"는
+      뜻입니다.
+    - 그 외(오래된 스냅샷, 갱신 시각 파싱 불가 등) → "종료_확인_불가"
+      (예: 강제 종료로 종료 배선 자체를 타지 못한 경우 — 마지막
+      스냅샷만 남고 더 이상 갱신되지 않음).
+    """
+    if run_status is None:
+        return "계측_비활성"
+    cs = run_status.get("clean_shutdown")
+    if cs is True:
+        return "정상_종료"
+    if cs is False:
+        return "종료_확인_불가"
+    updated_at = run_status.get("updated_at")
+    updated_dt = None
+    if updated_at:
+        try:
+            updated_dt = datetime.fromisoformat(str(updated_at))
+        except ValueError:
+            updated_dt = None
+    if updated_dt is not None and (datetime.now() - updated_dt).total_seconds() <= stale_after_sec:
+        return "실행_중"
+    return "종료_확인_불가"
+
+
 def build_order_status_summary(
-    target: date, observations: list[OrderStatusObservation],
+    target: date,
+    query_day_observations: list[OrderStatusObservation],
+    order_day_observations: list[OrderStatusObservation],
     trades_rows: list[dict], all_baselines: list[dict],
     shutdown_markers: list[dict] | None = None,
+    run_status: dict | None = None,
 ) -> str:
     """체결조회 증거 저장·커버리지 요약(2026-09-18 지적 2/3/4번 반영,
     2026-09-18 재검토에서 3번/2번 재보완).
@@ -568,6 +745,20 @@ def build_order_status_summary(
       가 각 호출에서 해당 계좌의 관측만 스스로 걸러내므로(2026-09-18
       재검토 반영), 여기서 관측 리스트를 스코프별로 미리 나눌 필요는
       없습니다.
+
+    2026-09-18 재재검토 반영(지적 2/3/5번): 이번 라운드에서 통계를
+    두 갈래로 명확히 분리했습니다 —
+    1) "조회일 활동 통계"(`query_day_observations`, `started_at` 기준
+       하루 슬라이스): 오늘 실제로 조회가 몇 번 실행됐는지.
+    2) 계좌별 "주문일별 관측률"(`order_day_observations`,
+       `order_accepted_at` 기준으로 전체 로그를 다시 훑은 결과):
+       오늘 접수된 주문이 (조회가 언제 일어났든) 실제로 얼마나
+       관측됐는지 — 이제 부분 조회 성공(`outcome="partial"`)은
+       `query_partial_count`로만 집계되고 관측률 분자에는 포함되지
+       않습니다(지적 2번).
+    또한 "현재 실행 상태"(`run_status`)를 종료 마커와 별도로 표시해,
+    번들이 실행 중인 프로그램에서 생성돼 이번 실행의 종료 마커가
+    아직 없는 상태(정상)와 실제 저장 실패를 구분합니다(지적 5번).
     """
     L: list[str] = []
     day = target.strftime("%Y-%m-%d")
@@ -576,37 +767,70 @@ def build_order_status_summary(
     L.append("  체결조회 증거 저장·커버리지 (order_status_coverage)")
     L.append("=" * 58)
     L.append("이 요약은 손익을 계산하지 않습니다 — 무엇을 조회했고 무엇을")
-    L.append("저장했으며 무엇이 빠졌는지만 구분합니다(1차 구현 완료 기준).")
+    L.append("저장했으며 무엇이 빠졌는지만 구분합니다.")
     L.append("")
+    L.append("※ 아래는 서로 다른 두 통계입니다(2026-09-18 재재검토 반영) — '조회일")
+    L.append("  활동 통계'는 오늘 조회가 실행된 건수(조회 시각 기준)이고, 계좌별")
+    L.append("  커버리지는 '주문 접수일(order_accepted_at)' 기준입니다. 전일 접수")
+    L.append("  주문을 오늘 조회했다면, 그 관측은 오늘이 아니라 원래 주문이 접수된")
+    L.append("  날짜의 커버리지에 집계됩니다(집계 기준 시각 = order_accepted_at).")
 
-    deduped, conflicting_ids = dedupe_by_write_id(observations)
-    L.append(f"observation_raw_line_count            = {len(observations)}")
-    L.append(f"observation_unique_write_id_count      = {len(deduped)}"
+    query_deduped, query_conflicting_ids = dedupe_by_write_id(query_day_observations)
+    L.append("")
+    L.append("[ 조회일 활동 통계 — 오늘(조회 시각 기준) ]")
+    L.append(f"observation_raw_line_count            = {len(query_day_observations)}")
+    L.append(f"observation_unique_write_id_count      = {len(query_deduped)}"
               " (같은 write_id+같은 내용 재시도는 1건으로 집계)")
-    if conflicting_ids:
-        L.append(f"⚠ observation_write_id_conflict_count = {len(conflicting_ids)}"
+    if query_conflicting_ids:
+        L.append(f"⚠ observation_write_id_conflict_count = {len(query_conflicting_ids)}"
                   " — 같은 write_id인데 내용이 다름(버그 신호, 임의로 하나를 고르지 않음)")
-        for wid in conflicting_ids[:10]:
+        for wid in query_conflicting_ids[:10]:
             L.append(f"    conflicting write_id: {wid}")
-        if len(conflicting_ids) > 10:
-            L.append(f"    ... 외 {len(conflicting_ids) - 10}건")
+        if len(query_conflicting_ids) > 10:
+            L.append(f"    ... 외 {len(query_conflicting_ids) - 10}건")
     else:
         L.append("observation_write_id_conflict_count    = 0")
 
     L.append("")
+    run_state = _classify_run_state(run_status)
+    L.append(f"observation_run_state(현재 실행 상태)   = {run_state}")
+    if run_status:
+        L.append(
+            f"    restart_id={run_status.get('restart_id', '')}"
+            f" updated_at={run_status.get('updated_at', '')}"
+        )
+        L.append(
+            f"    dropped_count={run_status.get('dropped_count')}"
+            f" fsync_unconfirmed_count={run_status.get('fsync_unconfirmed_count')}"
+            f" queue_full_dropped_count={run_status.get('queue_full_dropped_count')}"
+            f" file_healthy={run_status.get('file_healthy')}"
+        )
+    else:
+        L.append("    ⚠ 실행 상태 스냅샷 파일이 없습니다 — 관측 기능이 비활성"
+                  "(account_scope_id 미설정)이었거나 기록기가 아직 한 번도 시작된"
+                  " 적이 없습니다.")
+    L.append("    ※ '실행_중'은 최근 상태 갱신 시각 기준 추정(하트비트 방식)입니다 —")
+    L.append("      프로세스 생존을 다른 수단으로 확정하지는 않습니다.")
+
+    L.append("")
     markers = shutdown_markers or []
-    L.append(f"recorder_shutdown_marker_count          = {len(markers)}"
-              " (이 날짜 슬라이스 안에 기록된 정상/비정상 종료 마커 수)")
+    L.append(f"recorder_shutdown_marker_count(이 날짜)  = {len(markers)}"
+              " (이 날짜에 실제로 종료된 실행의 마커만 — 다른 날짜의 과거 마커는")
+    L.append("  포함하지 않습니다, 재재검토 지적 5번)")
     for m in markers:
         L.append(
             f"    restart_id={m.get('restart_id', '')} clean_shutdown={m.get('clean_shutdown')}"
             f" dropped_count={m.get('dropped_count')} shutdown_at={m.get('shutdown_at', '')}"
         )
     if not markers:
-        L.append("    ⚠ 종료 마커가 없습니다 — 이 날짜에 기록기가 정상 종료 배선을 타지 않고")
-        L.append("      프로세스가 끝났거나(예: 강제 종료), 아직 진행 중인 실행일 수 있습니다.")
-        L.append("      큐 포화/쓰기 실패는 app.log의 [ORDER_STATUS_OBS_QUEUE_FULL]/")
-        L.append("      [ORDER_STATUS_OBS_WRITE_FAILED] 태그로도 확인하세요.")
+        if run_state == "실행_중":
+            L.append("    이 날짜에 종료 마커가 없습니다 — 위 실행 상태가 '실행_중'이므로")
+            L.append("      정상입니다(아직 종료하지 않았으니 종료 마커가 없는 게 맞습니다).")
+        else:
+            L.append("    ⚠ 종료 마커가 없습니다 — 이 날짜에 기록기가 정상 종료 배선을 타지")
+            L.append("      않고 프로세스가 끝났을 수 있습니다(예: 강제 종료). 큐 포화/쓰기")
+            L.append("      실패는 app.log의 [ORDER_STATUS_OBS_QUEUE_FULL]/")
+            L.append("      [ORDER_STATUS_OBS_WRITE_FAILED] 태그로도 확인하세요.")
 
     # order_id 비교는 compute_coverage()/find_all_matching()과 동일하게
     # normalize_order_id()로 정규화합니다(0-padding 차이로 같은 주문이
@@ -660,8 +884,17 @@ def build_order_status_summary(
         candidate = str(obs.order_accepted_at)[:10]
         return candidate if len(candidate) == 10 and candidate[4] == "-" and candidate[7] == "-" else None
 
+    order_day_deduped, order_day_conflicting_ids = dedupe_by_write_id(order_day_observations)
+    L.append("")
+    L.append("[ 계좌별 커버리지 — 주문 접수일(order_accepted_at) 기준 ]")
+    L.append(f"order_day_observation_count           = {len(order_day_observations)}"
+              " (조회가 언제 실행됐든, 이 날짜에 접수된 주문에 대한 관측 전체)")
+    if order_day_conflicting_ids:
+        L.append(f"⚠ order_day_write_id_conflict_count   = {len(order_day_conflicting_ids)}"
+                  " — 같은 write_id인데 내용이 다름(버그 신호)")
+
     scopes = sorted({acc for acc, _env, _d, _oid in accepted_orders} | {
-        obs.account_scope_id for obs in deduped if obs.account_scope_id
+        obs.account_scope_id for obs in order_day_deduped if obs.account_scope_id
     })
     if not scopes:
         L.append("")
@@ -673,7 +906,7 @@ def build_order_status_summary(
     for scope_id in scopes:
         cov = compute_coverage(
             account_scope_id=scope_id, accepted_orders=accepted_orders,
-            observations=deduped, order_date_resolver=_order_date_resolver,
+            observations=order_day_deduped, order_date_resolver=_order_date_resolver,
         )
         L.append("")
         L.append(f"[ account_scope_id = {scope_id} ]")
@@ -693,12 +926,15 @@ def build_order_status_summary(
         L.append(f"  price_capture_rate(가격 확보율)       = {_pct(cov['price_capture_rate'])}")
         L.append(f"  query_attempt_count             = {cov['query_attempt_count']}")
         L.append(f"  query_success_count             = {cov['query_success_count']}")
+        L.append(f"  query_partial_count              = {cov['query_partial_count']}"
+                  " (oso/cntr 중 일부만 성공 — 완전한 조회 성공으로 집계하지 않음,"
+                  " 재재검토 지적 2번)")
         L.append(f"  query_failed_count              = {cov['query_failed_count']}")
         L.append(f"  unresolved_order_date_count      = {cov['unresolved_order_date_count']}"
                   " (journal에서 접수 시각을 확인하지 못한 관측 — 저널이 이미 삭제된 경우 등)")
         L.append(f"  orphan_observation_count         = {cov['orphan_observation_count']}"
-                  " (order_date는 확인됐지만 accepted_orders에 없는 조회 — 다른 날짜에"
-                  " 접수된 주문에 대한 오늘 조회 포함, 하루 단위 번들의 한계)")
+                  " (order_date는 확인됐지만 accepted_orders에 없는 조회 — trades.csv에")
+        L.append("    해당 주문이 없거나 계정/환경 연결이 안 된 경우")
 
     L.append("")
     L.append("※ 4번째 지표(조회·저장 품질)는 write_id 재시도/충돌 집계, 위 종료 마커,")
@@ -980,8 +1216,21 @@ def _read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def build(target: date, *, quiet: bool = False) -> Path | None:
-    """번들을 원자적으로 생성합니다. 락 획득 실패 시 None 반환."""
+def build(
+    target: date,
+    *,
+    quiet: bool = False,
+    settings_path: str | Path = "config/settings.yaml",
+    obs_log_path: str | Path | None = None,
+) -> Path | None:
+    """번들을 원자적으로 생성합니다. 락 획득 실패 시 None 반환.
+
+    `settings_path`/`obs_log_path`(2026-09-18 재재검토 반영, 지적
+    4번): 관측 로그 경로를 실제 설정에서 읽거나(기본 동작 —
+    `resolve_order_status_observation_log_path(settings_path)`),
+    `obs_log_path`로 직접 지정할 수 있습니다. 후자는 테스트나
+    수동 실행에서 특정 경로를 강제할 때 씁니다.
+    """
     day_compact = target.strftime("%Y%m%d")
     EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
     final_path = EXPORTS_DIR / f"bundle_{day_compact}.zip"
@@ -1185,7 +1434,22 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
         # 그걸 그대로 재사용(중복 조회 없음).
         manifest.append("")
         manifest.append("[ RAW — 체결조회 증거 관측 (order_status_observations.jsonl) ]")
-        obs_src = ORDER_STATUS_OBSERVATION_LOG
+        if obs_log_path is not None:
+            resolved_obs_log = Path(obs_log_path)
+            manifest.append(f"  observation_log_source = 명시적 지정(obs_log_path) → {resolved_obs_log}")
+        else:
+            resolved_obs_log, _loaded_from_settings = resolve_order_status_observation_log_path(settings_path)
+            if _loaded_from_settings:
+                manifest.append(
+                    f"  observation_log_source = config.settings.load_settings({settings_path!r})"
+                    f" → {resolved_obs_log}"
+                )
+            else:
+                manifest.append(
+                    f"  observation_log_source = 폴백(설정 로드 실패 또는 파일 없음, 지적 4번 대응)"
+                    f" → {resolved_obs_log}"
+                )
+        obs_src = resolved_obs_log
         obs_dst = work / f"order_status_observations_{day_compact}.jsonl"
         obs_records: list[OrderStatusObservation] = []
         obs_shutdown_markers: list[dict] = []
@@ -1220,7 +1484,30 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
                 )
             obs_shutdown_markers = _parse_shutdown_markers(obs_dst)
             if obs_shutdown_markers:
-                manifest.append(f"    종료 마커 {len(obs_shutdown_markers)}건 발견(상세는 커버리지 요약 참고)")
+                manifest.append(f"    이 날짜 종료 마커 {len(obs_shutdown_markers)}건 발견(상세는 커버리지 요약 참고)")
+
+        # 2026-09-18 재재검토 반영(지적 3번): "주문일별 관측률"은 조회
+        # 시각이 아니라 주문 접수일 기준이어야 하므로, 하루로 자르지
+        # 않은 전체 원본을 다시 훑어 order_accepted_at이 이 날짜인
+        # 관측을 모읍니다(조회가 다음날 이뤄졌어도 원래 주문일에 귀속).
+        order_day_records, order_day_parse_errors = _load_full_observations_for_order_date(
+            obs_src, target,
+        )
+        if order_day_parse_errors:
+            manifest.append(
+                f"    ⚠ 주문일 기준 관측 복원 실패 {len(order_day_parse_errors)}건"
+                "(알 수 없는 스키마 — 집계에서 제외)"
+            )
+
+        # 2026-09-18 재재검토 반영(지적 5번): 종료 마커와 별도로,
+        # 기록기가 살아있는 동안 주기적으로 갱신하는 "현재 실행 상태"
+        # 스냅샷을 함께 읽어 번들에 반영합니다.
+        obs_status_path = status_path_for(obs_src)
+        run_status = _read_running_status(obs_status_path)
+        manifest.append(
+            f"  observation_status_snapshot = {obs_status_path}"
+            f" ({'있음' if run_status is not None else '없음'})"
+        )
 
         manifest.append("")
         manifest.append("[ RAW — 로그 (allowlist 태그 줄만, 마스킹 적용) ]")
@@ -1281,10 +1568,11 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
         # 체결조회 증거 커버리지 — trades.csv(오늘 슬라이스)와
         # run_baseline.csv 조인 결과(all_baselines)를 그대로 재사용.
         order_status_summary = build_order_status_summary(
-            target, obs_records,
+            target, obs_records, order_day_records,
             _read_csv(work / f"trades_{day_compact}.csv"),
             all_baselines,
             shutdown_markers=obs_shutdown_markers,
+            run_status=run_status,
         )
         (work / "order_status_coverage.txt").write_text(order_status_summary, encoding="utf-8")
 
