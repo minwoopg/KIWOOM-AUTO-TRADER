@@ -39,6 +39,7 @@ import logging
 import os
 import queue
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date
@@ -155,6 +156,19 @@ class OrderStatusObservation:
         return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
 
 
+def status_path_for(observation_log_path: str | Path) -> Path:
+    """관측 로그 파일 경로로부터 "실행 중 상태 스냅샷" 파일 경로를
+    유도합니다(2026-09-18 재재검토 반영, 지적 5번).
+
+    기록기(쓰기 쪽, 이 모듈)와 exporter(읽기 쪽,
+    `export_daily_bundle.py`)가 각자 다른 규칙으로 경로를 계산하면
+    서로 어긋날 위험이 있으므로, 두 쪽 모두 이 함수 하나만 공유해
+    항상 같은 결과를 내도록 합니다.
+    """
+    p = Path(observation_log_path)
+    return p.with_name(p.stem + ".status.json")
+
+
 def build_entry_evidence(raw: dict) -> dict:
     """cntr/oso 원본 행 하나를 관측 레코드용 구조로 변환합니다.
 
@@ -214,10 +228,24 @@ class OrderStatusObservationRecorder:
         app_logger: logging.Logger | None = None,
         maxsize: int = 200,
         shutdown_drain_timeout_sec: float = 3.0,
+        status_update_interval_sec: float = 5.0,
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._app_logger = app_logger or logging.getLogger(__name__)
+        # 2026-09-18 재재검토 반영(지적 1번): truncate 자체가 실패해
+        # "쓰기 실패 이전" 경계로도 되돌릴 수 없게 되면, 그 사실이
+        # 확인될 때까지는 이 파일에 더 이상 쓰지 않습니다 — 그래야
+        # 다음 정상 기록이 이미 손상된 바이트 뒤에 이어붙어 함께
+        # 손상되는 연쇄를 막을 수 있습니다.
+        self._file_healthy = True
+        # 2026-09-18 재재검토 반영(지적 5번): 종료 시에만 남는 마커와
+        # 별도로, 기록기가 살아있는 동안 주기적으로 갱신하는 "현재
+        # 상태" 스냅샷 파일 경로 — exporter가 "실행 중"인지 판단할 때
+        # 이 파일의 최근 갱신 시각을 씁니다.
+        self._status_path = status_path_for(self.path)
+        self._status_update_interval_sec = status_update_interval_sec
+        self._last_status_update_monotonic = 0.0
         self._queue: "queue.Queue[OrderStatusObservation]" = queue.Queue(maxsize=maxsize)
         self._shutdown_drain_timeout_sec = shutdown_drain_timeout_sec
         self._thread: threading.Thread | None = None
@@ -249,6 +277,12 @@ class OrderStatusObservationRecorder:
     # ── 시작/복구 ──
     def start(self) -> None:
         self._quarantine_incomplete_tail()
+        # 2026-09-18 재재검토 반영(지적 5번): 상태 스냅샷 파일을 기록
+        # 시작 즉시 만들어 둡니다 — 그래야 exporter가 "상태 파일이
+        # 아예 없음(계측 비활성/시작 전)"과 "있지만 오래됨(비정상
+        # 종료 가능성)"을 구분할 수 있습니다.
+        self._write_running_status()
+        self._last_status_update_monotonic = time.monotonic()
         self._thread = threading.Thread(
             target=self._writer_loop, name="order-status-observation-writer", daemon=True,
         )
@@ -274,41 +308,79 @@ class OrderStatusObservationRecorder:
                 f"[ORDER_STATUS_OBS_RECOVERY] {self.path} 읽기 실패 — {type(exc).__name__}: {exc}"
             )
             return
-        if not lines:
+        if lines:
+            bad_indices = []
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    json.loads(stripped)
+                except json.JSONDecodeError:
+                    bad_indices.append(i)
+            if bad_indices:
+                last_idx = len(lines) - 1
+                if bad_indices == [last_idx]:
+                    # 마지막 줄만 손상 — 정상적인 강제종료 시나리오로 취급
+                    corrupt_path = self.path.with_suffix(self.path.suffix + ".corrupt")
+                    with corrupt_path.open("a", encoding="utf-8") as f:
+                        f.write(
+                            f"# quarantined_at={datetime.now().isoformat()} restart_id={self.restart_id}\n"
+                        )
+                        f.write(lines[last_idx])
+                    remaining = "".join(lines[:last_idx])
+                    tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+                    tmp.write_text(remaining, encoding="utf-8")
+                    os.replace(tmp, self.path)
+                    self._app_logger.critical(
+                        f"[ORDER_STATUS_OBS_RECOVERY] {self.path} 마지막 줄이 불완전해 "
+                        f"{corrupt_path.name}으로 격리했습니다(강제종료 추정) — 나머지는 정상 유지"
+                    )
+                else:
+                    self._app_logger.critical(
+                        f"[ORDER_STATUS_OBS_RECOVERY] {self.path} 마지막 줄이 아닌 위치({bad_indices})에서 "
+                        f"손상 발견 — 파일 자체가 손상됐을 수 있습니다. 자동 복구하지 않고 그대로 둡니다."
+                    )
+        # 2026-09-18 재재검토 반영(지적 1번, 재현된 버그): 마지막 줄이
+        # 완전한 JSON이어도 파일 자체가 개행으로 끝나지 않는 경우가
+        # 있습니다(예: 이전 실행이 write()+flush()까지는 성공했지만
+        # 그 뒤 "\n" 한 글자를 마저 쓰기 직전에 강제 종료된 경우 —
+        # 위 bad_indices 검사는 각 줄을 "\n" 기준으로 나눈 뒤 개별
+        # json.loads()만 확인하므로 이 사례를 잡지 못합니다). 이 상태를
+        # 그대로 두면 다음 기록이 이 줄 끝에 바로 이어붙어 **두 레코드
+        # 모두 파싱 불가능**해집니다. 내용 손실 없이 개행만 보정합니다.
+        self._ensure_trailing_newline()
+
+    def _ensure_trailing_newline(self) -> None:
+        """파일이 존재하고 비어있지 않은데 마지막 바이트가 개행이
+        아니면 개행 한 글자만 덧붙입니다(2026-09-18 재재검토 반영,
+        지적 1번). 내용은 전혀 바꾸지 않으므로 안전합니다."""
+        if not self.path.exists():
             return
-        bad_indices = []
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                json.loads(stripped)
-            except json.JSONDecodeError:
-                bad_indices.append(i)
-        if not bad_indices:
-            return
-        last_idx = len(lines) - 1
-        if bad_indices == [last_idx]:
-            # 마지막 줄만 손상 — 정상적인 강제종료 시나리오로 취급
-            corrupt_path = self.path.with_suffix(self.path.suffix + ".corrupt")
-            with corrupt_path.open("a", encoding="utf-8") as f:
-                f.write(
-                    f"# quarantined_at={datetime.now().isoformat()} restart_id={self.restart_id}\n"
+        try:
+            with self.path.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                if size == 0:
+                    return
+                f.seek(-1, os.SEEK_END)
+                last_byte = f.read(1)
+            if last_byte != b"\n":
+                with self.path.open("ab") as f:
+                    f.write(b"\n")
+                self._app_logger.warning(
+                    f"[ORDER_STATUS_OBS_RECOVERY] {self.path} 마지막 줄이 개행 없이 끝나"
+                    " 있어 보정했습니다(내용 손실 없음 — 이전 실행이 마지막 개행 쓰기"
+                    " 직전에 종료된 것으로 추정, 보정하지 않으면 다음 기록이 이어붙어"
+                    " 두 레코드 모두 파싱 불가능해짐)"
                 )
-                f.write(lines[last_idx])
-            remaining = "".join(lines[:last_idx])
-            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            tmp.write_text(remaining, encoding="utf-8")
-            os.replace(tmp, self.path)
+        except OSError as exc:
             self._app_logger.critical(
-                f"[ORDER_STATUS_OBS_RECOVERY] {self.path} 마지막 줄이 불완전해 "
-                f"{corrupt_path.name}으로 격리했습니다(강제종료 추정) — 나머지는 정상 유지"
+                f"[ORDER_STATUS_OBS_RECOVERY] {self.path} 개행 보정 확인 실패 — "
+                f"{type(exc).__name__}: {exc} — 다음 기록이 이 파일 끝에 손상 없이"
+                " 이어붙는다는 보장이 없습니다"
             )
-        else:
-            self._app_logger.critical(
-                f"[ORDER_STATUS_OBS_RECOVERY] {self.path} 마지막 줄이 아닌 위치({bad_indices})에서 "
-                f"손상 발견 — 파일 자체가 손상됐을 수 있습니다. 자동 복구하지 않고 그대로 둡니다."
-            )
+            self._file_healthy = False
 
     # ── 기록 ──
     def record(self, observation: OrderStatusObservation) -> None:
@@ -337,9 +409,11 @@ class OrderStatusObservationRecorder:
                 observation = self._queue.get(timeout=0.5)
             except queue.Empty:
                 self._maybe_log_queue_full_change()
+                self._maybe_update_running_status()
                 continue
             self._write_one(observation)
             self._maybe_log_queue_full_change()
+            self._maybe_update_running_status()
         # 2026-09-18 재검토 반영(지적 2번, 재현된 버그): 종료 마커 기록도
         # 이 작업자 스레드 안에서 수행합니다 — 예전엔 shutdown()을 호출한
         # (매매) 스레드가 join(timeout=...) 이후 **직접** 마커 파일을
@@ -353,6 +427,61 @@ class OrderStatusObservationRecorder:
         # 쓰기를 끝내려 시도합니다(데몬 스레드라 프로세스 종료를 막지
         # 않음).
         self._write_shutdown_marker()
+        self._write_running_status(clean_shutdown=self.marker_written)
+
+    def _maybe_update_running_status(self) -> None:
+        """상태 스냅샷 파일을 너무 잦지 않게(기본 5초 간격) 갱신합니다
+        (2026-09-18 재재검토 반영, 지적 5번) — exporter가 이 파일의
+        `updated_at`이 최근인지로 "지금 실행 중"을 판단하므로, 매매
+        활동이 없는 구간에도(관측할 조회 자체가 없어도) 폴링 주기마다
+        살아있다는 신호를 남겨야 합니다."""
+        now_mono = time.monotonic()
+        if now_mono - self._last_status_update_monotonic >= self._status_update_interval_sec:
+            self._write_running_status()
+            self._last_status_update_monotonic = now_mono
+
+    def _write_running_status(self, *, clean_shutdown: bool | None = None) -> None:
+        """"지금 이 순간의" 저장 품질 상태를 별도 스냅샷 파일에
+        남깁니다(2026-09-18 재재검토 반영, 지적 5번).
+
+        기존 종료 마커는 실제로 종료 배선을 탄 시점에만 남으므로,
+        번들이 보통 그렇듯 프로그램이 아직 실행 중일 때 생성되면
+        "이 실행의" 마커는 존재할 수 없습니다 — exporter가 이 사실을
+        "관측 실패"로 오인하지 않으려면, 실행 중에도 주기적으로
+        갱신되는 별도의 상태 신호가 필요합니다. `clean_shutdown`은
+        아직 종료하지 않았으면(정상 동작 중) `None`으로 남겨 "실행
+        중이거나 확인 불가"를 뜻하고, 종료 배선을 탄 뒤에만 실제
+        마커 기록 성공 여부(`marker_written`)로 True/False가 채워집니다
+        — 그래야 exporter가 "정상 종료/종료 확인 불가/실행 중"을
+        이 파일 하나만으로 구분할 수 있습니다.
+
+        이 파일 쓰기 자체가 실패해도(디스크 문제 등) 관측/매매에
+        영향을 주지 않도록 예외를 삼키고 경고만 남깁니다 — 진단
+        정보 하나가 없어지는 것일 뿐, 핵심 기능이 아니기 때문입니다.
+        """
+        with self._dropped_lock:
+            dropped_count = self.dropped_count
+            fsync_unconfirmed_count = self.fsync_unconfirmed_count
+            queue_full_dropped_count = self._queue_full_dropped_count
+        payload = {
+            "restart_id": self.restart_id,
+            "updated_at": datetime.now().isoformat(),
+            "dropped_count": dropped_count,
+            "fsync_unconfirmed_count": fsync_unconfirmed_count,
+            "queue_full_dropped_count": queue_full_dropped_count,
+            "file_healthy": self._file_healthy,
+            "clean_shutdown": clean_shutdown,
+        }
+        try:
+            self._status_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._status_path.with_suffix(self._status_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self._status_path)
+        except OSError as exc:
+            self._app_logger.warning(
+                f"[ORDER_STATUS_OBS_RECOVERY] 실행 상태 스냅샷({self._status_path}) 쓰기 실패"
+                f"(진단 정보만 영향 — 관측/매매 자체는 계속됨) — {type(exc).__name__}: {exc}"
+            )
 
     def _maybe_log_queue_full_change(self) -> None:
         with self._dropped_lock:
@@ -386,7 +515,25 @@ class OrderStatusObservationRecorder:
         (`fsync_unconfirmed_count`)와 로그 태그
         (`[ORDER_STATUS_OBS_FSYNC_FAILED]`)로 "저장 내구성 미확인"
         상태를 남기되, 레코드 자체는 유실 처리하지 않습니다.
+
+        2026-09-18 재재검토 반영(지적 1번, 재현된 버그): truncate 복구
+        **자체가 실패**하면(디스크 문제 등으로 되돌릴 크기조차 확정할
+        수 없으면) 예전엔 그냥 다음 레코드를 이 파일에 계속
+        append했습니다 — 그러면 그 다음 레코드도 이미 손상된 바이트
+        뒤에 이어붙어 함께 손상됐습니다(재현: truncate 실패 → w2도
+        파싱 불가). 이제 truncate 자체가 실패하면(또는 truncate
+        대상 크기조차 확인할 수 없으면) 이 파일을 더 이상 믿지 않고
+        `_quarantine_and_rotate_file()`로 옆으로 치운 뒤 같은 경로에
+        새 빈 파일로 다시 시작합니다 — 그래서 그 다음 레코드부터는
+        항상 깨끗한 파일에 쓰이고, `dropped_count`는 실제로 복구
+        불가능해진 레코드 수와 계속 일치합니다(격리된 파일에 추가로
+        덧붙는 레코드가 없으므로).
         """
+        if not self._file_healthy:
+            with self._dropped_lock:
+                self.dropped_count += 1
+            return
+
         try:
             pre_size = self.path.stat().st_size if self.path.exists() else 0
         except OSError:
@@ -416,21 +563,61 @@ class OrderStatusObservationRecorder:
                 f"[ORDER_STATUS_OBS_WRITE_FAILED] write_id={observation.write_id} — "
                 f"{type(exc).__name__}: {exc} — 같은 파일에 재시도하지 않고 유실 처리"
             )
-            if pre_size is not None:
-                self._truncate_partial_write(pre_size)
+            recovered = self._truncate_partial_write(pre_size) if pre_size is not None else False
+            if not recovered:
+                self._quarantine_and_rotate_file()
 
-    def _truncate_partial_write(self, pre_size: int) -> None:
+    def _truncate_partial_write(self, pre_size: int) -> bool:
         """쓰기 실패 후 파일을 실패 이전 크기로 되돌려 부분 쓰기 바이트를
         제거합니다 — 다음 레코드가 항상 깨끗한 줄 경계 뒤에 이어붙도록
-        보장합니다(2026-09-18 재검토 지적 1번)."""
+        보장합니다(2026-09-18 재검토 지적 1번). 성공하면 True, 실패하면
+        False를 반환합니다(2026-09-18 재재검토 반영 — 호출부가 실패
+        시 이 파일에 더 이상 쓰지 않고 격리/전환하도록 신호를 줌)."""
         try:
             with self.path.open("r+b") as f:
                 f.truncate(pre_size)
+            return True
         except OSError as exc:
             self._app_logger.critical(
                 f"[ORDER_STATUS_OBS_WRITE_FAILED] 부분 쓰기 복구(truncate) 실패 — "
                 f"{type(exc).__name__}: {exc} — 파일이 부분 쓰기 상태로 남아있을 수 있음"
             )
+            return False
+
+    def _quarantine_and_rotate_file(self) -> None:
+        """truncate 복구까지 실패해 파일의 마지막 경계를 더 이상 신뢰할
+        수 없을 때, 이 파일에는 더 이상 쓰지 않고 같은 경로에 새 빈
+        파일로 전환합니다(2026-09-18 재재검토 반영, 지적 1번 — "정상
+        경계 복구를 확인하지 못한 파일에는 추가 기록을 중단하고, 새
+        파일로 전환하거나 기록기를 오류 상태로 전환해야 합니다").
+
+        기존 파일은 삭제하지 않고 타임스탬프가 붙은 이름으로 옆에
+        남겨둡니다(수동 복구/조사 가능하도록). 격리(이동) 자체가
+        실패하면(디스크 문제가 더 근본적인 경우) 이 파일을 계속
+        믿을 수 없으므로 `_file_healthy`를 False로 유지해 이후
+        `_write_one()`이 즉시 유실 처리하고 반환하게 합니다 — 매매
+        프로그램 자체를 멈추지는 않지만, 손상 위에 계속 덮어쓰는
+        것만은 막습니다.
+        """
+        old_path = self.path
+        suffix = f".unrecoverable-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        quarantined = old_path.with_name(old_path.name + suffix)
+        try:
+            os.replace(old_path, quarantined)
+        except OSError as exc:
+            self._file_healthy = False
+            self._app_logger.critical(
+                f"[ORDER_STATUS_OBS_RECOVERY] {old_path} 손상 파일 격리 실패 — 이 기록기는"
+                f" 앞으로 이 파일에 기록하지 않습니다(손상 위에 계속 덮어쓰는 것을 막기"
+                f" 위함, dropped_count로 계속 유실 집계됨) — {type(exc).__name__}: {exc}"
+            )
+            return
+        self._file_healthy = True
+        self._app_logger.critical(
+            f"[ORDER_STATUS_OBS_RECOVERY] {old_path.name}의 마지막 경계를 복구하지 못해"
+            f" {quarantined.name}으로 격리하고 같은 경로에 새 파일로 전환했습니다"
+            f"(복구 불가능한 손상 확인 — 이후 정상 기록은 새 파일에 쌓입니다)"
+        )
 
     # ── 종료 ──
     def _write_shutdown_marker(self) -> None:
@@ -546,6 +733,18 @@ def compute_coverage(
     matching()`/`find_all_matching()`이 쓰는 것과 동일한
     `normalize_order_id()`로 정규화해, 0-padding 차이("000123" vs
     "123")로 같은 주문이 고아 관측으로 잘못 분류되지 않게 합니다.
+
+    2026-09-18 재재검토 반영(지적 2번, 재현된 버그): `outcome="partial"`
+    (oso/cntr 중 하나만 성공)이 `api_error`가 아니라는 이유만으로
+    `query_success`에 들어가, "원문 일부를 확보했다"는 사실이 "조회가
+    완전히 성공했다"로 오집계됐습니다(재현: cntr 조회만 실패해도
+    query_success_count=1, query_failed_count=0, 주문 관측률 100%로
+    나옴). 이제 `outcome`을 success/partial/api_error 세 갈래로 명시
+    구분합니다 — partial은 `query_partial_count`로 별도 집계하고,
+    `query_success_count`/`observed_keys`(따라서 주문 관측률의 분자)
+    어디에도 넣지 않습니다. 부분 증거로는 새 판정(FILLED 등)을 만들지
+    않는다는 `_safe_record_order_status_observation()`의 계약과도
+    일치합니다(partial 관측은 `psm_broker_status=None`으로 기록됨).
     """
 
     if not account_scope_id.strip():
@@ -561,6 +760,7 @@ def compute_coverage(
 
     query_attempt = 0
     query_success = 0
+    query_partial = 0
     query_failed = 0
     write_success = 0  # 실제 디스크 반영 여부는 이 함수 호출 시점엔 알 수 없음 — 별도 카운터로 다룸(라이터의 dropped_count 참고)
 
@@ -568,6 +768,14 @@ def compute_coverage(
         query_attempt += 1
         if obs.outcome == "api_error":
             query_failed += 1
+            continue
+        if obs.outcome == "partial":
+            # 부분 조회 성공은 "조회 성공"이 아닙니다 — 완전한 조회
+            # 성공과 구분해서 별도로만 집계하고, 아래 관측률 분자에는
+            # 포함하지 않습니다(수정 방향: "부분 증거를 관측률에
+            # 포함할지는 별도로 정의하되, 조회 성공으로 표시해서는
+            # 안 됩니다"를 그대로 반영 — 이번 라운드는 후자만 고정).
+            query_partial += 1
             continue
         query_success += 1
 
@@ -604,6 +812,7 @@ def compute_coverage(
         "price_capture_rate": price_capture_rate,
         "query_attempt_count": query_attempt,
         "query_success_count": query_success,
+        "query_partial_count": query_partial,
         "query_failed_count": query_failed,
         "unresolved_order_date_count": unresolved_date_count,
         "orphan_observation_count": orphan_count,
