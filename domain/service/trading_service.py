@@ -53,6 +53,7 @@ from infra.storage.tracked_order_journal import (
 from infra.storage.order_status_observation_store import (
     OrderStatusObservation, OrderStatusObservationRecorder, build_entry_evidence, resolve_env,
 )
+from infra.broker.kiwoom_order_status import find_all_matching, normalize_order_id
 from utils.time_utils import is_market_open, now_kst, parse_kst_bar_timestamp
 
 
@@ -3753,6 +3754,8 @@ class TradingService:
         failure_stage: str | None,
         error_repr: str | None,
         evidence: OrderStatusEvidence | None,
+        partial_oso_entries: list | None = None,
+        partial_cntr_entries: list | None = None,
     ) -> None:
         """`_reconcile_tracked_order_status()`의 조회 결과(성공/실패
         모두)를 관측 저장소에 기록합니다.
@@ -3764,6 +3767,14 @@ class TradingService:
         값 자체는 이 메서드 호출 이전에 확정되어 있고, 이 메서드는 그
         값을 "기록"만 할 뿐 "판정"에는 관여하지 않습니다. 기록기가
         비활성(`None`)이면 아무 것도 하지 않고 즉시 반환합니다.
+
+        2026-09-18 재검토 반영(지적 4번): `evidence`가 없어도(조회
+        자체가 실패해도) `partial_oso_entries`/`partial_cntr_entries`로
+        이미 성공한 조회의 원본 응답을 넘길 수 있습니다 — 두 번째
+        조회만 실패해도 첫 번째 조회 결과가 통째로 사라지지 않도록
+        하기 위함입니다. 이 값이 있으면 판정(`psm_broker_status`)은
+        만들지 않고(추가 판정을 하지 않음 — 실패는 실패로 유지)
+        `outcome`만 "partial"로 남깁니다.
         """
 
         recorder = self._order_status_observation_recorder
@@ -3789,16 +3800,40 @@ class TradingService:
                     outcome = "partial"
                     failure_stage = failure_stage or "evidence_build"
                     error_repr = error_repr or evidence.evidence_error
+            elif partial_oso_entries or partial_cntr_entries:
+                # 조회 자체는 실패했지만(evidence=None) 일부 원본 응답은
+                # 이미 확보됨 — 여기서 새로 판정을 만들지 않고(실패는
+                # 실패로 유지), 확보된 원본 중 이 order_id에 매칭되는
+                # 행만 골라 원문 그대로 보존합니다.
+                try:
+                    target = normalize_order_id(order_id)
+                    if partial_oso_entries:
+                        oso_matches = [
+                            build_entry_evidence(e) for e in find_all_matching(partial_oso_entries, target)
+                        ]
+                    if partial_cntr_entries:
+                        cntr_matches = [
+                            build_entry_evidence(e) for e in find_all_matching(partial_cntr_entries, target)
+                        ]
+                except Exception as exc:
+                    self.app_logger.warning(
+                        f"[ORDER_STATUS_OBS] {symbol} 부분 조회 결과 매칭 실패(관측만 영향): "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                outcome = "partial"
 
             base_qty: int | None = None
             target_qty: int | None = None
             journal_linked = False
+            order_accepted_at: str | None = None
             try:
                 record = self._tracked_order_journal.get(symbol)
                 if record is not None and str(record.order_id) == str(order_id):
                     base_qty = record.base_quantity_before_order
                     target_qty = record.target_quantity_after_order
                     journal_linked = True
+                    if record.accepted_at is not None:
+                        order_accepted_at = record.accepted_at.isoformat()
             except Exception as exc:
                 self.app_logger.warning(
                     f"[ORDER_STATUS_OBS] {symbol} journal 스냅샷 조회 실패(관측만 영향, "
@@ -3828,6 +3863,7 @@ class TradingService:
                 base_quantity_before_order=base_qty,
                 target_quantity_after_order=target_qty,
                 journal_linked=journal_linked,
+                order_accepted_at=order_accepted_at,
                 write_id=query_id,
             )
             recorder.record(observation)
@@ -3984,15 +4020,23 @@ class TradingService:
                 f"order_id={order_id} | {type(exc).__name__}: {exc} — "
                 f"기존 lifecycle 그대로 유지, 아무것도 해제하지 않음"
             )
-            # 실패한 조회도 반드시 기록합니다(개별 기록 없이 카운터로만
-            # 남던 v2의 결함 수정) — 이 호출은 완전히 격리되어 있어
-            # 여기서 무슨 일이 있어도 위 반환(return)을 바꾸지 않습니다.
+            # 2026-09-18 재검토 반영(지적 4번): 두 원본 조회 중 하나만
+            # 성공하고 나머지가 실패하면(KiwoomBroker가
+            # PartialOrderStatusFetchError로 감싸 전파) 이미 성공한
+            # 조회의 원본 응답을 함께 기록합니다 — 판정은 여전히
+            # 만들지 않고(실패로 유지) 원문만 보존합니다. 이 속성이
+            # 없는 일반 예외는 duck-typing으로 조용히 빈 리스트가
+            # 되므로 다른 브로커/예외 유형에도 안전합니다.
+            failure_stage = getattr(exc, "failure_stage", None) or "get_order_status_evidence"
+            partial_oso = getattr(exc, "oso_entries", None)
+            partial_cntr = getattr(exc, "cntr_entries", None)
             self._safe_record_order_status_observation(
                 symbol=symbol, order_id=order_id, kind=kind,
                 query_id=query_id, started_at_iso=query_started_at_iso,
                 pending_age_sec=observation_pending_age_sec,
-                outcome="api_error", failure_stage="get_order_status_evidence",
+                outcome="api_error", failure_stage=failure_stage,
                 error_repr=f"{type(exc).__name__}: {exc}", evidence=None,
+                partial_oso_entries=partial_oso, partial_cntr_entries=partial_cntr,
             )
             return
 
