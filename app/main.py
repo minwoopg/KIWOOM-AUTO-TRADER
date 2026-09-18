@@ -89,6 +89,38 @@ def build_trading_service(settings, broker, app_logger, trade_logger, signal_log
 OTHER_API_RATE_LIMIT_COOLDOWN_SECONDS = 180.0
 
 
+def _shutdown_order_status_observation_recorder(trading_service: TradingService, app_logger) -> None:
+    """체결조회 증거 관측 기록기를 종료합니다(2026-09-18 재검토 반영,
+    지적 2번의 "두 실행 모드의 종료 경로에 기록기 종료를 연결하라"는
+    요구 — 이전 라운드에서 유예됐던 app/main.py 실제 배선).
+
+    관측 기능이 비활성(`account_scope_id` 미설정)이면 기록기 자체가
+    `None`이므로 아무 것도 하지 않습니다. `OrderStatusObservationRecorder.
+    shutdown()`은 이미 자신의 제한시간(`shutdown_drain_timeout_sec`) 안에서만
+    대기하도록 설계돼 있으므로(작업자 스레드가 멈춰 있어도 마커 기록까지
+    포함해 그 시간 안에 반환됨), 여기서 추가로 타임아웃을 걸지 않습니다.
+    이 호출 자체가 실패해도(예상 밖 예외) 프로세스 종료를 막아서는 안
+    되므로 best-effort로 처리합니다 — 매매 로직과 무관한 부가 계측
+    기능이 종료 절차 자체를 방해해서는 안 되기 때문입니다.
+    """
+    recorder = getattr(trading_service, "_order_status_observation_recorder", None)
+    if recorder is None:
+        return
+    try:
+        result = recorder.shutdown()
+        app_logger.info(
+            f"[ORDER_STATUS_OBS_RECOVERY] 관측 기록기 종료: "
+            f"clean_shutdown={result.get('clean_shutdown')} "
+            f"dropped_count={result.get('dropped_count')} "
+            f"fsync_unconfirmed_count={result.get('fsync_unconfirmed_count')}"
+        )
+    except Exception as exc:
+        app_logger.critical(
+            f"[ORDER_STATUS_OBS_SHUTDOWN_MARKER_FAILED] 관측 기록기 종료 중 예외"
+            f"(매매 종료 자체는 계속 진행): {type(exc).__name__}: {exc}"
+        )
+
+
 async def trading_loop(trading_service: TradingService, settings: Settings, app_logger) -> None:
     """REST API 기반 매매 루프 (asyncio 버전)."""
 
@@ -405,6 +437,23 @@ async def _run_application(settings: Settings) -> None:
     )
 
     # ── WebSocket 조건검색 활성화 여부 ───────────────────────────
+    # 2026-09-18 재검토 반영(지적 2번): 두 실행 모드(아래
+    # _run_trading_modes()의 if/else) 중 어느 쪽으로 끝나든 — 정상
+    # 종료/예외/Ctrl+C로 인한 태스크 취소 모두 포함 — 관측 기록기
+    # 종료가 반드시 호출되도록 try/finally로 감쌉니다. 이전 라운드
+    # 에서는 이 배선 자체가 유예돼 있었습니다.
+    try:
+        await _run_trading_modes(trading_service, settings, app_logger)
+    finally:
+        _shutdown_order_status_observation_recorder(trading_service, app_logger)
+
+
+async def _run_trading_modes(trading_service: TradingService, settings: Settings, app_logger) -> None:
+    """websocket.enabled 여부에 따라 두 실행 모드 중 하나로 매매를
+    실행합니다(원래 `_run_application()`에 인라인돼 있던 로직을 그대로
+    옮긴 것 — 로직 변경 없음, 관측 기록기 종료를 try/finally로 감싸기
+    위해 별도 함수로 분리했을 뿐입니다)."""
+
     if settings.websocket.enabled:
         from infra.websocket.condition_watcher import ConditionWatcher
         from infra.websocket.real_token import fetch_real_token
