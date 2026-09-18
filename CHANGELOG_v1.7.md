@@ -2078,3 +2078,244 @@ FIFO/손익 계산, RiskManager/DailyReporter 연결, API 조회 빈도 확대�
 - `kiwoom_auto_trader_priority1_stage1_changed_files_20260918.zip` —
   실제 변경된 12개 파일(위 목록 그대로)을 원래 폴더 경로 유지한 채
   담음.
+
+---
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 우선순위1 1차 보완 — GPT 재검토 6건 수정 (2026-09-18, 손익 계산·B 색인 계속 제외)
+
+### 배경
+
+위 "우선순위1 1차 구현"(패치 0051~0059) 전달 후, 민우님이 전달한 GPT
+재검토에서 **실제로 재현된 결함 6건**을 이유로 1차 완료 판정을 보류했습니다.
+민우님의 지시는 다음과 같습니다.
+
+> 패치와 ZIP 정합성 및 신규 테스트 통과는 확인됐지만, 1차 완료 판정은
+> 보류합니다. 이번 보완은 ①부분 쓰기 후 후속 기록 보호 ②종료 배선·
+> 대기시간 상한·유실 계측의 번들 연결 ③계좌/정규화/주문일별 커버리지
+> ④부분 조회 실패 증거 보존 ⑤기존 판정 함수 예외 계약 유지 ⑥JSON
+> 구조를 보존하는 마스킹으로 한정해주세요. 각 항목은 위 재현 사례를
+> 회귀 테스트로 추가하고, 기존 API 조회 정책·PSM·주문·리스크 판정은
+> 유지해주세요. 손익 계산과 B 색인은 계속 제외합니다.
+
+이번 라운드는 **정확히 이 6개 항목**으로 범위를 한정했습니다 — 새 기능
+추가나 범위 확장은 하지 않았습니다.
+
+### 변경 내용
+
+1. **[지적 5번] 판정 함수 예외 계약 복원 (`infra/broker/kiwoom_order_
+   status.py`)**: `build_order_status_evidence()`가 기존 `derive_broker_
+   order_status()`(무변경) 호출을 더 이상 try/except로 감싸지 않습니다.
+   재현된 버그: malformed 입력(`[None, "not-a-dict"]`)에서 `derive_broker_
+   order_status()`를 직접 호출하면 `AttributeError`가 나야 하는데, 예전
+   `build_order_status_evidence()`는 이 예외를 삼켜 `evidence_error`를
+   채운 "정상적인 UNKNOWN"처럼 반환했습니다 — 기존 `get_order_status()`
+   호출부(`_reconcile_tracked_order_status()`의 `except Exception`)가
+   실패로 처리해야 할 상황을 성공처럼 흘려보냈습니다. 이제 판정 함수
+   자체의 예외는 그대로 전파되고, 이 함수가 새로 격리하는 것은 판정이
+   **성공한 다음** 단계인 `find_all_matching()` 기반 증거 목록 구성
+   실패뿐입니다(격리 범위를 정확히 좁힘).
+2. **[지적 4번] 두 번째 조회 실패 시 첫 번째 응답 보존 (`infra/broker/
+   kiwoom_order_status.py`의 신규 `PartialOrderStatusFetchError`,
+   `infra/broker/kiwoom_broker.py`의 `get_order_status_evidence()`)**:
+   `oso`/`cntr` 두 원본 조회를 각각 독립된 try/except로 감싸, 두 번째
+   조회(cntr)만 실패해도 이미 성공한 oso 응답이 사라지지 않고
+   `PartialOrderStatusFetchError.oso_entries`에 실려 전파됩니다.
+   `failure_stage`(`oso_fetch`/`cntr_fetch`)로 어느 단계에서 실패했는지도
+   구분됩니다. 여전히 **실패는 실패**입니다 — 추가 조회나 판정 대체 없이
+   예외가 그대로 전파돼 PSM 상태는 바뀌지 않습니다.
+3. **[지적 3·4번] 관측 서비스에 부분 증거·주문접수시각 반영 (`domain/
+   service/trading_service.py`)**: `_reconcile_tracked_order_status()`의
+   예외 처리에서 `getattr(exc, "failure_stage"/"oso_entries"/"cntr_entries",
+   None)`로 `PartialOrderStatusFetchError`의 부가 정보를 duck-typing으로
+   안전하게 추출해(다른 예외 타입에도 안전) `_safe_record_order_status_
+   observation()`에 전달합니다. 이 값이 있으면 새 판정을 만들지 않고
+   (`outcome="partial"`) 이미 확보한 원본 중 해당 order_id에 매칭되는
+   행만 `find_all_matching()` + `normalize_order_id()`(기존 함수 재사용)로
+   골라 원문 그대로 보존합니다. 또한 journal 스냅샷에서 `TrackedOrderRecord.
+   accepted_at`을 확인해 새 `OrderStatusObservation.order_accepted_at`
+   필드에 채웁니다 — exporter가 "오늘 trades.csv 멤버십"으로 주문일을
+   추정하던 방식(4번 항목 참고)을 대체하기 위한 근거 데이터입니다.
+4. **[지적 3번] 커버리지 계좌 스코핑·정규화·주문일 수정 (`infra/storage/
+   order_status_observation_store.py`의 `compute_coverage()`,
+   `export_daily_bundle.py`의 `build_order_status_summary()`)**: 재현된
+   200% 버그 — `compute_coverage()`는 분모(`scoped_accepted`)만
+   `account_scope_id`로 좁히고 분자(`observed_keys` 등)는 함수에 전달된
+   **모든** 관측(다른 계좌 포함)을 훑었습니다(계좌 A 1건 접수·1건 관측 +
+   계좌 B 1건 접수·1건 관측 → A의 관측률 200%). 이제 루프 진입 전에
+   `observations`를 해당 `account_scope_id`로 먼저 좁혀 분모·분자·조회
+   카운트 전부가 같은 계좌 범위 안에서만 계산됩니다. order_id 비교도
+   `find_all_matching()`이 쓰는 것과 동일한 `normalize_order_id()`로
+   정규화해 "000123"과 "123"이 다른 주문으로 갈리지 않습니다.
+   `export_daily_bundle.py`의 `_order_date_resolver()`는 "오늘 trades.csv에
+   같은 order_id가 있으면 오늘 주문"이라는 추정(키움 주문번호가 날짜마다
+   재사용될 수 있어 서로 다른 주문을 섞을 위험이 있었음)을 제거하고,
+   위 3번 항목의 `order_accepted_at`(journal에서 확인된 실제 접수 시각)의
+   날짜 접두사만 근거로 삼습니다 — 확인 불가 시 추정하지 않고 미확인으로
+   남깁니다.
+5. **[지적 1번] 부분 쓰기 실패 후 다음 기록 보호 (`OrderStatusObservation
+   Recorder._write_one()`, `infra/storage/order_status_observation_
+   store.py`)**: 재현된 버그 — 쓰기 도중 예외가 나면 이미 파일에 일부
+   바이트가 남을 수 있는데, 예전엔 이 상태 그대로 다음 레코드를
+   append해 부분 바이트 뒤에 다음 레코드가 이어붙어 **두 레코드 모두
+   파싱 불가**가 됐습니다. 이제 쓰기 시도 직전 파일 크기를 기록해 두고,
+   쓰기 중 예외가 나면 그 크기로 파일을 `truncate`해 부분 바이트를
+   제거한 뒤에만 다음 레코드를 받습니다. `fsync()` 실패는 별도로
+   다룹니다 — write()/flush()는 이미 성공했으므로 "쓰기 실패(유실)"가
+   아니라 "저장 내구성 미확인"으로 구분하고, 새 `fsync_unconfirmed_count`
+   카운터와 `[ORDER_STATUS_OBS_FSYNC_FAILED]` 로그 태그로 조용히
+   무시하지 않습니다(레코드 자체는 유실 처리하지 않음).
+6. **[지적 2번] 종료 배선·대기시간 상한·유실 계측 (`OrderStatusObservation
+   Recorder`, `app/main.py`)**: (a) 종료 마커 기록을 `shutdown()`을 호출한
+   스레드가 아니라 **작업자 스레드 자신**이 하도록 옮겼습니다 — 재현된
+   버그: 예전엔 `shutdown()`이 `join(timeout=...)` 이후 직접 마커를
+   썼는데, 이 쓰기 자체는 그 timeout 적용을 받지 않았습니다(timeout=
+   0.01초로 둬도 실제로는 ~0.20초 걸림). 이제 마커 쓰기가 작업자 스레드
+   안에서만 이뤄지므로 호출 스레드는 `join(timeout=...)` 하나로만
+   전체 대기시간이 제한됩니다. (b) `record()`의 큐 포화 경로에서
+   `app_logger.warning()`을 더 이상 **동기** 호출하지 않습니다 — 재현된
+   버그: 느린 로그 핸들러를 주입하면 이 호출을 한 매매 스레드 자체가
+   ~0.2~0.3초 대기했습니다. 이제 카운터만 올리고 즉시 반환하며, 작업자
+   스레드가 폴링 중 변화를 감지해 대신 로그를 남깁니다. (c) 관측 관련
+   로그 태그 5개(`[ORDER_STATUS_OBS_QUEUE_FULL]`,
+   `[ORDER_STATUS_OBS_WRITE_FAILED]`, `[ORDER_STATUS_OBS_RECOVERY]`,
+   `[ORDER_STATUS_OBS_SHUTDOWN_MARKER_FAILED]`,
+   `[ORDER_STATUS_OBS_FSYNC_FAILED]`)를 `export_daily_bundle.py`의
+   `LOG_TAGS` allowlist에 추가했습니다 — 예전엔 요약 텍스트가 "app.log
+   슬라이스에서 확인하라"고 안내하면서도 실제 번들에서는 제외됐습니다.
+   (d) **이전 라운드에서 의도적으로 유예했던 `app/main.py` 배선을 실제로
+   연결했습니다** — 기존 if/else(WebSocket 조건검색 모드/단순 폴링 모드)
+   로직은 전혀 바꾸지 않고 `_run_trading_modes()`라는 새 함수로 그대로
+   옮긴 뒤, `_run_application()`이 이 함수 호출을 `try/finally`로 감싸
+   `_shutdown_order_status_observation_recorder()`를 호출합니다 — 정상
+   종료·예외·Ctrl+C로 인한 태스크 취소 어느 경로로 끝나든 관측 기록기
+   종료가 호출됩니다. `export_daily_bundle.py`에 `_parse_shutdown_
+   markers()`를 추가해 커버리지 요약(`order_status_coverage.txt`)에
+   종료 마커 존재 여부·`dropped_count`·`clean_shutdown`을 노출합니다.
+7. **[지적 6번] JSON 구조를 보존하는 마스킹 (`export_daily_bundle.py`의
+   `slice_jsonl_observations()`, 신규 `_mask_json_value()`)**: 재현된
+   버그 — 예전엔 JSON으로 직렬화된 레코드 **전체 문자열**에 자유 텍스트
+   로그용 `mask()`(따옴표 없는 10~13자리 숫자까지 가리는 정규식 포함)를
+   그대로 적용해, 합성 원문의 숫자 필드(예: `1234567890`)가 따옴표 없는
+   `***`로 치환되면서 그 줄 전체가 파싱 불가능한 JSON이 됐습니다. 이제
+   마스킹은 **파싱된 JSON 객체 상태**에서 재귀적으로 적용합니다 — 키
+   이름이 `SENSITIVE_KEYS`와 **정확히 일치**(부분 문자열 아님, 그래서
+   `account_scope_id`가 `account`와 헷갈려 가려지지 않음)하면 그 값만
+   `"***"`로 치환하고, 그 외 문자열 값에는 기존 `mask()`를 적용해 자유
+   텍스트 안의 토큰 등을 잡되, 숫자/불리언/None은 절대 문자열 치환하지
+   않습니다 — 결과 줄은 항상 다시 `json.loads()`로 파싱 가능합니다. 또한
+   `ORDER_STATUS_OBSERVATION_LOG` 경로를 exporter에 별도로 하드코딩하지
+   않고 `config.settings.StorageConfig.order_status_observation_log_file`
+   필드의 기본값을 `dataclasses.fields()`로 직접 읽어오도록 바꿔, 두 곳의
+   경로가 어긋날 가능성을 없앴습니다.
+8. **테스트 갱신 (`test_order_status_evidence_observation.py`)**: 위
+   6개 재현 시나리오를 각각 회귀 테스트로 추가했고(아래 "테스트 및
+   검증" 참고), 지적 5번의 계약 변경에 맞춰 기존 검사 1-8(예전엔
+   "예외를 던지지 않고 evidence_error로 감쌈"을 정상으로 검증하던
+   테스트)을 "직접 호출과 동일한 예외가 그대로 전파됨"으로 수정하고,
+   판정 성공 후 증거 구성만 실패하는 격리 시나리오를 검증하는 1-9를
+   추가했습니다.
+
+### 테스트 및 검증
+
+- `test_order_status_evidence_observation.py`: **96/96 통과**(기존
+  50건 + 이번 라운드 46건 신규/수정). 신규 그룹:
+  - `2B`(8건): 지적 4번 — `KiwoomBroker.get_order_status_evidence()`
+    수준에서 oso 성공·cntr 실패/oso 자체 실패 각각 재현, `TradingService`
+    통합 수준에서 부분 실패도 `outcome=partial`로 기록되고 PSM lifecycle은
+    바뀌지 않으며 이미 확보한 oso 응답이 `oso_matches`에 보존되는지 확인.
+  - `3B/3C/3D`(7건): 지적 3번 — 두 계좌 200% 버그 재현 후 수정 확인,
+    "000123"/"123" 정규화, `order_accepted_at` 유무·날짜 차이에 따른
+    order_date 확정/미확인/고아 관측 분리.
+  - `4B`(8건): 지적 1번 — 실제 파일 쓰기 도중 예외를 주입해 부분 바이트가
+    남는 상황을 재현하고, truncate로 다음 레코드(w2/w3)가 항상 유효한
+    JSON으로 남는지 확인. `os.fsync` 실패를 별도 카운터로 구분하는지도
+    검증.
+  - `4C`(4건): 지적 2번 — 마커 쓰기 자체가 멈춰도 `shutdown()`이 제한시간
+    안에 반환되는지, 큐 포화 시 느린 로그 핸들러를 주입해도 `record()`가
+    블로킹하지 않는지 측정.
+  - `6-11`~`6-15`(5건): 지적 6번 — 번들에 포함된 관측 레코드 각 줄이
+    재파싱 가능한 유효 JSON인지, 숫자 필드가 보존되는지,
+    `account_scope_id`가 오탐 마스킹되지 않는지, 종료 마커가 raw/요약에
+    반영되는지.
+  - `7`(6건): 지적 2·6번 — 신규 LOG_TAGS가 실제 번들 app.log 슬라이스에
+    반영되는지, `ORDER_STATUS_OBSERVATION_LOG`이 `StorageConfig` 기본값과
+    일치하는지.
+  - `8`(6건): 지적 2번 — `app/main.py`의 종료 배선이 실제로 연결됐는지
+    (소스 검사 + 페이크 서비스로 헬퍼 동작 자체를 직접 호출 검증, 기록기가
+    `None`이거나 `shutdown()`이 예외를 던져도 크래시하지 않는지 포함).
+  - `1-8`/`1-8b`/`1-9`: 지적 5번 계약 변경 반영(위 "변경 내용" 8번 참고).
+- 기존 `test_order_status_reconciliation.py`(64/64), `test_tracked_
+  order_journal.py`(67/67), `test_export_daily_bundle_run_baseline.py`
+  (11/11) — 전부 무변경 통과. `shutdown()`의 반환 딕셔너리 shape가
+  일부 바뀌었지만(`marker_written` 필드 추가) 기존 테스트가 검사하는
+  키(`clean_shutdown`/`queue_drained`/`dropped_count`)는 그대로
+  유지했습니다.
+- 전체 회귀(`run_regression_tests.py`): **39/40 통과** — 유일한 실패는
+  이전 라운드와 동일한 `test_broker_order_status.py`의 fixture 파일
+  누락(`tests/fixtures/order_reconciliation/20260814_151548_005930_
+  market_buy_full_fill.jsonl`)이며 이번 변경과 무관합니다(이전
+  라운드에서도 동일하게 보고됨, 아래 "다음 작업" 참고).
+- `legacy_tests/test_entry_watch.py`: **11/11 통과**.
+
+### 변경하지 않은 것
+
+- 기존 API 조회 정책(폴링당 최대 1건, 30초 이상 대기/orphan만 대상),
+  `_select_order_status_query_target()`의 우선순위 로직, PSM의
+  BUY_PENDING/SELL_PENDING/ORPHAN 상태 전이 판정, 주문 접수·리스크
+  게이트 — 전혀 건드리지 않았습니다.
+- 손익 계산(FIFO 매칭, 확정 손익), B(확정 체결 키) 설계 — 민우님 지시대로
+  계속 제외합니다.
+- `derive_broker_order_status()`(판정 로직 자체), `find_all_matching()`/
+  `_find_matching()`의 매칭 알고리즘 — 무변경.
+- `TrackedOrderJournalStore`의 삭제 시점/동작 — 무변경.
+
+### 다음 작업
+
+1. `test_broker_order_status.py`의 fixture 디렉터리(`tests/fixtures/
+   order_reconciliation/`)가 저장소에 커밋돼 있는지 확인 — 두 라운드
+   연속으로 동일하게 누락 보고되고 있어 방치되지 않도록 확인이
+   필요합니다(이번 라운드와 무관).
+2. **적용 후 반드시 확인해야 할 절차** (민우님 지시): 현재 기본 설정에서는
+   `account_scope_id`가 비어 있어 관측 기능 자체가 꺼져 있습니다. 이
+   패치를 적용한 뒤 아래 절차를 거쳐야 다음 거래일부터 자료가 쌓입니다.
+   - `settings.yaml`(또는 해당 환경변수)의 `broker.account_scope_id`에
+     계좌를 구분할 비민감 라벨(예: `"acct-a"`)을 설정합니다 — 실제
+     계좌번호가 아니라 임의의 식별자면 됩니다.
+     `BrokerConfig.observation_enabled`는 이 값이 비어있지 않을 때만
+     `True`입니다.
+   - 프로그램을 재시작한 뒤 `app.log`에서 관측 기록기가 생성됐는지
+     확인합니다(라벨이 비어있으면 경고 로그만 남기고 기록기가 `None`이
+     되며 프로그램 기동 자체는 막지 않습니다 — 조용히 꺼진 채로 넘어가지
+     않도록 반드시 확인 필요).
+   - 하루 이상 운영 후 `export_daily_bundle.py`로 일일 번들을 생성해
+     `metadata/order_status_coverage.txt`에 `계측_비활성`이 아니라 실제
+     계좌 스코프(`[ account_scope_id = ... ]`)와 수치가 나타나는지, 종료
+     마커(`recorder_shutdown_marker_count`)가 정상적으로 쌓이는지
+     확인합니다.
+3. (1차 완료 확인 후) 이번에 쌓인 관측 데이터의 커버리지가 실제 운영에서
+   충분한 수준에 도달하는지 며칠 지켜본 뒤, B(확정 체결 키)·FIFO 손익
+   연결 설계를 별도로 요청할 수 있습니다 — 이번 라운드 범위 밖.
+
+### 전달 파일
+
+- 패치(0051~0059 적용된 트리 기준으로 이어서 적용):
+  - `0060-fix-kiwoom-order-status-exception-contract.patch` —
+    `infra/broker/kiwoom_order_status.py`
+  - `0061-fix-kiwoom-broker-partial-evidence.patch` —
+    `infra/broker/kiwoom_broker.py`
+  - `0062-fix-trading-service-partial-evidence-accepted-at.patch` —
+    `domain/service/trading_service.py`
+  - `0063-fix-order-status-observation-store-coverage-writes.patch` —
+    `infra/storage/order_status_observation_store.py`
+  - `0064-fix-export-daily-bundle-masking-shutdown-markers.patch` —
+    `export_daily_bundle.py`
+  - `0065-feat-main-shutdown-wiring.patch` — `app/main.py`
+  - `0066-test-order-status-evidence-observation-round2.patch` —
+    `test_order_status_evidence_observation.py`
+  - `0067-docs-CHANGELOG-v1.7-priority1-stage1-followup.patch` — 이
+    CHANGELOG
+- `kiwoom_auto_trader_priority1_stage1_followup_changed_files_20260918.zip`
+  — 실제 변경된 8개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래 폴더
+  경로 유지한 채 담음.
