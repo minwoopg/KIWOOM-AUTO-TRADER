@@ -2319,3 +2319,240 @@ FIFO/손익 계산, RiskManager/DailyReporter 연결, API 조회 빈도 확대�
 - `kiwoom_auto_trader_priority1_stage1_followup_changed_files_20260918.zip`
   — 실제 변경된 8개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래 폴더
   경로 유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 우선순위1 2차 보완 — GPT 재재검토 5건 수정 (2026-09-18, 손익 계산·B 색인 계속 제외)
+
+### 배경
+
+위 "우선순위1 1차 보완"(패치 0060~0067) 전달 후, 민우님이 전달한 GPT
+재재검토(2차)에서 0060~0067의 파일 정합성(8개 파일 일치)과 테스트
+결과(신규 96/96, 전체 회귀 39/40, legacy 11/11)는 확인됐지만, 더
+엄밀한 재현으로 **5건의 미해결/재발 문제**가 남아있다는
+지적을 받았습니다. 민우님의 지시는 다음과 같습니다.
+
+> 0060~0067의 파일 정합성 및 96/96·39/40·11/11 검증은 확인됐습니다.
+> 해결된 부분은 유지하고, 이번 보완은 ①truncate 실패·개행 누락 시
+> 후속 기록 보호 ②부분 조회 실패의 성공 오집계 ③익일 조회의 원래
+> 주문일 연결 ④식별자를 보존하는 마스킹과 실제 설정 경로 전달 ⑤실행
+> 중 저장 품질 스냅샷과 실행별 종료 상태 구분으로 한정해주세요. 위
+> 재현 사례를 실제 서비스·exporter 경로의 테스트로 추가해주세요. API
+> 조회 정책·PSM·주문·리스크 판정과 손익 계산 범위는 변경하지 마세요.
+
+이번 라운드도 **정확히 이 5개 항목**으로 범위를 한정했습니다. 1차
+보완에서 해결된 부분(계좌 스코핑 200% 버그, 판정 함수 예외 계약,
+부분 조회 응답 보존, 큐 포화 시 동기 로그 호출, 종료 마커 쓰기의
+대기시간 문제)은 이번 라운드에서 손대지 않았고, 회귀 테스트로 계속
+지켜지는지만 재확인했습니다.
+
+### 변경 내용
+
+1. **[지적 1번, 높음] truncate 자체의 실패 + 개행 누락 보호
+   (`infra/storage/order_status_observation_store.py`)**: 1차
+   보완에서 "쓰기 실패 → truncate로 부분 바이트 제거"까지는
+   해결했지만, **truncate 자체가 실패하는 경우**(디스크 문제 등으로
+   되돌릴 크기조차 확정할 수 없는 경우)는 그대로 다음 레코드를 같은
+   파일에 계속 append해, 그 다음 레코드까지 함께 손상되는 재현된
+   버그가 남아있었습니다. `_truncate_partial_write()`가 이제
+   성공/실패를 `bool`로 반환하고, 실패하면 새 `_quarantine_and_
+   rotate_file()`이 손상된 파일을 타임스탬프가 붙은 이름으로 옆에
+   격리(삭제하지 않음, 수동 조사 가능)한 뒤 **같은 경로에 새 빈
+   파일로 전환**합니다 — 그 다음 레코드부터는 항상 깨끗한 파일에
+   쓰이므로 `dropped_count`가 실제로 복구 불가능해진 레코드 수와
+   계속 일치합니다(격리 자체가 실패하면 `_file_healthy=False`로
+   전환해 이후 `_write_one()`이 즉시 유실 처리하고 반환 — 매매
+   프로그램 자체는 멈추지 않되 손상 위에 계속 덮어쓰는 것만 막음).
+   또한 `_quarantine_incomplete_tail()`(시작 시 복구)에 새
+   `_ensure_trailing_newline()`을 추가해, 기존 파일의 마지막 줄이
+   **유효한 JSON이지만 개행 없이 끝나는** 경우(이전 실행이
+   write()+flush()는 성공했지만 마지막 "\n" 쓰기 직전에 강제
+   종료된 상황 — 기존 `_quarantine_incomplete_tail()`은 "마지막
+   줄이 JSON 파싱에 실패하는" 경우만 감지해 이 경우를 놓쳤습니다)를
+   감지해 내용 손실 없이 개행만 보정합니다.
+2. **[지적 2번, 중간] 부분 조회 성공의 오집계 수정
+   (`compute_coverage()`, `infra/storage/order_status_observation_
+   store.py`)**: 재현된 버그 — `TradingService`가 `oso` 성공·`cntr`
+   실패를 `outcome="partial"`로 남기는데, `compute_coverage()`는
+   `outcome == "api_error"`만 실패로 세고 나머지는 전부 성공으로
+   세어(조회 시도 1건, 실패 0건, 주문 관측률 100%로 표시) "원문
+   일부를 확보했다"는 사실을 "조회가 완전히 성공했다"로 둔갑시켰습니다.
+   이제 `outcome`을 success/partial/api_error 세 갈래로 명시
+   구분합니다 — 새 `query_partial_count`로 별도 집계하고,
+   `query_success_count`와 관측률 분자(`observed_keys`) 어디에도
+   포함하지 않습니다(부분 증거로는 새 판정을 만들지 않는다는
+   `_safe_record_order_status_observation()`의 기존 계약과도 일치 —
+   partial 관측은 `psm_broker_status=None`으로 기록됨).
+3. **[지적 3번, 중간] 익일 조회의 원래 주문일 연결
+   (`export_daily_bundle.py`)**: 재현된 버그 — 주문 접수 시각
+   (`order_accepted_at`)을 기록하도록 개선했음에도(1차 보완), exporter가
+   여전히 **조회일(started_at) 슬라이스만으로 커버리지를 계산**해,
+   9/17 접수 주문을 9/18에 조회한 경우 9/17 번들엔 "관측 0건(0%)"으로,
+   9/18 번들엔 "고아 관측 1건"으로만 나타나 **양쪽 날짜 어디에도
+   정확히 반영되지 않았습니다**. 새 `_load_full_observations_for_
+   order_date()`가 하루로 자르지 않은 전체 원본 로그를 다시 훑어
+   `order_accepted_at`이 대상 날짜인 관측만 모으고, 계좌별 커버리지
+   계산은 이 결과(주문일 기준)로 수행합니다. 조회일 기준 통계
+   (`observation_raw_line_count`/write_id dedup)는 "조회일 활동
+   통계"로 명확히 분리해 표시하고, 계좌별 커버리지 섹션에는 "집계
+   기준 = order_accepted_at"임을 명시했습니다 — 조회가 언제
+   일어났는지와 무관하게, 접수일 기준으로 정확히 귀속됩니다.
+4. **[지적 4번, 중간] 식별자를 보존하는 마스킹 + 실제 설정 경로 전달
+   (`export_daily_bundle.py`)**: (a) 재현된 버그 — `_mask_json_value()`가
+   민감 키가 아닌 **모든** 문자열 값에도 자유문자열용 `mask()`를
+   적용해, `requested_order_id="1234567890"`/`cntr_pric_raw=
+   "9876543210"`처럼 의미가 명확한 식별자 필드까지 `mask()`의
+   `_ACCT_LONG_RE`(따옴표 없는 10~13자리 숫자 패턴)에 걸려 `"***"`로
+   뭉개졌습니다(서로 다른 주문번호가 전부 같은 `"***"`가 되어 후속
+   연결·집계 근거가 훼손됨). 이제 `mask()`는 새 `_FREEFORM_TEXT_
+   FIELDS`(현재는 `error_repr`만 — 실제로 자유 텍스트인 필드)에만
+   적용하고, 그 외 문자열은 키가 `SENSITIVE_KEYS`와 정확히 일치하지
+   않는 한 원문 그대로 보존합니다. (b) 재현된 버그 — `ORDER_STATUS_
+   OBSERVATION_LOG`가 `StorageConfig` 필드의 **기본값**만 읽어,
+   사용자가 `settings.yaml`에서 `custom/obs.jsonl`로 지정해도
+   exporter는 계속 기본 경로만 사용했습니다("필드 기본값을 읽는
+   것"과 "실제 설정값을 읽는 것"은 다르다는 지적을 그대로 반영).
+   새 `resolve_order_status_observation_log_path()`가
+   `config.settings.load_settings()`로 앱 기동 경로와 동일하게 실제
+   설정을 로드해 그 값을 쓰고(설정 파일이 없거나 파싱 실패 시엔
+   기존과 동일한 하드코딩 기본값으로 조용히 폴백), `build()`에
+   `settings_path`/`obs_log_path` 인자를 추가해 테스트나 수동 실행에서
+   경로를 직접 지정할 수 있게 했습니다.
+5. **[지적 5번, 중간] 실행 중 저장 품질 스냅샷 + 실행별 종료 상태 구분
+   (`infra/storage/order_status_observation_store.py`,
+   `export_daily_bundle.py`)**: 재현된 문제 — 자동 번들은 보통
+   프로그램이 실행 중일 때 생성되므로 "이번 실행"의 종료 마커는
+   존재할 수 없는데, 예전엔 종료 마커 유무만으로 저장 상태를
+   판단하려 해 "0건"이 "실행 중이라 정상"인지 "저장 실패"인지 구분할
+   수 없었습니다. 또한 exporter가 과거 종료 마커를 날짜와 무관하게
+   전부 포함해, 몇 달 전 정상 종료 마커가 오늘 번들에도 계속 나타나
+   "과거에 정상 종료했다"는 사실이 "지금도 정상"이라는 착시를 줄
+   위험이 있었습니다. 새로 추가한 것: (a) `OrderStatusObservation
+   Recorder`가 종료 마커와 별도로, 살아있는 동안 주기적으로(기본
+   5초 간격, `_maybe_update_running_status()`) `*.status.json`
+   스냅샷 파일(`status_path_for()`로 관측 로그 경로에서 유도 — 기록기/
+   exporter가 같은 규칙 하나만 공유)을 갱신합니다. 시작 즉시 한 번
+   써서 "계측 비활성(파일 없음)"과 "시작했지만 아직 갱신 안 됨"을
+   구분합니다. (b) exporter의 새 `_read_running_status()`/
+   `_classify_run_state()`가 이 스냅샷으로 **실행_중/정상_종료/
+   종료_확인_불가/계측_비활성** 4가지 상태를 판정합니다 —
+   `clean_shutdown`이 True/False로 확정돼 있으면(종료 배선을 실제로
+   탐) 그 값을 그대로 쓰고, 아직 `None`인데 최근(기본 120초 이내)
+   갱신됐으면 "실행_중", 오래됐으면 "종료_확인_불가"(강제 종료
+   추정)로 판단합니다. (c) `slice_jsonl_observations()`가 종료
+   마커도 `shutdown_at`이 대상 날짜인 것만 포함하도록 수정해, 다른
+   날짜의 과거 마커가 더 이상 섞이지 않습니다. (d) 커버리지 요약
+   문구를 "실행_중일 땐 종료 마커가 없는 게 정상"이라고 명확히
+   안내하도록 정정했습니다 — **1차 보완 전달 시 안내했던 "하루 운영
+   후 자동 번들에 종료 마커가 나타나는지 확인"은 부정확했습니다.
+   실행 중인 프로그램의 자동 번들에는 종료 마커가 없는 것이
+   정상이며, 대신 새 `observation_run_state`가 `실행_중`으로
+   표시되는지를 확인해야 합니다** — 아래 "다음 작업"에서 절차를
+   다시 정리했습니다.
+6. **테스트 추가 (`test_order_status_evidence_observation.py`)**: 위
+   5개 재현 시나리오를 실제 서비스/exporter 경로로 검증하는 그룹
+   9(9A~9F, 22건)를 추가했습니다 — 특히 9E는 `export_daily_bundle.
+   build()`를 실제로 호출해 익일 조회 연결·부분 조회 오집계 방지·
+   사용자 지정 경로·실행 중 상태 표시·과거 마커 배제·식별자 보존
+   마스킹을 **하나의 통합 번들**로 한 번에 재현/검증합니다. 기존
+   6-15의 라벨 문구가 이번 라운드에서 바뀐 것에 맞춰 어서션 문구만
+   갱신했습니다(검증 내용 자체는 동일).
+
+### 테스트 및 검증
+
+- `test_order_status_evidence_observation.py`: **118/118 통과**(기존
+  96건 + 이번 라운드 22건 신규, 6-15 라벨 갱신 1건 반영). 신규 그룹 9:
+  - `9A`(3건): 지적 1번 — `Path.open`을 모킹해 truncate 호출
+    자체(`"r+b"` open)가 실패하도록 재현, w2/w3가 새 파일에 정상
+    기록되는지·`dropped_count`가 실제 유실 건수와 일치하는지·손상
+    파일이 격리되는지 확인.
+  - `9B`(2건): 지적 1번 — 마지막 줄이 유효 JSON이지만 개행 없이
+    끝나는 파일을 직접 만들어 `_quarantine_incomplete_tail()` 호출 후
+    개행이 보정되는지, 다음 기록이 뒤섞이지 않는지 확인.
+  - `9C`(3건): 지적 2번 — `outcome="partial"` 관측을
+    `compute_coverage()`에 직접 전달해 `query_success_count`에
+    들어가지 않고 `query_partial_count`로만 집계되며 관측률에
+    포함되지 않는지 확인.
+  - `9D`(5건): 지적 5번 — `_classify_run_state()`의 4가지 상태(계측
+    비활성/정상 종료/종료 확인 불가/실행 중) 판정 분기를 각각 직접
+    호출로 확인.
+  - `9E`(9건): 지적 2·3·4·5번 통합 — `export_daily_bundle.build()`를
+    사용자 지정 `obs_log_path`로 실제 호출해, 9/17 접수·9/18 조회
+    주문이 9/17 커버리지에 `observed_unique_orders=1`로 정확히
+    귀속되는지, 부분 조회 주문이 `query_partial_count=1`로만
+    집계되는지, 커버리지 텍스트에 `실행_중` 상태와 관련 안내 문구가
+    나타나는지, 다른 날짜(9/12)의 과거 종료 마커가 9/17 번들에
+    나타나지 않는지, `requested_order_id`/`cntr_pric_raw`
+    원문(10자리 숫자)이 마스킹되지 않고 보존되는지를 한 번에 확인.
+  - `9F`(1건): 지적 4번 — 존재하지 않는 설정 파일 경로를 줘도
+    `resolve_order_status_observation_log_path()`가 예외 없이
+    기존 기본값으로 폴백하는지 확인.
+- 1차 보완에서 해결된 항목(계좌 스코핑 200%, 판정 함수 예외 계약,
+  부분 조회 응답 보존, 큐 포화 동기 로그, 종료 마커 대기시간)의
+  기존 테스트(그룹 2B/3B/3C/3D/4/4B/4C)는 전부 무변경 통과 —
+  이번 라운드가 그 부분을 건드리지 않았음을 재확인했습니다.
+- 전체 회귀(`run_regression_tests.py`): **39/40 통과** — 유일한 실패는
+  지난 두 라운드와 동일한 `test_broker_order_status.py`의 fixture
+  파일 누락이며 이번 변경과 무관합니다.
+- `legacy_tests/test_entry_watch.py`: **11/11 통과**.
+- 검증 절차: 이번에도 fresh clone에 0051~0059 → 0060~0067 → 이번
+  0068~0071을 순서대로 `git am`한 뒤 위 세 검증을 모두 재실행해
+  동일한 결과를 확인했습니다(아래 "전달 파일" 참고).
+
+### 변경하지 않은 것
+
+- 기존 API 조회 정책(폴링당 최대 1건, 30초 이상 대기/orphan만 대상),
+  `_select_order_status_query_target()`의 우선순위 로직, PSM의
+  BUY_PENDING/SELL_PENDING/ORPHAN 상태 전이 판정, 주문 접수·리스크
+  게이트 — 전혀 건드리지 않았습니다.
+- 손익 계산(FIFO 매칭, 확정 손익), B(확정 체결 키) 설계 — 계속
+  제외합니다.
+- 1차 보완에서 해결된 계좌 스코핑/정규화, 판정 함수 예외 계약, 부분
+  조회 응답 보존, 큐 포화 시 동기 로그 호출, 종료 마커 쓰기의
+  대기시간 문제 — 이번 라운드에서 다시 손대지 않았습니다(회귀
+  테스트로만 재확인).
+- `derive_broker_order_status()`(판정 로직 자체), `find_all_matching()`/
+  `_find_matching()`의 매칭 알고리즘, `TrackedOrderJournalStore`의
+  삭제 시점/동작 — 무변경.
+
+### 다음 작업
+
+1. `test_broker_order_status.py`의 fixture 디렉터리(`tests/fixtures/
+   order_reconciliation/`)가 저장소에 커밋돼 있는지 확인 — 세 라운드
+   연속으로 동일하게 누락 보고되고 있어 방치되지 않도록 확인이
+   필요합니다(이번 라운드와 무관).
+2. **적용 후 확인 절차 정정(1차 보완 안내 수정)**: `account_scope_id`
+   설정 및 재시작 절차는 1차 보완과 동일합니다. 다만 **"하루 운영 후
+   자동 번들에 종료 마커가 나타나는지 확인"이라는 이전 안내는
+   부정확하므로 다음으로 대체합니다**:
+   - 프로그램을 재시작한 뒤 `logs/` 아래에 관측 로그 파일과 함께
+     `*.status.json` 상태 스냅샷 파일이 생성됐는지 확인합니다(수 초
+     안에 생성됨).
+   - 운영 중 아무 때나 `export_daily_bundle.py`로 번들을 생성해
+     `metadata/order_status_coverage.txt`의 `observation_run_state`가
+     `실행_중`으로 표시되는지 확인합니다 — **이때 `recorder_shutdown_
+     marker_count(이 날짜)`가 0건인 것은 정상입니다**(아직 종료하지
+     않았으므로). 프로그램을 정상 종료한 뒤에는 같은 날짜 번들에서
+     `observation_run_state`가 `정상_종료`로 바뀌고 종료 마커도
+     함께 나타나는지 확인합니다.
+   - `종료_확인_불가` 또는 `계측_비활성`이 나오면 `app.log`의
+     `[ORDER_STATUS_OBS_*]` 태그를 확인해 원인을 파악합니다.
+3. (1차/2차 보완 완료 확인 후) 이번에 쌓인 관측 데이터의 커버리지가
+   실제 운영에서 충분한 수준에 도달하는지 며칠 지켜본 뒤, B(확정
+   체결 키)·FIFO 손익 연결 설계를 별도로 요청할 수 있습니다 — 이번
+   라운드 범위 밖.
+
+### 전달 파일
+
+- 패치(0051~0067이 적용된 트리 기준으로 이어서 적용):
+  - `0068-fix-order-status-observation-store-truncate-partial-coverage-status.patch`
+    — `infra/storage/order_status_observation_store.py`
+  - `0069-fix-export-daily-bundle-masking-config-path-order-day-run-status.patch`
+    — `export_daily_bundle.py`
+  - `0070-test-order-status-evidence-observation-round3.patch` —
+    `test_order_status_evidence_observation.py`
+  - `0071-docs-CHANGELOG-v1.7-priority1-stage2-followup.patch` — 이
+    CHANGELOG
+- `kiwoom_auto_trader_priority1_stage2_followup_changed_files_20260918.zip`
+  — 실제 변경된 4개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
+  폴더 경로 유지한 채 담음.
