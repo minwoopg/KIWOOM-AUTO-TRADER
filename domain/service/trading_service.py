@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 
@@ -26,7 +27,7 @@ from domain.market_regime.minute_analyzer import MinuteAnalyzer, MinuteAnalysis,
 from domain.market_regime.session_metrics import merge_session_bars, build_session_metrics, format_session_metrics_log_line
 from domain.models import (
     AccountBalance, BrokerOrderStatus, MarketRegime, OrderRequest,
-    OrderResult, OrderSide, Position, Signal, SignalType,
+    OrderResult, OrderSide, OrderStatusEvidence, Position, Signal, SignalType,
 )
 from domain.position.lifecycle import PositionLifecycle, PositionStateMachine, is_trackable_order_id
 from domain.risk.risk_manager import RiskManager
@@ -48,6 +49,9 @@ from domain.indicator.indicators import calc_atr, calc_bollinger, ATRResult, Bol
 from infra.storage.state_store import JsonStateStore
 from infra.storage.tracked_order_journal import (
     TrackedOrderJournalStore, TrackedOrderRecord, TrackedOrderJournalCorruptError,
+)
+from infra.storage.order_status_observation_store import (
+    OrderStatusObservation, OrderStatusObservationRecorder, build_entry_evidence, resolve_env,
 )
 from utils.time_utils import is_market_open, now_kst, parse_kst_bar_timestamp
 
@@ -193,6 +197,36 @@ class TradingService:
                 f"(잔고 조회·주문 판단에는 영향 없음): {type(exc).__name__}: {exc}"
             )
             self.exit_candidate_outage_logger = None
+
+        # 2026-09-18 (우선순위1 1차: 체결조회 증거 독립 저장): 순수 관측
+        # 계층입니다 — BUY/HOLD/SELL·리스크 판정·PSM 상태 전이 어디에도
+        # 관여하지 않습니다. `account_scope_id`가 설정되지 않았으면(지적
+        # 5번 반영) 프로그램 기동을 막지 않고 관측 기능만 조용히
+        # 비활성화합니다("0% 커버리지"가 아니라 "계측 비활성"으로
+        # 나중에 별도 표시됨 — infra/storage/order_status_observation_store.py
+        # 의 compute_coverage() 참고). 기록기 생성 자체가 실패해도(디스크
+        # 문제 등) 동일하게 fail-open으로 None 처리합니다(다른 shadow
+        # 로거들과 동일한 기존 패턴).
+        self._order_status_observation_recorder: OrderStatusObservationRecorder | None = None
+        if getattr(settings.broker, "observation_enabled", False):
+            try:
+                self._order_status_observation_recorder = OrderStatusObservationRecorder(
+                    settings.storage.order_status_observation_log_file,
+                    app_logger=self.app_logger,
+                )
+                self._order_status_observation_recorder.start()
+            except Exception as exc:
+                self.app_logger.warning(
+                    f"[ORDER_STATUS_OBS] 기록기 생성 실패 — 이번 실행에서는 관측을 비활성화합니다"
+                    f"(BUY/SELL/리스크 판정에는 영향 없음): {type(exc).__name__}: {exc}"
+                )
+                self._order_status_observation_recorder = None
+        else:
+            self.app_logger.info(
+                "[ORDER_STATUS_OBS] account_scope_id 미설정 — 이번 실행은 관측 기능을 "
+                "비활성화합니다(매매 프로그램 기동에는 영향 없음, 커버리지는 "
+                "'계측 비활성'으로 표시됨)"
+            )
 
         self.state, loaded_highest = self.state_store.load()
 
@@ -3706,6 +3740,103 @@ class TradingService:
 
         return best_symbol
 
+    def _safe_record_order_status_observation(
+        self,
+        *,
+        symbol: str,
+        order_id: str,
+        kind: str,
+        query_id: str,
+        started_at_iso: str,
+        pending_age_sec: float,
+        outcome: str,
+        failure_stage: str | None,
+        error_repr: str | None,
+        evidence: OrderStatusEvidence | None,
+    ) -> None:
+        """`_reconcile_tracked_order_status()`의 조회 결과(성공/실패
+        모두)를 관측 저장소에 기록합니다.
+
+        2026-09-18 (우선순위1 1차, 지적 1번 반영): 이 메서드 전체가
+        하나의 try/except로 감싸여 있어, 이 안에서 어떤 예외가 나도
+        호출부(`_reconcile_tracked_order_status()`)의 PSM 판정 흐름에
+        전혀 영향을 주지 않습니다 — 이미 계산된 `broker_order`/`evidence`
+        값 자체는 이 메서드 호출 이전에 확정되어 있고, 이 메서드는 그
+        값을 "기록"만 할 뿐 "판정"에는 관여하지 않습니다. 기록기가
+        비활성(`None`)이면 아무 것도 하지 않고 즉시 반환합니다.
+        """
+
+        recorder = self._order_status_observation_recorder
+        if recorder is None:
+            return
+        try:
+            account_scope_id = str(getattr(self.settings.broker, "account_scope_id", "") or "")
+            env = resolve_env(
+                use_mock=bool(getattr(self.settings.broker, "use_mock", False)),
+                is_paper_trading=bool(getattr(self.settings.broker, "is_paper_trading", False)),
+            )
+
+            cntr_matches: list = []
+            oso_matches: list = []
+            psm_broker_status: str | None = None
+            filled_price_parsed: int | None = None
+            if evidence is not None:
+                cntr_matches = [build_entry_evidence(e) for e in evidence.matched_cntr_entries]
+                oso_matches = [build_entry_evidence(e) for e in evidence.matched_oso_entries]
+                psm_broker_status = str(evidence.broker_order.status.value) if evidence.broker_order else None
+                filled_price_parsed = evidence.broker_order.filled_price if evidence.broker_order else None
+                if evidence.evidence_error and outcome == "success":
+                    outcome = "partial"
+                    failure_stage = failure_stage or "evidence_build"
+                    error_repr = error_repr or evidence.evidence_error
+
+            base_qty: int | None = None
+            target_qty: int | None = None
+            journal_linked = False
+            try:
+                record = self._tracked_order_journal.get(symbol)
+                if record is not None and str(record.order_id) == str(order_id):
+                    base_qty = record.base_quantity_before_order
+                    target_qty = record.target_quantity_after_order
+                    journal_linked = True
+            except Exception as exc:
+                self.app_logger.warning(
+                    f"[ORDER_STATUS_OBS] {symbol} journal 스냅샷 조회 실패(관측만 영향, "
+                    f"매매 로직 무관): {type(exc).__name__}: {exc}"
+                )
+
+            observation = OrderStatusObservation(
+                query_id=query_id,
+                started_at=started_at_iso,
+                finished_at=datetime.now().isoformat(),
+                account_scope_id=account_scope_id,
+                env=env,
+                symbol=symbol,
+                requested_order_id=str(order_id),
+                side_context=kind,
+                query_kind=kind,
+                pending_age_sec_at_query=pending_age_sec,
+                outcome=outcome,
+                failure_stage=failure_stage,
+                error_repr=error_repr,
+                psm_broker_status=psm_broker_status,
+                filled_price_parsed=filled_price_parsed,
+                cntr_matches=cntr_matches,
+                oso_matches=oso_matches,
+                cntr_match_count=len(cntr_matches),
+                oso_match_count=len(oso_matches),
+                base_quantity_before_order=base_qty,
+                target_quantity_after_order=target_qty,
+                journal_linked=journal_linked,
+                write_id=query_id,
+            )
+            recorder.record(observation)
+        except Exception as exc:
+            self.app_logger.critical(
+                f"[ORDER_STATUS_OBS_RECORD_FAILED] {symbol} | query_id={query_id} — "
+                f"관측 기록 실패(매매/리스크 판정에는 영향 없음): {type(exc).__name__}: {exc}"
+            )
+
     def _reconcile_tracked_order_status(self, symbol: str, broker_qty: int) -> None:
         """1P0.8-D.1: Tracked Order Reconciliation (read-only).
 
@@ -3773,12 +3904,29 @@ class TradingService:
         `BrokerOrderStatus`에 PARTIALLY_FILLED/CANCELLED/REJECTED 등이
         추가되어도 이 메서드가 그걸 FILLED처럼 처리하지 않도록 하는
         안전장치입니다.
+
+        2026-09-18 (우선순위1 1차: 체결조회 증거 독립 저장): `self.broker.
+        get_order_status()` 호출을 `get_order_status_evidence()`로
+        교체했습니다 — PSM이 소비하는 판정값(`broker_order`)과 API
+        호출 횟수·실패 처리 방식은 전혀 바뀌지 않습니다(`Broker` 기본
+        구현은 `get_order_status()`를 그대로 감싸기만 함,
+        `infra/broker/base.py` 참고). 추가된 것은 성공/실패 조회
+        결과를 별도 관측 저장소(`_safe_record_order_status_observation()`)
+        에 기록하는 것뿐이며, 그 기록 경로는 완전히 격리되어 있어
+        실패해도 이 메서드의 반환값/부작용을 절대 바꾸지 않습니다.
         """
         state = self._position_state_machine.get(symbol)
         lifecycle = state.lifecycle
 
         kind: str | None = None
         order_id: str | None = None
+        # 2026-09-18 (우선순위1 1차): 관측 기록용 pending/orphan 경과
+        # 시간. 기존 throttle 판정에 쓰이는 age_sec 변수는 그대로 두고
+        # (BUY_PENDING/SELL_PENDING에만 존재, ORPHAN엔 없었음), 세 분기
+        # 모두에서 채워지는 별도 변수를 둡니다 — 커버리지 계측이 "느린
+        # 체결에 편향되는가"를 실측하려면 orphan 분기의 경과 시간도
+        # 필요하기 때문입니다(기존 throttle 로직/변수는 전혀 바뀌지 않음).
+        observation_pending_age_sec = 0.0
         if lifecycle == PositionLifecycle.BUY_PENDING:
             kind = "BUY_PENDING"
             order_id = state.pending_order_id
@@ -3786,6 +3934,7 @@ class TradingService:
                 (datetime.now() - state.pending_since).total_seconds()
                 if state.pending_since else 0.0
             )
+            observation_pending_age_sec = age_sec
             if age_sec < self.ORDER_STATUS_QUERY_MIN_PENDING_AGE_SEC:
                 return
         elif lifecycle == PositionLifecycle.SELL_PENDING:
@@ -3795,11 +3944,16 @@ class TradingService:
                 (datetime.now() - state.pending_since).total_seconds()
                 if state.pending_since else 0.0
             )
+            observation_pending_age_sec = age_sec
             if age_sec < self.ORDER_STATUS_QUERY_MIN_PENDING_AGE_SEC:
                 return
         elif self._position_state_machine.has_orphan_order(symbol):
             kind = "ORPHAN"
             order_id = state.orphan_order_id
+            orphan_since = getattr(state, "orphan_since", None)
+            observation_pending_age_sec = (
+                (datetime.now() - orphan_since).total_seconds() if orphan_since else 0.0
+            )
         else:
             return  # BUY_PENDING/SELL_PENDING/orphan 아님 — 추적 대상 아님
             # (ERROR(ambiguous placement)/일반 OPEN/FLAT은 여기서 이미 제외됨)
@@ -3815,15 +3969,41 @@ class TradingService:
             return
         self._last_order_status_query_at[symbol] = now
 
+        # 2026-09-18 (우선순위1 1차: 체결조회 증거 독립 저장, 지적 2번
+        # 반영): 호출 "이전에" query_id/started_at을 발급합니다 —
+        # 실패한 조회도 같은 식별자로 종료 결과를 기록할 수 있어야
+        # 하기 때문입니다(성공한 조회만 기록되던 결함 수정).
+        query_id = uuid.uuid4().hex
+        query_started_at_iso = datetime.now().isoformat()
+
         try:
-            broker_order = self.broker.get_order_status(order_id, symbol)
+            evidence = self.broker.get_order_status_evidence(order_id, symbol)
         except Exception as exc:
             self.app_logger.warning(
                 f"[ORDER_STATUS_QUERY_FAILED] {symbol} | kind={kind} | "
                 f"order_id={order_id} | {type(exc).__name__}: {exc} — "
                 f"기존 lifecycle 그대로 유지, 아무것도 해제하지 않음"
             )
+            # 실패한 조회도 반드시 기록합니다(개별 기록 없이 카운터로만
+            # 남던 v2의 결함 수정) — 이 호출은 완전히 격리되어 있어
+            # 여기서 무슨 일이 있어도 위 반환(return)을 바꾸지 않습니다.
+            self._safe_record_order_status_observation(
+                symbol=symbol, order_id=order_id, kind=kind,
+                query_id=query_id, started_at_iso=query_started_at_iso,
+                pending_age_sec=observation_pending_age_sec,
+                outcome="api_error", failure_stage="get_order_status_evidence",
+                error_repr=f"{type(exc).__name__}: {exc}", evidence=None,
+            )
             return
+
+        broker_order = evidence.broker_order
+        self._safe_record_order_status_observation(
+            symbol=symbol, order_id=order_id, kind=kind,
+            query_id=query_id, started_at_iso=query_started_at_iso,
+            pending_age_sec=observation_pending_age_sec,
+            outcome="success", failure_stage=None, error_repr=None,
+            evidence=evidence,
+        )
 
         if broker_order.status == BrokerOrderStatus.OPEN:
             return  # 살아있다는 증거일 뿐 — 상태 변경 없음
