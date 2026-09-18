@@ -19,9 +19,12 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+import logging
 import sys
 import tempfile
 import time
+import unittest.mock as mock
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -47,8 +50,10 @@ from domain.position.lifecycle import PositionLifecycle as L
 from infra.broker.base import Broker
 from infra.broker.mock_broker import MockBroker
 from infra.broker.kiwoom_order_status import (
-    build_order_status_evidence, derive_broker_order_status, find_all_matching,
+    PartialOrderStatusFetchError, build_order_status_evidence, derive_broker_order_status,
+    find_all_matching, normalize_order_id,
 )
+from infra.broker.kiwoom_broker import KiwoomBroker
 from infra.storage.order_status_observation_store import (
     COVERAGE_DISABLED, OrderStatusObservation, OrderStatusObservationRecorder,
     build_entry_evidence, compute_coverage, dedupe_by_write_id, resolve_env,
@@ -125,14 +130,51 @@ check("1-6) build_order_status_evidence()의 broker_order == derive_broker_order
 check("1-7) 정상 입력에서는 evidence_error가 없음",
       _evidence.evidence_error is None)
 
-# 관측 가공 자체가 실패해도(예: 리스트 원소가 dict가 아님) broker_order는
-# 안전한 UNKNOWN 폴백으로 채워지고 예외가 전파되지 않음 — 지적 1번의
-# "관측 실패가 기존 판정을 막지 않아야 한다"는 요구를 가장 극단적인
-# 입력(완전히 잘못된 원소)으로 확인.
-_broken_evidence = build_order_status_evidence("123", "005930", [], [None, "not-a-dict"])
-check("1-8) 완전히 잘못된 원소가 섞여도 예외를 던지지 않고 evidence_error로 감쌈",
-      _broken_evidence.evidence_error is not None
-      and _broken_evidence.broker_order.status == BrokerOrderStatus.UNKNOWN)
+# 2026-09-18 재검토 반영(지적 5번, 재현된 버그): 이전 구현은 여기서
+# derive_broker_order_status()가 malformed 입력(리스트 원소가 dict가
+# 아님)에 대해 던지는 예외까지 잡아 UNKNOWN 폴백으로 바꿔 반환했는데,
+# 이는 기존 get_order_status() 호출부의 예외 계약(판정 함수 자체의
+# 예외는 그대로 전파돼야 함)을 조용히 바꾸는 것이었습니다. 이제
+# build_order_status_evidence()는 derive_broker_order_status()의
+# 예외를 절대 잡지 않고 그대로 전파해야 하므로, "직접 호출과 동일한
+# 예외가 그대로 전파되는지"를 확인합니다 — evidence_error로 감싸
+# 정상처럼 보이게 하지 않는지가 핵심입니다.
+_direct_exc_type = None
+try:
+    derive_broker_order_status("123", "005930", [], [None, "not-a-dict"])
+except Exception as exc:
+    _direct_exc_type = type(exc)
+
+_wrapped_exc_type = None
+try:
+    build_order_status_evidence("123", "005930", [], [None, "not-a-dict"])
+except Exception as exc:
+    _wrapped_exc_type = type(exc)
+
+check("1-8) 완전히 잘못된 원소(malformed) 입력에서 derive_broker_order_status() 직접 호출이"
+      " 예외를 던짐(재현 전제 확인)",
+      _direct_exc_type is not None)
+check("1-8b) build_order_status_evidence()도 동일한 예외 타입을 그대로 전파함"
+      "(evidence_error로 감싸 UNKNOWN처럼 보이게 바꾸지 않음)",
+      _wrapped_exc_type is not None and _wrapped_exc_type is _direct_exc_type)
+
+# 판정(derive_broker_order_status)이 "성공"한 다음 단계, 즉 이 함수가
+# 새로 추가한 find_all_matching() 기반 증거 목록 구성 단계만 실패하는
+# 경우는 여전히 격리돼야 합니다(격리 범위를 "판정 성공 이후"로 정확히
+# 좁히는지 확인) — find_all_matching()을 인위적으로 실패시켜, 같은
+# 입력에 대한 직접 판정 결과와 broker_order가 동일하게 보존되는지 봄.
+_valid_cntr_for_isolation = [{"ord_no": "0000123", "ord_stt": "체결", "ord_qty": "10",
+                              "cntr_qty": "10", "oso_qty": "0", "cntr_pric": "10000",
+                              "io_tp_nm": "+매수", "trde_tp": "시장가"}]
+with mock.patch(
+    "infra.broker.kiwoom_order_status.find_all_matching",
+    side_effect=RuntimeError("증거 목록 구성 중 인위적 실패(테스트 전용)"),
+):
+    _isolated_ev = build_order_status_evidence("123", "005930", [], _valid_cntr_for_isolation)
+_direct_ok = derive_broker_order_status("123", "005930", [], _valid_cntr_for_isolation)
+check("1-9) 판정이 성공한 다음 증거 목록 구성만 실패하면 예외를 던지지 않고"
+      " evidence_error로 감싸며, broker_order는 직접 판정 결과와 동일하게 보존됨",
+      _isolated_ev.evidence_error is not None and _isolated_ev.broker_order == _direct_ok)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -238,6 +280,129 @@ service._order_status_observation_recorder.shutdown()
 
 
 # ══════════════════════════════════════════════════════════════
+# 2B. 두 번째 API 실패 시 첫 번째 응답 증거 보존 (재검토 지적 4번)
+# ══════════════════════════════════════════════════════════════
+
+# 브로커 단위: oso 조회는 성공, cntr 조회만 실패 — 이미 받은 oso_entries가
+# 예외 객체에 그대로 실려있는지, failure_stage가 정확히 구분되는지 확인.
+_ps_config = BrokerConfig(
+    provider="kiwoom", use_mock=False, base_url="http://test.invalid",
+    app_key="k", secret_key="s", account_number="000-00", is_paper_trading=True,
+)
+_ps_broker = KiwoomBroker(_ps_config)
+_ps_oso_success = [{"ord_no": "0000999", "ord_stt": "접수", "ord_qty": "10",
+                     "cntr_qty": "0", "oso_qty": "10"}]
+_ps_broker._fetch_open_orders_raw = lambda symbol: _ps_oso_success
+
+
+def _ps_cntr_fail(symbol):
+    raise RuntimeError("cntr 조회 429(테스트 전용)")
+
+
+_ps_broker._fetch_fill_history_raw = _ps_cntr_fail
+
+_ps_raised: PartialOrderStatusFetchError | None = None
+try:
+    _ps_broker.get_order_status_evidence("999", "005930")
+except PartialOrderStatusFetchError as exc:
+    _ps_raised = exc
+except Exception:
+    _ps_raised = None
+
+check("2B-1) oso 성공·cntr 실패 시 예외가 여전히 전파됨(실패를 성공으로 바꾸지 않음)",
+      _ps_raised is not None)
+check("2B-2) failure_stage가 cntr_fetch로 정확히 구분됨(1번째 조회 실패와 구분)",
+      _ps_raised is not None and _ps_raised.failure_stage == "cntr_fetch")
+check("2B-3) 이미 성공한 oso_entries가 예외 객체에 그대로 보존됨",
+      _ps_raised is not None and _ps_raised.oso_entries == _ps_oso_success)
+
+# 반대로 oso 조회 자체가 실패하면 cntr을 아예 시도하지 않고(추가 조회
+# 금지) failure_stage=oso_fetch로 구분되며 oso_entries는 비어있어야 함.
+_ps_broker2 = KiwoomBroker(_ps_config)
+_ps_oso_calls = []
+
+
+def _ps_oso_fail(symbol):
+    _ps_oso_calls.append(symbol)
+    raise RuntimeError("oso 조회 429(테스트 전용)")
+
+
+_ps_cntr_calls = []
+_ps_broker2._fetch_open_orders_raw = _ps_oso_fail
+_ps_broker2._fetch_fill_history_raw = lambda symbol: _ps_cntr_calls.append(symbol)
+
+_ps_raised2: PartialOrderStatusFetchError | None = None
+try:
+    _ps_broker2.get_order_status_evidence("999", "005930")
+except PartialOrderStatusFetchError as exc:
+    _ps_raised2 = exc
+
+check("2B-4) oso 조회 자체가 실패하면 failure_stage=oso_fetch로 구분되고,"
+      " cntr은 아예 시도되지 않음(추가 조회 없음)",
+      _ps_raised2 is not None and _ps_raised2.failure_stage == "oso_fetch"
+      and _ps_raised2.oso_entries == [] and len(_ps_cntr_calls) == 0)
+
+# 서비스 단위: get_order_status_evidence()가 PartialOrderStatusFetchError를
+# 던지면 _reconcile_tracked_order_status()가 이를 duck-typing으로 감지해
+# failure_stage/oso_entries를 관측 기록에 전달하는지, 그리고 PSM 상태
+# 자체는(실패이므로) 바뀌지 않는지 확인.
+class _PartialEvidenceBroker(MockBroker):
+    """oso는 성공, cntr만 실패하는 것을 서비스 레벨까지 재현하는 더블."""
+
+    def __init__(self, oso_entries: list[dict]) -> None:
+        super().__init__()
+        self._oso_entries = oso_entries
+
+    def get_order_status_evidence(self, order_id: str, symbol: str) -> OrderStatusEvidence:
+        raise PartialOrderStatusFetchError(
+            RuntimeError("cntr 429(테스트 전용)"), "cntr_fetch",
+            oso_entries=self._oso_entries,
+        )
+
+
+_partial_oso_for_service = [{"ord_no": "555555", "ord_stt": "접수", "ord_qty": "10",
+                              "cntr_qty": "0", "oso_qty": "10"}]
+_partial_broker = _PartialEvidenceBroker(_partial_oso_for_service)
+_partial_tmpdir = tempfile.mkdtemp()
+_partial_settings = build_minimal_settings(_partial_tmpdir)
+_partial_settings = dataclasses.replace(
+    _partial_settings,
+    broker=dataclasses.replace(_partial_settings.broker, account_scope_id="acct-partial"),
+)
+_partial_service = _build_service_with_settings(_partial_broker, _partial_settings)
+
+_partial_psm = _partial_service._position_state_machine
+_partial_psm.get("005930").lifecycle = L.BUY_PENDING
+_partial_psm.get("005930").pending_order_id = "555555"
+_partial_psm.get("005930").pending_since = _OLD_PENDING
+_partial_psm.get("005930").base_quantity_before_order = 0
+_partial_psm.get("005930").expected_final_quantity = 10
+
+_partial_service._reconcile_tracked_order_status("005930", broker_qty=0)
+time.sleep(0.2)
+check("2B-5) 부분 실패 후에도 PSM lifecycle은 그대로 유지됨(실패를 성공으로 바꾸지 않음)",
+      _partial_psm.get("005930").lifecycle == L.BUY_PENDING)
+
+_partial_log_path = Path(_partial_settings.storage.order_status_observation_log_file)
+_partial_lines = (
+    _partial_log_path.read_text(encoding="utf-8").splitlines() if _partial_log_path.exists() else []
+)
+check("2B-6) 부분 실패 상황도 최소 1건 기록됨", len(_partial_lines) >= 1)
+_partial_parsed = [json.loads(l) for l in _partial_lines if l.strip()]
+check("2B-7) outcome=partial로 기록되고 failure_stage=cntr_fetch가 남음",
+      any(d.get("outcome") == "partial" and d.get("failure_stage") == "cntr_fetch"
+          for d in _partial_parsed))
+check("2B-8) 이미 확보한 oso_entries가 oso_matches를 통해 관측에 보존됨"
+      "(order_id=555555에 매칭되는 행이 실제로 담김)",
+      any(
+          d.get("outcome") == "partial" and len(d.get("oso_matches") or []) == 1
+          and (d.get("oso_matches") or [{}])[0].get("response_order_id") == "555555"
+          for d in _partial_parsed
+      ))
+_partial_service._order_status_observation_recorder.shutdown()
+
+
+# ══════════════════════════════════════════════════════════════
 # 3. 커버리지 식별 — 환경/주문일/분모 출처
 # ══════════════════════════════════════════════════════════════
 
@@ -294,6 +459,80 @@ _cov3 = compute_coverage(
 )
 check("3-9) order_date를 확정할 수 없으면 '미확인'으로 분리되고 관측에 포함되지 않음",
       _cov3["unresolved_order_date_count"] == 1 and _cov3["observed_unique_orders"] == 0)
+
+
+# ── 3B. 200% 커버리지 재현(재검토 지적 3번, 재현된 버그) ──────────
+# 계좌 A accepted 1건 + 계좌 B accepted 1건, 각각 관측 1건 →
+# 예전 구현은 A의 관측률이 200%로 나왔음(분자가 계좌로 스코핑되지
+# 않아 B의 관측까지 A의 분자에 더해짐). 이제 A/B를 각각 계산하면
+# 각자 100%를 넘지 않아야 함.
+_accepted_two_accounts = {
+    ("acct-A", "kiwoom_real", "2026-09-18", "10"),
+    ("acct-B", "kiwoom_real", "2026-09-18", "20"),
+}
+_obs_two_accounts = [_obs("10", account="acct-A"), _obs("20", account="acct-B")]
+_cov_a = compute_coverage(
+    account_scope_id="acct-A", accepted_orders=_accepted_two_accounts,
+    observations=_obs_two_accounts, order_date_resolver=lambda o: "2026-09-18",
+)
+_cov_b = compute_coverage(
+    account_scope_id="acct-B", accepted_orders=_accepted_two_accounts,
+    observations=_obs_two_accounts, order_date_resolver=lambda o: "2026-09-18",
+)
+check("3B-1) 재현된 200% 버그 수정 확인 — 계좌 A의 관측률이 100%를 넘지 않음"
+      "(다른 계좌 B의 관측이 A의 분자에 섞이지 않음)",
+      _cov_a["order_observation_rate"] == 1.0)
+check("3B-2) 계좌 A의 observed_unique_orders는 자기 계좌 몫인 1건뿐",
+      _cov_a["observed_unique_orders"] == 1)
+check("3B-3) 계좌 B도 마찬가지로 자기 몫만 집계됨(교차 오염 없음)",
+      _cov_b["order_observation_rate"] == 1.0 and _cov_b["observed_unique_orders"] == 1)
+
+# ── 3C. order_id 정규화(재검토 지적 3번) ─────────────────────────
+# "000123"(관측에 기록된 원문)과 "123"(accepted_orders 쪽 키)이
+# 같은 주문으로 정규화되지 않으면 고아 관측으로 잘못 분류됨.
+_accepted_padded = {("acct-1", "kiwoom_real", "2026-09-18", "123")}
+_obs_padded = _obs("000123", account="acct-1")
+_cov_norm = compute_coverage(
+    account_scope_id="acct-1", accepted_orders=_accepted_padded, observations=[_obs_padded],
+    order_date_resolver=lambda o: "2026-09-18",
+)
+check("3C-1) '000123'과 '123'이 같은 주문으로 정규화되어 고아 관측으로 분류되지 않음",
+      _cov_norm["orphan_observation_count"] == 0 and _cov_norm["observed_unique_orders"] == 1)
+
+# ── 3D. order_accepted_at 기반 order_date 확정(재검토 지적 3번) ──
+# export_daily_bundle.py의 _order_date_resolver()가 "오늘 trades.csv에
+# 같은 order_id가 있으면 오늘 주문"이라는 추정을 더 이상 쓰지 않고
+# obs.order_accepted_at의 날짜 접두사만 근거로 삼는지 확인 — 이 값이
+# 없으면 미확인으로 남아야 하고(주문 재사용 오인 방지), 있으면 그
+# 날짜로 정확히 분리돼야 한다(같은 order_id라도 접수일이 다르면
+# 서로 다른 키로 취급됨).
+def _order_date_resolver_under_test(obs: OrderStatusObservation) -> str | None:
+    if not obs.order_accepted_at:
+        return None
+    candidate = str(obs.order_accepted_at)[:10]
+    return candidate if len(candidate) == 10 and candidate[4] == "-" and candidate[7] == "-" else None
+
+
+_obs_no_accepted_at = _obs("99", account="acct-1")  # order_accepted_at 미설정(기본 None)
+check("3D-1) order_accepted_at이 없으면 order_date는 미확인(trades.csv 멤버십으로 추정하지 않음)",
+      _order_date_resolver_under_test(_obs_no_accepted_at) is None)
+
+_obs_today = dataclasses.replace(_obs("55", account="acct-1"), order_accepted_at="2026-09-18T09:00:00")
+_obs_yesterday = dataclasses.replace(_obs("55", account="acct-1"), order_accepted_at="2026-09-17T15:30:00")
+check("3D-2) 같은 order_id(55)라도 order_accepted_at의 날짜가 다르면 서로 다른 order_date로 확정됨"
+      "(키움 주문번호 재사용을 서로 다른 주문으로 정확히 구분)",
+      _order_date_resolver_under_test(_obs_today) == "2026-09-18"
+      and _order_date_resolver_under_test(_obs_yesterday) == "2026-09-17"
+      and _order_date_resolver_under_test(_obs_today) != _order_date_resolver_under_test(_obs_yesterday))
+
+_accepted_cross_day = {("acct-1", "kiwoom_real", "2026-09-18", "55")}
+_cov_cross_day = compute_coverage(
+    account_scope_id="acct-1", accepted_orders=_accepted_cross_day,
+    observations=[_obs_yesterday], order_date_resolver=_order_date_resolver_under_test,
+)
+check("3D-3) 어제 접수된 주문(55)에 대한 오늘 조회는 오늘 accepted_orders와 섞이지 않고"
+      " 고아 관측으로 분리됨(서로 다른 주문을 같은 주문으로 오인하지 않음)",
+      _cov_cross_day["orphan_observation_count"] == 1 and _cov_cross_day["observed_unique_orders"] == 0)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -367,6 +606,161 @@ _different = [_dummy, dataclasses.replace(_dummy, outcome="api_error")]
 _deduped2, _conflicts2 = dedupe_by_write_id(_different)
 check("4-8) 같은 write_id+다른 내용은 조용히 하나를 고르지 않고 충돌로 표시됨",
       len(_deduped2) == 0 and _conflicts2 == ["w1"])
+
+
+# ══════════════════════════════════════════════════════════════
+# 4B. 부분 쓰기 실패 후 다음 정상 기록 보호(재검토 지적 1번, 재현된 버그)
+# ══════════════════════════════════════════════════════════════
+#
+# 재현: w1 쓰기 도중 예외 발생(부분 바이트만 파일에 남음) → w2 정상
+# 기록 시도 → 예전엔 w1의 불완전한 바이트 뒤에 w2가 바로 이어붙어
+# 두 레코드 모두 파싱 불가가 됐음. 이제 w1 실패 시 파일을 실패 이전
+# 크기로 truncate하므로, w2/w3는 항상 깨끗한 경계 뒤에 붙어야 한다.
+
+_tmpdir4b = tempfile.mkdtemp()
+_pw_path = Path(_tmpdir4b) / "obs.jsonl"
+_pw_recorder = OrderStatusObservationRecorder(str(_pw_path), shutdown_drain_timeout_sec=1.0)
+
+_pw_call_count = {"n": 0}
+_real_path_open = Path.open
+
+
+def _flaky_open(self, *args, **kwargs):
+    _pw_call_count["n"] += 1
+    if _pw_call_count["n"] == 1 and self == _pw_path:
+        # 첫 번째 쓰기(w1)만 "일부 바이트를 실제로 파일에 쓴 뒤 예외"
+        # 상황을 흉내냅니다 — 디스크 풀/권한 등으로 인한 실제 부분
+        # 쓰기를 재현하기 위함(단순히 write() 전체를 막기만 하면
+        # "부분 쓰기"가 아니라 "쓰기 자체가 안 됨"이 되어 이 버그를
+        # 재현하지 못함).
+        real_f = _real_path_open(self, *args, **kwargs)
+
+        class _PartialWriteFile:
+            def write(_self, data):
+                partial = data[: max(1, len(data) // 2)]
+                real_f.write(partial)
+                raise OSError("simulated partial write failure(테스트 전용)")
+
+            def flush(_self):
+                real_f.flush()
+
+            def fileno(_self):
+                return real_f.fileno()
+
+            def close(_self):
+                real_f.close()
+
+            def __enter__(_self):
+                return _self
+
+            def __exit__(_self, exc_type, exc, tb):
+                _self.close()
+                return False
+
+        return _PartialWriteFile()
+    return _real_path_open(self, *args, **kwargs)
+
+
+_w1 = dataclasses.replace(_dummy, write_id="pw-w1", query_id="pw-w1")
+_w2 = dataclasses.replace(_dummy, write_id="pw-w2", query_id="pw-w2")
+_w3 = dataclasses.replace(_dummy, write_id="pw-w3", query_id="pw-w3")
+
+with mock.patch.object(Path, "open", _flaky_open):
+    _pw_recorder._write_one(_w1)  # 부분 쓰기 실패 유도 — 파일에 불완전한 바이트가 남을 뻔함
+_pw_recorder._write_one(_w2)  # 정상 기록 — truncate가 안 됐다면 w1의 잔여 바이트에 이어붙어 손상됨
+_pw_recorder._write_one(_w3)  # 정상 기록
+
+_pw_lines = [l for l in _pw_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+_pw_parsed_ok = []
+for _l in _pw_lines:
+    try:
+        _pw_parsed_ok.append(json.loads(_l))
+    except json.JSONDecodeError:
+        pass
+
+check("4B-1) w1 쓰기 실패는 dropped_count에 정확히 1건 반영됨",
+      _pw_recorder.dropped_count == 1)
+check("4B-2) 파일에 남은 모든 줄이 유효한 JSON으로 파싱됨"
+      "(w1의 부분 바이트가 truncate로 제거돼 w2/w3와 뒤섞이지 않음)",
+      len(_pw_lines) == len(_pw_parsed_ok))
+check("4B-3) w2가 온전히 파싱 가능한 레코드로 존재함(재현된 버그: 예전엔 이것도 복구 불가였음)",
+      any(d.get("write_id") == "pw-w2" for d in _pw_parsed_ok))
+check("4B-4) w3도 온전히 파싱 가능한 레코드로 존재함",
+      any(d.get("write_id") == "pw-w3" for d in _pw_parsed_ok))
+check("4B-5) w1 자체는(실패했으므로) 파일에 남아있지 않음 — 유실로 처리되고 재시도되지 않음",
+      not any(d.get("write_id") == "pw-w1" for d in _pw_parsed_ok))
+
+# fsync 실패는 dropped_count와 별도로 셈 — write() 자체는 성공했으므로
+# "쓰기 실패(유실)"가 아니라 "저장 내구성 미확인"으로 구분돼야 함.
+_tmpdir4c = tempfile.mkdtemp()
+_fsync_path = Path(_tmpdir4c) / "obs.jsonl"
+_fsync_recorder = OrderStatusObservationRecorder(str(_fsync_path))
+with mock.patch("os.fsync", side_effect=OSError("simulated fsync failure(테스트 전용)")):
+    _fsync_recorder._write_one(dataclasses.replace(_dummy, write_id="fsync-w1", query_id="fsync-w1"))
+check("4B-6) fsync() 실패는 dropped_count를 올리지 않음(write()는 성공 — 레코드 유실 아님)",
+      _fsync_recorder.dropped_count == 0)
+check("4B-7) fsync() 실패는 별도 카운터(fsync_unconfirmed_count)로 구분됨"
+      "(예전처럼 조용히 무시하지 않음)",
+      _fsync_recorder.fsync_unconfirmed_count == 1)
+_fsync_lines = [l for l in _fsync_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+check("4B-8) fsync 실패에도 레코드 자체는 파일에 온전히(파싱 가능하게) 남아있음",
+      len(_fsync_lines) == 1 and json.loads(_fsync_lines[0]).get("write_id") == "fsync-w1")
+
+
+# ══════════════════════════════════════════════════════════════
+# 4C. 종료 배선·대기시간 상한·유실 계측(재검토 지적 2번, 재현된 버그)
+# ══════════════════════════════════════════════════════════════
+
+# (a) 마커 기록 자체가 느려도 shutdown()의 제한시간을 넘기지 않아야
+# 함 — 예전엔 shutdown()을 호출한 스레드가 join() 이후 직접 마커를
+# 썼으므로 그 쓰기 자체가 timeout 적용을 받지 않았음(재현: timeout=
+# 0.01초로 둬도 실제로는 ~0.20초 걸림). 이제 마커 기록은 작업자
+# 스레드 안에서만 이뤄지므로, 마커 쓰기가 느려도(여기서는 완전히
+# 멈춘 것처럼 흉내) 호출 스레드는 join(timeout=...) 하나로만
+# 제한된다.
+class _SlowMarkerRecorder(OrderStatusObservationRecorder):
+    def _write_shutdown_marker(self) -> None:
+        time.sleep(5.0)  # 디스크가 멈춘 상황을 흉내냄
+        super()._write_shutdown_marker()
+
+
+_slow_marker_path = str(Path(tempfile.mkdtemp()) / "slow_marker.jsonl")
+_slow_marker_recorder = _SlowMarkerRecorder(_slow_marker_path, shutdown_drain_timeout_sec=0.05)
+_slow_marker_recorder.start()
+_t_marker0 = time.time()
+_slow_marker_result = _slow_marker_recorder.shutdown()
+_marker_elapsed = time.time() - _t_marker0
+check("4C-1) 마커 기록 자체가 멈춰도 shutdown()이 제한시간(약 0.05초) 안에 반환됨"
+      "(재현된 버그: 예전엔 마커 쓰기가 timeout 적용을 받지 않았음)",
+      _marker_elapsed < 2.0)
+check("4C-2) 이 경우 marker_written은 아직 알 수 없으므로 True로 거짓 확정하지 않음",
+      _slow_marker_result.get("marker_written") is not True)
+
+# (b) record()가 큐 포화 시 느린 로그 핸들러를 기다리지 않아야 함 —
+# 예전엔 record()가 큐 full 예외 처리 안에서 app_logger.warning()을
+# **동기** 호출했으므로 느린 핸들러가 매매 스레드 자체를 막았음.
+class _SlowHandler(logging.Handler):
+    def emit(self, record):
+        time.sleep(0.3)
+
+
+_slow_logger = logging.getLogger("test_order_status_obs_slow_handler")
+_slow_logger.addHandler(_SlowHandler())
+_slow_logger.setLevel(logging.DEBUG)
+
+_qf_path = str(Path(tempfile.mkdtemp()) / "queue_full.jsonl")
+_qf_recorder = OrderStatusObservationRecorder(_qf_path, app_logger=_slow_logger, maxsize=1)
+# 작업자 스레드를 시작하지 않아 큐가 절대 빠지지 않게 하고, put_nowait만
+# 재현 대상으로 삼음(스레드 스케줄링에 좌우되지 않게 하기 위함).
+_qf_recorder._queue.put_nowait(dataclasses.replace(_dummy, write_id="qf-0"))
+_t_qf0 = time.time()
+_qf_recorder.record(dataclasses.replace(_dummy, write_id="qf-1"))  # 큐가 이미 가득 참 → Full 경로
+_qf_elapsed = time.time() - _t_qf0
+check("4C-3) 큐 포화 시 record()가 느린 로그 핸들러를 기다리지 않고 즉시 반환됨"
+      "(재현된 버그: 예전엔 이 호출 자체가 ~0.2~0.3초 걸렸음)",
+      _qf_elapsed < 0.1)
+check("4C-4) 큐 포화로 인한 유실은 카운터에 정확히 반영됨(로그가 없어도 사실 자체는 남음)",
+      _qf_recorder.dropped_count == 1)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -462,7 +856,15 @@ try:
     #   2) 1)과 같은 write_id, 같은 내용(시각만 다름) → dedup 후 1건
     #   3) 다른 날짜(9/9) 관측 — 날짜 슬라이스에서 제외돼야 함
     #   4) 말미 불완전 줄(강제종료 시뮬레이션) — 제외되지만 빌드는 성공해야 함
-    def _obs_dict(query_id, started_at, order_id="OID1", write_id="w1", finished_at="2026-09-10T09:05:01"):
+    def _obs_dict(
+        query_id, started_at, order_id="OID1", write_id="w1",
+        finished_at="2026-09-10T09:05:01", order_accepted_at="2026-09-10T09:04:50",
+    ):
+        # 2026-09-18 재검토 반영(지적 3번): order_date는 더 이상 "오늘
+        # trades.csv에 같은 order_id가 있으면 오늘 주문"으로 추정하지
+        # 않고, journal에서 확인된 order_accepted_at을 근거로 삼습니다
+        # — 그래서 이 합성 관측에도 실제 주문 접수 시각을 명시적으로
+        # 채워둡니다(기본값은 OID1이 실제로 접수된 시각).
         return {
             "query_id": query_id, "started_at": started_at, "finished_at": finished_at,
             "account_scope_id": "acct-bundle-test", "env": "kiwoom_real", "symbol": "005930",
@@ -472,18 +874,33 @@ try:
             "psm_broker_status": "FILLED", "filled_price_parsed": 10000,
             "cntr_matches": [], "oso_matches": [], "cntr_match_count": 0, "oso_match_count": 0,
             "base_quantity_before_order": 0, "target_quantity_after_order": 10,
-            "journal_linked": False, "write_id": write_id, "restart_id": "r1", "seq_no": 1,
+            "journal_linked": False, "order_accepted_at": order_accepted_at,
+            "write_id": write_id, "restart_id": "r1", "seq_no": 1,
             "schema_version": 1,
+            # 2026-09-18 재검토 반영(지적 6번, 재현된 버그): 합성 원문에
+            # 따옴표 없는(bare) 10~13자리 숫자 필드를 넣어, 문자열
+            # 전체에 정규식 mask()를 적용하던 예전 구현이 이 값을
+            # 따옴표 없는 ***로 치환해 JSON을 깨뜨렸는지 검증합니다.
+            # 이 필드는 알려진 스키마 필드가 아니므로 커버리지 계산에는
+            # 영향이 없고, 오직 raw 슬라이스 결과의 JSON 유효성만
+            # 확인하는 용도입니다.
+            "numeric_probe": 1234567890,
         }
 
     # 실제 호출부(_reconcile_tracked_order_status)는 write_id=query_id로
     # 발급하므로, "같은 write_id의 재시도"는 실제로도 같은 query_id를
     # 공유합니다(호출부가 같은 관측 객체를 다시 큐에 넣는 경우) —
     # finished_at만 달라지는 것이 정상적인 재시도 시나리오입니다.
+    _shutdown_marker_line = _json.dumps({
+        "__marker__": "shutdown", "clean_shutdown": True, "queue_drained": True,
+        "dropped_count": 0, "restart_id": "r1", "last_seq_no": 3,
+        "shutdown_at": "2026-09-10T15:30:00",
+    })
     obs_lines = [
         _json.dumps(_obs_dict("q1", "2026-09-10T09:05:00")),
         _json.dumps(_obs_dict("q1", "2026-09-10T09:05:00", finished_at="2026-09-10T09:05:02")),
         _json.dumps(_obs_dict("q3", "2026-09-09T09:05:00", write_id="w3")),
+        _shutdown_marker_line,
     ]
     with (_logs / "order_status_observations.jsonl").open("w", encoding="utf-8") as f:
         f.write("\n".join(obs_lines) + "\n")
@@ -516,6 +933,34 @@ try:
               "observed_unique_orders         = 1" in coverage_text)
         check("6-9) 커버리지 요약에 acct-bundle-test 스코프가 나타남",
               "[ account_scope_id = acct-bundle-test ]" in coverage_text)
+
+        # 2026-09-18 재검토 반영(지적 6번, 재현된 버그): raw로 나간 관측
+        # 레코드 각 줄은 다시 json.loads()로 파싱 가능해야 하고, 숫자
+        # 필드(numeric_probe)는 값이 그대로 보존돼야 한다(따옴표 없는
+        # ***로 치환돼 JSON이 깨지던 예전 버그의 재현 확인).
+        _parsed_raw_lines = []
+        _all_raw_json_valid = True
+        for _l in obs_raw_lines:
+            try:
+                _parsed_raw_lines.append(_json.loads(_l))
+            except _json.JSONDecodeError:
+                _all_raw_json_valid = False
+        check("6-11) 번들에 포함된 관측 레코드 각 줄이 전부 유효한 JSON으로 재파싱됨"
+              "(재현된 버그: 예전엔 숫자 필드가 따옴표 없는 ***로 치환돼 파싱 불가였음)",
+              _all_raw_json_valid and len(_parsed_raw_lines) == len(obs_raw_lines))
+        check("6-12) 숫자 필드(numeric_probe)의 값이 마스킹 없이 그대로 보존됨"
+              "(민감 키가 아닌 일반 숫자 필드는 가려지지 않음)",
+              any(d.get("numeric_probe") == 1234567890 for d in _parsed_raw_lines))
+        check("6-13) account_scope_id는 SENSITIVE_KEYS의 'account'와 정확히 일치하지 않으므로"
+              " 가려지지 않고 그대로 남아있음(부분 문자열 매칭으로 오탐되지 않음)",
+              any(d.get("account_scope_id") == "acct-bundle-test" for d in _parsed_raw_lines))
+        check("6-14) 종료 마커도 raw 출력에 포함됨(shutdown_markers가 build_order_status_summary에"
+              " 전달돼 요약에 반영될 수 있도록)",
+              any(d.get("__marker__") == "shutdown" for d in _parsed_raw_lines))
+        check("6-15) 커버리지 요약에 종료 마커 발견 사실이 표시됨"
+              "(재검토 지적 2번 — 저장 실패/정상 종료 상태를 번들에서 확인 가능)",
+              "recorder_shutdown_marker_count          = 1" in coverage_text
+              and "restart_id=r1" in coverage_text)
 finally:
     _os.chdir(_orig_cwd)
 
@@ -533,6 +978,134 @@ try:
           bundle_path2 is not None and bundle_path2.exists())
 finally:
     _os.chdir(_orig_cwd)
+
+
+# ══════════════════════════════════════════════════════════════
+# 7. LOG_TAGS 확장 + 관측 파일 경로 설정 일관성(재검토 지적 2/6번)
+# ══════════════════════════════════════════════════════════════
+
+check("7-1) 관측 관련 신규 로그 태그가 LOG_TAGS allowlist에 포함됨"
+      "(예전엔 요약에서 'app.log 슬라이스에서 확인하라'고 안내하면서도"
+      " 실제로는 번들에서 제외됐음)",
+      all(
+          t in _bundle.LOG_TAGS
+          for t in (
+              "[ORDER_STATUS_OBS_QUEUE_FULL]", "[ORDER_STATUS_OBS_WRITE_FAILED]",
+              "[ORDER_STATUS_OBS_RECOVERY]", "[ORDER_STATUS_OBS_SHUTDOWN_MARKER_FAILED]",
+              "[ORDER_STATUS_OBS_FSYNC_FAILED]",
+          )
+      ))
+
+# app.log에 이 태그가 있는 줄이 실제로 번들에 포함되는지 통합 확인.
+_tags_tmpdir = tempfile.mkdtemp()
+try:
+    _os.chdir(_tags_tmpdir)
+    Path("logs").mkdir()
+    _tags_day = datetime(2026, 9, 12).date()
+    _tags_day_str = _tags_day.strftime("%Y-%m-%d")
+    (Path("logs") / "app.log").write_text(
+        f"{_tags_day_str} 09:00:00 WARNING [ORDER_STATUS_OBS_QUEUE_FULL] 누적 큐 포화 유실 3건\n"
+        f"{_tags_day_str} 09:00:01 INFO some unrelated line without any tag\n",
+        encoding="utf-8",
+    )
+    _tags_bundle_path = _bundle.build(_tags_day, quiet=True)
+    check("7-2) 번들 생성 자체는 성공함(관측 로그 없이 app.log만 있어도)",
+          _tags_bundle_path is not None and _tags_bundle_path.exists())
+    with _zipfile.ZipFile(_tags_bundle_path) as z:
+        _app_log_name = next((n for n in z.namelist() if n.startswith("raw/app_analysis_")), None)
+        check("7-3) app.log 슬라이스 파일이 번들에 포함됨", _app_log_name is not None)
+        if _app_log_name:
+            _app_log_text = z.read(_app_log_name).decode("utf-8")
+            check("7-4) [ORDER_STATUS_OBS_QUEUE_FULL] 태그가 붙은 줄이 실제로 번들에 포함됨"
+                  "(재현된 버그: 예전엔 LOG_TAGS에 없어서 제외됐음)",
+                  "[ORDER_STATUS_OBS_QUEUE_FULL]" in _app_log_text)
+            check("7-5) 태그가 없는 무관한 줄은 여전히 제외됨(allowlist 원칙 유지)",
+                  "unrelated line" not in _app_log_text)
+finally:
+    _os.chdir(_orig_cwd)
+
+# 관측 파일 경로가 config.settings.StorageConfig의 기본값과 일치하는지
+# (지적 6번 — "설정한 관측 파일 경로도 exporter가 현재 고정 경로 대신
+# 일관되게 사용하도록 맞추세요").
+from config.settings import StorageConfig as _StorageConfigForTest
+_expected_obs_log_default = next(
+    f.default for f in dataclasses.fields(_StorageConfigForTest)
+    if f.name == "order_status_observation_log_file"
+)
+check("7-6) export_daily_bundle.ORDER_STATUS_OBSERVATION_LOG이 StorageConfig의"
+      " order_status_observation_log_file 기본값과 정확히 일치함(별도 하드코딩 아님)",
+      str(_bundle.ORDER_STATUS_OBSERVATION_LOG) == _expected_obs_log_default)
+
+
+# ══════════════════════════════════════════════════════════════
+# 8. app/main.py 종료 배선 실제 연결(재검토 지적 2번, 이전 라운드
+#    유예분)
+# ══════════════════════════════════════════════════════════════
+
+import inspect as _inspect
+import app.main as _app_main
+
+check("8-1) app.main에 관측 기록기 종료 헬퍼가 정의됨",
+      hasattr(_app_main, "_shutdown_order_status_observation_recorder"))
+
+_run_application_src = _inspect.getsource(_app_main._run_application)
+check("8-2) _run_application()이 두 실행 모드 실행을 try/finally로 감싸"
+      " 관측 기록기 종료를 호출함(정상 종료/예외/취소 모두 포함)",
+      "try:" in _run_application_src
+      and "_shutdown_order_status_observation_recorder(" in _run_application_src
+      and "finally:" in _run_application_src)
+
+_run_trading_modes_src = _inspect.getsource(_app_main._run_trading_modes)
+check("8-3) _run_trading_modes()가 두 실행 모드(websocket.enabled 분기)를 그대로 보존함"
+      "(로직 자체는 변경하지 않고 종료 배선만 추가)",
+      "if settings.websocket.enabled:" in _run_trading_modes_src
+      and "await trading_loop(trading_service, settings, app_logger)" in _run_trading_modes_src)
+
+
+class _FakeRecorderForWiringTest:
+    def __init__(self):
+        self.shutdown_called = False
+
+    def shutdown(self):
+        self.shutdown_called = True
+        return {"clean_shutdown": True, "dropped_count": 0, "fsync_unconfirmed_count": 0}
+
+
+class _FakeServiceForWiringTest:
+    def __init__(self, recorder):
+        self._order_status_observation_recorder = recorder
+
+
+_fake_recorder = _FakeRecorderForWiringTest()
+_fake_service = _FakeServiceForWiringTest(_fake_recorder)
+_app_main._shutdown_order_status_observation_recorder(_fake_service, logging.getLogger("test_wiring"))
+check("8-4) 헬퍼 호출 시 실제로 recorder.shutdown()이 호출됨",
+      _fake_recorder.shutdown_called is True)
+
+_fake_service_none = _FakeServiceForWiringTest(None)
+_no_crash_none_recorder = True
+try:
+    _app_main._shutdown_order_status_observation_recorder(_fake_service_none, logging.getLogger("test_wiring"))
+except Exception:
+    _no_crash_none_recorder = False
+check("8-5) 기록기가 None(관측 비활성)이어도 예외 없이 아무 것도 하지 않고 반환함",
+      _no_crash_none_recorder)
+
+
+class _RaisingRecorderForWiringTest:
+    def shutdown(self):
+        raise RuntimeError("종료 중 인위적 실패(테스트 전용)")
+
+
+_fake_service_raising = _FakeServiceForWiringTest(_RaisingRecorderForWiringTest())
+_no_crash_raising = True
+try:
+    _app_main._shutdown_order_status_observation_recorder(_fake_service_raising, logging.getLogger("test_wiring"))
+except Exception:
+    _no_crash_raising = False
+check("8-6) recorder.shutdown() 자체가 예외를 던져도 프로세스 종료를 막지 않음"
+      "(best-effort — 관측 기능이 종료 절차를 방해하지 않음)",
+      _no_crash_raising)
 
 
 print(f"\n총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
