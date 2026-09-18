@@ -82,6 +82,34 @@ def find_all_matching(entries: Iterable[dict], target_normalized: str) -> list[d
     ]
 
 
+class PartialOrderStatusFetchError(RuntimeError):
+    """`get_order_status_evidence()`가 두 원본 조회(oso/cntr) 중 하나만
+    성공하고 나머지가 실패했을 때 씁니다(2026-09-18 재검토 지적 4번).
+
+    이 예외는 여전히 "실패"입니다 — `KiwoomBroker.get_order_status()`와
+    동일하게, 두 조회 중 하나라도 실패하면 판정을 만들지 않고 예외를
+    그대로 전파합니다(추가 조회나 대체 판정으로 실패를 성공처럼
+    바꾸지 않습니다). 다만 먼저 성공한 조회의 원본 응답을 이 예외
+    객체에 실어서, 호출부가 "무엇을 조회했고 무엇이 빠졌는지"를
+    관측 기록에 남길 수 있게 합니다 — 이전에는 두 번째 조회가
+    실패하면 이미 받아온 첫 번째 조회 결과까지 통째로 사라졌습니다.
+    """
+
+    def __init__(
+        self,
+        cause: Exception,
+        failure_stage: str,
+        *,
+        oso_entries: list | None = None,
+        cntr_entries: list | None = None,
+    ) -> None:
+        super().__init__(f"{failure_stage} 단계에서 실패: {type(cause).__name__}: {cause}")
+        self.cause = cause
+        self.failure_stage = failure_stage
+        self.oso_entries: list = list(oso_entries) if oso_entries else []
+        self.cntr_entries: list = list(cntr_entries) if cntr_entries else []
+
+
 def build_order_status_evidence(
     order_id: Any,
     symbol: str,
@@ -94,28 +122,28 @@ def build_order_status_evidence(
 
     이 함수는 순수 in-memory 가공만 하므로 API 호출을 하지 않습니다
     — 호출부가 이미 받아온 `oso_entries`/`cntr_entries`(ka10075/
-    ka10076 raw 응답)를 그대로 재사용합니다. `derive_broker_order_status()`
-    호출 자체가 실패할 이유는 사실상 없지만(순수 함수, 이미
-    실측 검증됨), 혹시 모를 예외를 여기서 잡아 `evidence_error`로
-    감싸고 `broker_order`만은 반드시 안전한 UNKNOWN 폴백으로
-    채웁니다 — 관측 가공 실패가 호출부의 상태 판정 흐름을 절대
-    막지 않아야 하기 때문입니다(단, 이 폴백은 이 함수 자신의
-    버그에 대한 방어일 뿐이며, `derive_broker_order_status()`가
-    이미 실측 검증된 순수 함수라는 점은 변하지 않습니다).
+    ka10076 raw 응답)를 그대로 재사용합니다.
+
+    2026-09-18 재검토 반영(지적 5번): 예전 구현은 `derive_broker_
+    order_status()` 호출까지 try/except로 감싸 예외를 UNKNOWN
+    폴백으로 바꿔 반환했는데, 이는 **기존 `get_order_status()`
+    호출부의 예외 계약을 조용히 바꾸는 것**이었습니다(malformed
+    입력에 대해 원래는 예외가 전파돼 `_reconcile_tracked_order_
+    status()`의 `except Exception`이 실패로 처리했는데, 이 함수를
+    거치면 "성공적으로 UNKNOWN을 판정했다"는 것처럼 보여 다른
+    코드 경로로 흘렀습니다). **`derive_broker_order_status()`
+    (기존, 무변경)의 예외는 이 함수가 절대 잡지 않고 그대로
+    전파합니다** — 판정 로직 자체의 실패는 이 함수 도입 이전과
+    완전히 동일하게 처리돼야 합니다. 이 함수가 새로 격리하는 것은
+    판정이 **성공한 다음** 단계, 즉 `find_all_matching()`으로 전체
+    매칭 행을 모으는(순전히 이 관측 기능만을 위한 추가 작업)
+    단계의 실패뿐입니다.
     """
 
     oso_list = list(oso_entries) if oso_entries else []
     cntr_list = list(cntr_entries) if cntr_entries else []
 
-    try:
-        broker_order = derive_broker_order_status(order_id, symbol, oso_list, cntr_list)
-    except Exception as exc:  # pragma: no cover - 순수 함수라 사실상 발생 안 함, 방어적 처리
-        return OrderStatusEvidence(
-            broker_order=BrokerOrder(
-                order_id=str(order_id or ""), symbol=symbol, status=BrokerOrderStatus.UNKNOWN,
-            ),
-            evidence_error=f"derive_broker_order_status 실패: {type(exc).__name__}: {exc}",
-        )
+    broker_order = derive_broker_order_status(order_id, symbol, oso_list, cntr_list)
 
     try:
         target = normalize_order_id(order_id)
