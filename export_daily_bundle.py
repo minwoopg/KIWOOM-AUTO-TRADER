@@ -58,7 +58,9 @@ create/update/orphan/terminal remove)을 남기는 로그 태그는 코드베이
 from __future__ import annotations
 
 import csv
+import dataclasses
 import io
+import json
 import os
 import re
 import shutil
@@ -73,6 +75,12 @@ from infra.storage.run_baseline import (
     RUN_BASELINE_FIELDS,
     load_run_baselines,
     parse_run_timestamp,
+    resolve_scope_for_trade_timestamp,
+)
+from infra.storage.order_status_observation_store import (
+    OrderStatusObservation,
+    compute_coverage,
+    dedupe_by_write_id,
 )
 from utils.time_utils import KST_TZ
 
@@ -315,6 +323,246 @@ def slice_log(sources: list[Path], dst: Path, target: date) -> tuple[int, int, l
     collected.sort(key=lambda l: l[:23])
     dst.write_text("\n".join(collected) + ("\n" if collected else ""), encoding="utf-8")
     return total, kept, collected, used
+
+
+# ── 체결조회 증거 관측 로그 (order_status_observations.jsonl) ─────
+# 2026-09-18 (우선순위1 1차, 지적 5번의 "번들 연결까지 1차에 포함"
+# 반영): `OrderStatusObservationRecorder`가 남기는 append-only JSONL을
+# 날짜로 잘라 raw로 포함하고, `compute_coverage()`로 커버리지 요약을
+# 만듭니다. 이 섹션은 다음을 지킵니다:
+#   - 마지막 줄이 불완전해도(강제종료 중 write) 그 한 줄만 제외하고
+#     번들 생성을 실패시키지 않습니다(라이브 로그 파일 자체는 건드리지
+#     않음 — `_quarantine_incomplete_tail()`과 달리 이건 읽기 전용
+#     스냅샷 처리).
+#   - 마지막 줄이 아닌 위치의 손상은 "파일 자체 손상 가능성"으로
+#     별도 표시하고 계속 진행합니다(조용히 넘어가지 않음).
+#   - `dedupe_by_write_id()`로 같은 write_id+같은 내용의 재시도 기록은
+#     1건으로 집계하고, 같은 write_id+다른 내용은 충돌로 별도 표시합니다.
+#   - 원문(raw) 필드는 이 exporter의 기존 `mask()`(SENSITIVE_KEYS 기반)를
+#     한 번 더 적용합니다 — 관측 레코드 자체는 계좌번호/토큰을 담지
+#     않는 필드만 쓰지만(모듈 docstring 참고), export 단계에서도
+#     동일한 방어선을 적용해 두 지점 중 하나가 뚫려도 나머지가
+#     막도록 합니다. 마스킹이 실제로 무언가를 가렸다면 그 사실을
+#     manifest에 남겨 "조용히 사라진 정보"가 없게 합니다.
+#   - 이 번들은 하루 단위이므로, 오늘 조회했지만 **다른 날짜에 접수된
+#     주문**은 이 번들만으로는 order_date를 확정할 수 없어 "미확인"
+#     으로 분류됩니다 — 이는 결함이 아니라 하루 단위 번들의 알려진
+#     한계입니다(1차 지적 3번의 "미래 B의 확정 키를 정하자는 뜻이
+#     아니라 현재 A의 통계부터 서로 다른 주문을 섞지 말자는 조건"과
+#     동일한 원칙 — 확인할 수 없으면 추정하지 않고 미확인으로 둠).
+ORDER_STATUS_OBSERVATION_LOG = LOGS_DIR / "order_status_observations.jsonl"
+
+_OBS_KNOWN_FIELDS = {f.name for f in dataclasses.fields(OrderStatusObservation)}
+
+
+def slice_jsonl_observations(
+    src: Path, dst: Path, target: date,
+) -> tuple[int, int, int, int, int]:
+    """관측 JSONL을 날짜로 잘라 새 파일로 씁니다(마스킹 재적용 포함).
+
+    반환: (전체 줄, 해당 날짜로 채택된 줄, 말미 불완전으로 제외된 줄,
+    말미가 아닌 위치의 손상 줄, 마스킹이 실제로 값을 바꾼 줄 수)
+    """
+    day = target.strftime("%Y-%m-%d")
+    lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
+    total = len(lines)
+    kept = 0
+    trailing_incomplete = 0
+    mid_file_corrupt = 0
+    masked_changed = 0
+    out_lines: list[str] = []
+    last_idx = total - 1
+    for i, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            if i == last_idx:
+                trailing_incomplete += 1
+            else:
+                mid_file_corrupt += 1
+            continue
+        if data.get("__marker__") == "shutdown":
+            # 종료 마커는 그 실행의 clean_shutdown/dropped_count를
+            # 그대로 보존합니다(날짜 필터링 대상 아님 — 하루 경계와
+            # 무관하게 그 실행이 이 로그 파일에 종료 마커를 남겼다는
+            # 사실 자체가 유용한 진단 정보이므로).
+            masked_line = mask(json.dumps(data, ensure_ascii=False, sort_keys=True))
+            out_lines.append(masked_line)
+            continue
+        started_at = str(data.get("started_at") or "")
+        if not started_at.startswith(day):
+            continue
+        kept += 1
+        original = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        masked_line = mask(original)
+        if masked_line != original:
+            masked_changed += 1
+        out_lines.append(masked_line)
+    dst.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
+    return total, kept, trailing_incomplete, mid_file_corrupt, masked_changed
+
+
+def _parse_observations_for_coverage(dst: Path) -> tuple[list[OrderStatusObservation], list[str]]:
+    """슬라이스된 관측 JSONL에서 커버리지 계산용 레코드만 복원합니다.
+
+    종료 마커(`__marker__`)는 `OrderStatusObservation`이 아니므로 제외합니다.
+    알 수 없는 필드(미래 스키마 변경분)가 섞여 있어도 이 exporter가
+    깨지지 않도록 알려진 필드만 골라 재구성합니다.
+    """
+    observations: list[OrderStatusObservation] = []
+    parse_errors: list[str] = []
+    if not dst.exists():
+        return observations, parse_errors
+    for raw_line in dst.read_text(encoding="utf-8").splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            parse_errors.append(str(exc))
+            continue
+        if data.get("__marker__") == "shutdown":
+            continue
+        filtered = {k: v for k, v in data.items() if k in _OBS_KNOWN_FIELDS}
+        try:
+            observations.append(OrderStatusObservation(**filtered))
+        except TypeError as exc:
+            parse_errors.append(f"필드 불일치: {exc}")
+    return observations, parse_errors
+
+
+def build_order_status_summary(
+    target: date, observations: list[OrderStatusObservation],
+    trades_rows: list[dict], all_baselines: list[dict],
+) -> str:
+    """체결조회 증거 저장·커버리지 요약(2026-09-18 지적 2/3/4번 반영).
+
+    - 고유 주문 기준(조회 횟수 아님)으로 집계합니다.
+    - 이 번들(하루 단위)이 확정할 수 있는 order_date는 "오늘 접수된
+      주문"뿐입니다 — trades.csv의 오늘 날짜 슬라이스에서 order_id를
+      뽑아 그 집합에 없으면 order_date를 "미확인"으로 둡니다(추정하지
+      않음).
+    - account_scope_id가 여럿 섞여 있으면(계정 여러 개를 같은 로그
+      파일에 쓴 경우) 스코프별로 각각 계산합니다.
+    """
+    L: list[str] = []
+    day = target.strftime("%Y-%m-%d")
+
+    L.append("=" * 58)
+    L.append("  체결조회 증거 저장·커버리지 (order_status_coverage)")
+    L.append("=" * 58)
+    L.append("이 요약은 손익을 계산하지 않습니다 — 무엇을 조회했고 무엇을")
+    L.append("저장했으며 무엇이 빠졌는지만 구분합니다(1차 구현 완료 기준).")
+    L.append("")
+
+    deduped, conflicting_ids = dedupe_by_write_id(observations)
+    L.append(f"observation_raw_line_count            = {len(observations)}")
+    L.append(f"observation_unique_write_id_count      = {len(deduped)}"
+              " (같은 write_id+같은 내용 재시도는 1건으로 집계)")
+    if conflicting_ids:
+        L.append(f"⚠ observation_write_id_conflict_count = {len(conflicting_ids)}"
+                  " — 같은 write_id인데 내용이 다름(버그 신호, 임의로 하나를 고르지 않음)")
+        for wid in conflicting_ids[:10]:
+            L.append(f"    conflicting write_id: {wid}")
+        if len(conflicting_ids) > 10:
+            L.append(f"    ... 외 {len(conflicting_ids) - 10}건")
+    else:
+        L.append("observation_write_id_conflict_count    = 0")
+
+    # 오늘 접수된 주문(BUY/SELL, accepted=True)만 order_date="오늘"로
+    # 확정할 수 있음 — 그 외 관측은 이 번들 범위에서 order_date 미확인.
+    def _accepted(r: dict) -> bool:
+        for k in ("accepted", "order_accepted", "success", "is_success"):
+            if k in r:
+                return str(r.get(k) or "").strip().lower() in ("true", "1", "y", "yes", "성공", "ok")
+        return False
+
+    today_order_ids = {
+        str(r.get("order_id") or "").strip()
+        for r in trades_rows if _accepted(r) and str(r.get("order_id") or "").strip()
+    }
+
+    accepted_orders: set[tuple[str, str, str, str]] = set()
+    scope_unresolved = 0
+    for r in trades_rows:
+        if not _accepted(r):
+            continue
+        oid = str(r.get("order_id") or "").strip()
+        if not oid:
+            continue
+        ts = str(r.get("timestamp") or r.get("time") or "").strip()
+        scope = resolve_scope_for_trade_timestamp(all_baselines, ts) if ts else None
+        if scope is None:
+            scope_unresolved += 1
+            continue
+        account_scope_id, env = scope
+        if not account_scope_id:
+            scope_unresolved += 1
+            continue
+        accepted_orders.add((account_scope_id, env, day, oid))
+
+    L.append("")
+    L.append(f"today_accepted_order_count(trades.csv)  = {len(today_order_ids)}")
+    L.append(f"today_accepted_order_scope_resolved      = {len(accepted_orders)}")
+    if scope_unresolved:
+        L.append(f"⚠ today_accepted_order_scope_unresolved = {scope_unresolved}"
+                  " — run_baseline.csv로 계정/환경을 연결하지 못한 주문(연결 실행 없음/"
+                  "account_scope_id 미설정) — 아래 커버리지 분모에서 제외됨")
+
+    def _order_date_resolver(obs: OrderStatusObservation) -> str | None:
+        return day if obs.requested_order_id in today_order_ids else None
+
+    scopes = sorted({acc for acc, _env, _d, _oid in accepted_orders})
+    if not scopes:
+        L.append("")
+        L.append("계정/환경 연결이 가능한 오늘 접수 주문이 없어 커버리지를 계산하지 않습니다"
+                  "(run_baseline.csv 참고 — 미설정이면 위 scope_unresolved에 반영됨).")
+        return "\n".join(L)
+
+    for scope_id in scopes:
+        cov = compute_coverage(
+            account_scope_id=scope_id, accepted_orders=accepted_orders,
+            observations=deduped, order_date_resolver=_order_date_resolver,
+        )
+        L.append("")
+        L.append(f"[ account_scope_id = {scope_id} ]")
+        if cov["status"] == "계측_비활성":
+            L.append(f"  status = 계측_비활성 ({cov.get('reason', '')})")
+            continue
+        L.append(f"  total_accepted_orders          = {cov['total_accepted_orders']}")
+        L.append(f"  observed_unique_orders         = {cov['observed_unique_orders']}")
+        L.append(f"  filled_unique_orders           = {cov['filled_unique_orders']}")
+        L.append(f"  priced_unique_orders           = {cov['priced_unique_orders']}")
+
+        def _pct(v):
+            return "N/A" if v is None else f"{v * 100:.0f}%"
+
+        L.append(f"  order_observation_rate(주문 관측률)   = {_pct(cov['order_observation_rate'])}")
+        L.append(f"  status_confirmation_rate(상태 확인률) = {_pct(cov['status_confirmation_rate'])}")
+        L.append(f"  price_capture_rate(가격 확보율)       = {_pct(cov['price_capture_rate'])}")
+        L.append(f"  query_attempt_count             = {cov['query_attempt_count']}")
+        L.append(f"  query_success_count             = {cov['query_success_count']}")
+        L.append(f"  query_failed_count              = {cov['query_failed_count']}")
+        L.append(f"  unresolved_order_date_count      = {cov['unresolved_order_date_count']}"
+                  " (다른 날짜에 접수된 주문에 대한 오늘 조회 — 정상, 하루 단위 번들의 한계)")
+        L.append(f"  orphan_observation_count         = {cov['orphan_observation_count']}"
+                  " (accepted_orders에 없는 조회 — 미수락 주문 조회 시도 등)")
+
+    L.append("")
+    L.append("※ 4번째 지표(조회·저장 품질)는 write_id 재시도/충돌 집계(위)와")
+    L.append("  기록기의 shutdown 마커(app_analysis 로그의 종료 마커 줄 또는")
+    L.append("  이 raw 파일 안의 __marker__ 줄)를 함께 참고하세요 — dropped_count는")
+    L.append("  기록기 프로세스 자신만 알 수 있으므로 이 exporter가 사후에")
+    L.append("  재구성할 수 없습니다(큐에서 버려진 레코드는애초에 이 파일에")
+    L.append("  없음 — 그래서 실행 중 [ORDER_STATUS_OBS_QUEUE_FULL]/")
+    L.append("  [ORDER_STATUS_OBS_WRITE_FAILED] 로그 태그를 app.log 슬라이스에서")
+    L.append("  함께 확인해야 완전한 그림이 됩니다).")
+    L.append("=" * 58)
+    return "\n".join(L)
 
 
 # ── 수집 품질 메타데이터 ────────────────────────────────────────
@@ -669,6 +917,11 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
         manifest.append("")
         manifest.append("[ RAW — 실행 기준선 (run_baseline.csv, B01) ]")
         baseline_src = LOGS_DIR / "run_baseline.csv"
+        # 2026-09-18: 체결조회 증거 커버리지 요약(아래)도 이 조인
+        # 결과가 필요하므로, run_baseline.csv가 없는 경우를 포함해
+        # 항상 정의해 둡니다(빈 리스트면 커버리지 쪽에서 scope_unresolved로
+        # 자연히 반영됨 — 별도 분기 불필요).
+        all_baselines: list[dict] = []
         if not baseline_src.exists():
             manifest.append(f"  {'run_baseline.csv':30s} | MISSING | 원본 없음 | excluded")
             manifest.append("  ⚠ 이 날짜의 거래/신호를 실행(run_id)에 연결할 근거가 없습니다.")
@@ -781,6 +1034,45 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
         manifest.append("  ※ run_id 연결은 시간범위 최선 추정입니다(암호학적 확정 아님) —")
         manifest.append("    기록 실패 여부는 app.log의 [RUN_BASELINE] 태그 라인을 참고하세요.")
 
+        # 2026-09-18 (우선순위1 1차, 체결조회 증거 저장·커버리지):
+        # order_status_observations.jsonl을 날짜로 잘라 raw로 포함.
+        # trades.csv는 이미 위에서 이 날짜로 슬라이스돼 work에 있으므로
+        # 그걸 그대로 재사용(중복 조회 없음).
+        manifest.append("")
+        manifest.append("[ RAW — 체결조회 증거 관측 (order_status_observations.jsonl) ]")
+        obs_src = ORDER_STATUS_OBSERVATION_LOG
+        obs_dst = work / f"order_status_observations_{day_compact}.jsonl"
+        obs_records: list[OrderStatusObservation] = []
+        if not obs_src.exists():
+            manifest.append(f"  {'order_status_observations.jsonl':30s} | MISSING | 원본 없음 | excluded")
+            manifest.append("  ⚠ 관측 기능이 비활성(account_scope_id 미설정)이었거나 아직 기록이 없습니다.")
+        else:
+            obs_total, obs_kept, obs_trailing_bad, obs_mid_bad, obs_masked = (
+                slice_jsonl_observations(obs_src, obs_dst, target)
+            )
+            raw_files.append(obs_dst.name)
+            manifest.append(
+                f"  {'order_status_observations.jsonl':30s} | OK | {obs_kept:,}줄 / 전체 {obs_total:,}줄"
+                f" | {obs_dst.stat().st_size / 1024:,.1f} KB"
+            )
+            if obs_trailing_bad:
+                manifest.append(
+                    f"    ⚠ 말미 불완전 줄 {obs_trailing_bad}건 제외(강제종료 추정 — 정상적인 상황)"
+                )
+            if obs_mid_bad:
+                manifest.append(
+                    f"    ⚠ 말미가 아닌 위치의 손상 줄 {obs_mid_bad}건 발견 — 파일 자체 손상"
+                    " 가능성(조용히 넘어가지 않고 표시만 하고 계속 진행)"
+                )
+            if obs_masked:
+                manifest.append(f"    민감정보 마스킹 재적용: {obs_masked}줄에서 값 변경됨")
+            obs_records, obs_parse_errors = _parse_observations_for_coverage(obs_dst)
+            if obs_parse_errors:
+                manifest.append(
+                    f"    ⚠ 커버리지 계산용 레코드 복원 실패 {len(obs_parse_errors)}건"
+                    "(알 수 없는 스키마 — 집계에서 제외)"
+                )
+
         manifest.append("")
         manifest.append("[ RAW — 로그 (allowlist 태그 줄만, 마스킹 적용) ]")
         app_sources = rotated_log_paths(LOGS_DIR)
@@ -837,9 +1129,19 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
         )
         (work / "collection_quality.txt").write_text(quality, encoding="utf-8")
 
+        # 체결조회 증거 커버리지 — trades.csv(오늘 슬라이스)와
+        # run_baseline.csv 조인 결과(all_baselines)를 그대로 재사용.
+        order_status_summary = build_order_status_summary(
+            target, obs_records,
+            _read_csv(work / f"trades_{day_compact}.csv"),
+            all_baselines,
+        )
+        (work / "order_status_coverage.txt").write_text(order_status_summary, encoding="utf-8")
+
         manifest.append("")
         manifest.append("[ METADATA ]")
         manifest.append("  collection_quality.txt — 수집 완전성·재시작·coverage 요약")
+        manifest.append("  order_status_coverage.txt — 체결조회 증거 저장·커버리지 요약(손익 계산 아님)")
         if is_provisional_report:
             manifest.append(
                 "  ⚠ daily_report — 잠정(대조 미완료) 상태로 생성됨. "
@@ -862,7 +1164,7 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
                     arc = f"reports/{p.name}"
                 elif p.name in raw_files:
                     arc = f"raw/{p.name}"
-                elif p.name == "collection_quality.txt":
+                elif p.name in ("collection_quality.txt", "order_status_coverage.txt"):
                     arc = f"metadata/{p.name}"
                 else:
                     arc = p.name
@@ -893,6 +1195,8 @@ def build(target: date, *, quiet: bool = False) -> Path | None:
             print("\n".join(manifest))
             print()
             print(quality)
+            print()
+            print(order_status_summary)
             print()
             print(f"저장: {final_path}  ({final_path.stat().st_size / 1024 / 1024:.1f} MB)")
         return final_path
