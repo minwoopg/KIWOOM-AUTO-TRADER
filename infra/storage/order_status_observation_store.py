@@ -43,6 +43,8 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date
 from pathlib import Path
+
+from infra.broker.kiwoom_order_status import normalize_order_id
 from typing import Any, Literal
 
 SCHEMA_VERSION = 1
@@ -120,6 +122,15 @@ class OrderStatusObservation:
     base_quantity_before_order: int | None = None
     target_quantity_after_order: int | None = None
     journal_linked: bool = False   # TrackedOrderRecord와 연결해 스냅샷을 채울 수 있었는가
+
+    # 2026-09-18 재검토 반영(지적 3번): 이 주문이 실제로 접수된 시각
+    # (TrackedOrderRecord.accepted_at, ISO 문자열) — journal_linked가
+    # True일 때만 채워집니다. exporter의 order_date 판정은 "오늘
+    # trades.csv에 같은 order_id가 있으면 오늘 주문"이라는 추정
+    # (키움 주문번호가 날짜마다 재사용될 수 있어 오판 위험이 있음)
+    # 대신 이 값을 우선 근거로 씁니다 — 이 값이 없으면 "미확인"으로
+    # 남기고 추정하지 않습니다.
+    order_accepted_at: str | None = None
 
     write_id: str = ""       # 이 "사건"의 식별자 — 재시도는 같은 값 재사용, 새 조회만 새로 발급
     restart_id: str = ""
@@ -216,6 +227,24 @@ class OrderStatusObservationRecorder:
         self.restart_id = uuid.uuid4().hex
         self.dropped_count = 0
         self._dropped_lock = threading.Lock()
+        # 2026-09-18 재검토 반영(지적 1번): fsync 실패는 dropped_count와
+        # 별도로 셉니다 — write() 자체는 성공해 파일에 온전한 줄이
+        # 남았고, 단지 디스크 반영이 확인 안 됐을 뿐이라 "유실"과는
+        # 다른 사실이기 때문입니다.
+        self.fsync_unconfirmed_count = 0
+        # 2026-09-18 재검토 반영(지적 2번, 재현된 버그): 큐 포화로 인한
+        # 유실은 dropped_count(전체 유실)와 별도로도 세어둡니다 —
+        # record()는 더 이상 이 값이 바뀌었다고 직접 로그를 남기지
+        # 않고(매매 스레드가 로그 I/O를 기다리는 걸 막기 위함),
+        # 작업자 스레드가 폴링마다 이 값의 변화를 감지해 대신 로그를
+        # 남깁니다(`_maybe_log_queue_full_change()` 참고).
+        self._queue_full_dropped_count = 0
+        self._last_logged_queue_full_count = 0
+        # shutdown()이 join(timeout=...)에서 이미 반환된 뒤에도 작업자
+        # 스레드가 실제로 마커를 남겼는지(성공/실패)를 나중에 확인할 수
+        # 있게 기록해 둡니다 — shutdown() 자신은 이 값을 기다리지
+        # 않습니다(제한시간 안에서만 join).
+        self.marker_written: bool | None = None
 
     # ── 시작/복구 ──
     def start(self) -> None:
@@ -290,30 +319,96 @@ class OrderStatusObservationRecorder:
         try:
             self._queue.put_nowait(observation)
         except queue.Full:
+            # 2026-09-18 재검토 반영(지적 2번, 재현된 버그): 예전엔 여기서
+            # app_logger.warning()을 **동기** 호출했습니다 — 느린 로그
+            # 핸들러를 주입해 측정하니 이 record()를 호출한 매매 스레드
+            # 자체가 ~0.20초 대기했습니다. record()는 "매매 루프가 디스크/
+            # 로그 완료를 기다리지 않는다"가 핵심 계약이므로, 여기서는
+            # 카운터만 올리고 즉시 반환합니다 — 실제 로그는 작업자
+            # 스레드가 폴링 중 이 값의 변화를 감지해 대신 남깁니다
+            # (`_maybe_log_queue_full_change()`).
             with self._dropped_lock:
                 self.dropped_count += 1
-            self._app_logger.warning(
-                f"[ORDER_STATUS_OBS_QUEUE_FULL] write_id={observation.write_id} — "
-                f"유실 처리(매매 루프는 대기하지 않음), 누적 유실 {self.dropped_count}건"
-            )
+                self._queue_full_dropped_count += 1
 
     def _writer_loop(self) -> None:
         while not self._stop_event.is_set() or not self._queue.empty():
             try:
                 observation = self._queue.get(timeout=0.5)
             except queue.Empty:
+                self._maybe_log_queue_full_change()
                 continue
             self._write_one(observation)
+            self._maybe_log_queue_full_change()
+        # 2026-09-18 재검토 반영(지적 2번, 재현된 버그): 종료 마커 기록도
+        # 이 작업자 스레드 안에서 수행합니다 — 예전엔 shutdown()을 호출한
+        # (매매) 스레드가 join(timeout=...) 이후 **직접** 마커 파일을
+        # 썼는데, 이 쓰기 자체는 그 timeout의 적용을 받지 않았습니다
+        # (재현: timeout=0.01초로 설정해도 실제 마커 쓰기에 ~0.20초가
+        # 걸림 — 디스크가 멈추면 종료시간 상한이 전혀 보장되지 않음).
+        # 이제 마커 쓰기가 이 스레드 안에서 이뤄지므로, 호출 스레드는
+        # join(timeout=...) 하나로만 전체 대기 시간이 제한됩니다 — 마커
+        # 쓰기가 느려지거나 멈춰도 join이 timeout에 도달하면 호출
+        # 스레드는 이미 반환된 뒤이고, 이 스레드는 계속 남아 마커
+        # 쓰기를 끝내려 시도합니다(데몬 스레드라 프로세스 종료를 막지
+        # 않음).
+        self._write_shutdown_marker()
+
+    def _maybe_log_queue_full_change(self) -> None:
+        with self._dropped_lock:
+            current = self._queue_full_dropped_count
+        if current != self._last_logged_queue_full_count:
+            self._app_logger.warning(
+                f"[ORDER_STATUS_OBS_QUEUE_FULL] 누적 큐 포화 유실 {current}건 — "
+                f"작업자 스레드에서 비동기로 기록(매매 루프는 대기하지 않았음)"
+            )
+            self._last_logged_queue_full_count = current
 
     def _write_one(self, observation: OrderStatusObservation) -> None:
+        """한 레코드를 파일 끝에 append합니다.
+
+        2026-09-18 재검토 반영(지적 1번, 재현된 버그): 쓰기 도중 예외가
+        나면 이미 파일에 일부 바이트가 써졌을 수 있습니다(레코드 하나가
+        부분적으로만 기록됨). 예전엔 이 상태를 그대로 두고 다음
+        레코드를 append했는데, 그러면 부분 기록된 바이트 뒤에 다음
+        레코드가 바로 이어붙어 **두 레코드가 한 줄로 뭉개져 함께 파싱
+        불가능**해졌습니다(재현: w1 부분 쓰기 실패 → w2 정상 기록
+        시도 → 실제로는 w1+w2 모두 복구 불가). 이제 쓰기 시도 "직전"
+        파일 크기를 먼저 확인해 두고, 쓰기 중 예외가 나면 그 크기로
+        파일을 truncate해 부분 바이트를 제거한 뒤에만 다음 레코드를
+        받습니다 — 그래서 파일은 항상 "완전한 줄들"로만 끝나는
+        상태를 유지합니다.
+
+        fsync() 실패는 별도로 다룹니다 — write()/flush() 자체는 이미
+        성공해 파일에 완전한 줄이 남았고, 단지 OS 캐시에서 디스크로의
+        반영이 확인되지 않았을 뿐이므로 "쓰기 실패(내용 유실)"와는
+        다른 성격입니다. 조용히 무시하지 않고 별도 카운터
+        (`fsync_unconfirmed_count`)와 로그 태그
+        (`[ORDER_STATUS_OBS_FSYNC_FAILED]`)로 "저장 내구성 미확인"
+        상태를 남기되, 레코드 자체는 유실 처리하지 않습니다.
+        """
+        try:
+            pre_size = self.path.stat().st_size if self.path.exists() else 0
+        except OSError:
+            # 크기 확인 자체가 안 되면 truncate 대상에서 제외합니다 —
+            # 잘못된 크기로 truncate해 더 큰 손상을 만들지 않기 위함.
+            pre_size = None
+
         try:
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(observation.to_json_line() + "\n")
                 f.flush()
                 try:
                     os.fsync(f.fileno())
-                except OSError:
-                    pass  # 기존 프로젝트 관례(TrackedOrderJournalStore)와 동일 — 치명적이지 않음
+                except OSError as fsync_exc:
+                    with self._dropped_lock:
+                        self.fsync_unconfirmed_count += 1
+                    self._app_logger.warning(
+                        f"[ORDER_STATUS_OBS_FSYNC_FAILED] write_id={observation.write_id} — "
+                        f"{type(fsync_exc).__name__}: {fsync_exc} — write()는 성공했으나 디스크"
+                        f" 반영 확인 안 됨(레코드는 유실 처리하지 않음, 누적 미확인 "
+                        f"{self.fsync_unconfirmed_count}건)"
+                    )
         except Exception as exc:
             with self._dropped_lock:
                 self.dropped_count += 1
@@ -321,26 +416,36 @@ class OrderStatusObservationRecorder:
                 f"[ORDER_STATUS_OBS_WRITE_FAILED] write_id={observation.write_id} — "
                 f"{type(exc).__name__}: {exc} — 같은 파일에 재시도하지 않고 유실 처리"
             )
+            if pre_size is not None:
+                self._truncate_partial_write(pre_size)
+
+    def _truncate_partial_write(self, pre_size: int) -> None:
+        """쓰기 실패 후 파일을 실패 이전 크기로 되돌려 부분 쓰기 바이트를
+        제거합니다 — 다음 레코드가 항상 깨끗한 줄 경계 뒤에 이어붙도록
+        보장합니다(2026-09-18 재검토 지적 1번)."""
+        try:
+            with self.path.open("r+b") as f:
+                f.truncate(pre_size)
+        except OSError as exc:
+            self._app_logger.critical(
+                f"[ORDER_STATUS_OBS_WRITE_FAILED] 부분 쓰기 복구(truncate) 실패 — "
+                f"{type(exc).__name__}: {exc} — 파일이 부분 쓰기 상태로 남아있을 수 있음"
+            )
 
     # ── 종료 ──
-    def shutdown(self) -> dict:
-        """상한 시간 안에 드레인을 시도하고 결과 마커를 기록합니다.
+    def _write_shutdown_marker(self) -> None:
+        """종료 마커를 파일에 append합니다(작업자 스레드 안에서만 호출됨).
 
-        반환값의 `clean_shutdown`은 "제한시간 내에 드레인 시도가 끝났다"는
-        뜻이지 "모든 레코드가 디스크에 안전히 저장됐다"는 뜻이 아닙니다
-        (지적 4번 반영 — queue_drained와 디스크 확정을 분리).
+        2026-09-18 재검토 반영(지적 2번): shutdown()을 호출한 스레드가
+        아니라 이 작업자 스레드 자신이 마커를 씁니다 — 그래서 이 쓰기가
+        아무리 느려지거나 멈춰도 shutdown()의 join(timeout=...)이 이미
+        정한 상한 시간을 넘기지 않습니다.
         """
-
-        self._stop_event.set()
-        queue_drained = True
-        if self._thread is not None:
-            self._thread.join(timeout=self._shutdown_drain_timeout_sec)
-            queue_drained = not self._thread.is_alive()
-
         result = {
-            "clean_shutdown": queue_drained,
-            "queue_drained": queue_drained,
+            "clean_shutdown": True,
+            "queue_drained": True,
             "dropped_count": self.dropped_count,
+            "fsync_unconfirmed_count": self.fsync_unconfirmed_count,
             "restart_id": self.restart_id,
             "last_seq_no": self._seq_no,
             "shutdown_at": datetime.now().isoformat(),
@@ -348,11 +453,45 @@ class OrderStatusObservationRecorder:
         try:
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps({"__marker__": "shutdown", **result}, ensure_ascii=False) + "\n")
+            self.marker_written = True
         except Exception as exc:
+            self.marker_written = False
             self._app_logger.critical(
                 f"[ORDER_STATUS_OBS_SHUTDOWN_MARKER_FAILED] {type(exc).__name__}: {exc}"
             )
-        return result
+
+    def shutdown(self) -> dict:
+        """상한 시간 안에 드레인을 기다리기만 합니다 — 그 이상의 블로킹
+        I/O(마커 파일 쓰기 등)는 이 메서드 자신이 하지 않습니다
+        (2026-09-18 재검토 반영, 지적 2번의 재현된 버그: 예전엔 join
+        이후 이 메서드가 직접 마커를 써서, join의 timeout이 종료
+        시간의 실제 상한이 되지 못했습니다).
+
+        반환값의 `clean_shutdown`은 "제한시간 내에 작업자 스레드가
+        (큐 드레인 + 마커 기록까지) 완전히 끝났다"는 뜻이고,
+        `queue_drained`는 "제한시간 내에 스레드가 살아있는 상태를
+        벗어났다"는 뜻입니다 — 스레드가 아직 살아있으면(마커 쓰기가
+        느려서 등) 마커가 실제로 기록됐는지는 이 메서드 호출 시점엔
+        알 수 없으므로 `marker_written`은 `None`으로 남습니다(디스크
+        확정 여부를 사실과 다르게 주장하지 않기 위함).
+        """
+
+        self._stop_event.set()
+        thread_finished = True
+        if self._thread is not None:
+            self._thread.join(timeout=self._shutdown_drain_timeout_sec)
+            thread_finished = not self._thread.is_alive()
+
+        return {
+            "clean_shutdown": thread_finished and self.marker_written is True,
+            "queue_drained": thread_finished,
+            "marker_written": self.marker_written if thread_finished else None,
+            "dropped_count": self.dropped_count,
+            "fsync_unconfirmed_count": self.fsync_unconfirmed_count,
+            "restart_id": self.restart_id,
+            "last_seq_no": self._seq_no,
+            "shutdown_at": datetime.now().isoformat(),
+        }
 
 
 # ── 실행 단위 메타데이터 (계좌/환경 ↔ trades.csv 연결) ────────────
@@ -381,7 +520,7 @@ COVERAGE_DISABLED = "계측_비활성"
 def compute_coverage(
     *,
     account_scope_id: str,
-    accepted_orders: set[tuple[str, str, str, str]],   # (account_scope_id, env, order_date, order_id)
+    accepted_orders: set[tuple[str, str, str, str]],   # (account_scope_id, env, order_date, order_id) — order_id는 normalize_order_id() 정규화된 값이어야 함
     observations: list[OrderStatusObservation],
     order_date_resolver,  # Callable[[OrderStatusObservation], str | None] — None이면 미확인
 ) -> dict:
@@ -394,10 +533,25 @@ def compute_coverage(
     - order_date를 확정할 수 없는 관측은 "미확인" 버킷으로 분리하고
       분모/분자 어디에도 넣지 않습니다.
     - `accepted_orders`에 없는 order_id의 관측은 "고아 관측"으로 분리합니다.
+
+    2026-09-18 재검토 반영(지적 3번, 재현된 버그): 이전 구현은 분모만
+    `account_scope_id`로 좁히고 분자(`observed_keys` 등)는 함수에 전달된
+    **모든** 관측(다른 계좌 포함)을 다 훑어서, 계좌 A가 1건 접수·1건
+    관측인데 계좌 B도 1건 접수·1건 관측이면 A의 관측률이 200%로
+    나오는 결함이 재현됐습니다(B의 키도 전체 `accepted_orders`
+    집합에는 있으므로 A를 계산할 때도 분자에 더해짐). 이제 루프에
+    들어가기 전에 `observations`를 이 함수가 계산 중인
+    `account_scope_id`로 먼저 좁혀, 분모·분자·조회 카운트 전부가
+    같은 계좌 범위 안에서만 계산됩니다. order_id 비교도 `_find_
+    matching()`/`find_all_matching()`이 쓰는 것과 동일한
+    `normalize_order_id()`로 정규화해, 0-padding 차이("000123" vs
+    "123")로 같은 주문이 고아 관측으로 잘못 분류되지 않게 합니다.
     """
 
     if not account_scope_id.strip():
         return {"status": COVERAGE_DISABLED, "reason": "account_scope_id 미설정"}
+
+    scoped_observations = [obs for obs in observations if obs.account_scope_id == account_scope_id]
 
     unresolved_date_count = 0
     orphan_count = 0
@@ -410,7 +564,7 @@ def compute_coverage(
     query_failed = 0
     write_success = 0  # 실제 디스크 반영 여부는 이 함수 호출 시점엔 알 수 없음 — 별도 카운터로 다룸(라이터의 dropped_count 참고)
 
-    for obs in observations:
+    for obs in scoped_observations:
         query_attempt += 1
         if obs.outcome == "api_error":
             query_failed += 1
@@ -422,7 +576,7 @@ def compute_coverage(
             unresolved_date_count += 1
             continue
 
-        key = (obs.account_scope_id, obs.env, order_date, obs.requested_order_id)
+        key = (obs.account_scope_id, obs.env, order_date, normalize_order_id(obs.requested_order_id))
         if key not in accepted_orders:
             orphan_count += 1
             continue
