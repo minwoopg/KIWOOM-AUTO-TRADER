@@ -30,6 +30,24 @@ class BrokerConfig:
     secret_key: str
     account_number: str
     is_paper_trading: bool
+    # 2026-09-18 (우선순위1 1차: 체결조회 증거 독립 저장): 계좌를
+    # 구분하는 **비민감** 식별자(예: "acct-a") — 실계좌번호(account_number)
+    # 자체는 아니며, 관측 저장소의 dedup·커버리지 집계 키에만 쓰입니다.
+    # 기본값 ""(빈 문자열)은 "라벨 미설정" 상태이며, 이 경우 관측
+    # 기능만 비활성화됩니다(기동 자체를 막지 않음 — 아래
+    # `observation_enabled` 참고). settings.yaml에 이 키가 없어도
+    # 하위호환으로 정상 로드됩니다(기존 설정 파일 변경 불필요).
+    account_scope_id: str = ""
+
+    @property
+    def observation_enabled(self) -> bool:
+        """`account_scope_id`가 비어있지 않을 때만 체결조회 증거
+        관측 기능이 활성화됩니다. 이 값이 False라고 해서 프로그램
+        기동 자체를 막지 않습니다 — 매매 로직과 무관한 부가 계측
+        기능이므로, 라벨이 없으면 그 계측만 꺼지고 커버리지는
+        "0%"가 아니라 "계측 비활성"으로 별도 표시되어야 합니다."""
+
+        return bool(self.account_scope_id.strip())
 
 
 @dataclass(frozen=True)
@@ -353,6 +371,15 @@ class StorageConfig:
     # highest_price 갱신에는 전혀 관여하지 않음 (infra/storage/logger.py의
     # ExitCandidateOutageLogger, domain/strategy/exit_calc.py 참고).
     exit_candidate_outage_log_file: str = "logs/exit_candidate_outage.csv"
+    # 2026-09-18 (우선순위1 1차: 체결조회 증거 독립 저장): get_order_status_
+    # evidence() 조회 결과(성공/실패 모두)를 순수 관측 목적으로만 append하는
+    # 로그. CSV가 아니라 JSON Lines(한 줄에 레코드 하나)입니다 — 조회
+    # 하나당 매칭 행이 여러 개일 수 있어 고정 컬럼 스키마에 맞지 않기
+    # 때문입니다. TrackedOrderJournalStore와 달리 이 파일은 안전한 시점에
+    # 삭제되지 않습니다(영구 append-only) — infra/storage/
+    # order_status_observation_store.py 참고. BUY/SELL/리스크 판정 어디에도
+    # 관여하지 않습니다.
+    order_status_observation_log_file: str = "logs/order_status_observations.jsonl"
 
 
 @dataclass(frozen=True)
