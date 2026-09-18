@@ -29,7 +29,9 @@ import requests
 
 from config.settings import BrokerConfig
 from domain.models import AccountBalance, BrokerOrder, MarketPrice, OrderRequest, OrderResult, OrderSide, OrderStatusEvidence, Position, PriceBar, WeeklyBar, MinuteBar
-from infra.broker.kiwoom_order_status import build_order_status_evidence, derive_broker_order_status, normalize_order_id
+from infra.broker.kiwoom_order_status import (
+    PartialOrderStatusFetchError, build_order_status_evidence, derive_broker_order_status, normalize_order_id,
+)
 from infra.broker.kiwoom_parsing import parse_abs_int
 from infra.broker.base import Broker
 
@@ -874,15 +876,30 @@ class KiwoomBroker(Broker):
         2026-09-18: `_fetch_open_orders_raw()`/`_fetch_fill_history_raw()`
         호출 횟수는 `get_order_status()`와 완전히 동일합니다(각각
         정확히 한 번, 페이지네이션 여부와 무관) — 이 메서드가 추가
-        API 호출을 만들지 않습니다. 두 raw fetch 자체가 던지는
-        예외(HTTP/타임아웃/페이지네이션 오류 등)는 기존과 동일하게
-        그대로 전파됩니다 — 아래에서 감싸지 않습니다. 오직 그 이후,
-        이미 받은 raw 리스트로 증거를 구성하는 순수 가공 단계만
-        `build_order_status_evidence()` 내부에서 격리됩니다.
+        API 호출을 만들지 않습니다. 두 raw fetch 중 하나라도 실패하면
+        (HTTP/타임아웃/페이지네이션 오류 등) `get_order_status()`와
+        동일하게 판정을 만들지 않고 예외를 전파합니다 — 실패를
+        성공처럼 바꾸거나 추가 조회를 하지 않습니다.
+
+        2026-09-18 재검토 반영(지적 4번): 다만 두 번째 조회(cntr)가
+        실패하면 이미 성공한 첫 번째 조회(oso) 결과가 예전엔 그냥
+        사라졌습니다 — `PartialOrderStatusFetchError`로 감싸 어느
+        단계에서 실패했는지와 이미 확보한 원본 응답을 함께 실어
+        전파합니다. 호출부의 예외 처리(`_reconcile_tracked_order_
+        status()`의 `except Exception` — 실패로 간주, PSM 상태 유지)는
+        이 예외도 동일하게 `Exception`이므로 전혀 바뀌지 않습니다.
         """
 
-        oso_entries = self._fetch_open_orders_raw(symbol)
-        cntr_entries = self._fetch_fill_history_raw(symbol)
+        try:
+            oso_entries = self._fetch_open_orders_raw(symbol)
+        except Exception as exc:
+            raise PartialOrderStatusFetchError(exc, "oso_fetch") from exc
+        try:
+            cntr_entries = self._fetch_fill_history_raw(symbol)
+        except Exception as exc:
+            raise PartialOrderStatusFetchError(
+                exc, "cntr_fetch", oso_entries=oso_entries,
+            ) from exc
         return build_order_status_evidence(order_id, symbol, oso_entries, cntr_entries)
 
     def place_order(self, order: OrderRequest) -> OrderResult:
