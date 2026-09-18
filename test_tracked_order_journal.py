@@ -557,9 +557,19 @@ check("12-1) TradingService.__init__이 journal을 주입 안 하면 storage 설
 check("12-2) 재시작 시 journal의 미확인 주문을 읽어 매매 차단을 복원함",
       "self._restore_order_recovery_blocks()" in TS_SRC
       and "self._tracked_order_journal.load_all()" in TS_SRC)
-check("12-3) 이번 라운드에서 get_order_status() 호출부를 추가로 늘리지 않음"
-      "(D.1/D.1.1이 이미 만든 호출부 개수 그대로)",
-      TS_SRC.count("self.broker.get_order_status(") == 1)
+# 2026-09-18 (우선순위1 1차: 체결조회 증거 독립 저장): D.1/D.1.1이 만든
+# 유일한 호출부가 `self.broker.get_order_status()`에서
+# `self.broker.get_order_status_evidence()`로 이름이 바뀌었습니다 —
+# `KiwoomBroker.get_order_status_evidence()`는 기존 get_order_status()와
+# 완전히 동일한 raw fetch(_fetch_open_orders_raw/_fetch_fill_history_raw
+# 각 1회)를 재사용할 뿐 추가 API 호출을 만들지 않으므로(테스트는
+# test_kiwoom_broker_placement_failure.py류의 호출횟수 검증과 별개로
+# infra/broker/kiwoom_broker.py의 docstring 참고), 이 검증의 의도
+# ("호출부가 여전히 1곳뿐")는 그대로 유지하고 대상 문자열만 갱신합니다.
+check("12-3) 이번 라운드에서 get_order_status 계열 호출부를 추가로 늘리지 않음"
+      "(D.1/D.1.1이 이미 만든 호출부 개수 그대로, 2026-09-18에 evidence로 개명)",
+      TS_SRC.count("self.broker.get_order_status(") == 0
+      and TS_SRC.count("self.broker.get_order_status_evidence(") == 1)
 check("12-4) journal 관련 코드 어디서도 BUY/SELL 자동 실행(재주문)을 하지 않음",
       "_tracked_order_journal" not in TS_SRC.split("_try_buy(")[0]
       or "place_order" not in TS_SRC[
