@@ -1685,6 +1685,168 @@ finally:
     _os.chdir(_orig_cwd10c)
 
 
+# ── 11. 2026-09-21 4차 재검토(GPT 4차) 3개 지적 사항 재현 — 상태 처리만
+#    한정(① 설정 활성인데 상태 파일 없음 → '상태확인_불가'로 구분,
+#    ② 잘못된 UTF-8 상태 파일, ③ 시간대 포함 updated_at) — 세 사례 모두
+#    실제 build() 경로로 검증한다. ──────────────────────────────────
+from datetime import timezone as _timezone
+
+# ── 11A. resolve_observation_configured_active() 단위 테스트 ──────
+_tmpdir11a = tempfile.mkdtemp()
+_repo_root_11 = Path(_os.getcwd())
+_real_settings_yaml_text_11 = (_repo_root_11 / "config" / "settings.yaml").read_text(encoding="utf-8")
+_active_settings_yaml_text_11 = _real_settings_yaml_text_11.replace(
+    "  is_paper_trading: true\n",
+    "  is_paper_trading: true\n  account_scope_id: acct-11a\n",
+    1,
+)
+check("11-0) 사전조건: account_scope_id 주입이 정확히 1곳(broker 섹션)에서만"
+      " 일어남(테스트 자체의 전제 확인)",
+      _active_settings_yaml_text_11.count("account_scope_id: acct-11a") == 1)
+
+_settings_path_11a_active = Path(_tmpdir11a) / "settings_active.yaml"
+_settings_path_11a_active.write_text(_active_settings_yaml_text_11, encoding="utf-8")
+check("11-1) 설정에서 account_scope_id가 채워져 있으면 True를 반환함",
+      _bundle.resolve_observation_configured_active(_settings_path_11a_active) is True)
+
+_settings_path_11a_blank = Path(_tmpdir11a) / "settings_blank.yaml"
+_settings_path_11a_blank.write_text(_real_settings_yaml_text_11, encoding="utf-8")
+check("11-2) 설정에 account_scope_id가 없으면(기본값 \"\") False를 반환함"
+      "(명시적 비활성 확인 — 실제 저장소의 config/settings.yaml 그대로)",
+      _bundle.resolve_observation_configured_active(_settings_path_11a_blank) is False)
+
+_settings_path_11a_missing = Path(_tmpdir11a) / "does_not_exist.yaml"
+check("11-3) 설정 파일 자체가 없으면 None을 반환함(확인 불가 — 호출부가 기존처럼"
+      " 보수적으로 '계측_비활성' 기본값으로 폴백하게 함)",
+      _bundle.resolve_observation_configured_active(_settings_path_11a_missing) is None)
+
+
+# ── 11B. 설정이 활성인데 상태 파일이 없으면 '계측_비활성'이 아니라
+#    '상태확인_불가'로 표시됨(지적 1번, 재현된 버그) — 실제 build()
+#    경로로 검증 ───────────────────────────────────────────────────
+_tmpdir11b = tempfile.mkdtemp()
+_orig_cwd11b = _os.getcwd()
+try:
+    _os.chdir(_tmpdir11b)
+    Path("logs").mkdir()
+    Path("config").mkdir()
+    (Path("config") / "settings.yaml").write_text(_active_settings_yaml_text_11, encoding="utf-8")
+    _day921b = datetime(2026, 9, 21).date()
+    (Path("logs") / "order_status_observations.jsonl").write_text("", encoding="utf-8")
+    # 상태 파일(obs.status.json)은 의도적으로 만들지 않음 — 재시작 직후
+    # 아직 첫 스냅샷을 쓰기 전이거나 파일이 삭제된 상황을 재현.
+
+    _bundle_path_11b = _bundle.build(_day921b, quiet=True)
+    check("11-4) 설정이 활성(account_scope_id 설정됨)인데 상태 파일이 없어도"
+          " 번들 생성은 예외 없이 성공함",
+          _bundle_path_11b is not None and _bundle_path_11b.exists())
+    with _zipfile.ZipFile(_bundle_path_11b) as z:
+        _cov11b_text = z.read("metadata/order_status_coverage.txt").decode("utf-8")
+        _manifest11b_text = z.read("MANIFEST.txt").decode("utf-8")
+    check("11-5) 커버리지 요약에 '계측_비활성'이 아니라 '상태확인_불가'로 표시됨"
+          "(재현된 버그: 예전엔 설정이 실제로 활성인데도 상태 파일 부재만으로"
+          " '관측 기능을 켠 적이 없다'고 오판했음)",
+          "observation_run_state(현재 실행 상태)   = 상태확인_불가" in _cov11b_text
+          and "observation_run_state(현재 실행 상태)   = 계측_비활성" not in _cov11b_text)
+    check("11-6) 커버리지 요약에 '설정(account_scope_id)은 활성화돼 있는 것으로"
+          " 확인됐지만' 경고 문구가 표시되어 '계측 비활성'과 혼동되지 않게 함",
+          "설정(account_scope_id)은 활성화돼 있는 것으로 확인됐지만" in _cov11b_text)
+    check("11-7) MANIFEST에도 observation_status_snapshot이 '없음(설정상 활성화"
+          " 확인됨 — 확인 필요)'로 표시됨",
+          "없음(설정상 활성화 확인됨 — 확인 필요)" in _manifest11b_text)
+finally:
+    _os.chdir(_orig_cwd11b)
+
+
+# ── 11C. 상태 파일에 잘못된 UTF-8 바이트가 있어도 번들 생성이 실패하지
+#    않음(지적 2번, 재현된 버그) ────────────────────────────────────
+_tmpdir11c_unit = tempfile.mkdtemp()
+_status_path_11c_unit = Path(_tmpdir11c_unit) / "obs.status.json"
+_status_path_11c_unit.write_bytes(b'{"clean_shutdown": null, "updated_at": "\xff\xfe bad utf8"}')
+_utf8_result, _utf8_existed = _bundle._read_running_status(_status_path_11c_unit)
+check("11-8) 잘못된 UTF-8 바이트가 있는 상태 파일을 읽어도 예외 없이 (None, True)를"
+      " 반환함(재현된 버그: 예전엔 UnicodeDecodeError가 그대로 전파돼 번들 생성"
+      " 자체가 실패했음)",
+      _utf8_result is None and _utf8_existed is True)
+
+_tmpdir11c = tempfile.mkdtemp()
+_orig_cwd11c = _os.getcwd()
+try:
+    _os.chdir(_tmpdir11c)
+    Path("logs").mkdir()
+    _day921c = datetime(2026, 9, 21).date()
+    _obs_path_11c = Path("logs") / "order_status_observations.jsonl"
+    _obs_path_11c.write_text("", encoding="utf-8")
+    _status_path_11c = _bundle.status_path_for(_obs_path_11c)
+    _status_path_11c.write_bytes(b'{"clean_shutdown": null, "updated_at": "\xff\xfe bad utf8"}')
+
+    _bundle_path_11c = _bundle.build(_day921c, quiet=True)
+    check("11-9) 상태 파일에 잘못된 UTF-8 바이트가 있어도 번들 생성 자체는 예외 없이"
+          " 성공함(재현된 버그: 예전엔 UnicodeDecodeError로 번들 생성이 통째로"
+          " 실패했음)",
+          _bundle_path_11c is not None and _bundle_path_11c.exists())
+    with _zipfile.ZipFile(_bundle_path_11c) as z:
+        _cov11c_text = z.read("metadata/order_status_coverage.txt").decode("utf-8")
+        _manifest11c_text = z.read("MANIFEST.txt").decode("utf-8")
+    check("11-10) 커버리지 요약에 '상태확인_불가'로 표시됨(손상을 '계측_비활성'과"
+          " 혼동하지 않음)",
+          "observation_run_state(현재 실행 상태)   = 상태확인_불가" in _cov11c_text)
+    check("11-11) MANIFEST에도 '손상'으로 표시됨", "손상" in _manifest11c_text)
+finally:
+    _os.chdir(_orig_cwd11c)
+
+
+# ── 11D. updated_at에 시간대(+09:00)가 포함돼도 TypeError 없이 판정됨
+#    (지적 3번, 재현된 버그) ────────────────────────────────────────
+_aware_now_iso_11d = datetime.now(_timezone(timedelta(hours=9))).isoformat()
+check("11-12) clean_shutdown=None이고 updated_at이 시간대(+09:00) 포함 최근 시각이면"
+      " TypeError 없이 '실행_중'으로 판정됨(재현된 버그: 예전엔 naive"
+      " datetime.now()와의 뺄셈에서 TypeError가 나 번들 생성 자체가 실패했음)",
+      _bundle._classify_run_state(
+          {"clean_shutdown": None, "updated_at": _aware_now_iso_11d}
+      ) == _bundle.RUN_STATE_RUNNING)
+
+_stale_aware_iso_11d = (
+    datetime.now(_timezone(timedelta(hours=9))) - timedelta(seconds=999)
+).isoformat()
+check("11-13) 같은 시간대 포함 형식이라도 오래된 시각이면 '종료_확인_불가'로 판정됨"
+      "(시간대 처리가 모든 경우를 무조건 '실행_중'으로 통과시키는 게 아님을 확인)",
+      _bundle._classify_run_state(
+          {"clean_shutdown": None, "updated_at": _stale_aware_iso_11d}
+      ) == _bundle.RUN_STATE_UNCLEAR_SHUTDOWN)
+
+_tmpdir11d = tempfile.mkdtemp()
+_orig_cwd11d = _os.getcwd()
+try:
+    _os.chdir(_tmpdir11d)
+    Path("logs").mkdir()
+    _day921d = datetime(2026, 9, 21).date()
+    _obs_path_11d = Path("logs") / "order_status_observations.jsonl"
+    _obs_path_11d.write_text("", encoding="utf-8")
+    _status_path_11d = _bundle.status_path_for(_obs_path_11d)
+    _status_path_11d.write_text(
+        _json.dumps({
+            "restart_id": "r11d", "clean_shutdown": None,
+            "updated_at": datetime.now(_timezone(timedelta(hours=9))).isoformat(),
+            "dropped_count": 0, "fsync_unconfirmed_count": 0,
+            "queue_full_dropped_count": 0, "file_healthy": True,
+        }),
+        encoding="utf-8",
+    )
+
+    _bundle_path_11d = _bundle.build(_day921d, quiet=True)
+    check("11-14) updated_at에 시간대가 포함돼 있어도 번들 생성 자체는 예외 없이"
+          " 성공함(재현된 버그: 예전엔 TypeError로 번들 생성이 통째로 실패했음)",
+          _bundle_path_11d is not None and _bundle_path_11d.exists())
+    with _zipfile.ZipFile(_bundle_path_11d) as z:
+        _cov11d_text = z.read("metadata/order_status_coverage.txt").decode("utf-8")
+    check("11-15) 커버리지 요약에 '실행_중'으로 정상 판정됨(최근 시각이므로) —"
+          " TypeError를 피하려고 무조건 '상태확인_불가'로 뭉뚱그리지 않았음을 확인",
+          "observation_run_state(현재 실행 상태)   = 실행_중" in _cov11d_text)
+finally:
+    _os.chdir(_orig_cwd11d)
+
+
 print(f"\n총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
 if failed:
     sys.exit(1)
