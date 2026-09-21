@@ -2895,3 +2895,129 @@ FIFO/손익 계산, RiskManager/DailyReporter 연결, API 조회 빈도 확대�
 - `kiwoom_auto_trader_priority1_stage4_followup_changed_files_20260921.zip`
   — 실제 변경된 3개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
   폴더 경로 유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 우선순위1 4차 보완 재보완 — "설정 확인 불가"를 "명시적 비활성"과 혼동하지 않도록 정정 (2026-09-21)
+
+### 배경
+
+위 "우선순위1 4차 보완"(패치 0076~0078) 전달 후, 민우님이 전달한
+재검토에서 세 가지 재현 오류(설정 활성+상태 파일 없음, 잘못된 UTF-8
+상태 파일, 시간대 포함 `updated_at`)는 모두 해결로 확인됐지만, 그
+수정 안에서 새 회귀가 하나 발견됐습니다. 민우님의 지시는 다음과
+같습니다.
+
+> 이번 세 가지 수정은 검증됐습니다. 마지막으로 상태 파일이 없을 때
+> `observation_configured_active=None`을 `상태확인_불가`로
+> 바꿔주세요. `False`만 `계측_비활성`으로 판정해야 합니다. 설정
+> 파일 누락·파싱 실패를 실제 `build()`로 검증하고, 기존 테스트의
+> 잘못된 기대값과 "확인 불가도 비활성으로 처리한다"는 설명을 함께
+> 정정해주세요. 그 외 범위는 유지해주세요.
+
+### 문제
+
+4차 보완에서 처음 구현한 `_classify_run_state()`는 상태 파일이
+없을 때 `observation_configured_active`가 `False`(설정을 읽었고
+명시적으로 `account_scope_id` 미설정을 확인)인 경우와 `None`(설정
+파일이 없거나 읽기/파싱에 실패해 활성 여부를 아예 확인할 수 없는
+경우)을 **똑같이** "계측_비활성"으로 판정했습니다. 그러나 이 둘은
+전혀 다른 사실입니다 — "설정을 읽었고 꺼져있음을 확인했다"와
+"설정을 아예 못 읽어서 모른다"를 같은 값으로 취급하면, 실제로는
+`account_scope_id`가 설정돼 있었는데 설정 파일이 배포 과정에서
+누락되거나 손상된 상황을 "관측 기능을 켠 적이 없다"로 조용히
+가리게 됩니다.
+
+### 변경 내용
+
+1. **`_classify_run_state()` 정정 (`export_daily_bundle.py`)**:
+   상태 파일이 없을 때 `observation_configured_active`가 정말로
+   `False`로 확인된 경우에만 "계측_비활성"을 반환하도록 수정.
+   `True`(활성 확인)뿐 아니라 `None`(확인 불가)도 모두
+   "상태확인_불가"로 판정합니다.
+2. **`build_order_status_summary()`의 안내 문구 3분기 (`export_daily_bundle.py`)**:
+   "명시적 비활성 확인"(기존 문구 유지) / "활성 확인됐지만 파일
+   없음"(기존 문구 유지) / "설정 확인 불가(파일 없음 또는 파싱
+   실패)"(신규 문구 — 설정 파일과 기록기 상태를 직접 확인하라고
+   안내)로 나눠 표시합니다.
+3. **`build()`의 MANIFEST `observation_status_snapshot` 표시 3분기
+   (`export_daily_bundle.py`)**: "없음(설정상 활성화 확인됨 — 확인
+   필요)" / "없음"(명시적 비활성) / "없음(설정 확인 불가 — 확인
+   필요)"(신규)로 구분합니다.
+4. **`resolve_observation_configured_active()` 문서 정정
+   (`export_daily_bundle.py`)**: 이 함수의 `None` 반환값을 호출부가
+   더 이상 "비활성으로 보수적 폴백"시키지 않는다는 점을 docstring에
+   명시했습니다(함수 자체의 반환값 로직은 변경 없음 — 여전히 설정을
+   읽었고 명시적으로 비어있으면 `False`, 못 읽으면 `None`).
+5. **기존 테스트의 잘못된 기대값 정정
+   (`test_order_status_evidence_observation.py`)**: 4차 보완에서
+   작성한 테스트 9-9와 10-8이 `_classify_run_state(None)`(즉
+   `observation_configured_active`를 지정하지 않아 기본값 `None`)을
+   "계측_비활성"으로 기대하고 있었습니다 — 이는 이번에 고친 바로 그
+   버그를 검증 없이 통과시키던 잘못된 기대값이었습니다. 9-9는
+   `observation_configured_active=False`를 명시한 케이스로 남기고,
+   그 옆에 기본값(`None`)이 이제 "상태확인_불가"가 됨을 확인하는
+   9-9b를 추가했습니다. 10-8도 동일하게 10-8/10-8b로 분리했습니다.
+   11-3의 설명 문구도 "확인 불가 시 계측_비활성으로 폴백"이라는
+   낡은 설명을 정정했습니다.
+6. **신규 build() 경로 검증 그룹 12(12A~12C, 9건)
+   (`test_order_status_evidence_observation.py`)**: 지시대로 설정
+   파일 누락·파싱 실패를 실제 `build()`로 검증합니다. 12A는
+   `config/` 디렉터리 자체가 없는 경우, 12B는 `config/settings.yaml`
+   이 있지만 파싱 불가(깨진 YAML)한 경우 — 둘 다 커버리지 요약에
+   "계측_비활성"이 아니라 "상태확인_불가"로 표시되는지 확인합니다.
+   12C는 대조군으로, 설정이 정상 로드되고 `account_scope_id`가
+   명시적으로 비어있는 경우에는 여전히 "계측_비활성"으로 표시되어
+   이번 수정이 모든 경우를 "상태확인_불가"로 뭉뚱그리지 않음을
+   확인합니다.
+
+### 테스트 및 검증
+
+- `test_order_status_evidence_observation.py`: **166/166 통과**
+  (기존 155건 중 9-9/10-8 2건을 정정하고 각각 파생 케이스(9-9b,
+  10-8b)를 추가 + 신규 그룹 12의 9건).
+- 전체 회귀(`run_regression_tests.py`): **39/40 통과** — 유일한
+  실패는 이전 라운드부터 동일한 `test_broker_order_status.py`의
+  fixture 누락이며 이번 변경과 무관.
+- `legacy_tests/test_entry_watch.py`: **11/11 통과**.
+- 검증 절차: fresh clone에 0051~0075 → 이번 0079~0081을 순서대로
+  `git am`한 뒤 위 세 검증을 모두 재실행해 동일한 결과를
+  확인했습니다(아래 "전달 파일" 참고).
+
+### 변경하지 않은 것
+
+- API 조회 정책, PSM 상태 전이 판정, 주문 접수·리스크 게이트 —
+  전혀 건드리지 않았습니다.
+- 손익 계산(FIFO 매칭, 확정 손익), B(확정 체결 키) 설계 — 계속
+  제외합니다.
+- 4차 보완에서 해결된 UTF-8 디코딩 예외 처리, 시간대 포함
+  `updated_at` 비교 — 이번 라운드에서 다시 손대지 않았습니다(회귀
+  테스트로만 재확인).
+- 3차 보완의 격리 파일 정상 레코드 복원, 익일 관측 근거 raw 파일
+  생성 — 무변경.
+
+### 다음 작업
+
+1. `test_broker_order_status.py`의 fixture 디렉터리(`tests/fixtures/
+   order_reconciliation/`)가 저장소에 커밋돼 있는지 확인 — 여섯
+   라운드 연속 동일하게 누락 보고되고 있음(이번 라운드와 무관).
+2. `상태확인_불가`가 나타나면(파일 손상, 시간대 비교 불가, 설정
+   확인 불가, 또는 설정 활성인데 파일 없음 등) "관측 기능이 꺼져
+   있다"는 뜻이 아니므로, 설정 파일과 `*.status.json` 파일을 직접
+   확인해야 합니다.
+3. (1~4차 보완 완료 확인 후) 관측 데이터 커버리지가 실제 운영에서
+   충분한 수준에 도달하는지 며칠 지켜본 뒤, B(확정 체결 키)·FIFO
+   손익 연결 설계를 별도로 요청 가능 — 이번 라운드 범위 밖.
+
+### 전달 파일
+
+- 패치(0051~0078이 적용된 트리 기준으로 이어서 적용):
+  - `0079-fix-export-daily-bundle-configured-active-unreadable-distinction.patch`
+    — `export_daily_bundle.py`
+  - `0080-test-order-status-evidence-observation-round6.patch` —
+    `test_order_status_evidence_observation.py`
+  - `0081-docs-CHANGELOG-v1.7-priority1-stage4-followup-correction.patch`
+    — 이 CHANGELOG
+- `kiwoom_auto_trader_priority1_stage4_followup_correction_changed_files_20260921.zip`
+  — 실제 변경된 3개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
+  폴더 경로 유지한 채 담음.
