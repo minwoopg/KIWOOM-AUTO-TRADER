@@ -749,16 +749,54 @@ def _read_running_status(status_path: Path) -> tuple[dict | None, bool]:
     (관측 기능을 켠 적이 없음)으로 오표시됐습니다. 이제 두 번째 값으로
     "파일이 실제로 존재했는가"를 함께 반환해 호출부가 구분할 수 있게
     합니다. 이 exporter는 읽기 전용이라 손상돼 있어도 복구를 시도하지
-    않습니다(원본 기록기 쪽 책임)."""
+    않습니다(원본 기록기 쪽 책임).
+
+    2026-09-21 4차 재검토 반영(지적 2번, 재현된 버그): 상태 파일에
+    유효하지 않은 UTF-8 바이트가 있으면 `read_text(encoding="utf-8")`가
+    `UnicodeDecodeError`(← `ValueError`의 하위 클래스이며 `OSError`가
+    아님)를 던져 이 함수가 그대로 예외를 전파했고, 그 결과 **번들
+    생성 자체가 실패**했습니다 — 진단용 스냅샷 파일 하나의 손상이
+    번들 전체를 막아서는 안 됩니다. `UnicodeDecodeError`도 명시적으로
+    잡아 "파일은 있지만 읽을 수 없음"(existed=True)으로 처리합니다."""
     if not status_path.exists():
         return None, False
     try:
         data = json.loads(status_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None, True
     if not isinstance(data, dict):
         return None, True
     return data, True
+
+
+def resolve_observation_configured_active(
+    settings_path: str | Path = "config/settings.yaml",
+) -> bool | None:
+    """실제 설정에서 체결조회 증거 관측 기능이 활성화되도록 구성됐는지
+    (`account_scope_id` 설정 여부)를 읽습니다(2026-09-21 4차 재검토
+    반영, 지적 1번).
+
+    반환: `True`(설정에서 `account_scope_id`가 채워져 있음을 확인 —
+    활성 구성 확인) / `False`(설정을 읽었고 `account_scope_id`가
+    비어있음을 확인 — 비활성 구성 확인) / `None`(설정 파일이 없거나
+    읽기 실패 — 이 exporter는 독립 실행 스크립트라 테스트·수동 실행
+    환경에는 설정 파일이 아예 없을 수 있으므로, 이 경우는 "비활성"으로
+    단정하지 않고 호출부가 기존처럼 보수적으로 처리하게 합니다).
+
+    재현된 버그: 기존에는 실행 상태 스냅샷 파일이 없으면 무조건
+    "계측_비활성"으로 표시했는데, `account_scope_id`가 실제로 설정돼
+    관측이 활성화된 상태에서도(예: 재시작 직후 아직 첫 스냅샷을 쓰기
+    전, 또는 스냅샷 파일이 외부에서 삭제된 경우) 이 파일 하나가
+    없다는 이유만으로 "관측 기능을 켠 적이 없다"고 오판했습니다.
+    이 함수가 반환하는 값으로 `_classify_run_state()`가 "명시적으로
+    비활성이 확인된 경우"와 "활성인데 확인 불가한 경우"를 구분합니다.
+    """
+    try:
+        from config.settings import load_settings as _load_settings
+        settings = _load_settings(settings_path)
+        return bool(str(settings.broker.account_scope_id or "").strip())
+    except Exception:
+        return None
 
 
 RUN_STATE_DISABLED = "계측_비활성"
@@ -771,14 +809,24 @@ RUN_STATE_STATUS_UNREADABLE = "상태확인_불가"
 def _classify_run_state(
     run_status: dict | None, *, stale_after_sec: float = 120.0,
     status_file_existed: bool = False,
+    observation_configured_active: bool | None = None,
 ) -> str:
     """실행 상태 스냅샷으로부터 5가지 상태 중 하나를 판정합니다
     (2026-09-18 재재검토 반영, 지적 5번의 "실행 중/정상 종료/종료
     확인 불가/계측 비활성" 구분에 2026-09-21 3차 재검토(지적 2번)로
-    "상태확인_불가"를 추가).
+    "상태확인_불가"를 추가, 2026-09-21 4차 재검토(지적 1번)로
+    `observation_configured_active` 구분을 추가).
 
-    - 스냅샷 자체가 없음(`status_file_existed=False`) → "계측_비활성"
-      (관측 기능이 시작된 적 없음 — account_scope_id 미설정 등).
+    - 스냅샷 자체가 없음(`status_file_existed=False`):
+      - `observation_configured_active`가 `False`(설정에서 명시적으로
+        `account_scope_id` 미설정을 확인) 또는 `None`(설정을 읽을 수
+        없어 확인 불가 — 기존과 동일한 보수적 기본값)이면 "계측_비활성".
+      - `observation_configured_active`가 `True`(설정에서 관측이
+        활성화돼 있음을 확인)면 "상태확인_불가"(재현된 버그: 예전엔
+        설정이 실제로 활성인데도 스냅샷 파일 하나가 없다는 이유만으로
+        "관측 기능을 켠 적이 없다"로 오판했습니다 — 재시작 직후 아직
+        첫 스냅샷을 쓰기 전이거나 파일이 외부에서 삭제된 경우일 수
+        있습니다).
     - 스냅샷 파일은 있었지만 읽지 못함(JSON 손상 등, `run_status is
       None`인데 `status_file_existed=True`) → "상태확인_불가"
       (재현된 버그: 예전엔 이 경우도 "계측_비활성"으로 잘못 표시돼
@@ -788,8 +836,12 @@ def _classify_run_state(
       "정상_종료"/"종료_확인_불가"로 반영(종료 배선을 실제로 탄 뒤의
       결과이므로 가장 신뢰도가 높음).
     - `clean_shutdown`이 아직 None(종료 배선을 타지 않음)인데
-      `updated_at`을 파싱할 수 없거나(형식 오류) **미래 시각**이면
-      → "상태확인_불가"(재현된 버그: 예전엔 미래 시각도
+      `updated_at`을 파싱할 수 없거나, 시간대가 달라 현재 시각과
+      비교할 수 없거나(재현된 버그: 예전엔 `updated_at`이 시간대
+      정보를 포함하면 `datetime.now()`(naive)와의 뺄셈에서
+      `TypeError`가 나 번들 생성 자체가 실패했습니다 — 이제
+      `updated_at`과 같은 시간대 기준으로 비교합니다), **미래 시각**
+      이면 → "상태확인_불가"(재현된 버그: 예전엔 미래 시각도
       `datetime.now() - updated_at`이 음수가 돼 항상 stale_after_sec
       이하로 판정돼 "실행_중"으로 잘못 통과했습니다 — 미래 시각은
       시계 오차든 파일 손상이든 정상 신호로 볼 수 없습니다).
@@ -802,7 +854,11 @@ def _classify_run_state(
       갱신되지 않음).
     """
     if run_status is None:
-        return RUN_STATE_STATUS_UNREADABLE if status_file_existed else RUN_STATE_DISABLED
+        if status_file_existed:
+            return RUN_STATE_STATUS_UNREADABLE
+        if observation_configured_active is True:
+            return RUN_STATE_STATUS_UNREADABLE
+        return RUN_STATE_DISABLED
     cs = run_status.get("clean_shutdown")
     if cs is True:
         return RUN_STATE_CLEAN_SHUTDOWN
@@ -817,7 +873,14 @@ def _classify_run_state(
             updated_dt = None
     if updated_dt is None:
         return RUN_STATE_STATUS_UNREADABLE
-    age_sec = (datetime.now() - updated_dt).total_seconds()
+    try:
+        now = datetime.now(updated_dt.tzinfo) if updated_dt.tzinfo is not None else datetime.now()
+        age_sec = (now - updated_dt).total_seconds()
+    except (TypeError, ValueError, OverflowError):
+        # updated_dt와 현재 시각을 비교할 수 없는 형식(예: 지원하지
+        # 않는 시간대 조합) — 정상 신호로 볼 수 없으므로 확인 불가로
+        # 판정하고, 예외를 전파해 번들 생성 자체를 막지 않습니다.
+        return RUN_STATE_STATUS_UNREADABLE
     if age_sec < 0:
         # 미래 시각 — 시계 오차든 파일 손상이든 정상 신호로 볼 수 없음.
         return RUN_STATE_STATUS_UNREADABLE
@@ -836,6 +899,7 @@ def build_order_status_summary(
     status_file_existed: bool = False,
     order_day_extra_count: int = 0,
     aggregation_computed_at: str | None = None,
+    observation_configured_active: bool | None = None,
 ) -> str:
     """체결조회 증거 저장·커버리지 요약(2026-09-18 지적 2/3/4번 반영,
     2026-09-18 재검토에서 3번/2번 재보완).
@@ -901,7 +965,10 @@ def build_order_status_summary(
         L.append("observation_write_id_conflict_count    = 0")
 
     L.append("")
-    run_state = _classify_run_state(run_status, status_file_existed=status_file_existed)
+    run_state = _classify_run_state(
+        run_status, status_file_existed=status_file_existed,
+        observation_configured_active=observation_configured_active,
+    )
     L.append(f"observation_run_state(현재 실행 상태)   = {run_state}")
     if run_status:
         L.append(
@@ -925,6 +992,16 @@ def build_order_status_summary(
                   "(JSON 손상, dict 아님, 또는 updated_at이 파싱 불가/미래 시각) —")
         L.append("      이 사실만으로 관측 기능이 비활성이라고 판단하면 안 됩니다."
                   " 파일을 직접 열어 확인하세요.")
+    elif observation_configured_active is True:
+        # 2026-09-21 4차 재검토 반영(지적 1번, 재현된 버그): 설정에서
+        # account_scope_id가 실제로 채워져 있음을 확인했는데도 스냅샷
+        # 파일이 없다는 이유만으로 "계측_비활성"(기능을 켠 적 없음)
+        # 이라고 판단하면 안 됩니다 — 재시작 직후 아직 첫 스냅샷을
+        # 쓰기 전이거나, 파일이 외부에서 삭제/이동됐을 수 있습니다.
+        L.append("    ⚠ 설정(account_scope_id)은 활성화돼 있는 것으로 확인됐지만"
+                  " 실행 상태 스냅샷 파일이 없습니다 — 기록기가 아직 시작되지")
+        L.append("      않았거나(재시작 직후) 파일이 삭제·이동됐을 수 있습니다."
+                  " '계측 비활성'과 혼동하지 마세요.")
     else:
         L.append("    ⚠ 실행 상태 스냅샷 파일이 없습니다 — 관측 기능이 비활성"
                   "(account_scope_id 미설정)이었거나 기록기가 아직 한 번도 시작된"
@@ -1707,10 +1784,16 @@ def build(
         # 반환값(status_file_existed)도 함께 받습니다.
         obs_status_path = status_path_for(obs_src)
         run_status, status_file_existed = _read_running_status(obs_status_path)
+        # 2026-09-21 4차 재검토 반영(지적 1번): 스냅샷 파일이 없을 때
+        # "계측_비활성"으로 단정하기 전에, 실제 설정에서 account_scope_id가
+        # 활성화돼 있는지를 먼저 확인합니다.
+        observation_configured_active = resolve_observation_configured_active(settings_path)
         if run_status is not None:
             status_display = "있음"
         elif status_file_existed:
             status_display = "손상(있지만 읽을 수 없음)"
+        elif observation_configured_active is True:
+            status_display = "없음(설정상 활성화 확인됨 — 확인 필요)"
         else:
             status_display = "없음"
         manifest.append(
@@ -1784,6 +1867,7 @@ def build(
             status_file_existed=status_file_existed,
             order_day_extra_count=len(order_day_extra_records),
             aggregation_computed_at=aggregation_computed_at,
+            observation_configured_active=observation_configured_active,
         )
         (work / "order_status_coverage.txt").write_text(order_status_summary, encoding="utf-8")
 
