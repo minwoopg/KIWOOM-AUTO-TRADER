@@ -56,7 +56,8 @@ from infra.broker.kiwoom_order_status import (
 from infra.broker.kiwoom_broker import KiwoomBroker
 from infra.storage.order_status_observation_store import (
     COVERAGE_DISABLED, OrderStatusObservation, OrderStatusObservationRecorder,
-    build_entry_evidence, compute_coverage, dedupe_by_write_id, resolve_env,
+    build_entry_evidence, compute_coverage, dedupe_by_write_id,
+    find_quarantined_observation_files, resolve_env,
 )
 from infra.storage.run_baseline import resolve_env_from_baseline_row
 from config.settings import BrokerConfig
@@ -1407,6 +1408,281 @@ _resolved_path, _loaded_from_settings = _bundle.resolve_order_status_observation
 )
 check("9-22) 설정 파일을 읽을 수 없으면 폴백하고(두 번째 반환값 False), 예외를 던지지 않음",
       _loaded_from_settings is False and _resolved_path == _bundle._default_order_status_observation_log_path())
+
+
+# ══════════════════════════════════════════════════════════════
+# 10. 2026-09-21 3차 재검토(GPT 3차) 3개 지적 사항 재현
+#    ①격리 파일의 정상 관측이 집계·번들에서 사라짐
+#    ②상태 파일 손상/미래 시각이 '계측_비활성'/'실행_중'으로 오표시
+#    ③주문일 커버리지에 쓰인 익일 관측의 번들 내 근거 부재
+# ══════════════════════════════════════════════════════════════
+
+# ── 10A. 격리된 파일의 정상 관측이 집계·번들에 다시 나타남(지적 1번,
+#    재현된 버그) — 9A와 동일한 방식(부분 쓰기 실패 → truncate 복구도
+#    실패)으로 실제 recorder를 통해 진짜 격리 파일을 만든 뒤, 격리
+#    직전까지 쌓여있던 정상 레코드(OIDQ1)와 격리 후 새 파일에 쓰인
+#    레코드(OIDQ2)가 exporter의 raw/커버리지 양쪽에 모두 나타나는지
+#    확인한다.
+_tmpdir10a = tempfile.mkdtemp()
+_orig_cwd10a = _os.getcwd()
+try:
+    _os.chdir(_tmpdir10a)
+    Path("logs").mkdir()
+    _day919 = datetime(2026, 9, 19).date()
+    _day919_compact = _day919.strftime("%Y%m%d")
+    _q_obs_path = Path("logs") / "order_status_observations.jsonl"
+
+    with (Path("logs") / "trades.csv").open("w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=TRADE_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        w.writerow({
+            "timestamp": "2026-09-19T09:00:00", "symbol": "005930", "side": "BUY",
+            "quantity": 10, "price": 10000, "accepted": "True", "message": "ok",
+            "order_id": "OIDQ1",
+        })
+        w.writerow({
+            "timestamp": "2026-09-19T09:10:00", "symbol": "005930", "side": "BUY",
+            "quantity": 10, "price": 10000, "accepted": "True", "message": "ok",
+            "order_id": "OIDQ2",
+        })
+
+    with (Path("logs") / "run_baseline.csv").open("w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=RUN_BASELINE_FIELDS)
+        w.writeheader()
+        w.writerow({
+            "run_id": "run-10a", "started_at": "2026-09-19T08:30:00+09:00",
+            "git_sha": "abc123", "git_dirty": "False",
+            "effective_config_hash": "hash1", "is_mock": "False",
+            "is_paper_trading": "False", "python_version": "3.11.0",
+            "account_scope_id": "acct-10a",
+        })
+
+    _q_recorder = OrderStatusObservationRecorder(str(_q_obs_path), shutdown_drain_timeout_sec=1.0)
+
+    _healthy_before_quarantine = OrderStatusObservation(
+        query_id="q-before", started_at="2026-09-19T09:00:00", finished_at="2026-09-19T09:00:01",
+        account_scope_id="acct-10a", env="kiwoom_real", symbol="005930",
+        requested_order_id="OIDQ1", side_context="BUY_PENDING", query_kind="BUY_PENDING",
+        pending_age_sec_at_query=31.0, outcome="success", psm_broker_status="FILLED",
+        filled_price_parsed=10000, order_accepted_at="2026-09-19T09:00:00",
+        write_id="w-before", restart_id="rq", seq_no=1,
+    )
+    _q_recorder._write_one(_healthy_before_quarantine)  # 격리 직전까지의 "정상" 레코드
+
+    _q_call_count = {"n": 0}
+
+    def _flaky_open_for_quarantine(self, *args, **kwargs):
+        _q_call_count["n"] += 1
+        n = _q_call_count["n"]
+        if self == _q_obs_path and n == 1:
+            real_f = _real_path_open(self, *args, **kwargs)
+
+            class _PartialWriteFile10a:
+                def write(_self, data):
+                    real_f.write(data[: max(1, len(data) // 2)])
+                    raise OSError("simulated partial write failure(테스트 전용, 10A)")
+
+                def flush(_self):
+                    real_f.flush()
+
+                def fileno(_self):
+                    return real_f.fileno()
+
+                def close(_self):
+                    real_f.close()
+
+                def __enter__(_self):
+                    return _self
+
+                def __exit__(_self, exc_type, exc, tb):
+                    _self.close()
+                    return False
+
+            return _PartialWriteFile10a()
+        if self == _q_obs_path and n == 2:
+            raise OSError("simulated truncate failure(테스트 전용, 10A)")
+        return _real_path_open(self, *args, **kwargs)
+
+    _poison10a = dataclasses.replace(
+        _dummy, write_id="poison", query_id="poison", started_at="2026-09-19T09:05:00",
+    )
+    with mock.patch.object(Path, "open", _flaky_open_for_quarantine):
+        _q_recorder._write_one(_poison10a)
+    # truncate까지 실패했으므로 파일이 격리되고 같은 경로에 새 파일로 전환됨.
+    _healthy_after_quarantine = dataclasses.replace(
+        _healthy_before_quarantine, write_id="w-after", query_id="q-after",
+        requested_order_id="OIDQ2",
+    )
+    _q_recorder._write_one(_healthy_after_quarantine)  # 격리 후 새 파일에 쓰인 정상 레코드
+
+    _found_quarantine_files = find_quarantined_observation_files(_q_obs_path)
+    check("10-1) find_quarantined_observation_files()가 실제로 격리된 파일을 정확히 찾음",
+          len(_found_quarantine_files) == 1)
+
+    _bundle_path_10a = _bundle.build(_day919, quiet=True)
+    check("10-2) 격리 파일이 있어도 번들 생성 자체는 예외 없이 성공함",
+          _bundle_path_10a is not None and _bundle_path_10a.exists())
+
+    with _zipfile.ZipFile(_bundle_path_10a) as z:
+        _manifest10a = z.read("MANIFEST.txt").decode("utf-8")
+        _raw10a_name = f"raw/order_status_observations_{_day919_compact}.jsonl"
+        _raw10a_text = z.read(_raw10a_name).decode("utf-8") if _raw10a_name in z.namelist() else ""
+        _cov10a_text = z.read("metadata/order_status_coverage.txt").decode("utf-8")
+
+    check("10-3) 격리 직전까지의 정상 레코드(OIDQ1)가 raw 슬라이스에 다시 나타남"
+          "(재현된 버그: 예전엔 격리된 파일의 정상 레코드가 집계·번들에서 그냥 사라졌음)",
+          "OIDQ1" in _raw10a_text)
+    check("10-4) 격리 후 새 파일에 쓰인 레코드(OIDQ2)도 raw 슬라이스에 정상적으로 나타남",
+          "OIDQ2" in _raw10a_text)
+    check("10-5) MANIFEST에 격리 파일 발견 사실과 복구 건수가 표시됨",
+          "격리된 손상 파일 1건" in _manifest10a and "정상 레코드 1건을 이 raw에 포함" in _manifest10a)
+    check("10-6) 커버리지 요약에 OIDQ1/OIDQ2 둘 다 반영돼 관측된 고유 주문이 2건임"
+          "(격리 파일의 정상 레코드가 집계에서 빠졌다면 1건으로만 나왔을 것)",
+          "observed_unique_orders         = 2" in _cov10a_text)
+finally:
+    _os.chdir(_orig_cwd10a)
+
+
+# ── 10B. 상태 파일 손상/미래 시각이 '계측_비활성'/'실행_중'으로
+#    오표시되지 않음(지적 2번, 재현된 버그) ──────────────────────
+check("10-7) 상태 파일이 있지만 손상(JSON 파싱 불가)됐으면 '계측_비활성'이 아니라"
+      " '상태확인_불가'로 판정됨(재현된 버그: 예전엔 손상도 '계측_비활성'과"
+      " 구분되지 않았음)",
+      _bundle._classify_run_state(None, status_file_existed=True)
+      == _bundle.RUN_STATE_STATUS_UNREADABLE)
+check("10-8) 상태 파일이 아예 없으면 여전히 '계측_비활성'(기존 동작 그대로 유지)",
+      _bundle._classify_run_state(None, status_file_existed=False)
+      == _bundle.RUN_STATE_DISABLED)
+
+_future_iso10b = (datetime.now() + timedelta(seconds=999)).isoformat()
+check("10-9) clean_shutdown=None인데 updated_at이 미래 시각이면 '실행_중'으로 잘못"
+      " 통과하지 않고 '상태확인_불가'로 판정됨(재현된 버그: 예전엔"
+      " datetime.now()-updated_at이 음수가 돼 stale_after_sec 이하로 판정되면서"
+      " 항상 '실행_중'으로 통과했음)",
+      _bundle._classify_run_state({"clean_shutdown": None, "updated_at": _future_iso10b})
+      == _bundle.RUN_STATE_STATUS_UNREADABLE)
+check("10-10) clean_shutdown=None인데 updated_at 자체가 파싱 불가한 문자열이면"
+      " '상태확인_불가'로 판정됨(예전엔 '종료_확인_불가'로 뭉뚱그려졌음)",
+      _bundle._classify_run_state({"clean_shutdown": None, "updated_at": "이런-시각-아님"})
+      == _bundle.RUN_STATE_STATUS_UNREADABLE)
+
+_tmpdir10b = tempfile.mkdtemp()
+_status_path_10b = Path(_tmpdir10b) / "obs.status.json"
+_missing_result, _missing_existed = _bundle._read_running_status(_status_path_10b)
+check("10-11) 상태 파일이 아예 없으면 (None, False)를 반환함",
+      _missing_result is None and _missing_existed is False)
+
+_status_path_10b.write_text("이건 JSON이 아님{{{", encoding="utf-8")
+_corrupt_result, _corrupt_existed = _bundle._read_running_status(_status_path_10b)
+check("10-12) 상태 파일이 있지만 JSON 파싱에 실패하면 (None, True)를 반환함"
+      "(재현된 버그: 예전엔 '파일 없음'과 '파일은 있지만 손상' 둘 다 그냥 None"
+      " 하나로 뭉뚱그려졌음)",
+      _corrupt_result is None and _corrupt_existed is True)
+
+_tmpdir10b2 = tempfile.mkdtemp()
+_orig_cwd10b2 = _os.getcwd()
+try:
+    _os.chdir(_tmpdir10b2)
+    Path("logs").mkdir()
+    _day920 = datetime(2026, 9, 20).date()
+    _obs_path_10b2 = Path("logs") / "order_status_observations.jsonl"
+    _obs_path_10b2.write_text("", encoding="utf-8")
+    _status_path_10b2 = _bundle.status_path_for(_obs_path_10b2)
+    _status_path_10b2.write_text("{{{손상된 JSON", encoding="utf-8")
+
+    _bundle_path_10b2 = _bundle.build(_day920, quiet=True)
+    check("10-13) 상태 스냅샷 파일이 손상돼 있어도 번들 생성 자체는 예외 없이 성공함",
+          _bundle_path_10b2 is not None and _bundle_path_10b2.exists())
+    with _zipfile.ZipFile(_bundle_path_10b2) as z:
+        _cov10b2_text = z.read("metadata/order_status_coverage.txt").decode("utf-8")
+        _manifest10b2_text = z.read("MANIFEST.txt").decode("utf-8")
+    check("10-14) 커버리지 요약에 '계측_비활성'이 아니라 '상태확인_불가'로 표시됨"
+          "(재현된 버그: 예전엔 상태 파일 손상이 '관측 기능을 켠 적 없음'으로"
+          " 오해될 수 있었음)",
+          "observation_run_state(현재 실행 상태)   = 상태확인_불가" in _cov10b2_text
+          and "observation_run_state(현재 실행 상태)   = 계측_비활성" not in _cov10b2_text)
+    check("10-15) MANIFEST에도 상태 스냅샷이 '있음'/'없음'이 아니라 '손상'으로 표시됨",
+          "손상" in _manifest10b2_text)
+finally:
+    _os.chdir(_orig_cwd10b2)
+
+
+# ── 10C. 주문일 커버리지에 쓰인 익일 관측의 번들 내 근거(지적 3번,
+#    재현된 버그) — 9/19 접수 주문(OIDX1)을 9/20에 조회한 경우, 9/19
+#    번들에 그 근거가 되는 raw 파일이 실제로 포함되는지 확인한다.
+_tmpdir10c = tempfile.mkdtemp()
+_orig_cwd10c = _os.getcwd()
+try:
+    _os.chdir(_tmpdir10c)
+    Path("logs").mkdir()
+    _day_10c = datetime(2026, 9, 19).date()
+    _day_10c_compact = _day_10c.strftime("%Y%m%d")
+
+    with (Path("logs") / "trades.csv").open("w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=TRADE_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        w.writerow({
+            "timestamp": "2026-09-19T09:10:00", "symbol": "005930", "side": "BUY",
+            "quantity": 10, "price": 10000, "accepted": "True", "message": "ok",
+            "order_id": "OIDX1",
+        })
+
+    with (Path("logs") / "run_baseline.csv").open("w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=RUN_BASELINE_FIELDS)
+        w.writeheader()
+        w.writerow({
+            "run_id": "run-10c", "started_at": "2026-09-19T08:30:00+09:00",
+            "git_sha": "abc123", "git_dirty": "False",
+            "effective_config_hash": "hash1", "is_mock": "False",
+            "is_paper_trading": "False", "python_version": "3.11.0",
+            "account_scope_id": "acct-10c",
+        })
+
+    _cross_day_obs = {
+        "query_id": "q-oidx1", "started_at": "2026-09-20T09:00:00",
+        "finished_at": "2026-09-20T09:00:01", "account_scope_id": "acct-10c",
+        "env": "kiwoom_real", "symbol": "005930", "requested_order_id": "OIDX1",
+        "side_context": "BUY_PENDING", "query_kind": "BUY_PENDING",
+        "pending_age_sec_at_query": 31.0, "outcome": "success",
+        "failure_stage": None, "error_repr": None,
+        "psm_broker_status": "FILLED", "filled_price_parsed": 10000,
+        "cntr_matches": [], "oso_matches": [], "cntr_match_count": 0, "oso_match_count": 0,
+        "base_quantity_before_order": 0, "target_quantity_after_order": 10,
+        "journal_linked": False, "order_accepted_at": "2026-09-19T09:10:00",
+        "write_id": "w-oidx1", "restart_id": "r10c", "seq_no": 1, "schema_version": 1,
+    }
+    with (Path("logs") / "order_status_observations.jsonl").open("w", encoding="utf-8") as f:
+        f.write(_json.dumps(_cross_day_obs) + "\n")
+
+    _bundle_path_10c = _bundle.build(_day_10c, quiet=True)
+    check("10-16) 익일 조회 관측이 있어도 번들 생성이 예외 없이 성공함",
+          _bundle_path_10c is not None and _bundle_path_10c.exists())
+
+    with _zipfile.ZipFile(_bundle_path_10c) as z:
+        _names_10c = z.namelist()
+        _extra_name_10c = f"raw/order_status_observations_orderday_extra_{_day_10c_compact}.jsonl"
+        check("10-17) 주문일 커버리지의 익일 근거 raw 파일이 실제로 번들에 포함됨"
+              "(재현된 버그: 예전엔 이 근거가 번들 어디에도 없었음)",
+              _extra_name_10c in _names_10c)
+        _extra_text_10c = z.read(_extra_name_10c).decode("utf-8") if _extra_name_10c in _names_10c else ""
+        check("10-18) 그 근거 파일에 실제로 OIDX1 관측이 담겨 있음",
+              "OIDX1" in _extra_text_10c)
+        _main_raw_10c = f"raw/order_status_observations_{_day_10c_compact}.jsonl"
+        _main_raw_text_10c = z.read(_main_raw_10c).decode("utf-8") if _main_raw_10c in _names_10c else ""
+        check("10-19) 반면 조회일(9/19) raw 슬라이스에는 이 관측이 없음(9/20에 조회됐으므로)"
+              " — 그래서 근거 파일이 별도로 필요했던 것",
+              "OIDX1" not in _main_raw_text_10c)
+        _cov10c_text = z.read("metadata/order_status_coverage.txt").decode("utf-8")
+        check("10-20) 커버리지 요약에 '조회일 raw 슬라이스에 없는 관측 = 1건'과 근거 파일"
+              " 경로가 표시됨",
+              "이 중 조회일 raw 슬라이스에 없는(다른 날짜에 조회된) 관측 = 1건" in _cov10c_text
+              and f"order_status_observations_orderday_extra_{_day_10c_compact}.jsonl" in _cov10c_text)
+        check("10-21) 커버리지 요약에 집계 기준 시각(전체 로그 재스캔 시각)이 기록됨"
+              "(재현된 버그: 예전엔 언제 훑은 결과인지 번들만으로 알 수 없었음)",
+              "집계 기준 시각(전체 로그 재스캔 시각) = " in _cov10c_text
+              and "= 알 수 없음" not in _cov10c_text)
+finally:
+    _os.chdir(_orig_cwd10c)
 
 
 print(f"\n총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
