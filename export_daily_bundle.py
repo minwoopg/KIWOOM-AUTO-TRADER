@@ -81,6 +81,7 @@ from infra.storage.order_status_observation_store import (
     OrderStatusObservation,
     compute_coverage,
     dedupe_by_write_id,
+    find_quarantined_observation_files,
     status_path_for,
 )
 from infra.broker.kiwoom_order_status import normalize_order_id
@@ -498,20 +499,33 @@ _OBS_KNOWN_FIELDS = {f.name for f in dataclasses.fields(OrderStatusObservation)}
 
 def slice_jsonl_observations(
     src: Path, dst: Path, target: date,
-) -> tuple[int, int, int, int, int]:
+    *, quarantine_paths: list[Path] | None = None,
+) -> tuple[int, int, int, int, int, int, int, int]:
     """관측 JSONL을 날짜로 잘라 새 파일로 씁니다(마스킹 재적용 포함).
 
     반환: (전체 줄, 해당 날짜로 채택된 줄, 말미 불완전으로 제외된 줄,
-    말미가 아닌 위치의 손상 줄, 마스킹이 실제로 값을 바꾼 줄 수)
+    말미가 아닌 위치의 손상 줄, 마스킹이 실제로 값을 바꾼 줄 수,
+    격리 파일 수, 격리 파일에서 이 날짜로 복구된 줄 수, 격리 파일
+    내에서 손상돼 제외된 줄 수)
 
     2026-09-18 재검토 지적 6번 반영: 마스킹은 문자열 전체가 아니라
     **파싱된 JSON 객체**에 대해 재귀적으로 적용합니다(`_mask_json_value`)
     — 그래서 결과 줄은 항상 다시 `json.loads()`로 파싱 가능한 유효한
     JSON입니다(재현된 버그: 숫자 필드가 따옴표 없는 `***`로 치환돼
     파싱 불가가 되던 문제).
+
+    2026-09-21 3차 재검토 반영(지적 1번, 재현된 버그): `src`가 격리
+    (`_quarantine_and_rotate_file()`)로 옆에 치워진 적이 있으면, 격리
+    직전까지 그 파일에 쌓여 있던 정상 레코드는 삭제되지 않고
+    `quarantine_paths`가 가리키는 파일들 안에 그대로 남아있습니다 —
+    예전엔 exporter가 `src`(격리 이후 새로 시작된 파일)만 읽어서 이
+    레코드들이 이후 번들·집계 어디에도 다시 나타나지 않았습니다. 이제
+    그 파일들도 같은 날짜 필터(+마스킹)를 적용해 `dst`에 함께
+    포함합니다. `src`가 아예 존재하지 않아도(격리 후 아직 새 파일이
+    생기지 않은 경우) 예외 없이 진행합니다.
     """
     day = target.strftime("%Y-%m-%d")
-    lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = src.read_text(encoding="utf-8", errors="replace").splitlines() if src.exists() else []
     total = len(lines)
     kept = 0
     trailing_incomplete = 0
@@ -558,8 +572,51 @@ def slice_jsonl_observations(
         if masked_line != original:
             masked_changed += 1
         out_lines.append(masked_line)
+
+    quarantine_file_count = 0
+    quarantine_recovered = 0
+    quarantine_skipped = 0
+    for qpath in (quarantine_paths or []):
+        quarantine_file_count += 1
+        try:
+            q_lines = qpath.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for q_raw_line in q_lines:
+            q_stripped = q_raw_line.strip()
+            if not q_stripped:
+                continue
+            try:
+                q_data = json.loads(q_stripped)
+            except json.JSONDecodeError:
+                # 격리 파일 자체가 "복구 불가능한 손상"이 확인된 뒤에
+                # 옆으로 치워진 것이므로, 위치(말미/중간) 구분 없이
+                # 손상 줄로만 집계합니다 — 이미 별도로 격리된 파일이라
+                # 정상 파일의 "말미만 예외" 가정을 적용할 근거가 없음.
+                quarantine_skipped += 1
+                continue
+            if q_data.get("__marker__") == "shutdown":
+                marker_at = str(q_data.get("shutdown_at") or "")
+                if not marker_at.startswith(day):
+                    continue
+                out_lines.append(
+                    json.dumps(_mask_json_value(q_data), ensure_ascii=False, sort_keys=True)
+                )
+                quarantine_recovered += 1
+                continue
+            q_started_at = str(q_data.get("started_at") or "")
+            if not q_started_at.startswith(day):
+                continue
+            out_lines.append(
+                json.dumps(_mask_json_value(q_data), ensure_ascii=False, sort_keys=True)
+            )
+            quarantine_recovered += 1
+
     dst.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
-    return total, kept, trailing_incomplete, mid_file_corrupt, masked_changed
+    return (
+        total, kept, trailing_incomplete, mid_file_corrupt, masked_changed,
+        quarantine_file_count, quarantine_recovered, quarantine_skipped,
+    )
 
 
 def _parse_observations_for_coverage(dst: Path) -> tuple[list[OrderStatusObservation], list[str]]:
@@ -615,6 +672,7 @@ def _parse_shutdown_markers(dst: Path) -> list[dict]:
 
 def _load_full_observations_for_order_date(
     src: Path, target: date,
+    *, quarantine_paths: list[Path] | None = None,
 ) -> tuple[list[OrderStatusObservation], list[str]]:
     """전체(하루로 자르지 않은) 관측 로그 원본에서 `order_accepted_at`이
     target 날짜인 관측만 골라 반환합니다(2026-09-18 재재검토 반영,
@@ -635,79 +693,121 @@ def _load_full_observations_for_order_date(
     슬라이스가 별도로 존재함) 이 함수를 호출하는 커버리지 계산에만
     쓰이므로, 여기서는 마스킹을 다시 적용하지 않습니다(파일 자체를
     노출하는 경로가 아니라 메모리 내 집계 전용).
+
+    2026-09-21 3차 재검토 반영(지적 1번): `src`뿐 아니라
+    `quarantine_paths`(격리된 옛 파일들)도 같은 기준으로 훑습니다 —
+    격리 직전까지 쌓여 있던 정상 레코드도 주문일 커버리지에서
+    사라지면 안 되기 때문입니다.
     """
     observations: list[OrderStatusObservation] = []
     parse_errors: list[str] = []
-    if not src.exists():
-        return observations, parse_errors
     day = target.strftime("%Y-%m-%d")
-    try:
-        raw_text = src.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        parse_errors.append(f"{src} 읽기 실패: {exc}")
-        return observations, parse_errors
-    for raw_line in raw_text.splitlines():
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
+
+    def _scan(path: Path) -> None:
+        if not path.exists():
+            return
         try:
-            data = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue  # 손상/불완전 줄 — raw 슬라이스 쪽에서 이미 별도로 표시되므로 여기서는 조용히 건너뜀
-        if data.get("__marker__") == "shutdown":
-            continue
-        accepted_at = str(data.get("order_accepted_at") or "")
-        if not accepted_at.startswith(day):
-            continue
-        filtered = {k: v for k, v in data.items() if k in _OBS_KNOWN_FIELDS}
-        try:
-            observations.append(OrderStatusObservation(**filtered))
-        except TypeError as exc:
-            parse_errors.append(f"필드 불일치: {exc}")
+            raw_text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            parse_errors.append(f"{path} 읽기 실패: {exc}")
+            return
+        for raw_line in raw_text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            try:
+                data = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue  # 손상/불완전 줄 — raw 슬라이스 쪽에서 이미 별도로 표시되므로 여기서는 조용히 건너뜀
+            if data.get("__marker__") == "shutdown":
+                continue
+            accepted_at = str(data.get("order_accepted_at") or "")
+            if not accepted_at.startswith(day):
+                continue
+            filtered = {k: v for k, v in data.items() if k in _OBS_KNOWN_FIELDS}
+            try:
+                observations.append(OrderStatusObservation(**filtered))
+            except TypeError as exc:
+                parse_errors.append(f"필드 불일치: {exc}")
+
+    _scan(src)
+    for qpath in (quarantine_paths or []):
+        _scan(qpath)
     return observations, parse_errors
 
 
-def _read_running_status(status_path: Path) -> dict | None:
+def _read_running_status(status_path: Path) -> tuple[dict | None, bool]:
     """`OrderStatusObservationRecorder`가 남기는 "현재 실행 상태"
-    스냅샷 파일을 읽습니다(2026-09-18 재재검토 반영, 지적 5번). 파일이
-    없거나(계측 비활성/아직 시작 전) 손상됐으면 `None`을 반환합니다
-    — 이 exporter는 읽기 전용이라 손상돼 있어도 복구를 시도하지
+    스냅샷 파일을 읽습니다(2026-09-18 재재검토 반영, 지적 5번).
+
+    반환: (파싱된 딕셔너리 또는 None, 파일이 존재했었는가).
+
+    2026-09-21 3차 재검토 반영(지적 2번, 재현된 버그): 예전엔 "파일이
+    없음"과 "파일은 있지만 JSON이 손상됐거나 dict가 아님"을 둘 다
+    `None` 하나로 뭉뚱그려 반환했습니다 — 그 결과 `_classify_run_state()`가
+    두 경우를 구분하지 못해 상태 파일이 손상됐을 때도 "계측_비활성"
+    (관측 기능을 켠 적이 없음)으로 오표시됐습니다. 이제 두 번째 값으로
+    "파일이 실제로 존재했는가"를 함께 반환해 호출부가 구분할 수 있게
+    합니다. 이 exporter는 읽기 전용이라 손상돼 있어도 복구를 시도하지
     않습니다(원본 기록기 쪽 책임)."""
     if not status_path.exists():
-        return None
+        return None, False
     try:
         data = json.loads(status_path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
     except (OSError, json.JSONDecodeError):
-        return None
+        return None, True
+    if not isinstance(data, dict):
+        return None, True
+    return data, True
 
 
-def _classify_run_state(run_status: dict | None, *, stale_after_sec: float = 120.0) -> str:
-    """실행 상태 스냅샷으로부터 4가지 상태 중 하나를 판정합니다
+RUN_STATE_DISABLED = "계측_비활성"
+RUN_STATE_CLEAN_SHUTDOWN = "정상_종료"
+RUN_STATE_UNCLEAR_SHUTDOWN = "종료_확인_불가"
+RUN_STATE_RUNNING = "실행_중"
+RUN_STATE_STATUS_UNREADABLE = "상태확인_불가"
+
+
+def _classify_run_state(
+    run_status: dict | None, *, stale_after_sec: float = 120.0,
+    status_file_existed: bool = False,
+) -> str:
+    """실행 상태 스냅샷으로부터 5가지 상태 중 하나를 판정합니다
     (2026-09-18 재재검토 반영, 지적 5번의 "실행 중/정상 종료/종료
-    확인 불가/계측 비활성" 구분을 그대로 반영).
+    확인 불가/계측 비활성" 구분에 2026-09-21 3차 재검토(지적 2번)로
+    "상태확인_불가"를 추가).
 
-    - 스냅샷 자체가 없음 → "계측_비활성"(관측 기능이 시작된 적 없음
-      — account_scope_id 미설정 등).
+    - 스냅샷 자체가 없음(`status_file_existed=False`) → "계측_비활성"
+      (관측 기능이 시작된 적 없음 — account_scope_id 미설정 등).
+    - 스냅샷 파일은 있었지만 읽지 못함(JSON 손상 등, `run_status is
+      None`인데 `status_file_existed=True`) → "상태확인_불가"
+      (재현된 버그: 예전엔 이 경우도 "계측_비활성"으로 잘못 표시돼
+      "관측 기능을 켠 적이 없다"는 오해를 줬습니다 — 실제로는 기능이
+      켜져 있었는데 상태 파일 하나만 손상된 것일 수 있습니다).
     - `clean_shutdown`이 True/False로 확정돼 있음 → 그 값을 그대로
       "정상_종료"/"종료_확인_불가"로 반영(종료 배선을 실제로 탄 뒤의
       결과이므로 가장 신뢰도가 높음).
     - `clean_shutdown`이 아직 None(종료 배선을 타지 않음)인데
-      `updated_at`이 최근(기본 120초 이내)이면 "실행_중"으로 판단합니다
+      `updated_at`을 파싱할 수 없거나(형식 오류) **미래 시각**이면
+      → "상태확인_불가"(재현된 버그: 예전엔 미래 시각도
+      `datetime.now() - updated_at`이 음수가 돼 항상 stale_after_sec
+      이하로 판정돼 "실행_중"으로 잘못 통과했습니다 — 미래 시각은
+      시계 오차든 파일 손상이든 정상 신호로 볼 수 없습니다).
+    - `updated_at`이 최근(기본 120초 이내, 미래가 아님)이면 "실행_중"
       — 기록기 작업자 스레드가 폴링마다(기본 5초 간격) 이 파일을
       갱신하므로, 최근 갱신은 "그 스레드가 최근까지 살아있었다"는
       뜻입니다.
-    - 그 외(오래된 스냅샷, 갱신 시각 파싱 불가 등) → "종료_확인_불가"
-      (예: 강제 종료로 종료 배선 자체를 타지 못한 경우 — 마지막
-      스냅샷만 남고 더 이상 갱신되지 않음).
+    - 그 외(오래된 스냅샷) → "종료_확인_불가"(예: 강제 종료로 종료
+      배선 자체를 타지 못한 경우 — 마지막 스냅샷만 남고 더 이상
+      갱신되지 않음).
     """
     if run_status is None:
-        return "계측_비활성"
+        return RUN_STATE_STATUS_UNREADABLE if status_file_existed else RUN_STATE_DISABLED
     cs = run_status.get("clean_shutdown")
     if cs is True:
-        return "정상_종료"
+        return RUN_STATE_CLEAN_SHUTDOWN
     if cs is False:
-        return "종료_확인_불가"
+        return RUN_STATE_UNCLEAR_SHUTDOWN
     updated_at = run_status.get("updated_at")
     updated_dt = None
     if updated_at:
@@ -715,9 +815,15 @@ def _classify_run_state(run_status: dict | None, *, stale_after_sec: float = 120
             updated_dt = datetime.fromisoformat(str(updated_at))
         except ValueError:
             updated_dt = None
-    if updated_dt is not None and (datetime.now() - updated_dt).total_seconds() <= stale_after_sec:
-        return "실행_중"
-    return "종료_확인_불가"
+    if updated_dt is None:
+        return RUN_STATE_STATUS_UNREADABLE
+    age_sec = (datetime.now() - updated_dt).total_seconds()
+    if age_sec < 0:
+        # 미래 시각 — 시계 오차든 파일 손상이든 정상 신호로 볼 수 없음.
+        return RUN_STATE_STATUS_UNREADABLE
+    if age_sec <= stale_after_sec:
+        return RUN_STATE_RUNNING
+    return RUN_STATE_UNCLEAR_SHUTDOWN
 
 
 def build_order_status_summary(
@@ -727,6 +833,9 @@ def build_order_status_summary(
     trades_rows: list[dict], all_baselines: list[dict],
     shutdown_markers: list[dict] | None = None,
     run_status: dict | None = None,
+    status_file_existed: bool = False,
+    order_day_extra_count: int = 0,
+    aggregation_computed_at: str | None = None,
 ) -> str:
     """체결조회 증거 저장·커버리지 요약(2026-09-18 지적 2/3/4번 반영,
     2026-09-18 재검토에서 3번/2번 재보완).
@@ -792,7 +901,7 @@ def build_order_status_summary(
         L.append("observation_write_id_conflict_count    = 0")
 
     L.append("")
-    run_state = _classify_run_state(run_status)
+    run_state = _classify_run_state(run_status, status_file_existed=status_file_existed)
     L.append(f"observation_run_state(현재 실행 상태)   = {run_state}")
     if run_status:
         L.append(
@@ -805,6 +914,17 @@ def build_order_status_summary(
             f" queue_full_dropped_count={run_status.get('queue_full_dropped_count')}"
             f" file_healthy={run_status.get('file_healthy')}"
         )
+    elif status_file_existed:
+        # 2026-09-21 3차 재검토 반영(지적 2번, 재현된 버그): 상태 파일이
+        # 존재는 했지만(JSON 손상/dict 아님/updated_at 파싱 불가·미래
+        # 시각) 읽을 수 없는 경우 — "계측_비활성"(기능을 켠 적이
+        # 없음)과 절대 혼동하면 안 됩니다. 관측 기능은 켜져 있었을 수
+        # 있고, 단지 이 진단용 스냅샷 파일 하나만 문제가 있는 것일 수
+        # 있습니다.
+        L.append("    ⚠ 실행 상태 스냅샷 파일이 있지만 내용을 신뢰할 수 없습니다"
+                  "(JSON 손상, dict 아님, 또는 updated_at이 파싱 불가/미래 시각) —")
+        L.append("      이 사실만으로 관측 기능이 비활성이라고 판단하면 안 됩니다."
+                  " 파일을 직접 열어 확인하세요.")
     else:
         L.append("    ⚠ 실행 상태 스냅샷 파일이 없습니다 — 관측 기능이 비활성"
                   "(account_scope_id 미설정)이었거나 기록기가 아직 한 번도 시작된"
@@ -823,9 +943,13 @@ def build_order_status_summary(
             f" dropped_count={m.get('dropped_count')} shutdown_at={m.get('shutdown_at', '')}"
         )
     if not markers:
-        if run_state == "실행_중":
+        if run_state == RUN_STATE_RUNNING:
             L.append("    이 날짜에 종료 마커가 없습니다 — 위 실행 상태가 '실행_중'이므로")
             L.append("      정상입니다(아직 종료하지 않았으니 종료 마커가 없는 게 맞습니다).")
+        elif run_state == RUN_STATE_STATUS_UNREADABLE:
+            L.append("    ⚠ 종료 마커도 없고 위 실행 상태도 확인할 수 없습니다(스냅샷 손상/")
+            L.append("      시각 이상) — 정상 종료인지 비정상 종료인지 이 정보만으로는")
+            L.append("      판단할 수 없습니다. 상태 스냅샷 파일을 직접 확인하세요.")
         else:
             L.append("    ⚠ 종료 마커가 없습니다 — 이 날짜에 기록기가 정상 종료 배선을 타지")
             L.append("      않고 프로세스가 끝났을 수 있습니다(예: 강제 종료). 큐 포화/쓰기")
@@ -885,10 +1009,30 @@ def build_order_status_summary(
         return candidate if len(candidate) == 10 and candidate[4] == "-" and candidate[7] == "-" else None
 
     order_day_deduped, order_day_conflicting_ids = dedupe_by_write_id(order_day_observations)
+    day_compact = target.strftime("%Y%m%d")
     L.append("")
     L.append("[ 계좌별 커버리지 — 주문 접수일(order_accepted_at) 기준 ]")
     L.append(f"order_day_observation_count           = {len(order_day_observations)}"
               " (조회가 언제 실행됐든, 이 날짜에 접수된 주문에 대한 관측 전체)")
+    # 2026-09-21 3차 재검토 반영(지적 3번, 재현된 버그): 위 카운트에는
+    # 익일(다른 날짜)에 조회된 관측도 섞여 있는데, 그 관측은 "조회일
+    # raw 슬라이스"(started_at 기준)에는 나타나지 않아 번들만으로는
+    # 근거를 재확인할 수 없었습니다. 이제 그 몫만 별도 raw 파일(아래
+    # order_day_extra_count>0일 때 build()가 생성)로 함께 포함하고,
+    # 여기서는 그 사실과 건수, 그리고 이 집계가 전체 로그를 다시
+    # 훑은 시각을 함께 남깁니다(로그가 그 이후 더 늘어나면 다음 번들의
+    # 수치가 달라질 수 있음을 명시).
+    L.append(
+        f"  ⤷ 이 중 조회일 raw 슬라이스에 없는(다른 날짜에 조회된) 관측 = {order_day_extra_count}건"
+        + (
+            f" — raw/order_status_observations_orderday_extra_{day_compact}.jsonl 참고"
+            if order_day_extra_count else ""
+        )
+    )
+    L.append(
+        f"  ⤷ 집계 기준 시각(전체 로그 재스캔 시각) = {aggregation_computed_at or '알 수 없음'}"
+        " (이 시각 이후 로그가 추가되면 다음 번들의 수치가 달라질 수 있음)"
+    )
     if order_day_conflicting_ids:
         L.append(f"⚠ order_day_write_id_conflict_count   = {len(order_day_conflicting_ids)}"
                   " — 같은 write_id인데 내용이 다름(버그 신호)")
@@ -1453,18 +1597,31 @@ def build(
         obs_dst = work / f"order_status_observations_{day_compact}.jsonl"
         obs_records: list[OrderStatusObservation] = []
         obs_shutdown_markers: list[dict] = []
-        if not obs_src.exists():
+        # 2026-09-21 3차 재검토 반영(지적 1번): 격리(_quarantine_and_rotate_file())로
+        # 옆으로 치워진 옛 파일이 있으면, 격리 직전까지 쌓여있던 정상
+        # 레코드도 이 번들에 포함해야 합니다 — obs_src(격리 후 새로
+        # 시작된 파일)만 읽으면 그 레코드들은 영원히 사라집니다.
+        quarantined_obs_paths = find_quarantined_observation_files(obs_src)
+        if not obs_src.exists() and not quarantined_obs_paths:
             manifest.append(f"  {'order_status_observations.jsonl':30s} | MISSING | 원본 없음 | excluded")
             manifest.append("  ⚠ 관측 기능이 비활성(account_scope_id 미설정)이었거나 아직 기록이 없습니다.")
         else:
-            obs_total, obs_kept, obs_trailing_bad, obs_mid_bad, obs_masked = (
-                slice_jsonl_observations(obs_src, obs_dst, target)
+            (
+                obs_total, obs_kept, obs_trailing_bad, obs_mid_bad, obs_masked,
+                obs_q_files, obs_q_recovered, obs_q_skipped,
+            ) = slice_jsonl_observations(
+                obs_src, obs_dst, target, quarantine_paths=quarantined_obs_paths,
             )
             raw_files.append(obs_dst.name)
-            manifest.append(
-                f"  {'order_status_observations.jsonl':30s} | OK | {obs_kept:,}줄 / 전체 {obs_total:,}줄"
-                f" | {obs_dst.stat().st_size / 1024:,.1f} KB"
-            )
+            if not obs_src.exists():
+                manifest.append(
+                    f"  {'order_status_observations.jsonl':30s} | MISSING(원본) | 격리된 파일에서만 복구"
+                )
+            else:
+                manifest.append(
+                    f"  {'order_status_observations.jsonl':30s} | OK | {obs_kept:,}줄 / 전체 {obs_total:,}줄"
+                    f" | {obs_dst.stat().st_size / 1024:,.1f} KB"
+                )
             if obs_trailing_bad:
                 manifest.append(
                     f"    ⚠ 말미 불완전 줄 {obs_trailing_bad}건 제외(강제종료 추정 — 정상적인 상황)"
@@ -1476,6 +1633,15 @@ def build(
                 )
             if obs_masked:
                 manifest.append(f"    민감정보 마스킹 재적용: {obs_masked}줄에서 값 변경됨")
+            if obs_q_files:
+                manifest.append(
+                    f"    ⚠ 격리된 손상 파일 {obs_q_files}건 발견 — 격리 직전까지의 정상 레코드"
+                    f" {obs_q_recovered}건을 이 raw에 포함했습니다(2026-09-21 3차 재검토 반영,"
+                    " 지적 1번 — 예전엔 격리된 파일의 정상 레코드가 집계·번들에서 그냥"
+                    " 사라졌습니다)"
+                )
+                if obs_q_skipped:
+                    manifest.append(f"      격리 파일 내 손상 줄 {obs_q_skipped}건은 계속 제외됨")
             obs_records, obs_parse_errors = _parse_observations_for_coverage(obs_dst)
             if obs_parse_errors:
                 manifest.append(
@@ -1490,8 +1656,10 @@ def build(
         # 시각이 아니라 주문 접수일 기준이어야 하므로, 하루로 자르지
         # 않은 전체 원본을 다시 훑어 order_accepted_at이 이 날짜인
         # 관측을 모읍니다(조회가 다음날 이뤄졌어도 원래 주문일에 귀속).
+        # 2026-09-21 3차 재검토 반영(지적 1번): 격리된 파일도 함께 훑음.
+        aggregation_computed_at = datetime.now().isoformat()
         order_day_records, order_day_parse_errors = _load_full_observations_for_order_date(
-            obs_src, target,
+            obs_src, target, quarantine_paths=quarantined_obs_paths,
         )
         if order_day_parse_errors:
             manifest.append(
@@ -1499,14 +1667,54 @@ def build(
                 "(알 수 없는 스키마 — 집계에서 제외)"
             )
 
+        # 2026-09-21 3차 재검토 반영(지적 3번, 재현된 버그): 주문일
+        # 커버리지 집계(order_day_records)에는 다른 날짜(익일 등)에
+        # 조회된 관측도 섞여 있는데, 그 관측은 조회일 raw 슬라이스
+        # (obs_records, started_at 기준)에는 나타나지 않아 번들만으로는
+        # 그 수치의 근거를 재확인할 수 없었습니다. write_id로 차집합을
+        # 구해 그 몫만 별도 raw 파일로 남깁니다.
+        query_day_write_ids = {obs.write_id for obs in obs_records if obs.write_id}
+        order_day_extra_records = [
+            obs for obs in order_day_records
+            if not obs.write_id or obs.write_id not in query_day_write_ids
+        ]
+        if order_day_extra_records:
+            extra_dst = work / f"order_status_observations_orderday_extra_{day_compact}.jsonl"
+            extra_lines = [
+                json.dumps(_mask_json_value(dataclasses.asdict(o)), ensure_ascii=False, sort_keys=True)
+                for o in order_day_extra_records
+            ]
+            extra_dst.write_text("\n".join(extra_lines) + "\n", encoding="utf-8")
+            raw_files.append(extra_dst.name)
+            manifest.append("")
+            manifest.append("[ RAW — 주문일 커버리지에 쓰인 익일(교차일) 관측 근거 ]")
+            manifest.append(
+                f"  {extra_dst.name:44s} | OK | {len(order_day_extra_records):,}건"
+                " (2026-09-21 3차 재검토 반영, 지적 3번 — 이 날짜 접수 주문을 다른"
+                " 날짜에 조회한 관측. 계좌별 커버리지 집계에는 포함되지만 위 조회일"
+                " raw 슬라이스에는 나타나지 않는 근거)"
+            )
+        else:
+            manifest.append("")
+            manifest.append("[ RAW — 주문일 커버리지에 쓰인 익일(교차일) 관측 근거 ]")
+            manifest.append("  없음 (이 날짜 접수 주문에 대해 다른 날짜에 조회된 관측 없음)")
+
         # 2026-09-18 재재검토 반영(지적 5번): 종료 마커와 별도로,
         # 기록기가 살아있는 동안 주기적으로 갱신하는 "현재 실행 상태"
         # 스냅샷을 함께 읽어 번들에 반영합니다.
+        # 2026-09-21 3차 재검토 반영(지적 2번, 재현된 버그): "파일 없음"과
+        # "파일은 있지만 손상돼 못 읽음"을 구분해야 하므로 두 번째
+        # 반환값(status_file_existed)도 함께 받습니다.
         obs_status_path = status_path_for(obs_src)
-        run_status = _read_running_status(obs_status_path)
+        run_status, status_file_existed = _read_running_status(obs_status_path)
+        if run_status is not None:
+            status_display = "있음"
+        elif status_file_existed:
+            status_display = "손상(있지만 읽을 수 없음)"
+        else:
+            status_display = "없음"
         manifest.append(
-            f"  observation_status_snapshot = {obs_status_path}"
-            f" ({'있음' if run_status is not None else '없음'})"
+            f"  observation_status_snapshot = {obs_status_path} ({status_display})"
         )
 
         manifest.append("")
@@ -1573,6 +1781,9 @@ def build(
             all_baselines,
             shutdown_markers=obs_shutdown_markers,
             run_status=run_status,
+            status_file_existed=status_file_existed,
+            order_day_extra_count=len(order_day_extra_records),
+            aggregation_computed_at=aggregation_computed_at,
         )
         (work / "order_status_coverage.txt").write_text(order_status_summary, encoding="utf-8")
 
