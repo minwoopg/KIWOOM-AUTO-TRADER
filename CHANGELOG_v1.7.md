@@ -2728,3 +2728,170 @@ FIFO/손익 계산, RiskManager/DailyReporter 연결, API 조회 빈도 확대�
 - `kiwoom_auto_trader_priority1_stage3_followup_changed_files_20260921.zip`
   — 실제 변경된 4개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
   폴더 경로 유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 우선순위1 4차 보완 — GPT 4차 재검토 상태 처리 3건 수정 (2026-09-21, 저장·집계 구조 무변경)
+
+### 배경
+
+위 "우선순위1 3차 보완"(패치 0072~0075) 전달 후, 민우님이 전달한 GPT
+4차 재검토에서 0072~0075의 파일 정합성과 기존 테스트 결과(139/139,
+전체 회귀 39/40, legacy 11/11)는 확인됐고, 3차 보완의 지적 ①(격리
+기록 보존)·③(익일 관측 근거 포함)은 해결로 확인됐습니다. 다만
+지적 ②(상태 판정)에서 3가지 구체적인 재현 버그가 새로 발견됐습니다.
+민우님의 지시는 다음과 같습니다.
+
+> 격리 기록 보존과 익일 관측 근거 포함은 확인했으므로 유지해주세요.
+> 이번 보완은 상태 처리에만 한정합니다.
+> ① 설정이 활성인데 상태 파일이 없으면 `상태확인_불가`로 표시하고,
+> 명시적인 설정 비활성만 `계측_비활성`으로 판정해주세요.
+> ② 잘못된 UTF-8 상태 파일과 ③ 시간대가 포함된 `updated_at`에서도
+> 번들 생성이 실패하지 않도록 처리해주세요. 세 사례 모두 실제
+> `build()` 경로로 검증해주세요. API·PSM·주문·리스크·손익 계산은
+> 변경하지 마세요.
+
+이번 라운드는 지시대로 **상태 판정·예외 처리로만** 범위를
+한정했고, 저장·집계 구조(격리 파일 복원, 익일 근거 raw 파일 등)는
+전혀 손대지 않았습니다.
+
+### 변경 내용
+
+1. **[지적 1번] 설정이 활성인데 상태 파일이 없으면 '계측_비활성'으로
+   오판됨 (`export_daily_bundle.py`)**: 재현된 버그 — 기존
+   `_classify_run_state()`는 상태 스냅샷 파일이 없으면(재시작 직후
+   아직 첫 스냅샷을 쓰기 전, 또는 파일이 외부에서 삭제된 경우 포함)
+   무조건 "계측_비활성"(관측 기능을 켠 적이 없음)으로 판정했습니다
+   — 그러나 `account_scope_id`가 실제로 설정돼 있다면 이는 "기능을
+   켠 적이 없다"가 아니라 "확인이 필요한 상태"입니다. 새 함수
+   `resolve_observation_configured_active(settings_path)`를 추가해
+   앱 기동 경로와 동일한 `config.settings.load_settings()`로 실제
+   설정의 `broker.account_scope_id`를 읽고, 설정을 읽을 수 없으면
+   (테스트·수동 실행 환경 등) 기존처럼 보수적으로 `None`을 반환해
+   `계측_비활성` 기본값을 유지합니다. `_classify_run_state()`와
+   `build_order_status_summary()`에 `observation_configured_active`
+   파라미터를 추가해, "명시적으로 비활성 확인"(`False`/`None`) →
+   `계측_비활성`, "활성 확인됐지만 파일 없음"(`True`) →
+   `상태확인_불가`로 분리했습니다. 커버리지 요약과 MANIFEST의
+   `observation_status_snapshot` 표시도 "없음(설정상 활성화 확인됨
+   — 확인 필요)"로 구분해, `계측_비활성`과 혼동되지 않게 했습니다.
+2. **[지적 2번] 잘못된 UTF-8 바이트가 있는 상태 파일이 번들 생성
+   자체를 실패시킴 (`export_daily_bundle.py`)**: 재현된 버그 —
+   `_read_running_status()`는 `(OSError, json.JSONDecodeError)`만
+   잡고 있었는데, `status.json`에 유효하지 않은 UTF-8 바이트가 있으면
+   `read_text(encoding="utf-8")`가 `UnicodeDecodeError`(`ValueError`의
+   하위 클래스이며 `OSError`가 아님)를 던져 그대로 전파됐고, 그
+   결과 진단용 스냅샷 파일 하나의 손상이 **번들 생성 전체를
+   막았습니다**. `UnicodeDecodeError`를 예외 목록에 추가해 기존
+   JSON 손상과 동일하게 "파일은 있지만 읽을 수 없음"
+   (`existed=True`) → `상태확인_불가`로 처리하고, 번들 생성은 계속
+   진행되도록 했습니다.
+3. **[지적 3번] `updated_at`에 시간대 정보가 있으면 비교에서
+   `TypeError`가 나 번들 생성이 실패함 (`export_daily_bundle.py`)**:
+   재현된 버그 — `_classify_run_state()`는
+   `datetime.now() - updated_dt`로 경과 시간을 계산했는데,
+   `updated_at`이 `+09:00` 같은 시간대 정보를 포함하면
+   `datetime.fromisoformat()`이 시간대 인식(aware) 객체를 반환하고,
+   이를 시간대 미인식(naive)인 `datetime.now()`와 뺄셈하면
+   `TypeError`가 나 번들 생성 자체가 실패했습니다. 이제
+   `updated_dt`가 시간대를 포함하면 `datetime.now(updated_dt.tzinfo)`로
+   같은 시간대 기준으로 비교하고, 그래도 비교할 수 없는 형식이면
+   (`TypeError`/`ValueError`/`OverflowError`) 예외를 전파하지 않고
+   `상태확인_불가`로 판정해 번들 생성은 계속 진행되도록
+   방어적으로 처리했습니다.
+4. **테스트 추가
+   (`test_order_status_evidence_observation.py`)**: 위 3개 재현
+   시나리오를 지시대로 **실제 `export_daily_bundle.build()` 경로로**
+   검증하는 그룹 11(11A~11D, 16건)을 추가했습니다. 11A는
+   `resolve_observation_configured_active()` 단위 테스트(활성/명시적
+   비활성/설정 파일 없음 3가지), 11B는 저장소의 실제
+   `config/settings.yaml`을 복사해 `account_scope_id`를 채운 뒤
+   상태 파일 없이 `build()`를 호출해 커버리지·MANIFEST가
+   `상태확인_불가`로 표시되는지, 11C는 잘못된 UTF-8 바이트가 있는
+   `status.json`을 실제로 두고 `build()`가 예외 없이 성공하며
+   `상태확인_불가`로 표시되는지, 11D는 시간대(`+09:00`)가 포함된
+   `updated_at`을 둔 채 `build()`가 예외 없이 성공하고(최근 시각이면
+   `실행_중`, 오래된 시각이면 `종료_확인_불가`로) 올바르게 판정되는지
+   각각 확인합니다.
+
+### 테스트 및 검증
+
+- `test_order_status_evidence_observation.py`: **155/155 통과**(기존
+  139건 전부 무변경 유지 + 이번 라운드 16건 신규). 신규 그룹 11:
+  - `11A`(4건): 지적 1번 단위 테스트 —
+    `resolve_observation_configured_active()`가 실제 로드 가능한
+    `settings.yaml` 픽스처(저장소의 `config/settings.yaml`을 복사해
+    `account_scope_id`만 주입/공백 유지)로 활성/명시적 비활성/설정
+    파일 없음 3가지를 정확히 구분하는지 확인.
+  - `11B`(4건): 지적 1번 — 활성 설정 + 상태 파일 없음 조합으로
+    실제 `build()`를 호출해 커버리지 요약이 `계측_비활성`이 아니라
+    `상태확인_불가`로 표시되고, 경고 문구·MANIFEST 표시가 모두
+    올바른지 확인.
+  - `11C`(4건): 지적 2번 — `_read_running_status()` 단위 테스트로
+    잘못된 UTF-8 바이트에도 예외 없이 `(None, True)`가 반환되는지
+    확인 + 그 상태 파일을 실제로 둔 채 `build()`가 예외 없이
+    성공하고 `상태확인_불가`·"손상"으로 표시되는지 확인.
+  - `11D`(4건): 지적 3번 — `_classify_run_state()` 단위 테스트로
+    시간대 포함 `updated_at`(최근/오래됨 둘 다)이 `TypeError` 없이
+    올바르게 판정되는지 확인 + 시간대 포함 상태 파일을 실제로 둔
+    채 `build()`가 예외 없이 성공하고 `실행_중`으로 표시되는지 확인.
+- 3차 보완까지 해결된 항목(격리 레코드 복원, 익일 관측 근거 포함,
+  계좌 스코핑, 부분 조회 오집계, 식별자 보존 마스킹 등)의 기존
+  테스트(그룹 2B/3B/3C/3D/4/4B/4C/9A~9F/10A~10C)는 전부 무변경
+  통과 — 이번 라운드가 상태 판정 이외의 어떤 것도 건드리지 않았음을
+  재확인했습니다.
+- 전체 회귀(`run_regression_tests.py`): **39/40 통과** — 유일한
+  실패는 지난 네 라운드와 동일한 `test_broker_order_status.py`의
+  fixture 파일 누락이며 이번 변경과 무관합니다.
+- `legacy_tests/test_entry_watch.py`: **11/11 통과**.
+- 검증 절차: fresh clone에 0051~0059 → 0060~0067 → 0068~0071 →
+  0072~0075 → 이번 0076~0078을 순서대로 `git am`한 뒤 위 세 검증을
+  모두 재실행해 동일한 결과를 확인했습니다(아래 "전달 파일" 참고).
+
+### 변경하지 않은 것
+
+- 기존 API 조회 정책, PSM 상태 전이 판정, 주문 접수·리스크 게이트 —
+  전혀 건드리지 않았습니다.
+- 손익 계산(FIFO 매칭, 확정 손익), B(확정 체결 키) 설계 — 계속
+  제외합니다.
+- 3차 보완에서 해결된 격리 파일 정상 레코드 복원
+  (`find_quarantined_observation_files()`,
+  `slice_jsonl_observations()`/`_load_full_observations_for_order_date()`의
+  `quarantine_paths` 확장)과 익일 관측 근거 raw 파일 생성
+  — 이번 라운드에서 다시 손대지 않았습니다(회귀 테스트로만
+  재확인).
+- `derive_broker_order_status()`(판정 로직 자체), `find_all_matching()`/
+  `_find_matching()`의 매칭 알고리즘, `TrackedOrderJournalStore`의
+  삭제 시점/동작 — 무변경.
+
+### 다음 작업
+
+1. `test_broker_order_status.py`의 fixture 디렉터리(`tests/fixtures/
+   order_reconciliation/`)가 저장소에 커밋돼 있는지 확인 — 다섯
+   라운드 연속으로 동일하게 누락 보고되고 있어 방치되지 않도록
+   확인이 필요합니다(이번 라운드와 무관).
+2. `상태확인_불가`가 나타나면(파일 손상, 시간대 비교 불가, 또는
+   설정 활성인데 파일 없음 등) 이는 "관측 기능이 꺼져 있다"는
+   뜻이 아니므로, 먼저 해당 `*.status.json` 파일 자체(존재 여부,
+   인코딩, JSON 형식, `updated_at` 시각·시간대)를 직접 열어 확인해야
+   합니다. 특히 `observation_status_snapshot`이 "없음(설정상
+   활성화 확인됨 — 확인 필요)"로 표시되면, 기록기가 재시작 직후
+   아직 첫 스냅샷을 쓰기 전인지, 또는 파일이 외부에서 삭제·이동됐는지
+   확인이 필요합니다.
+3. (1~4차 보완 완료 확인 후) 이번에 쌓인 관측 데이터의 커버리지가
+   실제 운영에서 충분한 수준에 도달하는지 며칠 지켜본 뒤, B(확정
+   체결 키)·FIFO 손익 연결 설계를 별도로 요청할 수 있습니다 — 이번
+   라운드 범위 밖.
+
+### 전달 파일
+
+- 패치(0051~0075가 적용된 트리 기준으로 이어서 적용):
+  - `0076-fix-export-daily-bundle-status-active-config-utf8-timezone.patch`
+    — `export_daily_bundle.py`
+  - `0077-test-order-status-evidence-observation-round5.patch` —
+    `test_order_status_evidence_observation.py`
+  - `0078-docs-CHANGELOG-v1.7-priority1-stage4-followup.patch` — 이
+    CHANGELOG
+- `kiwoom_auto_trader_priority1_stage4_followup_changed_files_20260921.zip`
+  — 실제 변경된 3개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
+  폴더 경로 유지한 채 담음.
