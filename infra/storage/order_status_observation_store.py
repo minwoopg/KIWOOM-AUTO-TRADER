@@ -156,6 +156,36 @@ class OrderStatusObservation:
         return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
 
 
+QUARANTINE_SUFFIX_PREFIX = ".unrecoverable-"
+
+
+def find_quarantined_observation_files(observation_log_path: str | Path) -> list[Path]:
+    """`_quarantine_and_rotate_file()`이 옆으로 치워둔 손상 파일들을 찾습니다
+    (2026-09-21 3차 재검토 반영, 지적 1번: "격리 파일의 정상 기록이
+    집계·번들에서 빠짐").
+
+    격리 시점 이전까지 그 파일에 쌓여 있던 정상 레코드는 삭제되지
+    않고 이 파일들 안에 그대로 남아있는데, exporter가 지금까지
+    `observation_log_path`(격리 이후 새로 시작된 파일)만 읽어서 그
+    정상 레코드들이 이후 어떤 집계·번들에도 다시 나타나지 않았습니다
+    (재현된 버그). 기록기(쓰기 쪽)와 exporter(읽기 쪽)가 같은
+    접미사 규칙(`QUARANTINE_SUFFIX_PREFIX`)을 공유해야 하므로, 이
+    함수를 여기 두고 양쪽 모두 재사용합니다(`status_path_for()`와
+    동일한 이유).
+
+    반환은 파일명(=격리 시각 문자열 포함) 오름차순 — 격리된 순서와
+    일치합니다.
+    """
+    p = Path(observation_log_path)
+    parent = p.parent
+    if not parent.exists():
+        return []
+    prefix = p.name + QUARANTINE_SUFFIX_PREFIX
+    return sorted(
+        f for f in parent.iterdir() if f.is_file() and f.name.startswith(prefix)
+    )
+
+
 def status_path_for(observation_log_path: str | Path) -> Path:
     """관측 로그 파일 경로로부터 "실행 중 상태 스냅샷" 파일 경로를
     유도합니다(2026-09-18 재재검토 반영, 지적 5번).
@@ -600,7 +630,10 @@ class OrderStatusObservationRecorder:
         것만은 막습니다.
         """
         old_path = self.path
-        suffix = f".unrecoverable-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        suffix = (
+            f"{QUARANTINE_SUFFIX_PREFIX}{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            f"-{uuid.uuid4().hex[:8]}"
+        )
         quarantined = old_path.with_name(old_path.name + suffix)
         try:
             os.replace(old_path, quarantined)
