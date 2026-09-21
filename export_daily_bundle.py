@@ -778,18 +778,30 @@ def resolve_observation_configured_active(
 
     반환: `True`(설정에서 `account_scope_id`가 채워져 있음을 확인 —
     활성 구성 확인) / `False`(설정을 읽었고 `account_scope_id`가
-    비어있음을 확인 — 비활성 구성 확인) / `None`(설정 파일이 없거나
-    읽기 실패 — 이 exporter는 독립 실행 스크립트라 테스트·수동 실행
-    환경에는 설정 파일이 아예 없을 수 있으므로, 이 경우는 "비활성"으로
-    단정하지 않고 호출부가 기존처럼 보수적으로 처리하게 합니다).
+    비어있음을 확인 — 명시적 비활성 구성 확인) / `None`(설정 파일이
+    없거나 읽기·파싱에 실패 — 활성 여부를 전혀 확인할 수 없음).
 
-    재현된 버그: 기존에는 실행 상태 스냅샷 파일이 없으면 무조건
+    2026-09-21 4차 재검토 재보완(지적 1번, 재현된 버그): 처음
+    구현에서는 이 `None`(확인 불가)을 `_classify_run_state()`가
+    `False`(명시적 비활성 확인)와 똑같이 취급해 "계측_비활성"으로
+    폴백시켰습니다 — 그러나 "설정 파일이 없거나 손상돼 읽을 수
+    없다"는 "설정을 읽었고 실제로 꺼져있음을 확인했다"와 전혀 다른
+    사실입니다. 특히 설정 파일이 배포 과정에서 실수로 빠졌거나
+    손상된 경우, 실제로는 `account_scope_id`가 설정돼 있었을 수도
+    있는데도 "계측_비활성"으로만 표시되면 이 사실이 조용히
+    가려집니다. 이제 `None`도 `True`와 마찬가지로 "확인이 더
+    필요하다"는 `_classify_run_state()`의 "상태확인_불가"로
+    이어지며, 정말로 설정을 읽었고 명시적으로 비활성임을 확인한
+    `False`인 경우만 "계측_비활성"으로 남습니다.
+
+    재현된 버그(1차): 기존에는 실행 상태 스냅샷 파일이 없으면 무조건
     "계측_비활성"으로 표시했는데, `account_scope_id`가 실제로 설정돼
     관측이 활성화된 상태에서도(예: 재시작 직후 아직 첫 스냅샷을 쓰기
     전, 또는 스냅샷 파일이 외부에서 삭제된 경우) 이 파일 하나가
     없다는 이유만으로 "관측 기능을 켠 적이 없다"고 오판했습니다.
     이 함수가 반환하는 값으로 `_classify_run_state()`가 "명시적으로
-    비활성이 확인된 경우"와 "활성인데 확인 불가한 경우"를 구분합니다.
+    비활성이 확인된 경우"와 "그 외(활성 확인 또는 확인 불가)"를
+    구분합니다.
     """
     try:
         from config.settings import load_settings as _load_settings
@@ -818,15 +830,24 @@ def _classify_run_state(
     `observation_configured_active` 구분을 추가).
 
     - 스냅샷 자체가 없음(`status_file_existed=False`):
-      - `observation_configured_active`가 `False`(설정에서 명시적으로
-        `account_scope_id` 미설정을 확인) 또는 `None`(설정을 읽을 수
-        없어 확인 불가 — 기존과 동일한 보수적 기본값)이면 "계측_비활성".
+      - `observation_configured_active`가 `False`(설정을 실제로 읽었고
+        `account_scope_id`가 명시적으로 비어있음을 확인)일 때만
+        "계측_비활성"으로 판정합니다 — 이때만 "관측 기능을 켠 적이
+        없다"고 확정할 수 있습니다.
       - `observation_configured_active`가 `True`(설정에서 관측이
-        활성화돼 있음을 확인)면 "상태확인_불가"(재현된 버그: 예전엔
-        설정이 실제로 활성인데도 스냅샷 파일 하나가 없다는 이유만으로
-        "관측 기능을 켠 적이 없다"로 오판했습니다 — 재시작 직후 아직
-        첫 스냅샷을 쓰기 전이거나 파일이 외부에서 삭제된 경우일 수
-        있습니다).
+        활성화돼 있음을 확인)이거나 `None`(설정 파일이 없거나 읽기/
+        파싱에 실패해 활성 여부를 확인할 수 없음)이면 둘 다
+        "상태확인_불가"로 판정합니다(2026-09-21 4차 재검토 재보완,
+        지적 1번 재현된 버그: 이전 라운드에서는 `None`(확인 불가)을
+        `False`(명시적 비활성 확인)와 같은 값으로 취급해 "계측_비활성"
+        으로 판정했습니다 — 그러나 "설정을 읽지 못해 모른다"는
+        "설정을 읽었고 꺼져있음을 확인했다"와 전혀 다른 사실이며,
+        확인 불가를 비활성으로 단정하면 실제로는 켜져 있는데 설정
+        파일이 손상·누락된 상황을 "관측 기능을 켠 적이 없다"로
+        조용히 숨기게 됩니다. `True`와 마찬가지로 "확인이 더
+        필요하다"는 뜻의 "상태확인_불가"로 판정하고, 정말 명시적으로
+        비활성임이 확인된 경우(`False`)만 "계측_비활성"으로
+        남겨둡니다).
     - 스냅샷 파일은 있었지만 읽지 못함(JSON 손상 등, `run_status is
       None`인데 `status_file_existed=True`) → "상태확인_불가"
       (재현된 버그: 예전엔 이 경우도 "계측_비활성"으로 잘못 표시돼
@@ -856,9 +877,13 @@ def _classify_run_state(
     if run_status is None:
         if status_file_existed:
             return RUN_STATE_STATUS_UNREADABLE
-        if observation_configured_active is True:
-            return RUN_STATE_STATUS_UNREADABLE
-        return RUN_STATE_DISABLED
+        if observation_configured_active is False:
+            return RUN_STATE_DISABLED
+        # observation_configured_active가 True(활성 확인)이거나
+        # None(설정 확인 불가)이면 둘 다 "계측_비활성"으로 단정하지
+        # 않습니다 — 확인 불가를 비활성으로 단정하면 실제로는 켜져
+        # 있는데 설정 파일이 손상·누락된 상황을 조용히 숨기게 됩니다.
+        return RUN_STATE_STATUS_UNREADABLE
     cs = run_status.get("clean_shutdown")
     if cs is True:
         return RUN_STATE_CLEAN_SHUTDOWN
@@ -1002,10 +1027,25 @@ def build_order_status_summary(
                   " 실행 상태 스냅샷 파일이 없습니다 — 기록기가 아직 시작되지")
         L.append("      않았거나(재시작 직후) 파일이 삭제·이동됐을 수 있습니다."
                   " '계측 비활성'과 혼동하지 마세요.")
+    elif observation_configured_active is None:
+        # 2026-09-21 4차 재검토 재보완(지적 1번, 재현된 버그): 설정
+        # 파일이 없거나 읽기/파싱에 실패해 account_scope_id 활성
+        # 여부를 아예 확인할 수 없는 경우 — 이전 라운드에서는 이
+        # "확인 불가"를 "명시적 비활성 확인"과 똑같이 취급해
+        # "계측_비활성"으로 단정했지만, 설정을 못 읽은 것과 설정을
+        # 읽고 꺼져있음을 확인한 것은 다른 사실입니다. 실제로는
+        # account_scope_id가 설정돼 있었는데 설정 파일만 손상·누락된
+        # 상황을 "관측 기능을 켠 적이 없다"로 조용히 가리면 안 되므로,
+        # 설정도 상태 파일도 모두 확인 불가능한 상태로 안내합니다.
+        L.append("    ⚠ 설정 파일을 읽을 수 없어(파일 없음 또는 파싱 실패)"
+                  " account_scope_id 활성 여부를 확인하지 못했고, 실행 상태")
+        L.append("      스냅샷 파일도 없습니다 — 이 사실만으로 '계측 비활성'을"
+                  " 단정하면 안 됩니다. 설정 파일과 기록기 상태를 직접"
+                  " 확인하세요.")
     else:
         L.append("    ⚠ 실행 상태 스냅샷 파일이 없습니다 — 관측 기능이 비활성"
-                  "(account_scope_id 미설정)이었거나 기록기가 아직 한 번도 시작된"
-                  " 적이 없습니다.")
+                  "(account_scope_id 미설정으로 설정에서 확인됨)이었거나"
+                  " 기록기가 아직 한 번도 시작된 적이 없습니다.")
     L.append("    ※ '실행_중'은 최근 상태 갱신 시각 기준 추정(하트비트 방식)입니다 —")
     L.append("      프로세스 생존을 다른 수단으로 확정하지는 않습니다.")
 
@@ -1788,14 +1828,22 @@ def build(
         # "계측_비활성"으로 단정하기 전에, 실제 설정에서 account_scope_id가
         # 활성화돼 있는지를 먼저 확인합니다.
         observation_configured_active = resolve_observation_configured_active(settings_path)
+        # 2026-09-21 4차 재검토 재보완(지적 1번, 재현된 버그): 설정을
+        # 아예 확인할 수 없는 경우(observation_configured_active is
+        # None)를 "명시적 비활성 확인"(False)과 같이 취급하지 않고
+        # True(활성 확인)와 같은 "확인 필요" 문구로 안내합니다 —
+        # 설정 파일 손상·누락으로 확인 자체가 안 됐다는 사실이
+        # "관측 기능을 켠 적이 없다"로 조용히 가려지면 안 됩니다.
         if run_status is not None:
             status_display = "있음"
         elif status_file_existed:
             status_display = "손상(있지만 읽을 수 없음)"
         elif observation_configured_active is True:
             status_display = "없음(설정상 활성화 확인됨 — 확인 필요)"
-        else:
+        elif observation_configured_active is False:
             status_display = "없음"
+        else:
+            status_display = "없음(설정 확인 불가 — 확인 필요)"
         manifest.append(
             f"  observation_status_snapshot = {obs_status_path} ({status_display})"
         )
