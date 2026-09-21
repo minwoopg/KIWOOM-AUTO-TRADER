@@ -1248,8 +1248,19 @@ check("9-8) 부분 조회만으로는 주문 관측률(observed_unique_orders)�
 # ── 9D. _classify_run_state() 4가지 상태 구분(지적 5번) ──────────
 _now_iso = datetime.now().isoformat()
 _stale_iso = (datetime.now() - timedelta(seconds=999)).isoformat()
-check("9-9) 상태 스냅샷이 아예 없으면 '계측_비활성'(관측 기능이 시작된 적 없음)",
-      _bundle._classify_run_state(None) == "계측_비활성")
+check("9-9) 상태 스냅샷이 아예 없고 설정에서 명시적으로 비활성(account_scope_id"
+      " 미설정)이 확인되면 '계측_비활성'(관측 기능이 시작된 적 없음)"
+      "(2026-09-21 4차 재검토 재보완 반영 — observation_configured_active를"
+      " 명시적으로 False로 지정한 경우만 이 값이 나옴)",
+      _bundle._classify_run_state(None, observation_configured_active=False)
+      == "계측_비활성")
+check("9-9b) 상태 스냅샷이 없고 설정 활성 여부를 확인할 수 없으면(기본값,"
+      " observation_configured_active 지정 안 함) '계측_비활성'이 아니라"
+      " '상태확인_불가'로 판정됨(2026-09-21 4차 재검토 재보완 반영, 재현된"
+      " 버그: 이전 라운드에선 이 '확인 불가'를 '명시적 비활성 확인'과 똑같이"
+      " 취급해 계측_비활성으로 단정했음 — 설정을 못 읽은 것과 설정을 읽고"
+      " 꺼져있음을 확인한 것은 다른 사실임)",
+      _bundle._classify_run_state(None) == _bundle.RUN_STATE_STATUS_UNREADABLE)
 check("9-10) clean_shutdown=True면 '정상_종료'",
       _bundle._classify_run_state({"clean_shutdown": True, "updated_at": _now_iso}) == "정상_종료")
 check("9-11) clean_shutdown=False면 '종료_확인_불가'(종료 배선은 탔지만 마커 기록 자체가 실패)",
@@ -1550,9 +1561,17 @@ check("10-7) 상태 파일이 있지만 손상(JSON 파싱 불가)됐으면 '계
       " 구분되지 않았음)",
       _bundle._classify_run_state(None, status_file_existed=True)
       == _bundle.RUN_STATE_STATUS_UNREADABLE)
-check("10-8) 상태 파일이 아예 없으면 여전히 '계측_비활성'(기존 동작 그대로 유지)",
+check("10-8) 상태 파일이 아예 없고 설정에서 명시적으로 비활성이 확인되면"
+      " '계측_비활성'(observation_configured_active=False를 명시한 경우만)",
+      _bundle._classify_run_state(
+          None, status_file_existed=False, observation_configured_active=False
+      ) == _bundle.RUN_STATE_DISABLED)
+check("10-8b) 상태 파일이 없고 설정 활성 여부도 확인할 수 없으면(기본값) 더 이상"
+      " '계측_비활성'으로 단정하지 않고 '상태확인_불가'로 판정됨(2026-09-21"
+      " 4차 재검토 재보완 반영 — 10-8의 이전 기대값은 '확인 불가'를 '명시적"
+      " 비활성'과 혼동한 잘못된 기대값이었음)",
       _bundle._classify_run_state(None, status_file_existed=False)
-      == _bundle.RUN_STATE_DISABLED)
+      == _bundle.RUN_STATE_STATUS_UNREADABLE)
 
 _future_iso10b = (datetime.now() + timedelta(seconds=999)).isoformat()
 check("10-9) clean_shutdown=None인데 updated_at이 미래 시각이면 '실행_중'으로 잘못"
@@ -1716,8 +1735,10 @@ check("11-2) 설정에 account_scope_id가 없으면(기본값 \"\") False를 �
       _bundle.resolve_observation_configured_active(_settings_path_11a_blank) is False)
 
 _settings_path_11a_missing = Path(_tmpdir11a) / "does_not_exist.yaml"
-check("11-3) 설정 파일 자체가 없으면 None을 반환함(확인 불가 — 호출부가 기존처럼"
-      " 보수적으로 '계측_비활성' 기본값으로 폴백하게 함)",
+check("11-3) 설정 파일 자체가 없으면 None을 반환함(확인 불가 — 2026-09-21 4차"
+      " 재검토 재보완 반영: 호출부는 더 이상 이 None을 '계측_비활성'으로"
+      " 폴백시키지 않고 '상태확인_불가'로 판정함 — 확인 불가와 명시적 비활성은"
+      " 다른 사실이므로)",
       _bundle.resolve_observation_configured_active(_settings_path_11a_missing) is None)
 
 
@@ -1845,6 +1866,105 @@ try:
           "observation_run_state(현재 실행 상태)   = 실행_중" in _cov11d_text)
 finally:
     _os.chdir(_orig_cwd11d)
+
+
+# ── 12. 2026-09-21 4차 재검토 재보완 — "설정 확인 불가"를 "명시적
+#    비활성"과 혼동하지 않음(재현된 버그: 11B에서 처음 구현한
+#    observation_configured_active=None 처리가 여전히 False와 같이
+#    취급돼 '계측_비활성'으로 표시됐음) — 설정 파일 누락·파싱 실패를
+#    실제 build() 경로로 검증한다. ─────────────────────────────────
+
+# ── 12A. 설정 파일 자체가 없음(config/ 디렉터리조차 없음) + 상태
+#    파일 없음 → '계측_비활성'이 아니라 '상태확인_불가' ────────────
+_tmpdir12a = tempfile.mkdtemp()
+_orig_cwd12a = _os.getcwd()
+try:
+    _os.chdir(_tmpdir12a)
+    Path("logs").mkdir()
+    _day921_12a = datetime(2026, 9, 21).date()
+    (Path("logs") / "order_status_observations.jsonl").write_text("", encoding="utf-8")
+    # config/settings.yaml 자체를 만들지 않음 — resolve_observation_configured_active()가
+    # None을 반환하는 상황(설정 파일 없음).
+
+    _bundle_path_12a = _bundle.build(_day921_12a, quiet=True)
+    check("12-1) 설정 파일이 아예 없어도(config 디렉터리조차 없음) 번들 생성은"
+          " 예외 없이 성공함",
+          _bundle_path_12a is not None and _bundle_path_12a.exists())
+    with _zipfile.ZipFile(_bundle_path_12a) as z:
+        _cov12a_text = z.read("metadata/order_status_coverage.txt").decode("utf-8")
+        _manifest12a_text = z.read("MANIFEST.txt").decode("utf-8")
+    check("12-2) 커버리지 요약에 '계측_비활성'이 아니라 '상태확인_불가'로 표시됨"
+          "(재현된 버그: 이전 라운드에선 설정 확인 불가(None)를 명시적 비활성"
+          "(False)과 똑같이 취급해 '계측_비활성'으로 잘못 단정했음)",
+          "observation_run_state(현재 실행 상태)   = 상태확인_불가" in _cov12a_text
+          and "observation_run_state(현재 실행 상태)   = 계측_비활성" not in _cov12a_text)
+    check("12-3) 커버리지 요약에 '설정 파일을 읽을 수 없어' 경고 문구가 표시되어"
+          " '계측 비활성'과 혼동되지 않게 함",
+          "설정 파일을 읽을 수 없어(파일 없음 또는 파싱 실패)" in _cov12a_text)
+    check("12-4) MANIFEST에도 observation_status_snapshot이 '없음(설정 확인 불가"
+          " — 확인 필요)'로 표시됨(단순 '없음'이나 '설정상 활성화 확인됨'과 구분됨)",
+          "없음(설정 확인 불가 — 확인 필요)" in _manifest12a_text)
+finally:
+    _os.chdir(_orig_cwd12a)
+
+
+# ── 12B. 설정 파일은 있지만 파싱 불가(깨진 YAML) + 상태 파일 없음
+#    → 역시 '계측_비활성'이 아니라 '상태확인_불가' ──────────────────
+_tmpdir12b = tempfile.mkdtemp()
+_orig_cwd12b = _os.getcwd()
+try:
+    _os.chdir(_tmpdir12b)
+    Path("logs").mkdir()
+    Path("config").mkdir()
+    (Path("config") / "settings.yaml").write_text(
+        "broker:\n  provider: [이건: 잘못된 YAML 들여쓰기\n", encoding="utf-8"
+    )
+    _day921_12b = datetime(2026, 9, 21).date()
+    (Path("logs") / "order_status_observations.jsonl").write_text("", encoding="utf-8")
+
+    check("12-5) 파싱 불가한 config/settings.yaml에 대해"
+          " resolve_observation_configured_active()가 예외 없이 None을 반환함",
+          _bundle.resolve_observation_configured_active("config/settings.yaml") is None)
+
+    _bundle_path_12b = _bundle.build(_day921_12b, quiet=True)
+    check("12-6) 설정 파일이 있지만 파싱할 수 없어도 번들 생성은 예외 없이 성공함",
+          _bundle_path_12b is not None and _bundle_path_12b.exists())
+    with _zipfile.ZipFile(_bundle_path_12b) as z:
+        _cov12b_text = z.read("metadata/order_status_coverage.txt").decode("utf-8")
+    check("12-7) 커버리지 요약에 '계측_비활성'이 아니라 '상태확인_불가'로 표시됨"
+          "(설정 파일이 손상돼 활성 여부를 확인할 수 없는 경우도 12A의 '설정"
+          " 파일 없음'과 동일하게 처리됨)",
+          "observation_run_state(현재 실행 상태)   = 상태확인_불가" in _cov12b_text
+          and "observation_run_state(현재 실행 상태)   = 계측_비활성" not in _cov12b_text)
+finally:
+    _os.chdir(_orig_cwd12b)
+
+
+# ── 12C. 대조군 — 설정이 정상 로드되고 명시적으로 비활성(account_scope_id
+#    미설정)이면 여전히 '계측_비활성'으로 표시됨(이 회귀 수정이 "항상
+#    상태확인_불가"로 뭉뚱그리는 게 아님을 확인) ─────────────────────
+_tmpdir12c = tempfile.mkdtemp()
+_orig_cwd12c = _os.getcwd()
+try:
+    _os.chdir(_tmpdir12c)
+    Path("logs").mkdir()
+    Path("config").mkdir()
+    (Path("config") / "settings.yaml").write_text(_real_settings_yaml_text_11, encoding="utf-8")
+    _day921_12c = datetime(2026, 9, 21).date()
+    (Path("logs") / "order_status_observations.jsonl").write_text("", encoding="utf-8")
+
+    _bundle_path_12c = _bundle.build(_day921_12c, quiet=True)
+    check("12-8) 설정이 정상 로드되고 account_scope_id가 명시적으로 비어있으면"
+          " 번들 생성이 예외 없이 성공함",
+          _bundle_path_12c is not None and _bundle_path_12c.exists())
+    with _zipfile.ZipFile(_bundle_path_12c) as z:
+        _cov12c_text = z.read("metadata/order_status_coverage.txt").decode("utf-8")
+    check("12-9) 이 경우(명시적 비활성 확인)에는 여전히 '계측_비활성'으로 표시됨"
+          "(설정 확인 불가와 명시적 비활성을 구분하는 이번 수정이, 실제로"
+          " 비활성이 확인된 경우까지 '상태확인_불가'로 과잉 판정하지 않음을 확인)",
+          "observation_run_state(현재 실행 상태)   = 계측_비활성" in _cov12c_text)
+finally:
+    _os.chdir(_orig_cwd12c)
 
 
 print(f"\n총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
