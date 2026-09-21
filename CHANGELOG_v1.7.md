@@ -2556,3 +2556,175 @@ FIFO/손익 계산, RiskManager/DailyReporter 연결, API 조회 빈도 확대�
 - `kiwoom_auto_trader_priority1_stage2_followup_changed_files_20260918.zip`
   — 실제 변경된 4개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
   폴더 경로 유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 우선순위1 3차 보완 — GPT 3차 재검토 3건 수정 (2026-09-21, 손익 계산·B 색인 계속 제외)
+
+### 배경
+
+위 "우선순위1 2차 보완"(패치 0068~0071) 전달 후, 민우님이 전달한 GPT
+3차 재검토에서 0068~0071의 파일 정합성과 기존 테스트 결과(118/118,
+전체 회귀 39/40, legacy 11/11)는 확인됐지만, 더 엄밀한 재현으로
+**3건의 남은 문제**가 지적됐습니다. 민우님의 지시는 다음과 같습니다.
+
+> 0068~0071의 ZIP 정합성과 기존 테스트 결과는 확인했습니다. 다음
+> 보완은 ① 격리 파일 내 정상 관측의 집계·번들 보존 ② 설정 비활성과
+> 상태 파일 손상·시각 이상 구분 ③ 주문일 커버리지에 사용한 익일
+> 관측 근거의 번들 포함으로 한정해주세요. 각각 재현 테스트를
+> 추가하고, API 조회 정책·PSM·주문·리스크·손익 계산은 변경하지
+> 마세요.
+
+이번 라운드도 **정확히 이 3개 항목**으로 범위를 한정했습니다. 1·2차
+보완에서 해결된 부분(계좌 스코핑, 부분 조회 오집계, 익일 조회 연결,
+식별자 보존 마스킹, truncate 실패 보호 등)은 이번 라운드에서 손대지
+않았고, 회귀 테스트로 계속 지켜지는지만 재확인했습니다.
+
+### 변경 내용
+
+1. **[지적 1번] 격리 파일의 정상 기록이 집계·번들에서 빠짐
+   (`infra/storage/order_status_observation_store.py`,
+   `export_daily_bundle.py`)**: 재현된 버그 — 정상 기록 저장 → 부분
+   쓰기·truncate 실패 → `_quarantine_and_rotate_file()`이 파일을
+   옆으로 격리 → 새 기록 저장 시, exporter는 격리 후 새로 시작된
+   파일(원래 경로)만 읽어 **격리 직전까지 쌓여있던 정상 레코드가
+   집계·번들 어디에도 다시 나타나지 않았습니다**. 격리된 파일은
+   삭제되지 않고 그대로 남아있는데도 아무도 다시 읽지 않았던
+   것입니다. 기록기/exporter가 같은 격리 접미사 규칙
+   (`.unrecoverable-<시각>-<uuid>`)을 공유하도록 새
+   `QUARANTINE_SUFFIX_PREFIX` 상수와
+   `find_quarantined_observation_files()`를 저장소 모듈에 추가했고
+   (`status_path_for()`와 동일한 이유로 기록기 쪽 규칙을 그대로
+   재사용), `slice_jsonl_observations()`와
+   `_load_full_observations_for_order_date()`가 이 함수로 찾은
+   격리 파일들도 원본과 동일한 날짜 필터(+마스킹)로 함께 훑어 raw
+   슬라이스와 주문일 커버리지 양쪽에 포함하도록 확장했습니다. 격리
+   파일 내부의 손상/제외 줄 수는 `quarantine_skipped_count`로 별도
+   집계해 MANIFEST에 "격리된 손상 파일 N건 발견 — 정상 레코드 M건을
+   raw에 포함(손상 K건은 계속 제외)"로 표시합니다 — 정상 레코드
+   손실 없이 복구하되, 진짜 손상된 줄까지 조용히 섞어 넣지는
+   않습니다.
+2. **[지적 2번] 상태 파일 손상이 '계측 비활성'으로 오표시됨
+   (`export_daily_bundle.py`)**: 재현된 버그 — (a) 깨진
+   `status.json`(JSON 파싱 실패, 또는 dict가 아님)을 넣으면 파일이
+   없는 경우와 똑같이 `None`이 반환돼 `계측_비활성`(관측 기능을 켠
+   적이 없음)으로 표시됐습니다 — 실제로는 기능이 켜져 있었는데
+   진단용 스냅샷 파일 하나만 문제가 있는 것일 수 있는데도 이를
+   구분하지 못했습니다. (b) 미래 시각의 `updated_at`을 넣으면
+   `datetime.now() - updated_at`이 음수가 돼 항상
+   `stale_after_sec`(120초) 이하로 판정되면서 `실행_중`으로 잘못
+   통과했습니다. `_read_running_status()`가 이제
+   `(파싱된 데이터 또는 None, 파일이 존재했는가)` 튜플을 반환하고,
+   `_classify_run_state()`에 새 상태 `상태확인_불가`를 추가해 "파일
+   자체가 없음(계측_비활성)"과 "파일은 있지만 읽을 수 없거나
+   시각이 비정상(상태확인_불가)"을 명확히 구분합니다. `updated_at`이
+   미래(경과 시간이 음수)이거나 파싱 자체가 불가능하면 더 이상
+   `실행_중`/`계측_비활성` 어느 쪽으로도 통과시키지 않고
+   `상태확인_불가`로만 판정합니다. 커버리지 요약과 MANIFEST 문구도
+   "파일이 있지만 신뢰할 수 없다"는 사실을 명시하도록 갱신했습니다.
+3. **[지적 3번] 주문일 커버리지에 사용한 익일 관측의 근거가 번들에
+   없음 (`export_daily_bundle.py`)**: 재현된 버그 — 9/17 접수 주문을
+   9/18에 조회한 경우, 9/17 번들의 계좌별 커버리지 집계에는 그
+   관측이 정확히 1건 반영되지만(2차 보완에서 해결), 그 근거가 되는
+   원본 레코드는 9/17 raw 슬라이스(조회일=`started_at` 기준)에는
+   **나타나지 않아** 번들만 갖고는 그 "1건"이 어디서 왔는지 재확인할
+   방법이 없었습니다. 이제 주문일 집계(`order_day_records`)에서
+   조회일 raw 슬라이스에 없는(write_id 기준 차집합) 몫만 추려 별도
+   raw 파일
+   (`order_status_observations_orderday_extra_<날짜>.jsonl`)로
+   번들에 포함하고, 커버리지 요약에 그 건수("이 중 조회일 raw
+   슬라이스에 없는(다른 날짜에 조회된) 관측 = N건")와 근거 파일
+   경로, 그리고 **집계 기준 시각(전체 로그를 다시 훑은 시각)**을
+   함께 기록합니다 — 이 시각 이후 로그가 더 늘어나면 다음 번들에서
+   수치가 달라질 수 있다는 점도 명시해, 번들이 "그 순간의 스냅샷"
+   임을 분명히 했습니다.
+4. **테스트 추가
+   (`test_order_status_evidence_observation.py`)**: 위 3개 재현
+   시나리오를 실제 서비스/exporter 경로로 검증하는 그룹 10(10A~10C,
+   21건)을 추가했습니다 — 10A는 9A와 동일한 방식(부분 쓰기 실패 →
+   truncate 복구도 실패)으로 실제 recorder를 통해 진짜 격리 파일을
+   만든 뒤 `export_daily_bundle.build()`로 격리 전/후 레코드가 모두
+   집계·raw에 나타나는지 확인하고, 10B는 손상된 status.json이 실제
+   번들에서 `상태확인_불가`로 표시되는지, 10C는 9/19 접수·9/20
+   조회 관측이 9/19 번들에 별도 근거 파일로 포함되는지를 각각
+   확인합니다.
+
+### 테스트 및 검증
+
+- `test_order_status_evidence_observation.py`: **139/139 통과**(기존
+  118건 전부 무변경 유지 + 이번 라운드 21건 신규). 신규 그룹 10:
+  - `10A`(6건): 지적 1번 — 실제 `OrderStatusObservationRecorder`로
+    부분 쓰기 실패 + truncate 복구 실패를 재현해 진짜 격리 파일을
+    만들고, `find_quarantined_observation_files()`가 이를 정확히
+    찾는지, `export_daily_bundle.build()`로 만든 번들의 raw
+    슬라이스와 커버리지 요약(`observed_unique_orders`)에 격리 전/후
+    레코드(OIDQ1/OIDQ2)가 모두 반영되는지 확인.
+  - `10B`(9건): 지적 2번 — `_classify_run_state()`/
+    `_read_running_status()` 단위 테스트로 "파일 없음"과 "손상/
+    미래시각"이 서로 다른 상태로 분리되는지 확인 + 손상된
+    `status.json`을 실제로 둔 채 `build()`를 호출해 번들의
+    커버리지 요약이 `상태확인_불가`(계측_비활성이 아님)로 표시되고
+    MANIFEST에도 "손상"으로 나타나는지 확인.
+  - `10C`(6건): 지적 3번 — 9/19 접수·9/20 조회 관측을 만들고
+    9/19 번들에 별도 근거 파일이 포함되는지, 그 파일에 실제
+    레코드가 담겼는지, 조회일 raw 슬라이스에는 없는지, 커버리지
+    요약에 건수·근거 경로·집계 기준 시각이 함께 나타나는지 확인.
+- 1·2차 보완에서 해결된 항목(계좌 스코핑 200%, 부분 조회 오집계,
+  익일 조회 연결, 식별자 보존 마스킹, truncate 실패 보호, 개행
+  누락 보호 등)의 기존 테스트(그룹 2B/3B/3C/3D/4/4B/4C/9A~9F)는
+  전부 무변경 통과 — 이번 라운드가 그 부분을 건드리지 않았음을
+  재확인했습니다.
+- 전체 회귀(`run_regression_tests.py`): **39/40 통과** — 유일한
+  실패는 지난 세 라운드와 동일한 `test_broker_order_status.py`의
+  fixture 파일 누락이며 이번 변경과 무관합니다.
+- `legacy_tests/test_entry_watch.py`: **11/11 통과**.
+- 검증 절차: 이번에도 fresh clone에 0051~0059 → 0060~0067 →
+  0068~0071 → 이번 0072~0075를 순서대로 `git am`한 뒤 위 세 검증을
+  모두 재실행해 동일한 결과를 확인했습니다(아래 "전달 파일" 참고).
+
+### 변경하지 않은 것
+
+- 기존 API 조회 정책, PSM 상태 전이 판정, 주문 접수·리스크 게이트 —
+  전혀 건드리지 않았습니다.
+- 손익 계산(FIFO 매칭, 확정 손익), B(확정 체결 키) 설계 — 계속
+  제외합니다.
+- 1·2차 보완에서 해결된 계좌 스코핑, 부분 조회 오집계 수정, 익일
+  조회 연결, 식별자 보존 마스킹, truncate/개행 실패 보호 — 이번
+  라운드에서 다시 손대지 않았습니다(회귀 테스트로만 재확인).
+- `derive_broker_order_status()`(판정 로직 자체), `find_all_matching()`/
+  `_find_matching()`의 매칭 알고리즘, `TrackedOrderJournalStore`의
+  삭제 시점/동작 — 무변경.
+
+### 다음 작업
+
+1. `test_broker_order_status.py`의 fixture 디렉터리(`tests/fixtures/
+   order_reconciliation/`)가 저장소에 커밋돼 있는지 확인 — 네
+   라운드 연속으로 동일하게 누락 보고되고 있어 방치되지 않도록
+   확인이 필요합니다(이번 라운드와 무관).
+2. 적용 후 확인 절차는 2차 보완과 동일합니다(`account_scope_id`
+   설정·재시작 후 `*.status.json` 생성 확인, `observation_run_state`가
+   `실행_중`/`정상_종료`로 표시되는지 확인). 다만 이제 상태 스냅샷
+   파일이 존재하는데도 내용을 신뢰할 수 없는 경우
+   (`상태확인_불가`)가 나타나면, 이는 "관측 기능이 꺼져 있다"는
+   뜻이 **아니므로** `account_scope_id` 설정을 다시 확인하기 전에
+   먼저 해당 `*.status.json` 파일 자체(JSON 형식, `updated_at`
+   시각)를 직접 열어 확인해야 합니다.
+3. (1~3차 보완 완료 확인 후) 이번에 쌓인 관측 데이터의 커버리지가
+   실제 운영에서 충분한 수준에 도달하는지 며칠 지켜본 뒤, B(확정
+   체결 키)·FIFO 손익 연결 설계를 별도로 요청할 수 있습니다 — 이번
+   라운드 범위 밖.
+
+### 전달 파일
+
+- 패치(0051~0071이 적용된 트리 기준으로 이어서 적용):
+  - `0072-fix-order-status-observation-store-quarantine-finder.patch`
+    — `infra/storage/order_status_observation_store.py`
+  - `0073-fix-export-daily-bundle-quarantine-status-crossday-evidence.patch`
+    — `export_daily_bundle.py`
+  - `0074-test-order-status-evidence-observation-round4.patch` —
+    `test_order_status_evidence_observation.py`
+  - `0075-docs-CHANGELOG-v1.7-priority1-stage3-followup.patch` — 이
+    CHANGELOG
+- `kiwoom_auto_trader_priority1_stage3_followup_changed_files_20260921.zip`
+  — 실제 변경된 4개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
+  폴더 경로 유지한 채 담음.
