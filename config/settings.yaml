@@ -14,6 +14,7 @@ broker:
   app_key: ${KIWOOM_APP_KEY}
   secret_key: ${KIWOOM_SECRET_KEY}
   account_number: ${KIWOOM_ACCOUNT_NUMBER}
+  account_scope_id: "acct-a"
   is_paper_trading: true
 
 # 감시할 종목 목록 (조건검색 OFF 시 사용)
