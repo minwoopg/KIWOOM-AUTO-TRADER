@@ -3135,3 +3135,177 @@ FIFO/손익 계산, RiskManager/DailyReporter 연결, API 조회 빈도 확대�
 - `kiwoom_auto_trader_bundle_analysis_followup_changed_files_20260922.zip`
   — 실제 변경된 4개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
   폴더 경로 유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 신규 진입 가격·분봉 정합성 검증 — 9/23 005930 재현·차단 (2026-09-23)
+
+### 배경
+
+주간(9/21~9/23) 종합 분석 이후 사용자가 4항목 우선순위 계획을
+제시하며, 그중 1번("진입 가격·분봉 지표 불일치 조사 및 보완")부터
+착수하라고 지시했습니다. 지시에 인용된 구체 사례: 9/23 삼성전자
+(005930) 매수 주문 참조가 276,500원인데 직전 당일 분봉 가격대는
+283,500~284,500원이라는 불일치.
+
+`signal_log_20260923.csv`를 005930 기준으로 행 단위 대조한 결과,
+다음 흐름이 재현됐습니다.
+
+- 09:00:02.37 — 시세 캐시 최초 적재, 현재가 276,500원(당시
+  `latest_bar_timestamp`는 전거래일 19:59로, 분봉도 아직 당일로
+  안 넘어온 상태).
+- 09:00:30.11 — 매수 체결(주문 참조가 276,500원). 이 시점에는
+  `latest_bar_timestamp`가 이미 당일 09:00으로 정상 갱신돼
+  있었으나, 시세 캐시는 `price_refresh_seconds`(60초) 이내라서
+  09:00:02의 값을 그대로 재사용 — 매수 판단 자체가 부정확한 가격
+  위에서 이뤄짐.
+- 09:00:41.39 — 포지션이 보유로 전환되며 캐시를 우회하는 직접조회
+  경로(`_process_symbol()` 2329행 부근)를 타자마자 현재가가
+  283,500원으로 즉시 점프(11초 만의 계단형 변화 — 점진적 시세
+  변동이 아니라 캐시된 값 자체가 틀렸던 것으로 판단).
+- 09:05:41.59 — `entry_watch` 최소수익미달청산으로 매도(참조가
+  284,250원). `entry_watch_shadow.csv`의 실제 손익은 평균매입가
+  283,905원(브로커의 실제 잔고 평균단가) 기준 +0.122%로,
+  헤드라인(276,500→284,250, +2.8%)과 크게 다름 — 단, 이 손익
+  재계산·리포트 기준 분리는 이번 라운드의 범위(항목 3)가 아니라
+  다음 라운드로 명시적으로 미뤄둡니다.
+
+근본 원인: `_get_market_price_with_cache()`(시세 캐시, 순수
+시간경과 기반 스로틀)와 `_get_minute_analysis()`(분봉 분석, 완전히
+독립된 별도 API 호출)가 서로 무관하게 갱신되며, 신규 진입 판단에는
+이 둘의 정합성을 검증하는 장치가 전혀 없었습니다. 기존 `_try_buy()`
+의 `STALE_MARKET_PRICE` 가드는 캐시의 "나이"만 볼 뿐, 캐시된 값
+자체가 실제 시세와 맞는지는 전혀 확인하지 않습니다.
+
+### 변경 내용
+
+사용자 지시대로 신규 매수(진입)와 기존 보유 종목의 청산 경로를
+명확히 구분하고, 진입 경로에만 최소한의 수정을 적용했습니다.
+
+1. `config/settings.py` — `TradingConfig`에
+   `new_entry_price_revalidation_tolerance_pct: float = 0.5`(%)
+   추가. `__post_init__`에서 양의 유한값 검증. 기본값이 있어
+   `build_minimal_settings()`를 포함한 기존 호출부는 수정 불필요.
+2. `domain/service/trading_service.py` — `_process_symbol()`에서
+   신규 진입(`position is None`) BUY 신호가 나오면, `_try_buy()`
+   호출 직전에 `self.broker.get_market_price()`로 한 번 더 직접
+   재조회해 판단 시점 가격과 비교합니다.
+   - 재조회 자체가 실패(예외)하면 → 이번 폴링의 매수를
+     `HOLD(PRICE_REVALIDATION_FAILED)`로 보류.
+   - 재조회는 성공했지만 판단 시점 가격과의 차이가
+     `new_entry_price_revalidation_tolerance_pct`(기본 0.5%)를
+     넘으면 → `HOLD(PRICE_STALE_VS_LIVE)`로 보류.
+   - 재조회 결과는 성공/실패·일치/불일치 여부와 무관하게(단, 실패
+     시엔 제외) 캐시에 반영해 다음 폴링부터는 정확한 값을 사용.
+   - 허용치 이내로 일치하면 신호는 그대로 BUY 유지, `_try_buy()`에
+     넘기는 가격도 원래 판단 시점 가격 그대로(정상 케이스의 동작을
+     바꾸지 않음).
+
+보유 종목(`position is not None`)의 매도 감시는 이 신규 블록이
+`position is None` 조건으로 아예 실행되지 않는 완전히 별도의
+코드 경로(2329행 부근, 이미 캐시를 거치지 않는 직접조회)이므로
+전혀 영향받지 않습니다 — 사용자 지시대로 "조회 실패 시 신규
+진입은 보류하되 청산 감시는 유지"가 구조적으로 보장됩니다.
+
+### 콜백 잔고 조회 분리(항목 2) — 별도 커밋 없이 기존 수정으로 충족 확인
+
+사용자가 이번 지시에서 항목 2로 "콜백 잔고 조회 분리는 별도
+커밋으로 진행해주세요"를 명시하며, 완료 기준으로 "최초 429·장애
+지속·복구 모두에서 콜백이 백오프를 우회하지 않음"을 제시했습니다.
+이는 지난 라운드(9/22, 위 "🔧 9/21~9/22 번들 분석 재검토" 절)에서
+이미 커밋한 `update_targets()`의 `is_in_balance_outage()` 가드가
+사실상 해당 기준을 충족하는지 다시 코드와 기존 테스트로 대조한
+결과입니다 — 새 코드 작성 없이 확인만 했습니다.
+
+- **장애 지속**: `is_in_balance_outage()`가 True인 동안
+  `update_targets()`는 `broker.get_account_balance()`를 전혀
+  호출하지 않습니다(`test_outage_active_with_unresolved_orders_
+  never_calls_broker` — 3회 연속 호출해도 0회 확인).
+- **최초 429**(아직 `enter_balance_outage()`가 호출되기 전 —
+  `is_in_balance_outage()`가 여전히 False인 시점): 이 시점엔
+  지켜야 할 백오프 자체가 아직 없으므로, `update_targets()`는
+  이전과 동일하게 잔고 API를 한 번 호출하고 예외를 조용히 삼켜
+  `held_symbols=[]`로 처리합니다(`test_no_outage_broker_exception_
+  still_swallowed` — 독스트링에 "outage 진입 직전의 최초 429"로
+  명시). 이 예외 자체가 `enter_balance_outage()`를 부르지는
+  않습니다 — 실제 outage 진입은 `app/main.py`의 `trading_loop()`가
+  자신의 `run_once()` 호출에서 `kiwoom_balance_fetch_failure`
+  표시가 붙은 429를 잡았을 때만 이뤄집니다(변경 없음).
+- **복구**(outage가 풀려 `is_in_balance_outage()`가 다시 False로
+  돌아온 뒤): `update_targets()`는 다시 정상 분기(`else`)로
+  돌아가 이전과 완전히 동일하게 동작합니다
+  (`test_no_outage_behavior_unchanged_success`) — 더 이상 지킬
+  백오프가 없는 상태이므로 "우회"라는 개념 자체가 적용되지
+  않습니다.
+
+세 경우 모두 기존 `test_update_targets_balance_outage_guard.py`
+(9/22 패치 `0082`, 5건 전부 통과 유지)가 이미 회귀로 고정하고
+있음을 이번에 재확인했습니다. 따라서 항목 2는 추가 코드 변경이나
+별도 커밋 없이 이미 충족된 것으로 판단하며, 이번 라운드는 항목 1
+(가격 재검증)에 대한 커밋만 별도로 남깁니다(사용자 지시대로).
+
+### 테스트 및 검증
+
+- 신규: `test_new_entry_price_revalidation.py` 12건 전부 통과.
+  1) 장전 캐시가 남은 상태에서 개장 후 가격이 크게 달라짐 → 보류,
+     캐시는 재조회한 실제 값으로 갱신됨.
+  2) 분봉은 fresh(entry_safe=True)인데 현재가만 stale → 동일하게
+     보류(분봉 신선도 검사와는 독립된 경로임을 확인).
+  3) 재조회 자체가 429로 실패 → 예외 전파 없이 정상 종료, 보류,
+     기존 캐시는 보존됨.
+  4) (회귀) 재조회 결과가 판단 시점 가격과 허용치 이내로 일치 →
+     `_try_buy()`가 정상 호출됨.
+  5) 보유 종목 처리에서는 이 신규 블록 자체가 실행되지 않아(재조회
+     호출이 2329행 경로 1회로 유지) SELL 신호가 차단 없이
+     `_try_sell()`까지 정상 도달함.
+- `build_minimal_settings()`에 의존하는 기존 테스트 파일 24개
+  (신규 파일 포함) 전부 개별 재실행해 회귀 없음 확인 — 예:
+  `test_order_status_evidence_observation.py` 166/166,
+  `test_partial_fill_lifecycle.py` 336/336,
+  `test_candidate_a_guard.py` 61/61,
+  `test_stale_minute_data_safety.py` 59/59(인접한 분봉 스테일
+  가드 로직, 이번 수정과 함께 실행돼도 회귀 없음).
+- 패치를 `0082~0084`가 적용된 트리 기준으로 이어 붙인 fresh
+  clone에서 `git am`한 뒤 위 검증을 모두 재실행해 동일한 결과를
+  확인했습니다(아래 "전달 파일" 참고).
+
+### 변경하지 않은 것
+
+- 전략 임계값(RSI/MACD/진입점수 등), `entry_watch` 로직, 손익
+  확정 로직 — 사용자 지시대로 전혀 건드리지 않았습니다.
+- 콜백 잔고 조회 분리(항목 2) — 위에서 확인한 대로 기존 9/22
+  수정이 이미 충족하고 있어 이번 라운드에서 추가로 건드리지
+  않았습니다.
+- 체결내역 대조와 보고서 기준 분리(항목 3, "매수 후 단순 평균가
+  치환이 아니라 설계부터") — 사용자가 명시적으로 이번 라운드
+  범위 밖으로 지정했으므로 코드 변경 없음.
+- 저상승여력·PR 진입 후보 비교(항목 4, shadow 로깅) — 역시 사용자가
+  명시적으로 이번 라운드 범위 밖으로 지정했으므로 코드 변경 없음.
+
+### 다음 작업
+
+1. `new_entry_price_revalidation_tolerance_pct`(현재 0.5%) 초기값을
+   실측(`PRICE_REVALIDATE` 로그의 실제 괴리 분포)으로 조정할지
+   판단 — 다음 며칠 데이터 축적 후 검토.
+2. 항목 3(체결내역 대조·보고서 기준 분리) 설계 — 매수 후 단순
+   평균가 치환이 아니라, 장 마감 후 체결조회 원문과 대조해
+   "확정된 체결"과 "미확정"을 분리하는 접근을 먼저 설계하고
+   합의한 뒤 구현.
+3. 항목 4(저상승여력·PR 진입 후보 shadow 비교) — entry_watch·
+   손절·트레일링은 그대로 둔 채 관측만 추가.
+4. (참고, 사용자가 아직 명시적으로 요청하지 않음) 9/23 주간종합
+   문서(`2026-09-23-weekly-synthesis-profitability.md`)의 "005930
+   2전 2승" 평가는 이번에 확인된 헤드라인(+2.8%, +162,750원) 대신
+   실제 평균단가 기준(+0.12%, 약 +7,140원)으로 다시 봐야 함 —
+   항목 3(리포트 기준 분리) 설계가 끝나면 함께 정정 필요.
+
+### 전달 파일
+
+- 패치(0082~0084가 적용된 트리 기준으로 이어서 적용):
+  - `0085-fix-trading-service-new-entry-price-revalidation.patch`
+    — `config/settings.py`, `domain/service/trading_service.py`,
+    `test_new_entry_price_revalidation.py`
+  - `0086-docs-CHANGELOG-v1.7-price-revalidation.patch` — 이 CHANGELOG
+- `kiwoom_auto_trader_price_revalidation_changed_files_20260923.zip`
+  — 실제 변경된 4개 파일(위 목록 그대로, 이 CHANGELOG 포함)을
+  원래 폴더 경로 유지한 채 담음.
