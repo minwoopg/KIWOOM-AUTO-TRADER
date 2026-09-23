@@ -113,6 +113,18 @@ class TradingConfig:
     # 실측 후 조정 대상 — "안전성이 입증된 값"이라는 뜻은 아니다.
     balance_retry_backoff_min_seconds: float = 30.0
     balance_retry_backoff_max_seconds: float = 180.0
+    # 2026-09-23 (신규 진입 가격·분봉 정합성 검증, GPT 재검토 반영):
+    # 신규 진입(position is None) BUY 신호가 나오면, _try_buy() 호출
+    # 직전에 한 번 더 직접 시세를 조회해 판단에 쓴 캐시 가격과 비교
+    # 한다. 두 값의 차이가 이 비율(%)을 넘으면 이번 폴링의 매수를
+    # 보류한다 — 9/23 005930 재현: 세션 시작 직후 캐시된 276,500원이
+    # 실제로는 283,500원대였던 것을, 매수 직후 다음 폴링(보유 전환
+    # 후 캐시를 우회하는 직접조회 경로)에서야 뒤늦게 확인됨(매수 판단
+    # 자체가 부정확한 가격 위에서 이뤄진 것으로 재현 확인). 보유
+    # 종목의 매도 감시는 이미 캐시를 거치지 않는 별도 경로(2329행
+    # 부근)라 이 검사와 무관하게 계속 동작한다. 초기 설정값이며,
+    # 실측 후 조정 대상.
+    new_entry_price_revalidation_tolerance_pct: float = 0.5
 
     def __post_init__(self):
         # frozen=True dataclass라 self.x = ... 직접 대입은 FrozenInstanceError.
@@ -139,6 +151,20 @@ class TradingConfig:
                 "balance_retry_backoff_max_seconds보다 클 수 없습니다 "
                 f"(min={self.balance_retry_backoff_min_seconds}, "
                 f"max={self.balance_retry_backoff_max_seconds})"
+            )
+
+        # 2026-09-23 (신규 진입 가격·분봉 정합성 검증): 음수·0·inf가
+        # 조용히 통과해 검증이 사실상 무력화(0)되거나 항상 실패(음수)
+        # 하는 것을 시작 시점에 막는다.
+        if not (
+            isinstance(self.new_entry_price_revalidation_tolerance_pct, (int, float))
+            and math.isfinite(self.new_entry_price_revalidation_tolerance_pct)
+            and self.new_entry_price_revalidation_tolerance_pct > 0
+        ):
+            raise ValueError(
+                "TradingConfig.new_entry_price_revalidation_tolerance_pct는 "
+                "양의 유한한 숫자여야 합니다 "
+                f"(받은 값: {self.new_entry_price_revalidation_tolerance_pct!r})"
             )
 
 

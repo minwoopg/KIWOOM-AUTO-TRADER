@@ -2555,6 +2555,45 @@ class TradingService:
                     reason=f"지표기반 SELL 보류(stale) — {minute_data_reason}",
                 )
 
+            # 2026-09-23 (신규 진입 가격·분봉 정합성 검증, GPT 재검토
+            # 반영): 9/23 005930 재현 — 신규 진입(position is None)
+            # BUY 판단에 쓰인 현재가(캐시, 276,500원)가 실제로는
+            # 283,500원대였던 것을, 매수 직후 다음 폴링(보유로 전환돼
+            # 캐시를 우회하는 직접조회 경로, 2329행 부근)에서야 뒤늦게
+            # 드러남 — 매수 자체가 부정확한 가격 위에서 판단된 것으로
+            # 재현 확인됨. 신규 진입 BUY 신호가 나오면 주문 시도
+            # 직전에 한 번 더 직접 조회해 검증하고, 조회 실패나 큰
+            # 괴리 모두 이번 폴링의 매수를 보류(HOLD)시킨다. 보유
+            # 종목의 매도 감시는 이미 이 캐시를 거치지 않는 별도
+            # 경로(2329행)라 이 검사와 무관하게 계속 동작한다 —
+            # 위험 축소 행동을 막으면 안 되므로.
+            if position is None and signal.type == SignalType.BUY:
+                tolerance_pct = self.settings.trading.new_entry_price_revalidation_tolerance_pct
+                try:
+                    revalidated_price = self.broker.get_market_price(symbol)
+                except Exception as exc:
+                    self.app_logger.warning(
+                        f"[PRICE_REVALIDATE] {symbol} | 신규 진입 직전 재조회 실패 — "
+                        f"이번 폴링의 매수는 보류합니다: {exc}"
+                    )
+                    signal = Signal(type=SignalType.HOLD, reason="PRICE_REVALIDATION_FAILED")
+                else:
+                    self.cached_market_prices[symbol] = revalidated_price
+                    self.cached_market_price_loaded_at[symbol] = datetime.now()
+                    _decision_price = market_price.current_price
+                    diff_pct = (
+                        abs(revalidated_price.current_price - _decision_price) / _decision_price * 100
+                        if _decision_price else 0.0
+                    )
+                    if diff_pct > tolerance_pct:
+                        self.app_logger.warning(
+                            f"[PRICE_REVALIDATE] {symbol} | 신규 진입 직전 재조회 결과 "
+                            f"불일치(판단 시점 {_decision_price:,}원 → 실제 "
+                            f"{revalidated_price.current_price:,}원, {diff_pct:.2f}% 차이, "
+                            f"허용 {tolerance_pct}%) — 이번 폴링의 매수는 보류합니다"
+                        )
+                        signal = Signal(type=SignalType.HOLD, reason="PRICE_STALE_VS_LIVE")
+
             self._log_signal_decision(
                 symbol, signal, market_price.current_price,
                 regime, position, minute_analysis
