@@ -143,6 +143,19 @@ def build_minimal_settings(tmpdir: str) -> Settings:
             # 새게 됩니다(0.5단계 CSV 누출 사고와 동일 클래스 — 이번에는
             # 미리 반영해 재현 없이 예방).
             exit_candidate_outage_log_file=f"{tmpdir}/exit_candidate_outage.csv",
+            # 2026-09-22 (체결조회 증거 관측 테스트 로그 누출 수정, GPT
+            # 재검토 반영): 위와 동일한 이유로 반드시 tmpdir 기준 경로
+            # 명시 — 안 하면 StorageConfig 기본값
+            # ("logs/order_status_observations.jsonl")이 그대로 쓰여서
+            # 이 헬퍼를 재사용하는 test_order_status_evidence_
+            # observation.py 등의 테스트가 프로젝트 루트의 실제 logs/
+            # 에 JSONL을 새게 됩니다(0.5단계 CSV 누출 사고와 동일
+            # 클래스 — 실제로 운영 PC의 실 로그 파일에 account_scope_
+            # id="acct-test"/"acct-partial", env="local_mock" 테스트
+            # 레코드가 섞여 들어간 것을 9/22 번들에서 재현 확인 후
+            # 수정). 상태 스냅샷 파일(.status.json)은 이 경로에서
+            # 파생되므로 별도 지정이 필요 없습니다.
+            order_status_observation_log_file=f"{tmpdir}/order_status_observations.jsonl",
         ),
         websocket=WebSocketConfig(
             enabled=False, url="", condition_seqs=[], max_symbols=10,
@@ -159,6 +172,40 @@ def build_minimal_settings(tmpdir: str) -> Settings:
 async def main() -> int:
     with tempfile.TemporaryDirectory() as tmpdir:
         settings = build_minimal_settings(tmpdir)
+
+        # 2026-09-22 (체결조회 증거 관측 테스트 로그 누출 수정, GPT
+        # 재검토 반영): build_minimal_settings()가 반환하는 모든
+        # StorageConfig 경로가 실제로 tmpdir 하위인지 여기서 직접
+        # 대조합니다 — 필드 하나라도 tmpdir 기준으로 명시하는 것을
+        # 빠뜨리면 이 헬퍼를 재사용하는 다른 테스트들이 조용히 프로젝트
+        # 루트의 실제 logs//data/ 에 파일을 새게 되므로(0.5단계 CSV
+        # 누출 사고와 동일 클래스), 헬퍼 변경 시 항상 회귀로 잡히도록
+        # 고정해 둡니다.
+        _storage_paths = {
+            "state_file": settings.storage.state_file,
+            "trade_log_file": settings.storage.trade_log_file,
+            "signal_log_file": settings.storage.signal_log_file,
+            "app_log_file": settings.storage.app_log_file,
+            "minute_bars_dir": settings.storage.minute_bars_dir,
+            "entry_watch_shadow_log_file": settings.storage.entry_watch_shadow_log_file,
+            "position_lifecycle_log_file": settings.storage.position_lifecycle_log_file,
+            "entry_quality_shadow_log_file": settings.storage.entry_quality_shadow_log_file,
+            "tracked_order_journal_file": settings.storage.tracked_order_journal_file,
+            "low_upside_shadow_log_file": settings.storage.low_upside_shadow_log_file,
+            "min_profit_extension_shadow_log_file": settings.storage.min_profit_extension_shadow_log_file,
+            "balance_freshness_log_file": settings.storage.balance_freshness_log_file,
+            "delayed_eval_candidate_log_file": settings.storage.delayed_eval_candidate_log_file,
+            "exit_candidate_outage_log_file": settings.storage.exit_candidate_outage_log_file,
+            "order_status_observation_log_file": settings.storage.order_status_observation_log_file,
+        }
+        storage_paths_isolated = all(
+            str(Path(path).resolve()).startswith(str(Path(tmpdir).resolve()))
+            for path in _storage_paths.values()
+        )
+        unisolated_fields = [
+            name for name, path in _storage_paths.items()
+            if not str(Path(path).resolve()).startswith(str(Path(tmpdir).resolve()))
+        ]
 
         from domain.market_regime.classifier import MarketRegimeClassifier
         from domain.risk.risk_manager import RiskManager
@@ -242,6 +289,12 @@ async def main() -> int:
         check(
             "나머지 미보유 종목은 원래 targets 순서 그대로 유지",
             remaining_actual == remaining_expected,
+        )
+        check(
+            f"build_minimal_settings()의 모든 storage 경로가 tmpdir 하위로 격리됨"
+            f"(미격리: {unisolated_fields})" if unisolated_fields else
+            "build_minimal_settings()의 모든 storage 경로가 tmpdir 하위로 격리됨",
+            storage_paths_isolated,
         )
 
         print()

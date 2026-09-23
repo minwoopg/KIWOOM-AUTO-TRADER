@@ -3021,3 +3021,117 @@ FIFO/손익 계산, RiskManager/DailyReporter 연결, API 조회 빈도 확대�
 - `kiwoom_auto_trader_priority1_stage4_followup_correction_changed_files_20260921.zip`
   — 실제 변경된 3개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
   폴더 경로 유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 9/21~9/22 번들 분석 재검토 — 잔고 백오프 우회 경로 차단 + 테스트 관측 로그 누출 수정 (2026-09-22)
+
+### 배경
+
+9/21·9/22 번들("21일 22일 데이터입니다. 분석하고 개선점 잡아봅시다")
+1차 분석에 대한 재검토에서 다음 두 가지 실제 코드 결함이 확인됐습니다.
+
+1. **조건검색 콜백이 잔고 장애 백오프를 우회**: `balance_freshness.csv`의
+   `fetch_failed_429_fallback_disabled` 건수는 9/21 19건, 9/22 40건이며,
+   `trigger_reason=unresolved_orders`로 짧은 간격(0.5초 이내)에 반복되는
+   429가 다수 확인됐습니다. 코드 대조 결과, 실시간 조건검색 콜백
+   (`app/main.py`의 `on_symbols_changed()`)이 호출하는
+   `TradingService.update_targets()`는 `trading_loop()`가
+   `is_in_balance_outage()`로 지키는 독립 재시도 경로
+   (`handle_balance_outage_tick()`)와 완전히 별개로, 미해결 주문이
+   있으면 조건 없이 `_get_balance_with_cache()`를 호출하고
+   있었습니다 — 잔고 장애로 재시도 백오프가 걸려 있는 동안에도
+   조건검색 이벤트가 들어올 때마다 잔고 API를 추가로 두드려 백오프를
+   사실상 무력화시킬 수 있는 경로였습니다.
+2. **테스트 관측 레코드가 실제 운영 로그에 누출**: 9/22 번들의
+   `order_status_observations.jsonl` 원문에 `account_scope_id=
+   "acct-test"/"acct-partial"`, `env="local_mock"`인 테스트 레코드
+   2건이 섞여 있던 것을 발견. `build_minimal_settings()`
+   (`test_run_once_integration.py`)의 `StorageConfig(...)` 호출에서
+   `order_status_observation_log_file`만 tmpdir 기준 경로 지정이
+   빠져 있어, 이 헬퍼를 재사용하는 `test_order_status_evidence_
+   observation.py` 등을 실행할 때마다 프로젝트 루트의 실제 `logs/`에
+   JSONL이 추가되고 있었습니다(0.5단계 CSV 누출 사고와 동일 클래스 —
+   다른 storage 필드들은 그때 전부 수정됐으나 이 필드는 이후 신설되며
+   누락된 것으로 보임).
+
+같은 재검토에서 1차 분석의 해석 오류도 함께 지적됐습니다 — 손실
+확대의 주 요인이 승률 하락이 아니라 비용 모델(Stress 0.90%)이라는
+점, `acct-a` 활성화 이후 관측률 29%를 "오후에 켰기 때문"으로만
+설명할 수 없다는 점, entry_watch 표는 9건 중 5건만 실렸다는 점,
+"자연 기술적 BULLISH" 진입 분류는 리포트 생성 시점 기준 판정을
+매수 시점 판정으로 오인한 것이라는 점 등. 이 내용은 프로젝트 문서
+(`2026-09-22-two-day-bundle-analysis-0921-0922.md`)에 정정 반영했고,
+이 CHANGELOG는 실제 코드가 바뀐 두 항목만 다룹니다.
+
+### 변경 내용
+
+1. `domain/service/trading_service.py` — `update_targets()`가
+   `is_in_balance_outage()`를 먼저 확인하도록 변경. 장애 상태에서는
+   잔고 API를 호출하지 않고 마지막으로 성공한 `cached_balance`만
+   재사용해 보유 종목 감시를 유지(체결 확정 등 판단에는 관여하지
+   않는 감시 목록 계산 전용 경로이므로 안전). 장애가 아닐 때의 동작은
+   완전히 동일하게 유지.
+2. `test_run_once_integration.py` — `build_minimal_settings()`에
+   `order_status_observation_log_file=f"{tmpdir}/order_status_
+   observations.jsonl"` 추가. `main()`에 모든 storage 경로가 tmpdir
+   하위인지 확인하는 회귀 체크(15개 필드 전수 대조)도 함께 추가 —
+   앞으로 새 StorageConfig 필드가 생기며 같은 실수가 반복돼도 즉시
+   실패하도록 고정.
+
+### 테스트 및 검증
+
+- 신규: `test_update_targets_balance_outage_guard.py` 5건(장애 중 API
+  미호출, 보유종목 유지, 캐시 없을 때 빈 목록 처리, 장애 아닐 때
+  회귀 없음 2건) — 전체 통과.
+- `test_run_once_integration.py`의 storage 경로 격리 회귀 체크 —
+  통과.
+- `build_minimal_settings()`에 의존하는 기존 테스트 파일 23개 전부
+  개별 재실행해 회귀 없음 확인(예: `test_order_status_evidence_
+  observation.py` 166/166, `test_partial_fill_lifecycle.py` 336/336,
+  `test_balance_outage_exit_observation.py` 45/45 — 기존 통과 건수
+  그대로 유지).
+- 패치를 `0082`부터 이어 붙인 fresh clone에서 `git am`한 뒤 위 검증을
+  모두 재실행해 동일한 결과를 확인했습니다(아래 "전달 파일" 참고).
+
+### 변경하지 않은 것
+
+- 매수/매도/보유 판단 기준(전략 파라미터, RSI/MACD/진입점수 등) —
+  전혀 건드리지 않았습니다.
+- 조건검색 종목 선택(정렬 기준, `max_symbols` 상한) — 이번 재검토
+  에서 별도로 지적됐으나, 429 문제가 있는 상태에서 상한 확대나 추가
+  API 호출을 먼저 적용하지 않는 편이 안전하다는 판단에 따라 이번
+  라운드 범위 밖으로 남겼습니다. 대신 현재 선택/탈락 종목의 shadow
+  비교 데이터를 먼저 쌓는 방향을 다음 작업으로 남깁니다.
+- entry_watch 안전장치, 저상승여력·PR 진입 판정 로직 — 이번 재검토
+  에서 "완화 근거 부족"이 확인됐으므로 그대로 유지합니다.
+- 체결조회 응답의 `tdy_trde_cmsn`/`tdy_trde_tax` 필드를 비용 계산에
+  반영하는 작업 — 주문별 금액인지 누적값인지, 모의투자에서의 의미가
+  아직 확인되지 않아 이번 라운드에서는 다루지 않았습니다.
+
+### 다음 작업
+
+1. `acct-a` 전일 커버리지(9/23~) 확보 후 `order_observation_rate`가
+   어떻게 나오는지 확인 — 29%가 "활성화 첫날"이라서인지 "일정 시간
+   이상 pending인 주문만 조회하는 기존 정책" 때문인지 구분.
+2. 체결조회 원문의 `tdy_trde_cmsn`/`tdy_trde_tax` 필드 의미(주문별/
+   누적, 모의투자에서의 실제 반영 여부) 확인 후 비용 계산 반영 여부
+   결정.
+3. 저상승여력·PR 계열 진입(9/22 102110·360750·379810 등, 진입 시
+   최근 고점까지 거리 0.03~0.04%)과 조건검색에서 잘린 대체 후보를
+   shadow로 비교하는 작업 — 진입 후 최대 상승·하락폭과 비용까지
+   함께 봐야 하므로 차단 규칙을 바로 만들지 않고 데이터부터 쌓음.
+
+### 전달 파일
+
+- 패치(0079~0081이 적용된 트리 기준으로 이어서 적용):
+  - `0082-fix-trading-service-update-targets-balance-outage-guard.patch`
+    — `domain/service/trading_service.py`,
+    `test_update_targets_balance_outage_guard.py`
+  - `0083-test-run-once-integration-observation-log-isolation.patch`
+    — `test_run_once_integration.py`
+  - `0084-docs-CHANGELOG-v1.7-bundle-analysis-followup.patch` — 이
+    CHANGELOG
+- `kiwoom_auto_trader_bundle_analysis_followup_changed_files_20260922.zip`
+  — 실제 변경된 4개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
+  폴더 경로 유지한 채 담음.

@@ -585,11 +585,34 @@ class TradingService:
         if sym_to_reliable is not None:
             self._symbol_condition_source_reliable = dict(sym_to_reliable)
         holding_symbols: list[str] = []
-        try:
-            balance = self._get_balance_with_cache()
-            holding_symbols = [p.symbol for p in balance.positions]
-        except Exception:
-            pass
+        if self.is_in_balance_outage():
+            # 2026-09-22 (조건검색 콜백의 잔고 백오프 우회 수정, GPT
+            # 재검토 반영): 이 메서드는 조건검색 실시간 콜백
+            # (`on_symbols_changed()`)에서 호출되며, `app/main.py`의
+            # `trading_loop()`가 `is_in_balance_outage()`로 지키는
+            # 독립 재시도 경로(`handle_balance_outage_tick()`)와는
+            # 완전히 별개의 호출 경로입니다. 이전에는 여기서 조건 없이
+            # `_get_balance_with_cache()`를 호출했는데, 미해결 주문이
+            # 있으면 그 메서드가 캐시와 무관하게 매번 실제 API를
+            # 재조회하므로, 장애로 재시도 백오프가 걸려 있는 동안에도
+            # 조건검색 이벤트가 들어올 때마다 잔고 API를 추가로 두드려
+            # 백오프를 사실상 무력화시켰습니다(9/22 번들 실측: 짧은
+            # 간격의 429 다수가 이 경로에서 발생한 것으로 확인됨).
+            # 장애가 진행 중일 때는 새로 조회하지 않고, 마지막으로
+            # 성공적으로 확인된 잔고(있다면)만 재사용해 보유 종목
+            # 감시 목록을 유지합니다 — 이 값은 여기서 체결 확정 등
+            # 판단에는 쓰이지 않고(update_targets()는 감시 목록 계산
+            # 전용) held_symbols 파악에만 쓰이므로, 다소 오래된 값을
+            # 재사용해도 이전에 P0-1을 되돌린 안전 문제(스테일 수량이
+            # 체결 확인으로 오인되는 위험)는 재발하지 않습니다.
+            if self.cached_balance is not None:
+                holding_symbols = [p.symbol for p in self.cached_balance.positions]
+        else:
+            try:
+                balance = self._get_balance_with_cache()
+                holding_symbols = [p.symbol for p in balance.positions]
+            except Exception:
+                pass
 
         merged = list(symbols)
         for sym in holding_symbols:
