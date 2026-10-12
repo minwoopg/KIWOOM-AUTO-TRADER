@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from domain.strategy.entry_vwap_guard import entry_vwap_block_reason
+
 """자동매매의 중심 흐름을 담당하는 서비스.
 
 이 서비스가 하는 일은 다음과 같습니다.
@@ -4864,6 +4866,19 @@ class TradingService:
             # (2026-07-09: 여기서 한 번 더 기록하던 걸 제거 — 동일 이벤트가
             #  SKIP_EXCLUDED_SYMBOL / EXCLUDED_SYMBOL 두 줄로 중복 집계되던 버그)
             return "EXCLUDED_SYMBOL"
+
+        # All entry strategies (including gap fallback) share this check.
+        # The cache holds the direct revalidation quote from _process_symbol;
+        # use both prices because a sub-tolerance move can cross VWAP.
+        if self.settings.trading.require_entry_above_vwap:
+            live = self.cached_market_prices.get(symbol)
+            reason = entry_vwap_block_reason(
+                getattr(minute_analysis, "vwap", None), current_price,
+                getattr(live, "current_price", None) if loaded_at is not None else None,
+            )
+            if reason:
+                self.app_logger.info(f"[ENTRY_VWAP] {symbol} | {reason}")
+                return reason
 
         # ── 동일 종목 1일 1회 진입 제한 (allow_multi=False일 때만) ────
         allow_multi = getattr(

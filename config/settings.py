@@ -126,7 +126,12 @@ class TradingConfig:
     # 실측 후 조정 대상.
     new_entry_price_revalidation_tolerance_pct: float = 0.5
 
+    # 기존 설정 파일은 호환 유지; 배포 YAML에서 명시적으로 활성화합니다.
+    require_entry_above_vwap: bool = False
+
     def __post_init__(self):
+        if type(self.require_entry_above_vwap) is not bool:
+            raise ValueError("TradingConfig.require_entry_above_vwap must be a boolean")
         # frozen=True dataclass라 self.x = ... 직접 대입은 FrozenInstanceError.
         # object.__setattr__로 우회 (2026-07-20: excluded_symbols=None으로
         # 생성될 때 FrozenInstanceError가 나던 잠재 버그를 테스트 중 발견 —

@@ -18,6 +18,8 @@ import csv
 import math
 import sys
 from collections import Counter, defaultdict
+from domain.cost_model import CostModel, SCENARIO_ORDER, load_cost_model
+from utils.time_utils import KST_TZ
 from datetime import date, datetime
 from pathlib import Path
 
@@ -148,73 +150,87 @@ def load(start: date, end: date) -> list[dict]:
 # ── 매매 쌍 매칭 (매수-매도 페어링) ──────────────────────────────
 def pair_trades(rows: list[dict]) -> list[dict]:
     """BUY-SELL 쌍을 매칭해 손익을 계산합니다."""
-    accepted = [r for r in rows if str(r.get("accepted","")).lower() == "true"]
-    buys:  dict[str, list[dict]] = defaultdict(list)
-    sells: dict[str, list[dict]] = defaultdict(list)
-
-    for r in accepted:
-        sym = r.get("symbol","")
+    ordered = []
+    for r in rows:
+        if str(r.get("accepted", "")).lower() != "true":
+            continue
+        try:
+            stamp = datetime.fromisoformat(r["timestamp"])
+            stamp = stamp.replace(tzinfo=KST_TZ) if stamp.tzinfo is None else stamp.astimezone(KST_TZ)
+        except (KeyError, ValueError, TypeError):
+            continue
+        ordered.append((stamp, r))
+    ordered.sort(key=lambda item: item[0])  # stable for equal timestamps
+    buys = defaultdict(list)
+    matched = []
+    for stamp, r in ordered:
+        sym = r.get("symbol", "")
+        if not sym:
+            continue
+        key = (sym, stamp.date())
         if r.get("side") == "BUY":
-            buys[sym].append(r)
-        elif r.get("side") == "SELL":
-            sells[sym].append(r)
+            buys[key].append(r)
+        elif r.get("side") == "SELL" and buys[key]:
+            matched.append((sym, buys[key].pop(0), r))
 
     pairs = []
-    for sym, sell_list in sells.items():
-        buy_list = buys.get(sym, [])
-        for sell in sell_list:
-            if not buy_list:
-                break
-            buy = buy_list.pop(0)
-            buy_price  = int(buy.get("price", 0) or 0)
+    for sym, buy, sell in matched:
+        # Conservative one-to-one estimate, never infer partial fills.
+        # Reject malformed quantities, reversed chronology, or overnight
+        # pairings that can connect an orphan exit to a later entry.
+        try:
+            buy_price = int(buy.get("price", 0) or 0)
             sell_price = int(sell.get("price", 0) or 0)
-            qty        = int(sell.get("quantity", 0) or 0)
-            if buy_price <= 0 or sell_price <= 0:
-                continue
-            pnl_pct = (sell_price - buy_price) / buy_price * 100
-            pnl_amt = (sell_price - buy_price) * qty
-            pairs.append({
-                "symbol":        sym,
-                "buy_price":     buy_price,
-                "sell_price":    sell_price,
-                "quantity":      qty,
-                "pnl_pct":       pnl_pct,
-                "pnl_amount":    pnl_amt,
-                # 2026-08-21 (1P0.8-OBS.2-C → closure): 최초엔 "win"
-                # (pnl_pct>0)을 그대로 두고 헤드라인 승률만 outcome
-                # 기준으로 바꿨으나, 세부 구간
-                # breakdown(exit_reason/전략/점수/V-PR/volume_spike/
-                # Low Upside/당일 등락률/종목별/추세꺾임/트레일링/
-                # 조건검색식별)도 전부 "wins / len(grp)"(=BREAKEVEN이
-                # 분모에 섞임) 형태였다는 지적을 받아 전부
-                # win_rate_pct()/win_rate_frac()(둘 다 outcome 기준,
-                # 분모는 wins+losses만)로 통일했습니다. "win" 필드
-                # 자체는 이제 이 파일 안에서 더 이상 쓰이지 않지만,
-                # 하위호환을 위해 그대로 남겨둡니다(외부에서 참조할
-                # 가능성 대비 — 의미는 예전과 동일하게 pnl_pct>0).
-                "outcome":       classify_outcome(pnl_pct),
-                "win":           pnl_pct > 0,
-                "entry_strategy": buy.get("entry_strategy",""),
-                "market_regime": buy.get("market_regime",""),
-                "entry_score":   buy.get("entry_score",""),
-                "entry_reason":  buy.get("entry_reason",""),
-                "is_v_rebound":  safe_bool(buy.get("is_v_rebound")),
-                "is_pr":         safe_bool(buy.get("is_pulldown_recovery")),
-                "v_drop_pct":    safe_float(buy.get("v_drop_pct")),
-                "v_rise_pct":    safe_float(buy.get("v_rise_pct")),
-                "upside":        safe_float_zero_valid(buy.get("upside_to_recent_high_pct")),
-                "rebound_spike": safe_bool(buy.get("rebound_volume_spike")),
-                "change_rate":   safe_float(buy.get("change_rate_pct")),
-                "exit_reason":   sell.get("exit_reason",""),
-                "hold_minutes":  safe_float(sell.get("hold_minutes")),
-                "buy_time":      buy.get("timestamp",""),
-                "sell_time":     sell.get("timestamp",""),
-            })
+            qty = int(sell.get("quantity", 0) or 0)
+            buy_qty = int(buy.get("quantity", 0) or 0)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            continue
+        if buy_price <= 0 or sell_price <= 0 or qty <= 0 or qty != buy_qty:
+            continue
+        pnl_pct = (sell_price - buy_price) / buy_price * 100
+        pnl_amt = (sell_price - buy_price) * qty
+        pairs.append({
+            "symbol":        sym,
+            "buy_price":     buy_price,
+            "sell_price":    sell_price,
+            "quantity":      qty,
+            "pnl_pct":       pnl_pct,
+            "pnl_amount":    pnl_amt,
+            # 2026-08-21 (1P0.8-OBS.2-C → closure): 최초엔 "win"
+            # (pnl_pct>0)을 그대로 두고 헤드라인 승률만 outcome
+            # 기준으로 바꿨으나, 세부 구간
+            # breakdown(exit_reason/전략/점수/V-PR/volume_spike/
+            # Low Upside/당일 등락률/종목별/추세꺾임/트레일링/
+            # 조건검색식별)도 전부 "wins / len(grp)"(=BREAKEVEN이
+            # 분모에 섞임) 형태였다는 지적을 받아 전부
+            # win_rate_pct()/win_rate_frac()(둘 다 outcome 기준,
+            # 분모는 wins+losses만)로 통일했습니다. "win" 필드
+            # 자체는 이제 이 파일 안에서 더 이상 쓰이지 않지만,
+            # 하위호환을 위해 그대로 남겨둡니다(외부에서 참조할
+            # 가능성 대비 — 의미는 예전과 동일하게 pnl_pct>0).
+            "outcome":       classify_outcome(pnl_pct),
+            "win":           pnl_pct > 0,
+            "entry_strategy": buy.get("entry_strategy",""),
+            "market_regime": buy.get("market_regime",""),
+            "entry_score":   buy.get("entry_score",""),
+            "entry_reason":  buy.get("entry_reason",""),
+            "is_v_rebound":  safe_bool(buy.get("is_v_rebound")),
+            "is_pr":         safe_bool(buy.get("is_pulldown_recovery")),
+            "v_drop_pct":    safe_float(buy.get("v_drop_pct")),
+            "v_rise_pct":    safe_float(buy.get("v_rise_pct")),
+            "upside":        safe_float_zero_valid(buy.get("upside_to_recent_high_pct")),
+            "rebound_spike": safe_bool(buy.get("rebound_volume_spike")),
+            "change_rate":   safe_float(buy.get("change_rate_pct")),
+            "exit_reason":   sell.get("exit_reason",""),
+            "hold_minutes":  safe_float(sell.get("hold_minutes")),
+            "buy_time":      buy.get("timestamp",""),
+            "sell_time":     sell.get("timestamp",""),
+        })
     return pairs
 
 
 # ── 분석 ────────────────────────────────────────────────────────
-def analyze(rows: list[dict], start: date, end: date) -> str:
+def analyze(rows: list[dict], start: date, end: date, *, cost_model: CostModel | None = None) -> str:
     lines = []
     W = 60
 
@@ -232,10 +248,15 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
     pairs = pair_trades(rows)
 
     title(f"📈 trades.csv 분석  {start} ~ {end}")
-    row("총 체결 건수", f"{len(rows):,}건")
-    row("매수 체결", f"{len(buy_rows):,}건")
-    row("매도 체결", f"{len(sell_rows):,}건")
-    row("매매 쌍 (손익 계산 가능)", f"{len(pairs):,}건")
+    lines.append("  주의: accepted=True는 주문 접수이며 체결 확정이 아닙니다.")
+    lines.append("  아래 손익은 주문 기록 가격으로 추정한 값이며 계좌 실현손익이 아닙니다.")
+    row("총 주문 기록", f"{len(rows):,}건")
+    row("매수 접수", f"{len(buy_rows):,}건")
+    row("매도 접수", f"{len(sell_rows):,}건")
+    row("매매 쌍 (주문가격 기준 추정)", f"{len(pairs):,}건")
+
+    row("미대응·제외 접수 주문", f"{len(buy_rows) + len(sell_rows) - 2 * len(pairs):,}건")
+    lines.append("  동일 날짜·정방향 시간·동일 수량의 1:1 쌍만 추정; 부분/이월 주문은 제외.")
 
     if not pairs:
         lines.append("  매매 쌍이 없습니다.")
@@ -265,6 +286,19 @@ def analyze(rows: list[dict], start: date, end: date) -> str:
     holds = [p["hold_minutes"] for p in pairs if p["hold_minutes"] is not None]
     if holds:
         row("평균 보유 시간", f"{sum(holds)/len(holds):.1f}분")
+
+    sub("1a. 비용 민감도 (주문가격 기준 추정)")
+    model = cost_model if cost_model is not None else load_cost_model()
+    model.validate()
+    notional = sum(p["buy_price"] * p["quantity"] for p in pairs)
+    row("누적 매수금액 (계좌 원금 아님)", f"{notional:,.0f}원")
+    for scenario in SCENARIO_ORDER:
+        net_amount = total_pnl - model.cost_amount(notional, scenario)
+        positive = sum(p["pnl_pct"] > model.cost_pct(scenario) for p in pairs)
+        row(f"{scenario.capitalize()} ({model.cost_pct(scenario):.2f}%)",
+            f"{net_amount:+,.0f}원 / 평균 {avg_pnl - model.cost_pct(scenario):+.2f}%",
+            f"플러스 {positive}/{len(pairs)}; 동률 포함 전체 쌍 분모")
+    lines.append("  비용은 매수금액 대비 왕복 추정치. 이하 구간별 통계는 비용 전(Gross).")
 
     # ── 2. exit_reason별 손익 ──────────────────────────────
     sub("2. exit_reason별 손익")

@@ -30,6 +30,7 @@ run_id, 코드 커밋 SHA와 미커밋 변경 여부, 실효 설정의 식별 �
 `resolve_run_id_for_timestamp()`가 이 조인을 구현합니다.
 """
 
+import os
 import hashlib
 import json
 import subprocess
@@ -144,24 +145,45 @@ def capture_git_info(repo_root: str = ".") -> tuple[str, bool | None]:
     return sha, dirty
 
 
-# 2026-09-11 (B01 보완, 민우님/GPT 지적): git_sha + git_dirty만으로는
-# "이 실행이 정확히 어떤 코드였는지"를 특정할 수 없습니다. 같은 SHA
-# 위에 서로 다른 미커밋 패치를 각각 적용한 두 실행은 git_dirty=True로
-# 완전히 동일하게 보이므로, "정확한 식별이 가능하다"고 서술하면
-# 과장입니다. git_sha+git_dirty는 "리뷰받은 그 커밋과 정확히 같은지"를
-# 최소한으로 배제하는 용도(dirty=False면 최소 코드가 커밋 그대로라는
-# 뜻)로만 신뢰해야 하고, dirty=True인 두 실행을 구분해야 하는 상황이면
-# 이 두 값만으로는 불가능합니다.
-#
-# 제안(이번 라운드에서 구현하지 않음, 별도 승인 필요): 미커밋 변경의
-# 내용까지 구분해야 한다면 `git diff`(추적 대상 파일만)의 해시값을
-# "코드 지문(diff fingerprint)"으로 추가 기록하는 방식을 검토할 수
-# 있습니다. 원본 diff 텍스트를 그대로 저장하면 (a) 민감정보가 diff에
-# 우연히 섞여 들어갈 위험, (b) 로그 파일 크기·보관 정책 문제가 생기므로
-# 원문이 아니라 해시만 남기는 것을 전제로 합니다. 이 방식도 "같은
-# 패치인지 다른 패치인지"만 구분할 뿐 "패치 내용이 무엇인지"는 여전히
-# 알려주지 않으므로, 실제로 필요한 수준(구분만 vs 내용 확인까지)을
-# 먼저 정한 뒤 설계해야 합니다 — 이번 제출물에는 포함하지 않습니다.
+def capture_source_fingerprint(repo_root: str = ".") -> dict:
+    """Hash on-disk Python sources and requirements, never their raw contents.
+
+    This identifies a scoped file snapshot, not imported bytecode or a fully
+    reproducible environment. Configuration is redacted separately. Symlinks
+    are excluded and reported; missing roots/read errors cannot look complete.
+    """
+    root = Path(repo_root)
+    files, errors = {}, []
+    candidates = [root / "requirements.txt"]
+    for folder in ("app", "config", "domain", "infra", "utils"):
+        base = root / folder
+        if not base.is_dir() or base.is_symlink():
+            errors.append(folder)
+            continue
+        def onerror(exc):
+            errors.append(str(Path(exc.filename).relative_to(root)))
+        for current, dirs, names in os.walk(base, followlinks=False, onerror=onerror):
+            for name in list(dirs):
+                child = Path(current) / name
+                if child.is_symlink():
+                    errors.append(child.relative_to(root).as_posix())
+                    dirs.remove(name)
+                elif name == "__pycache__":
+                    dirs.remove(name)
+            candidates.extend(Path(current) / n for n in names if n.endswith(".py"))
+    for path in sorted(candidates):
+        relative = path.relative_to(root).as_posix()
+        try:
+            if path.is_symlink():
+                raise OSError("symlink excluded")
+            files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            errors.append(relative)
+    digest = hashlib.sha256(json.dumps(files, sort_keys=True,
+                                       separators=(",", ":")).encode()).hexdigest()
+    return {"schema_version": 1, "scope": "app,config,domain,infra,utils/**/*.py;requirements.txt",
+            "sha256": digest, "files": files, "complete": not errors,
+            "unreadable_or_excluded": sorted(set(errors))}
 
 
 class RunBaseline:
@@ -437,7 +459,9 @@ def perform_run_baseline_startup(
         config_snapshot_dir = str(
             Path(settings.storage.run_baseline_log_file).parent / "run_baseline_configs"
         )
-        snapshot_path = save_effective_config_snapshot(run_baseline, settings, config_snapshot_dir)
+        snapshot_path = save_effective_config_snapshot(
+            run_baseline, settings, config_snapshot_dir, repo_root=repo_root
+        )
 
         app_logger.info(
             f"[RUN_BASELINE] run_id={run_baseline.run_id} | "
@@ -458,7 +482,7 @@ def perform_run_baseline_startup(
 
 
 def save_effective_config_snapshot(
-    baseline: "RunBaseline", settings: Any, snapshot_dir: str
+    baseline: "RunBaseline", settings: Any, snapshot_dir: str, *, repo_root: str = "."
 ) -> Path | None:
     """이번 실행의 redacted 설정 전체를 run_id별 JSON 파일로 저장합니다.
 
@@ -485,6 +509,7 @@ def save_effective_config_snapshot(
             "started_at": baseline.started_at,
             "effective_config_hash": baseline.effective_config_hash,
             "config": redact_settings(settings),
+            "source_fingerprint": capture_source_fingerprint(repo_root),
         }
         path.write_text(
             json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2, default=str),

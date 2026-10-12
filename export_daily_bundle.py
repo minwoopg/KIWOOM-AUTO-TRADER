@@ -167,6 +167,7 @@ CSV_SOURCES: list[tuple[str, tuple[str, ...]]] = [
 # SENSITIVE_KEYS 대상 필드는 담지 않음 — 매매 로직·저장 로직 자체는
 # 무변경.
 LOG_TAGS: tuple[str, ...] = (
+    "[ENTRY_VWAP]", "[PRICE_REVALIDATE]", "[EXCL]",
     "[COND_STATUS]", "[COND_TRUNCATE]", "[COND]",
     "[WS]", "[SESSION_SHADOW]", "[EXPERIMENTAL]",
     "[REPORT]", "[ANALYSIS]", "[RECONCILE]", "[MIN_STALE]",
