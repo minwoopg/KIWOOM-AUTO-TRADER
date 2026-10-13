@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter.scrolledtext import ScrolledText
 
-from app.desktop_model import ROOT, ProcessController, snapshot, today_string, read_tail
+from app.desktop_model import ROOT, ProcessController, snapshot, today_string, read_tail, log
 from config.settings import load_settings
 from infra.storage.process_lock import single_instance_lock
 
@@ -53,7 +53,7 @@ class Dashboard:
         ttk.Label(title, text='조회 날짜 (한국 시간)').pack(side='right', padx=8)
         entry = ttk.Entry(title, textvariable=self.day, width=12)
         entry.pack(side='right')
-        entry.bind('<Return>', lambda event: self.refresh())
+        entry.bind('<Return>', lambda event: self.refresh(manual=True))
         ttk.Label(outer, textvariable=self.status, font=(font, 11, 'bold')).pack(anchor='w', pady=(12, 8))
         buttons = ttk.Frame(outer)
         buttons.pack(fill='x', pady=(0, 12))
@@ -61,7 +61,7 @@ class Dashboard:
         self.start_button.pack(side='left')
         self.stop_button = ttk.Button(buttons, text='■ 정상 종료', command=self.stop)
         self.stop_button.pack(side='left', padx=8)
-        ttk.Button(buttons, text='새로고침', command=self.refresh).pack(side='left')
+        ttk.Button(buttons, text='새로고침', command=lambda: self.refresh(manual=True)).pack(side='left')
         ttk.Button(buttons, text='이전 창 실행 종료 요청', command=self.recover_stop).pack(side='left', padx=8)
         ttk.Button(buttons, text='보고서 폴더', command=lambda: self.open_folder('reports')).pack(side='right')
         self.export_button = ttk.Button(buttons, text='분석 ZIP 내보내기', command=self.export)
@@ -117,16 +117,19 @@ class Dashboard:
             if not messagebox.askyesno('자동매매 시작', f'{mode} 설정으로 시작합니다.\n기존 설정에 따라 주문이 제출될 수 있습니다.\n\n시작하시겠습니까?', parent=self.window):
                 return
             self.control.start()
+            log(f'자동매매 시작 요청 — 모드={mode}, PID={self.control.process.pid}')
             # Best-effort only: catches the common case of a terminal-run
             # instance already holding the single-instance lock, so the user
             # isn't left staring at "실행 중" for 2+ seconds before it dies.
             # A slower failure still surfaces through the regular status text.
             self.window.after(900, self.check_start_result)
         except Exception as exc:
+            log(f'자동매매 시작 실패: {exc}')
             self.error(exc)
 
     def check_start_result(self):
         if self.control.start_failed_fast():
+            log(f'자동매매 시작 실패 확인 — 종료 코드 {self.control.process.returncode}(이미 다른 곳에서 실행 중일 가능성)')
             self.error(RuntimeError(
                 f'자동매매 시작 실패 (종료 코드 {self.control.process.returncode}).\n'
                 '이미 다른 곳(터미널 등)에서 실행 중인지 확인해 주세요.\n\n'
@@ -139,15 +142,19 @@ class Dashboard:
         if messagebox.askyesno('정상 종료 요청', '종료는 전량 매도가 아닙니다.\n실제 보유·미체결 내역은 키움에서 확인해 주세요.\n현재 순회 완료 후 종료하며, 그 전에는 주문이 이어질 수 있습니다.\n종료 후 보유종목 감시가 중단됩니다.\n\n종료를 요청하시겠습니까?', parent=self.window):
             try:
                 self.control.request_stop()
+                log(f'정상 종료 요청 전송 — PID={self.control.process.pid}')
             except OSError as exc:
+                log(f'종료 요청 실패: {exc}')
                 self.error(exc)
 
     def recover_stop(self):
         if messagebox.askyesno('이전 GUI 실행 복구', '관리 창이 비정상 종료되어 남은 실행에 종료를 요청합니다.\n이 저장소의 GUI 실행 기록에만 요청하며, 실제 종료 여부는 로그로 확인해야 합니다.\n종료 후 보유종목 감시는 멈춥니다. 요청하시겠습니까?', parent=self.window):
             try:
                 count = self.control.request_previous_stops()
+                log(f'이전 창 실행 종료 요청 — {count}건(이 저장소의 GUI 실행 기록 기준)')
                 messagebox.showinfo('종료 요청', f'{count}개 GUI 실행 기록에 요청했습니다. 실제 실행 건수는 아닙니다.\n수동 터미널 실행에는 영향을 주지 않습니다.', parent=self.window)
             except OSError as exc:
+                log(f'이전 창 종료 요청 실패: {exc}')
                 self.error(exc)
 
     def close(self):
@@ -169,19 +176,28 @@ class Dashboard:
                 os.startfile(path)
             else:
                 subprocess.Popen(['xdg-open', str(path)])
+            log(f'폴더 열기 — {name}')
         except OSError as exc:
+            log(f'폴더 열기 실패({name}): {exc}')
             self.error(exc)
 
     def export(self):
         try:
             self.control.export(self.day.get())
+            log(f'분석 ZIP 내보내기 시작 — 조회일 {self.day.get()}')
         except Exception as exc:
+            log(f'ZIP 내보내기 실패: {exc}')
             self.error(exc)
 
-    def refresh(self):
+    def refresh(self, manual=False):
         if self.loading:
             return
         day = self.day.get()
+        if manual:
+            # 2초마다 자동으로도 호출되는 함수라, 버튼/Enter로 명시적으로
+            # 눌렀을 때만(manual=True) 터미널에 남긴다 — 그렇지 않으면
+            # 2초마다 스팸이 됨.
+            log(f'새로고침 요청 — 조회일 {day}')
         self.loading = True
         def read():
             try:

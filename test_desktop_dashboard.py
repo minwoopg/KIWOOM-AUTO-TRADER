@@ -1,6 +1,8 @@
 """Offline desktop control/data tests. No broker login or real orders."""
 import asyncio
+import contextlib
 import csv
+import io
 import os
 from pathlib import Path
 import tempfile
@@ -9,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from app.desktop_control import STOP_FILE_ENV, sleep_or_stop, cleanup_stop_record
-from app.desktop_model import ProcessController, csv_rows, snapshot, on_day, read_tail
+from app.desktop_model import ProcessController, csv_rows, snapshot, on_day, read_tail, log
 from app.main import trading_loop
 from domain.cost_model import CostModel
 from test_run_once_integration import build_minimal_settings
@@ -184,6 +186,15 @@ class DataTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/'app.log';p.write_text('appkey=SECRET_EXAMPLE\n')
             self.assertNotIn('SECRET_EXAMPLE',read_tail(p))
+
+    def test_log_writes_timestamped_line_to_stdout(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            log('자동매매 시작 요청 — 모드=모의투자, PID=123')
+        out = buf.getvalue()
+        self.assertIn('[GUI ', out)
+        self.assertIn('자동매매 시작 요청 — 모드=모의투자, PID=123', out)
+        self.assertTrue(out.endswith('\n'))
 
 
 if __name__=='__main__':

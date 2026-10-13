@@ -27,6 +27,16 @@ def today_string():
     return datetime.now(KST_TZ).date().isoformat()
 
 
+def log(message):
+    # 버튼 조작을 이 화면을 띄운 콘솔(start_desktop.bat의 cmd 창 등)에도
+    # 그대로 남긴다 — GUI 자체 로그(매매 로그/실행 로그 탭)와는 별개로,
+    # "방금 뭘 눌렀는지"를 터미널에서 바로 보고 싶다는 요청(2026-10-13).
+    # 실제 매매 자식 프로세스의 로그가 아니라 이 관리 화면 자체의
+    # 동작만 다룬다 — 자식 프로세스 로그는 여전히 logs/desktop_child.log
+    # 와 "실행 / 내보내기 로그" 탭을 통해서만 본다.
+    print(f"[GUI {datetime.now(KST_TZ).strftime('%H:%M:%S')}] {message}", flush=True)
+
+
 def read_tail(path: Path, limit=64 * 1024) -> str:
     try:
         with path.open('rb') as f:
