@@ -157,6 +157,17 @@ class ProcessController:
             raise
         self.stopping = False
 
+    def start_failed_fast(self):
+        """True once the just-started process has already exited with a non-zero
+        code (e.g. blocked by the single-instance lock because another run — a
+        terminal session, typically — already holds it). A graceful stop always
+        exits 0, so this never fires for a normal shutdown; it only flags a
+        launch that never really started. Best-effort only: a slow failure past
+        the GUI's short grace window still surfaces through the regular status
+        text on the next tick, same as before this check existed.
+        """
+        return self.process is not None and self.process.poll() is not None and self.process.returncode != 0
+
     def request_previous_stops(self):
         count = 0
         for path in (self.root / 'data/desktop').glob('*.owner'):

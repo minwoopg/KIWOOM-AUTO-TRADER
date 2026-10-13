@@ -89,6 +89,20 @@ class ControlTests(unittest.TestCase):
                 self.assertFalse(controller.stop_file.exists())
                 self.assertFalse(controller.stop_file.with_suffix('.owner').exists())
 
+    def test_start_failed_fast_flags_only_nonzero_exit(self):
+        with tempfile.TemporaryDirectory() as d:
+            controller = ProcessController(d)
+            self.assertFalse(controller.start_failed_fast())  # 아직 시작 전
+            proc = Mock(pid=123, returncode=None)
+            proc.poll.return_value = None
+            with patch('app.desktop_model.subprocess.Popen', return_value=proc):
+                controller.start()
+            self.assertFalse(controller.start_failed_fast())  # 실행 중 — 아직 종료 안 함
+            proc.poll.return_value = 0; proc.returncode = 0
+            self.assertFalse(controller.start_failed_fast())  # 정상 종료(코드 0)는 실패가 아님
+            proc.returncode = 1
+            self.assertTrue(controller.start_failed_fast())  # 비정상 종료(예: 락 충돌)
+
     def test_recovery_targets_only_gui_owner_records(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)/'data/desktop'; root.mkdir(parents=True)

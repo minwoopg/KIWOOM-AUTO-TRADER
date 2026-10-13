@@ -117,8 +117,21 @@ class Dashboard:
             if not messagebox.askyesno('자동매매 시작', f'{mode} 설정으로 시작합니다.\n기존 설정에 따라 주문이 제출될 수 있습니다.\n\n시작하시겠습니까?', parent=self.window):
                 return
             self.control.start()
+            # Best-effort only: catches the common case of a terminal-run
+            # instance already holding the single-instance lock, so the user
+            # isn't left staring at "실행 중" for 2+ seconds before it dies.
+            # A slower failure still surfaces through the regular status text.
+            self.window.after(900, self.check_start_result)
         except Exception as exc:
             self.error(exc)
+
+    def check_start_result(self):
+        if self.control.start_failed_fast():
+            self.error(RuntimeError(
+                f'자동매매 시작 실패 (종료 코드 {self.control.process.returncode}).\n'
+                '이미 다른 곳(터미널 등)에서 실행 중인지 확인해 주세요.\n\n'
+                + read_tail(self.control.console_path)[-600:]
+            ))
 
     def stop(self):
         if not self.control.running:
