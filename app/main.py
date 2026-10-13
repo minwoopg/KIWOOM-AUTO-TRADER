@@ -19,6 +19,7 @@ import shutil
 import time
 from pathlib import Path
 
+from app.desktop_control import cleanup_stop_record, sleep_or_stop, stop_requested
 from app.target_selection import compute_day_targets
 from config.settings import Settings, load_settings
 from domain.market_regime.classifier import MarketRegimeClassifier
@@ -131,7 +132,9 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
         app_logger.info(
             f"application ready — 장 시작까지 {wait_min}분 대기 중 (09:00 시작)"
         )
-        await asyncio.sleep(wait_sec)
+        if await sleep_or_stop(wait_sec):
+            app_logger.info("[DESKTOP_STOP] 장전 대기 종료")
+            return
         app_logger.info("장 시작 — 매매 루프 시작")
         # 2026-07-20: reset_daily_loss_counts() 명시 호출 제거 — run_once()가
         # 매 폴링마다 날짜변경을 직접 감지해서 확실하게 호출하도록 바뀌어
@@ -147,6 +150,9 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
     other_api_rate_limit_until: float | None = None
 
     while True:
+        if stop_requested():
+            app_logger.info("[DESKTOP_STOP] 현재 순회 완료 — 정상 종료")
+            return
         try:
             now = now_local()
             if is_market_open() or settings.broker.use_mock:
@@ -278,7 +284,9 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
                 # tasks() 내부에서 "대조 미완료" 경고를 별도로 남긴다.
                 if now.hour > 15 or (now.hour == 15 and now.minute >= 25):
                     trading_service._run_end_of_day_tasks(now)
-            await asyncio.sleep(poll)
+            if await sleep_or_stop(poll):
+                app_logger.info("[DESKTOP_STOP] 정상 종료 요청 처리")
+                return
 
         except (asyncio.CancelledError, KeyboardInterrupt):
             app_logger.info("application stopped by user")
@@ -312,12 +320,16 @@ async def trading_loop(trading_service: TradingService, settings: Settings, app_
                     f"{OTHER_API_RATE_LIMIT_COOLDOWN_SECONDS:.0f}초 동안 정상 순회를 "
                     f"건너뜁니다(장 종료·날짜변경·취소 감지는 계속 정상 동작)."
                 )
-            await asyncio.sleep(poll)
+            if await sleep_or_stop(poll):
+                app_logger.info("[DESKTOP_STOP] 정상 종료 요청 처리")
+                return
 
 
 # ── 메인 ────────────────────────────────────────────────────────
 
 async def async_main() -> None:
+    if stop_requested():
+        return
     load_dotenv()
     settings = load_settings()
     with single_instance_lock(Path(settings.storage.state_file).with_suffix(".lock")):
@@ -443,7 +455,8 @@ async def _run_application(settings: Settings) -> None:
     # 종료가 반드시 호출되도록 try/finally로 감쌉니다. 이전 라운드
     # 에서는 이 배선 자체가 유예돼 있었습니다.
     try:
-        await _run_trading_modes(trading_service, settings, app_logger)
+        if not stop_requested():
+            await _run_trading_modes(trading_service, settings, app_logger)
     finally:
         _shutdown_order_status_observation_recorder(trading_service, app_logger)
 
@@ -657,6 +670,7 @@ def main() -> int:
         # 파일 핸들러를 명시적으로 flush/close.
         # (Ctrl+C 시 close() 없이 종료되면 다음 실행 때 app.log에
         #  로그가 안 찍히는 것처럼 보이는 문제의 원인이었음)
+        cleanup_stop_record()
         logging.shutdown()
         print("[종료] 로그 정리 완료. 프로그램을 종료합니다.")
     return exit_code
