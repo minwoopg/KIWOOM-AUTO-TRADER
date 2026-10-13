@@ -3309,3 +3309,72 @@ FIFO/손익 계산, RiskManager/DailyReporter 연결, API 조회 빈도 확대�
 - `kiwoom_auto_trader_price_revalidation_changed_files_20260923.zip`
   — 실제 변경된 4개 파일(위 목록 그대로, 이 CHANGELOG 포함)을
   원래 폴더 경로 유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 데스크톱 대시보드 시작 실패 즉시 알림 (2026-10-13)
+
+### 배경
+
+원격 저장소에 외부(Codex) 기여로 두 건의 커밋이 추가됐습니다 —
+`d2509ac`(VWAP 진입 정합성 검사)와 `27e5a88`(로컬 Tkinter 대시보드 +
+협조적 종료). 두 커밋 모두 코드 직접 대조·신선한 클론 기반 전체
+회귀 재실행으로 검토해 안전성을 확인했고, 그 결과는 각각 대화와
+프로젝트 문서(`2026-10-13-desktop-dashboard-cooperative-stop-review.md`)로
+전달했습니다. 사용자가 실제로 대시보드를 켜서 사용 중임을 확인하며,
+리뷰 중 제안한 개선 사항 중 하나("중복 시작 시 즉시 팝업")를
+적용해 달라고 요청했습니다.
+
+문제: `27e5a88`의 "▶ 자동매매 시작" 버튼은 이미 터미널 등에서
+실행 중이라 기존 `single_instance_lock`에 걸려 자식 프로세스가
+거의 즉시 비정상 종료되는 경우에도, 2초 주기 tick의 상태 텍스트로만
+이를 알렸습니다. 그 사이 사용자가 "실행 중"으로 오인할 수 있는
+짧은 공백이 있었습니다.
+
+### 변경 내용
+
+- `app/desktop_model.py`: `ProcessController.start_failed_fast()` —
+  시작한 프로세스가 이미 0이 아닌 종료 코드로 끝났는지만 판정하는
+  순수 조회 메서드. 정상 종료(코드 0)는 절대 해당하지 않으므로
+  협조적 종료 자체의 동작(현재 순회 완료 후 종료)은 전혀 바뀌지
+  않습니다.
+- `app/desktop.py`: `Dashboard.start()`가 시작 직후 900ms 뒤 한 번
+  `check_start_result()`로 best-effort 확인을 수행해, 실패 시 즉시
+  오류 팝업(콘솔 로그 tail 포함)을 띄웁니다. 그보다 늦게(가져오기
+  지연 등으로) 실패하는 경우는 기존과 동일하게 2초 tick의 상태
+  텍스트로 계속 드러납니다 — 이 변경으로 없어지는 안전망은 없으며,
+  단지 가장 흔한 경우(락 충돌)를 더 빨리 알려줄 뿐입니다.
+
+### 테스트 및 검증
+
+- `test_desktop_dashboard.py`에 `test_start_failed_fast_flags_only_nonzero_exit`
+  신규 추가 — 시작 전/실행 중/정상 종료(코드 0)/비정상 종료(코드
+  1) 네 가지 상태에서 `start_failed_fast()`가 마지막 경우에만
+  True를 반환함을 확인. 전체 15/15 통과.
+- GitHub `origin/main`(`27e5a88`)에서 새로 클론한 트리에 패치를
+  `git am`으로 적용 후 전체 `test_*.py`(공백 포함 파일 포함,
+  46개) 재실행 — 기존에 보고된 사전 존재 실패 3건(픽스처 누락
+  2건 + `account_scope_id` 기존 버그 1건) 외 새로운 회귀 없음.
+
+### 변경하지 않은 것
+
+- 매매 로직(`domain/service/trading_service.py`, `app/main.py`의
+  `trading_loop`) — 전혀 건드리지 않았습니다. BUY/HOLD/SELL 판단에
+  영향 없습니다.
+- 협조적 종료의 동작 자체(종료 시점·순회 완료 대기·보유종목 감시
+  중단 등) — 그대로입니다. 이번 변경은 "시작 실패를 더 빨리
+  알리는 것"뿐입니다.
+- `27e5a88`이 추가한 다른 기능(ZIP 내보내기, 이전 창 실행 종료
+  요청, 데이터 조회 로직 등) — 건드리지 않았습니다.
+
+### 전달 파일
+
+- 패치(GitHub `origin/main`의 `27e5a88` 기준으로 적용):
+  - `0087-fix-surface-desktop-dashboard-start-failure-immediat.patch`
+    — `app/desktop.py`, `app/desktop_model.py`,
+    `test_desktop_dashboard.py`
+  - `0088-docs-CHANGELOG-v1.7-desktop-start-popup.patch` — 이
+    CHANGELOG
+- `kiwoom_auto_trader_desktop_start_popup_changed_files_20261013.zip`
+  — 실제 변경된 4개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
+  폴더 경로 유지한 채 담음.
