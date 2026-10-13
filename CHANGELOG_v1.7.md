@@ -3373,8 +3373,69 @@ FIFO/손익 계산, RiskManager/DailyReporter 연결, API 조회 빈도 확대�
   - `0087-fix-surface-desktop-dashboard-start-failure-immediat.patch`
     — `app/desktop.py`, `app/desktop_model.py`,
     `test_desktop_dashboard.py`
-  - `0088-docs-CHANGELOG-v1.7-desktop-start-popup.patch` — 이
-    CHANGELOG
+  - `0088-docs-CHANGELOG_v1.7.md.patch` — 이 CHANGELOG
 - `kiwoom_auto_trader_desktop_start_popup_changed_files_20261013.zip`
+  — 실제 변경된 4개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
+  폴더 경로 유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 데스크톱 대시보드 버튼 동작 — 콘솔(터미널) 출력 추가 (2026-10-13)
+
+### 배경
+
+`27e5a88`(대시보드) + `0087`(시작 실패 즉시 알림) 적용 후, 사용자가
+"자동매매 시작/정상 종료/새로고침 등 버튼을 누를 때 터미널에 관련
+메시지가 출력되도록 할 수 있는지" 질문. 두 가지로 나눠 답변:
+(1) GUI 버튼 클릭 자체를 콘솔에 echo — 간단함, (2) 자식 매매
+프로세스의 로그까지 콘솔에 실시간 미러링 — 기존에 "PIPE 데드락
+방지"를 위해 일부러 파일 전용으로 설계해둔 구조를 손봐야 해서 더
+신중한 설계가 필요함. 사용자가 (1)을 선택.
+
+### 변경 내용
+
+- `app/desktop_model.py`: `log(message)` — 타임스탬프를 붙여 stdout에
+  한 줄 출력하는 순수 함수. Tkinter에 의존하지 않아 테스트 가능.
+  `start_desktop.bat`가 콘솔이 붙는 `python.exe`로 대시보드를
+  띄우므로, 그 cmd 창에 바로 출력됨(`flush=True`로 버퍼링 지연
+  없이).
+- `app/desktop.py`: 모든 버튼 핸들러(시작/종료/새로고침[버튼+Enter]/
+  이전 창 실행 종료 요청/ZIP 내보내기/폴더 열기)의 성공·실패
+  시점에 `log()` 호출 추가. 새로고침은 `tick()`에 의해 2초마다
+  자동으로도 호출되는 함수이므로, `refresh(manual=True)`로 명시적
+  호출일 때만 로그를 남기도록 플래그를 추가 — 그렇지 않으면 2초마다
+  콘솔이 스팸으로 도배됨.
+
+### 변경하지 않은 것
+
+- 실제 매매 자식 프로세스(`python -m app.main`)의 로그 흐름 — 여전히
+  `logs/desktop_child.log` 파일 + GUI "실행 / 내보내기 로그" 탭으로만
+  봄. 질문에 답할 때 설명한 (2)번(자식 프로세스 로그까지 콘솔
+  미러링)은 이번 범위 밖 — 별도 요청 시 설계부터 다시 논의 필요.
+- 매매 로직(`trading_service.py`, `main.py`의 `trading_loop`) — 전혀
+  건드리지 않음. BUY/HOLD/SELL 판단에 영향 없음.
+
+### 테스트 및 검증
+
+- `test_desktop_dashboard.py`에 `test_log_writes_timestamped_line_to_stdout`
+  신규 추가 — `log()`가 `[GUI HH:MM:SS]` 형식으로 줄바꿈 포함 한 줄을
+  stdout에 쓰는지 확인. 전체 16/16 통과.
+- GitHub `origin/main`(`27e5a88`) 기준 신선한 클론에 0087→0088→0089
+  패치를 순서대로 `git am` 적용 후 전체 `test_*.py`(공백 포함 파일
+  포함, 46개) 재실행 — 기존에 보고된 사전 존재 실패 3건 외 새로운
+  회귀 없음.
+- Tkinter가 설치되지 않은 환경이라(기존 테스트 스위트도 같은 이유로
+  `app.desktop`을 전혀 import하지 않음) `app/desktop.py` 자체는
+  `ast.parse`로 문법만 검증했습니다 — 실제 버튼 클릭 시 콘솔 출력
+  동작은 Windows 환경에서 직접 확인이 필요합니다.
+
+### 전달 파일
+
+- 패치(0087~0088이 적용된 트리 기준으로 이어서 적용):
+  - `0089-feat-echo-desktop-dashboard-button-actions-to-the-la.patch`
+    — `app/desktop.py`, `app/desktop_model.py`,
+    `test_desktop_dashboard.py`
+  - `0090-docs-CHANGELOG_v1.7.md.patch` — 이 CHANGELOG
+- `kiwoom_auto_trader_desktop_console_log_changed_files_20261013.zip`
   — 실제 변경된 4개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
   폴더 경로 유지한 채 담음.
