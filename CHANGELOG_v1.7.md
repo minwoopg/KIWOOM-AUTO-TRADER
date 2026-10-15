@@ -3439,3 +3439,111 @@ FIFO/손익 계산, RiskManager/DailyReporter 연결, API 조회 빈도 확대�
 - `kiwoom_auto_trader_desktop_console_log_changed_files_20261013.zip`
   — 실제 변경된 4개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
   폴더 경로 유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 볼린저 차단 영향 분석("bb_block") 반복 실패 — 근본 원인 수정 (2026-10-15)
+
+### 배경
+
+민우님이 10/15 분석 문서에서 "자동 ZIP 단계가 막히는 현상은 10월
+13~15일 연속 확인된다. 이제는 전략 실험보다 먼저 고쳐야 할 명확한
+운영 결함"이라고 지적했다. 2026-09-18에 처음 발견돼 그동안 "번들만으론
+원인을 알 수 없다"로 남아 있던 bb_block 반복 실패의 **실제 원인**을
+이번에 찾았다.
+
+### 원인 (재현 확인)
+
+`trading_service.py`의 `_run_bb_block_impact_today()`는
+`subprocess.run([sys.executable, "analyze_bb_block_impact.py", date_str])`로
+저장소 루트의 스크립트를 실행한다. 그런데 저장소에는 **확장자 없는
+`analyze_bb_block_impact`**만 있었다 — `.py` 버전은 이 파일이 추가된
+최초 커밋부터 git 역사 전체에 한 번도 존재한 적이 없다. 매번
+```
+python3: can't open file '.../analyze_bb_block_impact.py': [Errno 2] No such file or directory
+```
+로 즉시 실패(exit code 2)했다. 직접 재현해 확인함 — 올바른 파일명으로
+실행하면 정상 동작(최소 픽스처로 직접 실행 → exit 0, `reports/`에
+정상 저장).
+
+이 1줄짜리 interpreter 오류 메시지가
+`self.app_logger.warning(f"...실패:\n{result.stderr}")`의 개행 뒤에
+오면서, 2026-10-14 보고서 안정화 1차(0091 패치)로 고치기 전의 구
+`slice_log()`("날짜로 시작하는 줄만 채택")에 걸려 번들에서 통째로
+잘려나갔다 — 그래서 9/18부터 지금까지 "원인을 알 수 없다"는 결론이
+반복됐다. 다른 6개 EOD 후속 스크립트(`export_daily_bundle.py`,
+`analyze_shadow.py`, `analyze_signal_log.py`, `analyze_trades.py`,
+`analyze_indicators.py`, `replay_runner.py`)는 전부 호출명과 실제
+파일명이 일치했다 — bb_block만의 문제였다.
+
+`_run_eod_followups()`는 7개 분석 단계가 모두 성공한 뒤에만 `bundle`
+단계를 실행하도록 설계돼 있어(2026-09-17, GPT 11차 재검토 — 번들이
+오래된 분석 결과를 담은 채 성공 처리되는 걸 막기 위한 의도적 설계),
+bb_block이 매번 실패하면 `bundle` 단계 자체가 영원히 실행되지 않는다
+— 그래서 자동 ZIP 생성이 막혔다(민우님이 그동안 번들을 직접
+수동으로 만들어 올려야 했던 이유).
+
+### 수정
+
+`analyze_bb_block_impact` → `analyze_bb_block_impact.py`로 `git mv`.
+로직은 전혀 건드리지 않음 — 파일명만 고쳤다.
+
+재발 방지: `test_eod_followup_script_paths.py` 신규. 하드코딩한
+목록이 아니라 `trading_service.py` 소스를 정규식으로 스캔해
+`subprocess.run([sys.executable, "<name>.py", ...])` 형태로 호출하는
+모든 스크립트 이름을 추출하고, 그 이름 그대로(확장자 포함) 저장소
+루트에 파일이 실제로 존재하는지 검증한다. 이 클래스의 버그(호출
+파일명과 실제 파일명 불일치)가 다른 6개 스크립트 중 어디서든
+재발해도 즉시 잡힌다.
+
+### 테스트 및 검증
+
+- `test_eod_followup_script_paths.py` 신규 2건 전부 통과.
+- `analyze_bb_block_impact.py`를 최소 `logs/signal_log.csv` 픽스처로
+  직접 실행 — exit 0, "해당 기간에 볼린저 상단돌파 차단 기록이
+  없습니다" 정상 출력 + `reports/`에 저장 확인.
+- 전체 회귀(45개 파일, 이 패치는 origin/main 0fb5952 기준이라 0091
+  이전 상태) — 기존부터 알려진 `test_broker_order_status.py`(로컬
+  전용 픽스처 누락)와 `test_order_status_evidence_observation.py`
+  12-9(0092로 이미 고쳤으나 아직 미반영된 트리라 재현됨) 2건만 남고,
+  이번 변경으로 인한 새 회귀는 없음.
+
+### 변경하지 않은 것
+
+- 매매 판단 로직 — 전혀 건드리지 않았다.
+- `_run_eod_followups()`의 "7단계 전부 성공해야 bundle 실행" 설계 —
+  2026-09-17에 의도적으로 도입된 안전장치라 그대로 둔다. bb_block
+  자체가 고쳐졌으니 이 설계 변경(실패해도 부분 번들을 내보내는 것)
+  없이도 당장의 막힘은 해소된다. 민우님이 10/15 문서에서 요청한
+  "실패 시에도 원천 자료·실패 내역이 포함된 번들 생성"은 — bb_block이
+  더 이상 실패하지 않을 것으로 예상되므로 우선순위를 낮추되, 다른
+  단계가 또 비슷하게 막히는 경우에 대한 일반적 방어책으로 필요하면
+  별도 설계안으로 제안하겠음(이 파이프라인은 9/16~9/18 사이에도 여러
+  미묘한 버그가 있었던 곳이라 바로 코드부터 쓰지 않음).
+- `analyze_bb_block_impact.py`가 저장 파일명에 `today`(스크립트
+  실행 시각의 오늘 날짜)를 쓰고 요청한 날짜(`date_str`)를 쓰지
+  않는 부분(같은 날 실행되는 정상 경로에서는 영향 없음, backfill/
+  지연 재시도 시나리오에서만 어긋날 수 있음) — 이번 범위 밖으로 남겨
+  별도 확인 필요 항목으로 기록.
+
+### 다음 작업
+
+- 이 패치를 반영한 뒤 다음 EOD 리포트부터 bb_block/bundle이 정상
+  동작하는지 확인(10/14~10/15 보고서 안정화 패치 0091~0096도 아직
+  미반영 상태이므로, 가능하면 다 같이 반영).
+- 10/15 문서가 지적한 삼성전자(005930) 분봉 갱신 30분 지연은 별도
+  조사 필요 — 요청 시각·응답의 최신 봉 시각·캐시 사용 여부·재시도
+  결과를 연결하는 로깅 보강이 선행돼야 함(다음 설계 대상).
+
+### 전달 파일
+
+- 패치(GitHub `origin/main`, 0fb5952 기준 — 0091~0096과 무관하게
+  독립적으로 적용 가능, 파일이 겹치지 않음):
+  - `0097-fix-analyze-bb-block-impact-missing-py-extension.patch`
+    — `analyze_bb_block_impact` → `analyze_bb_block_impact.py`,
+    `test_eod_followup_script_paths.py`
+  - `0098-docs-CHANGELOG_v1.7.md.patch` — 이 CHANGELOG
+- `kiwoom_auto_trader_bb_block_rootcause_changed_files_20261015.zip`
+  — 변경된 2개 파일 + 이 CHANGELOG, 원래 경로 유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
