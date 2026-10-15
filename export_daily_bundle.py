@@ -1300,13 +1300,33 @@ def build_collection_quality(target: date, log_lines: list[str],
                              counts: dict[str, int],
                              shadow_rows: list[dict],
                              trades_rows: list[dict],
-                             signal_rows: list[dict] | None = None) -> str:
+                             signal_rows: list[dict] | None = None,
+                             same_day_run_count: int | None = None,
+                             carried_over_run_present: bool = False) -> str:
     """분석자가 그날 데이터를 어디까지 믿어도 되는지 판정합니다.
 
     2026-08-06 (1I.1): 8/6처럼 장중 재시작이 여러 번 있었던 날은
     session VWAP 관측이 통째로 무의미해지는데, 리포트만 봐서는
     그걸 알 수 없었음. 판정은 **보수적으로** — 조건을 전부
     만족할 때만 COMPLETE.
+
+    2026-10-14 (보고식 민우님 지적, 재현 확인): 재시작 횟수(starts)를
+    그날 날짜로 시작하는 "[COND] watcher.start() 진입" 로그 줄만 세어
+    판정했는데, **전날(또는 그 이전)에 시작해 자정을 넘겨 이어지다가
+    당일 장중에 교체된 실행**은 이 방식으로 전혀 잡히지 않음 —
+    교체 시점에 새로 시작한 실행의 watcher.start() 로그만 "당일 1회
+    시작"으로 보여서, 실제로는 서로 다른 두 프로세스가 하루를 나눠
+    수집했는데도 "정상적으로 1회만 기동"한 것처럼 보임
+    (10/14 사례: run_baseline.csv에 전날 15:01:54 시작 실행 1건 +
+    10/14 10:18:57 시작 실행 1건이 둘 다 당일 세션에 걸쳐 있었고,
+    체결조회 관측 기록기의 clean_shutdown 마커도 10:18:44에 남아
+    있어 장중 재시작이 명백했음 — 그런데도 watcher.start() 로그
+    기준 starts==1이라 COMPLETE로 오판정됨).
+    run_baseline.csv 조인 결과(같은 날 시작 실행 수 + 전날 이월 추정
+    실행 유무)를 함께 받으면, 그 교차 확인으로 이런 경우도
+    재시작으로 잡아낸다. 두 신호 중 더 큰 쪽(보수적 쪽)을 쓴다 —
+    run_baseline.csv가 없거나 호출자가 넘기지 않으면(None) 교차
+    확인 없이 기존 로그 기준 동작을 그대로 유지한다(하위 호환).
     """
     signal_rows = signal_rows or []
     L: list[str] = []
@@ -1406,9 +1426,28 @@ def build_collection_quality(target: date, log_lines: list[str],
     # signal_log 범위만 맞으면 COMPLETE가 됐음. 보고한 판정 기준은
     # "프로세스 재시작 없음"이 아니라 "정확히 1회 기동"이어야 하고,
     # 로그가 아예 없는 경우는 판정 근거 자체가 없으므로 따로 구분한다.
-    if starts == 0:
+    #
+    # 2026-10-14 (보고식 민우님 지적, 재현 확인): watcher.start() 로그
+    # 기준 starts는 "전날 이월 실행 → 당일 장중 교체" 패턴을 못 잡음
+    # (위 docstring 참고). run_baseline.csv 조인 결과를 받았으면
+    # (same_day_run_count is not None) 교차 확인해서 더 큰 쪽을 쓴다.
+    run_baseline_touch_count = None
+    restart_cross_check_note = None
+    if same_day_run_count is not None:
+        run_baseline_touch_count = same_day_run_count + (1 if carried_over_run_present else 0)
+    effective_starts = starts
+    if run_baseline_touch_count is not None and run_baseline_touch_count > starts:
+        effective_starts = run_baseline_touch_count
+        restart_cross_check_note = (
+            f"watcher.start() 로그는 {starts}회만 보였지만 run_baseline.csv 교차 확인 결과"
+            f" 이 거래일에 걸친 실행이 {run_baseline_touch_count}건"
+            f"(당일 시작 {same_day_run_count}건"
+            f"{' + 전날 이월 실행 1건' if carried_over_run_present else ''})으로 확인되어"
+            " 장중 재시작으로 간주합니다."
+        )
+    if effective_starts == 0:
         status = "UNKNOWN_START_PARTIAL"
-    elif starts > 1:
+    elif effective_starts > 1:
         status = "RESTARTED_PARTIAL"
     elif open_ok and close_ok:
         status = "COMPLETE"
@@ -1437,11 +1476,16 @@ def build_collection_quality(target: date, log_lines: list[str],
     add("trade_date", day)
     add("first_log_timestamp", first_ts or "N/A")
     add("last_log_timestamp", last_ts or "N/A")
-    add("process_start_count", starts)
+    add("process_start_count", effective_starts)
+    add("watcher_start_log_count", starts)
+    add("run_baseline_distinct_run_count",
+        run_baseline_touch_count if run_baseline_touch_count is not None else "N/A(run_baseline 미연동)")
     add("websocket_connect_count", ws_connect)
     add("websocket_reconnect_count", ws_reconnect)
     add("collection_status", status)
     add("full_day_collection", status == "COMPLETE")
+    if restart_cross_check_note:
+        L.append(f"  ⚠ {restart_cross_check_note}")
     L.append("")
     add("signal_log_rows", counts.get("signal_log.csv", 0))
     add("entry_quality_shadow_rows", counts.get("entry_quality_shadow.csv", 0))
@@ -1506,6 +1550,10 @@ def build_collection_quality(target: date, log_lines: list[str],
     L.append("그 외에는 PARTIAL 또는 RESTARTED_PARTIAL. session 게이트는")
     L.append("ready=True 행이 하나도 없으면 성과 해석이 불가능하므로")
     L.append("INVALID_FOR_THIS_DAY로 표시합니다.")
+    L.append("process_start_count는 watcher_start_log_count와")
+    L.append("run_baseline_distinct_run_count 중 더 큰 값입니다 — 전날 이월 실행이")
+    L.append("당일 장중에 교체된 경우(watcher.start() 로그만으론 안 보임)도")
+    L.append("run_baseline.csv 교차 확인으로 재시작에 포함합니다(2026-10-14).")
     L.append("=" * 58)
     return "\n".join(L)
 
@@ -1618,6 +1666,12 @@ def build(
         # 항상 정의해 둡니다(빈 리스트면 커버리지 쪽에서 scope_unresolved로
         # 자연히 반영됨 — 별도 분기 불필요).
         all_baselines: list[dict] = []
+        # 2026-10-14 (보고식 민우님 지적): collection_quality의 재시작
+        # 교차 확인에 쓸 수 있도록, run_baseline.csv가 없는 경우에도
+        # (if 분기) 항상 정의된 기본값을 둔다 — else 분기 안에서만
+        # 정의하면 NameError 위험이 있었음.
+        same_day: list[tuple[dict, object]] = []
+        carried_over: tuple[dict, object] | None = None
         if not baseline_src.exists():
             manifest.append(f"  {'run_baseline.csv':30s} | MISSING | 원본 없음 | excluded")
             manifest.append("  ⚠ 이 날짜의 거래/신호를 실행(run_id)에 연결할 근거가 없습니다.")
@@ -1937,11 +1991,16 @@ def build(
                 pass
 
         # 수집 품질
+        # 2026-10-14 (보고식 민우님 지적): 위에서 이미 조인해 둔
+        # run_baseline.csv 결과(same_day/carried_over)를 그대로 넘겨
+        # "전날 이월 실행 → 당일 장중 교체" 재시작도 잡아낸다.
         quality = build_collection_quality(
             target, log_lines, counts,
             _read_csv(work / f"entry_quality_shadow_{day_compact}.csv"),
             _read_csv(work / f"trades_{day_compact}.csv"),
             _read_csv(work / f"signal_log_{day_compact}.csv"),
+            same_day_run_count=len(same_day),
+            carried_over_run_present=carried_over is not None,
         )
         (work / "collection_quality.txt").write_text(quality, encoding="utf-8")
 
