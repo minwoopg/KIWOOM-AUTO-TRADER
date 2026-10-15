@@ -379,34 +379,74 @@ def rotated_log_paths(logs_dir: Path) -> list[Path]:
     return found
 
 
+_LOG_RECORD_START_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+
+
 def slice_log(sources: list[Path], dst: Path, target: date) -> tuple[int, int, list[str], list[str]]:
     """여러 로그 파일에서 allowlist 태그 줄만 모아 시간순으로 씁니다.
 
-    반환: (전체줄, 추출줄, 추출된 줄 목록, 사용한 소스 파일명)
+    2026-10-14 (보고서 안정화 1차, 9/18 bb_block 분석 때 발견했던
+    관측성 공백 해결): infra/storage/logger.py의 포매터
+    ("%(asctime)s | %(levelname)s | %(message)s")는 message 자체에
+    개행이 있으면 그 전체를 한 번에 emit()한다.
+    `self.app_logger.warning(f"...실패:\n{result.stderr}")`가 대표적
+    예 — 결과물은 맨 첫 물리 줄에만 날짜 접두사가 붙고, 뒤따르는 실제
+    예외 내용(원인 전체)에는 접두사가 없다. 예전엔 "날짜로 시작하는
+    줄만 채택"했기 때문에 이 뒤따르는 줄들을 전부 버렸다 — bb_block
+    실패의 진짜 원인이 번들에서 몇 주째 보이지 않았던 이유다.
+    이제 "새 레코드의 시작"(타임스탬프 패턴)을 판별해, 채택된
+    레코드에 뒤따르는 연속줄도 새 레코드가 시작되기 전까지 함께
+    보존한다. 채택되지 않은 레코드의 연속줄은 기존과 동일하게
+    버려진다(버퍼가 비어 있으면 연속줄도 버림).
+
+    반환: (전체줄, 추출줄(물리 줄 수), 추출된 레코드 목록(여러 물리
+    줄이 합쳐진 블록일 수 있음), 사용한 소스 파일명)
     """
     day = target.strftime("%Y-%m-%d")
     total = kept = 0
-    collected: list[str] = []
+    collected: list[tuple[str, str]] = []  # (정렬키, 레코드 전체 텍스트)
     used: list[str] = []
     for src in sources:
         hit = 0
+        buf_lines: list[str] = []
+        buf_sort_key = ""
+        buf_accepted = False
+
+        def _flush() -> None:
+            nonlocal hit
+            if buf_accepted and buf_lines:
+                collected.append((buf_sort_key, "\n".join(buf_lines)))
+
         with src.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
+            for raw_line in f:
                 total += 1
-                if not line.startswith(day):
-                    continue
-                if not any(t in line for t in LOG_TAGS):
-                    continue
-                collected.append(mask(line.rstrip("\r\n")))
-                hit += 1
+                line = raw_line.rstrip("\r\n")
+                if _LOG_RECORD_START_RE.match(line):
+                    _flush()
+                    buf_lines = [line]
+                    buf_sort_key = line[:23]
+                    buf_accepted = (
+                        line.startswith(day) and any(t in line for t in LOG_TAGS)
+                    )
+                    if buf_accepted:
+                        hit += 1
+                else:
+                    # 연속줄 — 버퍼가 비어 있으면(=레코드 시작 전에
+                    # 잘려 보이는 선두 줄) 안전하게 버린다.
+                    if buf_lines:
+                        buf_lines.append(line)
+                        if buf_accepted:
+                            hit += 1
+            _flush()
         if hit:
             used.append(f"{src.name} ({hit:,}줄)")
         kept += hit
     # 로테이션 파일은 app.log.N이 오래된 순이라 파일 순서가 시간순이
     # 아님 — 타임스탬프 접두사로 정렬해 하나의 파일로 합칩니다.
-    collected.sort(key=lambda l: l[:23])
-    dst.write_text("\n".join(collected) + ("\n" if collected else ""), encoding="utf-8")
-    return total, kept, collected, used
+    collected.sort(key=lambda pair: pair[0])
+    records = [mask(text) for _key, text in collected]
+    dst.write_text("\n".join(records) + ("\n" if records else ""), encoding="utf-8")
+    return total, kept, records, used
 
 
 # ── 체결조회 증거 관측 로그 (order_status_observations.jsonl) ─────
