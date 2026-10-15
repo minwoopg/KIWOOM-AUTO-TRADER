@@ -265,7 +265,15 @@ experimental:
   reward_risk_guard_mode: "off"     # 4단계: 상승여력·손익비 하드 게이트
   candidate_ranking_mode: "off"     # 5단계: 후보 순위화
   trailing_breakeven_mode: "off"    # 6단계: 순본전 트레일링
-  entry_quality_guard_mode: "off"   # 1E.5단계: MACD/VWAP 진입 품질 shadow 관측 (off/shadow만 지원)
+  entry_quality_guard_mode: "shadow"  # 1E.5단계: MACD/VWAP 진입 품질 shadow 관측 (off/shadow만 지원)
+  # 2026-10-14 (민우님 요청 "품질 비교 기능도 on으로"): off→shadow.
+  # shadow는 계산·로그만 — BUY/HOLD/SELL 어떤 결정도 건드리지 않음
+  # (trading_service.py 6084행 주석: "Signal이나 주문 결과는 이 블록이
+  # 절대 건드리지 않음"). enforce는 __post_init__에서 아직 명시적으로
+  # 막혀 있어(ValueError) 이번 변경으로 전환될 위험 없음. 켜면
+  # entry_quality_shadow.csv에 legacy BUY 후보 기준 MACD/VWAP
+  # would_block_* 관측이 쌓이기 시작한다(오늘 번들 기준 0/1,151행 —
+  # 지금까지 off였어서 비어 있었음).
   # Candidate A Production Pilot v1 (2026-08-28 A단계 shadow 배포,
   # 2026-09-03 B단계 완료 + 민우님 승인으로 C단계 limited enforce
   # pilot 시작):

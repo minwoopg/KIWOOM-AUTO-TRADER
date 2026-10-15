@@ -53,9 +53,14 @@ check("1) settings.yaml에 experimental 섹션이 정상 파싱됨", settings.ex
 # 상황에 맞는 값인지"를 검증하도록 갱신. 1C는 shadow까지 진행됨,
 # 나머지 5개 단계(2~6단계)는 아직 착수 전이라 여전히 off여야 함.
 # 2026-08-05 (1E.5단계): entry_quality_guard_mode 신규 추가 —
-# 이 단계는 아직 shadow 관측 코드만 구현됐고 settings.yaml의
+# 이 단계는 처음엔 shadow 관측 코드만 구현됐고 settings.yaml의
 # 실제 값은 "off"로 시작(운영자가 명시적으로 shadow로 전환하기
 # 전까지는 계산 자체가 스킵됨).
+# 2026-10-14 (민우님 요청 "품질 비교 기능도 on으로"): 운영자가
+# 명시적으로 off→shadow 전환(settings.yaml). BUY/HOLD/SELL 결정은
+# 건드리지 않는 순수 관측 단계 전환이라 이 테스트의 "현재 상태"
+# 기준도 함께 갱신한다 — session_metrics_mode가 1C.2 완료 때 그랬던
+# 것과 동일한 패턴.
 EXPECTED_MODES = {
     "session_metrics_mode": "shadow",      # 1단계: 1C.2 완료, shadow 관찰 중
     "decision_engine_mode": "off",         # 2단계: 착수 전
@@ -63,14 +68,15 @@ EXPECTED_MODES = {
     "reward_risk_guard_mode": "off",       # 4단계: 착수 전
     "candidate_ranking_mode": "off",       # 5단계: 착수 전
     "trailing_breakeven_mode": "off",      # 6단계: 착수 전
-    "entry_quality_guard_mode": "off",     # 1E.5단계: 코드 구현 완료, shadow 전환 대기
+    "entry_quality_guard_mode": "shadow",  # 1E.5단계: 2026-10-14 off→shadow 전환
 }
 modes_match = all(
     getattr(settings.experimental, f) == expected
     for f, expected in EXPECTED_MODES.items()
 )
 check("2) 각 플래그가 현재 리팩터링 진행 상황과 일치함"
-      "(session_metrics_mode만 shadow, 나머지 5개는 여전히 off)", modes_match)
+      "(session_metrics_mode·entry_quality_guard_mode는 shadow, 나머지 4개는 여전히 off)",
+      modes_match)
 if not modes_match:
     for f, expected in EXPECTED_MODES.items():
         actual = getattr(settings.experimental, f)
