@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import re
 import sys
 import tempfile
 import time
@@ -1714,7 +1715,28 @@ from datetime import timezone as _timezone
 _tmpdir11a = tempfile.mkdtemp()
 _repo_root_11 = Path(_os.getcwd())
 _real_settings_yaml_text_11 = (_repo_root_11 / "config" / "settings.yaml").read_text(encoding="utf-8")
-_active_settings_yaml_text_11 = _real_settings_yaml_text_11.replace(
+# 2026-10-14 (보고서 안정화 1차, "account_scope_id='' 오분류" 재조사
+# 반영): 이 섹션은 원래 "실제 저장소의 config/settings.yaml을 그대로
+# 가져오면 account_scope_id가 비어 있다"는 전제로 11-2의 "blank" 기준
+# 텍스트를 만들었다. 그 전제는 2026-09-22부터 더 이상 성립하지 않는다
+# — 체결조회 증거 관측 기능을 실제로 켜면서(정상적인 운영 변경,
+# 9/22 번들 분석 문서에 기록됨) 실제 운영 설정이
+# `account_scope_id: "acct-a"`로 바뀌었기 때문이다. 이 테스트는
+# resolve_observation_configured_active()의 코드 결함을 검증하는
+# 것이 아니라 "값이 없을 때의 동작"을 검증하는 것이므로, 실제
+# 운영값이 또 바뀌어도 흔들리지 않도록 이 모듈 전용 "blank" 기준
+# 텍스트에서 account_scope_id 줄 자체를 제거한다(필드가 아예 없으면
+# dataclass 기본값 ""이 적용됨 — config/settings.py 확인).
+_blank_settings_yaml_text_11 = re.sub(
+    r'^\s*account_scope_id:\s*.*\n', "", _real_settings_yaml_text_11, flags=re.M,
+)
+check("11-0a) 사전조건: 실제 settings.yaml에 account_scope_id 줄이 있어야"
+      " 이 제거 로직 자체가 의미 있음(테스트 전제 확인)",
+      _blank_settings_yaml_text_11 != _real_settings_yaml_text_11)
+check("11-0b) 사전조건: 제거 후에는 account_scope_id 줄이 전혀 남지 않음",
+      "account_scope_id" not in _blank_settings_yaml_text_11)
+
+_active_settings_yaml_text_11 = _blank_settings_yaml_text_11.replace(
     "  is_paper_trading: true\n",
     "  is_paper_trading: true\n  account_scope_id: acct-11a\n",
     1,
@@ -1729,9 +1751,10 @@ check("11-1) 설정에서 account_scope_id가 채워져 있으면 True를 반환
       _bundle.resolve_observation_configured_active(_settings_path_11a_active) is True)
 
 _settings_path_11a_blank = Path(_tmpdir11a) / "settings_blank.yaml"
-_settings_path_11a_blank.write_text(_real_settings_yaml_text_11, encoding="utf-8")
+_settings_path_11a_blank.write_text(_blank_settings_yaml_text_11, encoding="utf-8")
 check("11-2) 설정에 account_scope_id가 없으면(기본값 \"\") False를 반환함"
-      "(명시적 비활성 확인 — 실제 저장소의 config/settings.yaml 그대로)",
+      "(명시적 비활성 확인 — account_scope_id 줄을 제거한 이 테스트"
+      " 전용 기준 텍스트. 실제 운영 설정값과는 독립적)",
       _bundle.resolve_observation_configured_active(_settings_path_11a_blank) is False)
 
 _settings_path_11a_missing = Path(_tmpdir11a) / "does_not_exist.yaml"
@@ -1949,7 +1972,7 @@ try:
     _os.chdir(_tmpdir12c)
     Path("logs").mkdir()
     Path("config").mkdir()
-    (Path("config") / "settings.yaml").write_text(_real_settings_yaml_text_11, encoding="utf-8")
+    (Path("config") / "settings.yaml").write_text(_blank_settings_yaml_text_11, encoding="utf-8")
     _day921_12c = datetime(2026, 9, 21).date()
     (Path("logs") / "order_status_observations.jsonl").write_text("", encoding="utf-8")
 
