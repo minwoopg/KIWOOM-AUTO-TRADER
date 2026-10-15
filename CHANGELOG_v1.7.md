@@ -3468,7 +3468,7 @@ python3: can't open file '.../analyze_bb_block_impact.py': [Errno 2] No such fil
 
 이 1줄짜리 interpreter 오류 메시지가
 `self.app_logger.warning(f"...실패:\n{result.stderr}")`의 개행 뒤에
-오면서, 2026-10-14 보고서 안정화 1차(0091 패치)로 고치기 전의 구
+오면서, 2026-10-14 보고서 안정화(0093 패치)로 고치기 전의 구
 `slice_log()`("날짜로 시작하는 줄만 채택")에 걸려 번들에서 통째로
 잘려나갔다 — 그래서 9/18부터 지금까지 "원인을 알 수 없다"는 결론이
 반복됐다. 다른 6개 EOD 후속 스크립트(`export_daily_bundle.py`,
@@ -3529,21 +3529,153 @@ bb_block이 매번 실패하면 `bundle` 단계 자체가 영원히 실행되지
 ### 다음 작업
 
 - 이 패치를 반영한 뒤 다음 EOD 리포트부터 bb_block/bundle이 정상
-  동작하는지 확인(10/14~10/15 보고서 안정화 패치 0091~0096도 아직
-  미반영 상태이므로, 가능하면 다 같이 반영).
+  동작하는지 확인(이어지는 0093~0097 "보고서 안정화" 패치도 함께
+  반영 권장).
 - 10/15 문서가 지적한 삼성전자(005930) 분봉 갱신 30분 지연은 별도
   조사 필요 — 요청 시각·응답의 최신 봉 시각·캐시 사용 여부·재시도
   결과를 연결하는 로깅 보강이 선행돼야 함(다음 설계 대상).
 
 ### 전달 파일
 
-- 패치(GitHub `origin/main`, 0fb5952 기준 — 0091~0096과 무관하게
-  독립적으로 적용 가능, 파일이 겹치지 않음):
-  - `0097-fix-analyze-bb-block-impact-missing-py-extension.patch`
+- 패치(GitHub `origin/main`, 0fb5952 기준 — 가장 먼저 적용):
+  - `0091-fix-analyze-bb-block-impact-missing-py-extension.patch`
     — `analyze_bb_block_impact` → `analyze_bb_block_impact.py`,
     `test_eod_followup_script_paths.py`
-  - `0098-docs-CHANGELOG_v1.7.md.patch` — 이 CHANGELOG
+  - `0092-docs-CHANGELOG_v1.7.md.patch` — 이 CHANGELOG
 - `kiwoom_auto_trader_bb_block_rootcause_changed_files_20261015.zip`
   — 변경된 2개 파일 + 이 CHANGELOG, 원래 경로 유지한 채 담음.
+- 이어서 0093~0097("보고서 안정화" — slice_log 다중 줄 보존,
+  account_scope_id 테스트 기준 분리, collection_quality 재시작
+  교차 확인, entry_quality_guard_mode shadow 전환)을 순서대로 적용.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 보고서 안정화 — 번들 로그 관측성 공백 + 수집 완전성 재시작 교차 확인 + 진입 품질 shadow 전환 (2026-10-14/15)
+
+### 배경
+
+0091~0092(bb_block 근본 원인 수정)에 이어, 10/14 번들 검증과 10/15
+분석 문서에서 나온 나머지 항목들을 반영한다: (1) bb_block 등 여러
+EOD 분석 실패가 번들에서 "원인을 알 수 없게" 잘려나가던 관측성
+공백, (2) 수집 완전성(collection_quality) 재시작 오판정, (3) 민우님
+요청 "품질 비교 기능도 on으로".
+
+### 변경 1 — 번들 로그 슬라이스가 예외 스택트레이스를 자르던 공백
+
+`slice_log()`가 "날짜로 시작하는 물리 줄만 채택"하던 방식이라,
+`self.app_logger.warning(f"...실패:\n{result.stderr}")`처럼 메시지
+자체에 개행이 있는 로그는 맨 첫 줄만 남고 뒤따르는 실제 예외 내용
+(원인 전체)이 통째로 잘려나갔다. "새 레코드의 시작"(타임스탬프
+패턴)을 판별해, 채택된 레코드에 뒤따르는 연속줄도 새 레코드가
+시작되기 전까지 함께 보존하도록 수정. 바로 이 공백 때문에
+bb_block의 실제 원인(파일명 확장자 누락, 0091 패치)이 9/18부터
+번들에서 보이지 않았다.
+
+### 변경 2 — account_scope_id 테스트가 운영 설정 변화에 흔들리던 문제
+
+`test_order_status_evidence_observation.py`가 실제 저장소의
+`config/settings.yaml`을 "account_scope_id가 비어있는 기준 텍스트"로
+그대로 재사용했는데, 2026-09-22부터 실제 운영 설정이
+`account_scope_id: "acct-a"`로 바뀌면서(체결조회 증거 관측 기능을
+실제로 켠 것 — 정상적인 운영 변경) 그 전제가 깨져 있었다.
+`resolve_observation_configured_active()`/`_classify_run_state()`
+자체는 결함이 없었음을 확인했다. 기준 텍스트에서 `account_scope_id`
+줄을 제거해 이 테스트 모듈 전용 고정 텍스트로 만들었다.
+
+### 변경 3 — collection_quality 재시작 오판정 수정
+
+10/14 번들로 재현 확인: `run_baseline.csv`에 전날(10/13) 15:01:54
+시작 실행 + 10/14 10:18:57 시작 실행이 둘 다 이 거래일 세션에
+걸쳐 있었고, 체결조회 관측 기록기의 종료 마커도 10:18:44에 남아
+있어 장중 재시작이 명백했다. 그런데도 `collection_quality.txt`는
+`process_start_count=1`, `collection_status=COMPLETE`로 표시됐다.
+
+원인: 재시작 집계(`starts`)가 "[COND] watcher.start() 진입" 로그
+줄을 **그 거래일 날짜로 찍힌 줄만** 세는 방식이었음. 전날 시작해
+자정을 넘겨 이어지던 실행은 자기 기동 로그가 전날 날짜라 이 집계에
+전혀 보이지 않고, 교체 시점에 새로 시작한 실행의 기동 로그만
+"당일 1회 시작"으로 보임.
+
+`build_collection_quality()`가 번들 생성 코드가 이미 조인해 둔
+`run_baseline.csv` 결과(당일 시작 실행 수 + 전날 이월 실행 유무)를
+함께 받아 로그 기준 집계와 교차 확인하도록 확장. 두 신호 중 더
+큰(보수적인) 쪽을 `process_start_count`로 사용. run_baseline
+데이터를 넘기지 않는 호출부는 기존 동작 그대로(하위 호환).
+`watcher_start_log_count`/`run_baseline_distinct_run_count` 필드와
+불일치 시 경고 줄을 `collection_quality.txt`에 추가.
+
+이 수정을 반영한 뒤 10/14 번들을 다시 생성하면 `process_start_count=2`,
+`collection_status=RESTARTED_PARTIAL`로 재분류될 것으로 예상.
+
+### 변경 4 — entry_quality_guard_mode: off → shadow
+
+민우님 요청("품질 비교 기능도 on으로 변경해주세요") 그대로 전환.
+shadow는 계산·로그만 하는 순수 관측 단계(BUY/HOLD/SELL 어떤 결정도
+건드리지 않음 — `trading_service.py` 6084행 주석으로 확인). enforce는
+아직 `ValueError`로 막혀 있어 이번 전환으로 enforce가 켜질 위험
+없음. 전환 후 `entry_quality_shadow.csv`에 MACD/VWAP `would_block_*`
+관측이 쌓이기 시작(10/14 기준 0/1,151행 — 지금까지 off였어서
+비어 있었음). `test_experimental_config.py`의 "현재 리팩터링
+진행 상황" 고정 기준도 함께 갱신.
+
+### 10/14 번들 자체 검증 — 사용자 분석 문서와 교차 확인 (전부 일치)
+
+- `signal_log.csv` `order_block_reason`: 83 `DAILY_ENTRY_LIMIT` + 58
+  `ENTRY_BELOW_VWAP` + 9 `SKIP_CANDIDATE_A_GUARD` + 5
+  `EXCLUDED_SYMBOL` = 155건.
+- `balance_freshness.csv`: `KiwoomHttpError` ×
+  `fetch_failed_429_fallback_disabled` 9건.
+- `order_status_coverage.txt`: 접수 주문 4건, 관측 0건(기존 ~29%
+  수준 낮은 커버리지 범위 안 — 새 문제 아님).
+- `position_lifecycle.csv`: SELL_REQUESTED→SELL_RESULT 간격 약
+  20.3초/22.5초 — 보고된 수치와 일치.
+
+### 테스트 및 검증
+
+- `test_slice_log_multiline_records.py` 신규 7건, `test_collection_quality_restart_crosscheck.py`
+  신규 5건 전부 통과.
+- `test_order_status_evidence_observation.py` 168/168 통과(기존
+  166건 + 신규 사전조건 2건, 기존 실패했던 12-9 포함 전부 통과).
+- `test_experimental_config.py` 9/9 통과(기준 갱신 반영).
+- 전체 회귀(47개 파일) — 기존부터 알려진 `test_broker_order_status.py`
+  1건(`.gitignore`된 로컬 전용 픽스처 누락, 코드 무관)만 남고 새로운
+  회귀 없음.
+
+### 변경하지 않은 것
+
+- 매매 판단 로직(`trading_service.py`의 BUY/HOLD/SELL 경로) — 전혀
+  건드리지 않았다. entry_quality_guard_mode=shadow 전환도 이 로직에
+  영향을 주지 않는 순수 관측 단계임을 코드 주석으로도 확인했다.
+- `resolve_observation_configured_active()`/`_classify_run_state()`
+  자체 — 결함이 없어 변경하지 않았다(테스트 기준 텍스트만 수정).
+- 체결 기준 성과 집계(민우님 5단계 로드맵의 2번) — 여전히 별도
+  설계안 합의 후 구현 대상.
+
+### 다음 작업
+
+- 0091~0097을 모두 반영한 뒤 재생성된 번들로 bb_block 정상 동작,
+  재시작 재분류, entry_quality_shadow 수집 시작을 확인.
+- 10/15 문서가 지적한 삼성전자(005930) 분봉 갱신 30분 지연 조사 —
+  요청 시각·응답의 최신 봉 시각·캐시 사용 여부·재시도 결과를
+  연결하는 로깅 보강 설계.
+- entry_quality_shadow.csv에 며칠치 관측이 쌓이면 두 전략 가설(약한
+  모멘텀 4점 진입 제외, 조건부 5분 청산 연장) 검증에 활용.
+
+### 전달 파일
+
+- 패치(GitHub `origin/main`, 0091~0092가 적용된 트리 기준으로 이어서
+  적용):
+  - `0093-fix-export-slice-log-multiline-exception.patch` —
+    `export_daily_bundle.py`, `test_slice_log_multiline_records.py`
+  - `0094-test-account-scope-id-fixture-isolation.patch` —
+    `test_order_status_evidence_observation.py`
+  - `0095-fix-export-collection-quality-restart-crosscheck.patch` —
+    `export_daily_bundle.py`, `test_collection_quality_restart_crosscheck.py`
+  - `0096-feat-config-entry-quality-guard-mode-shadow.patch` —
+    `config/settings.yaml`, `test_experimental_config.py`
+  - `0097-docs-CHANGELOG_v1.7.md.patch` — 이 CHANGELOG
+- `kiwoom_auto_trader_report_stabilization_changed_files_20261015.zip`
+  — 변경된 6개 파일(위 목록 그대로, 이 CHANGELOG 포함), 원래 경로
+  유지한 채 담음.
 
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
