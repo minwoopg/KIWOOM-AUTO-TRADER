@@ -154,6 +154,27 @@ check("4-2) 차단된 종목이 blocked로 정확히 보고됨",
 check("4-3) day_symbols에는 차단 전 후보가 전부 남아있음(집계용)",
       set(sel4.day_symbols) == {"111111", "222222", "333333"})
 
+# 2026-10-21 (민우님 지적, 외부 LLM 검토 문서 3B 확인됨): 수동
+# 지정 종목(manual_symbols)이 excluded_symbols를 우회해 다시
+# 감시 대상에 들어가던 결함 재현 + 수정 확인.
+sel4b = compute_day_targets(
+    confirmed_symbols_by_seq={"1": {"111111"}, "2": set(), "3": set()},
+    realtime_unresolved=set(),
+    day_seqs=[1, 2, 3],
+    manual_symbols=["222222", "444444"],
+    excluded_symbols={"222222", "333333"},
+    max_symbols=10,
+)
+check("4-4) 수동 지정 종목도 excluded_symbols면 최종 targets에서 빠짐"
+      "(기존엔 우회됐던 결함)",
+      "222222" not in sel4b.final_targets)
+check("4-5) 수동 지정 종목 중 제외되지 않은 종목은 그대로 포함됨",
+      "444444" in sel4b.final_targets and "111111" in sel4b.final_targets)
+check("4-6) 제외된 수동 지정 종목도 blocked에 포함됨(재편입 차단 로그용)",
+      "222222" in sel4b.blocked)
+check("4-7) 최종 targets가 정확히 두 종목(111111, 444444)",
+      set(sel4b.final_targets) == {"111111", "444444"})
+
 
 # ══════════════════════════════════════════════════════════════
 # 5) 중복 제거 / 결정성

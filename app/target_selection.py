@@ -150,6 +150,18 @@ def compute_day_targets(
     조건식이 되었으므로 그 분기를 제거했습니다. `day_seqs` 필터링
     자체는 남겨둡니다 — 설정에 등록되지 않은 seq의 결과가 흘러들어와
     조용히 targets에 섞이는 일을 막는 방어선이기 때문입니다.
+
+    ── 2026-10-21 (민우님 지적, 외부 LLM 검토 문서 3B 확인됨) ──
+    기존에는 `excluded_symbols` 필터가 `day_symbols`(조건검색 유래
+    종목)에만 적용되고 `manual_symbols`에는 적용되지 않았습니다 —
+    `combined = manual_symbols + filtered`로 바로 합쳤기 때문에,
+    수동 지정 목록(`settings.targets`)에 설정상 매수 제외 종목이
+    들어있으면 `excluded_symbols` 필터를 완전히 우회해 다시 감시
+    대상에 포함됐습니다. 이제 `manual_symbols`도 동일하게 걸러내고,
+    제외된 수동 지정 종목도 `blocked`에 함께 보고합니다. 보유 종목
+    청산 감시는 `trading_service.py`의 `cycle_targets = [*self.
+    targets, *held_symbols]` 합집합이 보유 중이면 계속 포함시키므로
+    영향 없습니다.
     """
     day_seqs_set = {str(s) for s in day_seqs}
 
@@ -166,9 +178,21 @@ def compute_day_targets(
             day_symbols.append(s)
             unresolved_used.append(s)
 
-    blocked = excluded_symbols & set(day_symbols)
+    # 2026-10-21 (민우님 지적, 외부 LLM 검토 문서 3B 확인됨): 기존에는
+    # 조건검색 유래 종목(day_symbols)만 excluded_symbols로 걸러내고
+    # manual_symbols는 그대로 합쳤습니다 — 그래서 수동 지정 목록
+    # (settings.targets)에 설정상 매수 제외 종목이 들어있으면
+    # excluded_symbols 필터를 완전히 우회해 다시 감시 대상에
+    # 포함됐습니다. 이제 manual_symbols도 동일하게 걸러냅니다.
+    # 보유 종목 청산 감시는 trading_service.py의
+    # cycle_targets = [*self.targets, *held_symbols] 합집합이
+    # final_targets에서 빠진 종목도 보유 중이면 계속 포함시키므로
+    # 영향 없습니다.
+    manual_blocked = excluded_symbols & set(manual_symbols)
+    manual_filtered = [s for s in manual_symbols if s not in excluded_symbols]
+    blocked = (excluded_symbols & set(day_symbols)) | manual_blocked
     filtered = [s for s in day_symbols if s not in excluded_symbols]
-    combined = list(dict.fromkeys(list(manual_symbols) + filtered))
+    combined = list(dict.fromkeys(list(manual_filtered) + filtered))
     limited = combined[:max_symbols]
 
     # 2026-08-06 (1G): 조건검색 유래 종목만 따로 집계 — 수동 targets와
