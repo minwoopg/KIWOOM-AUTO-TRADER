@@ -60,6 +60,49 @@ class DayTargetSelection:
     truncated_condition_count: int = 0
 
 
+def merge_excluded_symbols(
+    dynamic_excluded: set[str],
+    permanent_excluded_symbols,
+) -> set[str]:
+    """당일 동적 제외 집합과 설정상 영구 제외 목록을 합칩니다.
+
+    2026-10-21 (민우님 10/20~21 번들 분석, "감시 대상 정리" 1순위):
+
+    **증상**: `config/settings.yaml`의 `excluded_symbols`(신규매수
+    영구 차단 종목, 예: 114800·252670)는 지금까지 `_try_buy()`
+    바로 앞의 최종 주문 게이트에서만 걸러졌습니다. 반면
+    `app/main.py`가 `compute_day_targets()`에 넘기는
+    `excluded_symbols` 인자는 `trading_service.get_excluded_symbols()`
+    (UNKNOWN 장세 3회 연속·거래대금 부족 3회 연속으로만 채워지는
+    당일 동적 집합)뿐이었고, 설정상 영구 차단 목록은 전혀 반영되지
+    않았습니다. 그 결과 영구 차단 종목이 감시 대상에서 한 번도
+    빠지지 않고 매 폴링마다 분봉 분석·장세 판정·시그널 계산까지
+    전부 수행된 뒤에야 마지막에 막혔습니다 — 10/20(37.0%)·
+    10/21(58.8%, 삼성전자 포함 92.7%) 판단 횟수가 이 두 종목(과
+    삼성전자 눌림목 반복 판단)에 낭비됐다는 사용자 분석과 일치.
+
+    **수정**: `compute_day_targets()`에 넘기기 전에 동적 제외
+    집합과 설정상 영구 제외 목록을 합쳐서 넘깁니다.
+    `compute_day_targets()` 자체의 필터링 로직은 전혀 바꾸지
+    않습니다 — 이미 `excluded_symbols & set(day_symbols)`로 받은
+    집합을 그대로 걸러내므로, 호출부에서 넘기는 집합만 넓히면
+    충분합니다.
+
+    **보유 종목 청산 감시는 영향 없음**: `trading_service.py`의
+    `cycle_targets = [*self.targets, *held_symbols]` 합집합이
+    `self.targets`(= 이 함수의 결과가 반영된 `final_targets`)에서
+    빠진 종목이라도 보유 중이면 계속 포함시키므로, 영구 제외
+    종목을 보유 중일 때 청산 감시가 끊기는 일은 없습니다.
+
+    permanent_excluded_symbols는 `None`/빈 리스트/리스트 모두
+    안전하게 처리합니다(`settings.trading.excluded_symbols`는
+    `__post_init__`에서 `None`이면 `[]`로 바뀌지만, 방어적으로
+    둘 다 받습니다).
+    """
+    extra = set(permanent_excluded_symbols) if permanent_excluded_symbols else set()
+    return dynamic_excluded | extra
+
+
 def compute_day_targets(
     *,
     confirmed_symbols_by_seq: dict[str, set[str]],

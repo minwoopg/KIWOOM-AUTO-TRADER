@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 from app.desktop_control import cleanup_stop_record, sleep_or_stop, stop_requested
-from app.target_selection import compute_day_targets
+from app.target_selection import compute_day_targets, merge_excluded_symbols
 from config.settings import Settings, load_settings
 from domain.market_regime.classifier import MarketRegimeClassifier
 from domain.risk.risk_manager import RiskManager
@@ -482,7 +482,16 @@ async def _run_trading_modes(trading_service: TradingService, settings: Settings
             # (b) 출처 미확정(실시간 편입) 종목이 targets에서 통째로
             # 누락되던 P0 결함을 고치기 위함. 상세 배경은 해당 모듈의
             # compute_day_targets() 주석 참고.
-            excluded = trading_service.get_excluded_symbols()
+            # 2026-10-21 (민우님 10/20~21 분석, "감시 대상 정리" 1순위):
+            # 당일 동적 제외 집합(UNKNOWN·거래대금 부족 3회 연속)
+            # 만으로는 설정상 영구 차단 종목(excluded_symbols)이
+            # 걸러지지 않아, 매수가 아예 불가능한 종목이 매 폴링
+            # 마다 전부 분석되는 낭비가 있었음 — 자세한 배경은
+            # app/target_selection.merge_excluded_symbols() 주석 참고.
+            excluded = merge_excluded_symbols(
+                trading_service.get_excluded_symbols(),
+                getattr(settings.trading, "excluded_symbols", None),
+            )
             selection = compute_day_targets(
                 confirmed_symbols_by_seq=watcher.confirmed_symbols_by_seq,
                 realtime_unresolved=watcher.realtime_unresolved_symbols,
