@@ -1296,6 +1296,56 @@ def _first_last_ts(rows: list[dict], col: str) -> tuple[str, str]:
     return (vals[0], vals[-1]) if vals else ("", "")
 
 
+def resolve_carried_over_touches_today(
+    carried_over_present: bool,
+    same_day_started_ats: list,
+    activity_timestamps: list,
+) -> bool:
+    """`carried_over`(run_baseline.csv에서 "오늘 이전 가장 최근 실행"으로
+    고른 행)가 실제로 오늘 활동을 남겼는지 판정합니다.
+
+    2026-10-21 (민우님 지적, 재현 확인된 오탐): `run_baseline.csv`에는
+    종료 시각 필드가 전혀 없습니다(RUN_BASELINE_FIELDS 참고). 그래서
+    "오늘 이전 가장 최근 실행"이라는 사실만으로는 그 실행이 오늘
+    자정까지 이어졌는지, 아니면 며칠 전에 이미 정상 종료된 채 그냥
+    "가장 최근" 기록으로만 남아있는지 구분할 수 없었습니다. 그 결과
+    `build_collection_quality()`가 받는 `carried_over_run_present`가
+    운영 둘째 날부터는 거의 항상 True가 되어, **"전날 정상 종료 →
+    오늘 개장 전 정상 시작 → 재시작 없음"인 완전히 정상적인 날도
+    RESTARTED_PARTIAL류로 오판정**했습니다.
+
+    판정 기준(기존 코드로 바로 확인 가능한 신호만 사용 — 새 로그
+    태그나 종료 시각 기록을 추가하지 않습니다):
+
+    - `carried_over_present`가 False면 당연히 False.
+    - 오늘 자체 시작(`same_day_started_ats`)이 하나도 없으면, 오늘의
+      활동은(있다면) 전부 carried_over 실행 몫일 수밖에 없으므로 True
+      (자정을 넘겨 재시작 없이 계속 도는 경우 — 기존 동작 그대로 유지).
+    - 오늘 자체 시작이 있으면, `single_instance_lock` 전제상 그 새
+      실행이 시작되려면 이전에 돌던 실행이 반드시 끝나 있어야 합니다.
+      다만 "언제" 끝났는지는 모릅니다 — 그래서 오늘 자정 이후, 그
+      새 실행이 시작되기 **전에** 이미 판단/신호 활동(`activity_
+      timestamps`, 보통 signal_log.csv의 timestamp)이 있었는지를
+      봅니다. 그런 활동이 있다면 그 시점엔 오늘의 새 실행이 아직
+      시작 전이었으므로 carried_over 실행이 남긴 것일 수밖에
+      없습니다(진짜 이월 — 10/14 장중 교체 사례와 동일 패턴).
+      그런 활동이 전혀 없으면, 이 carried_over 행은 오늘과 무관한
+      과거 실행 기록일 뿐이므로 False로 판정해 오탐을 피합니다.
+
+    `activity_timestamps`에는 보통 signal_log.csv의 timestamp를
+    `parse_run_timestamp()`로 파싱한 값들을 넘깁니다 — 매 폴링마다
+    기록되는 가장 촘촘한 신호이기 때문입니다. `same_day_started_ats`
+    에는 `run_baseline.csv`의 `same_day` 조인 결과(각 행의 파싱된
+    시작 시각)를 넘깁니다.
+    """
+    if not carried_over_present:
+        return False
+    if not same_day_started_ats:
+        return True
+    earliest_same_day_start = min(same_day_started_ats)
+    return any(ts < earliest_same_day_start for ts in activity_timestamps)
+
+
 def build_collection_quality(target: date, log_lines: list[str],
                              counts: dict[str, int],
                              shadow_rows: list[dict],
@@ -1994,13 +2044,35 @@ def build(
         # 2026-10-14 (보고식 민우님 지적): 위에서 이미 조인해 둔
         # run_baseline.csv 결과(same_day/carried_over)를 그대로 넘겨
         # "전날 이월 실행 → 당일 장중 교체" 재시작도 잡아낸다.
+        #
+        # 2026-10-21 (민우님 지적, 재현 확인된 오탐 수정): carried_over가
+        # 단순히 "오늘 이전 가장 최근 실행"이라는 사실만으로는 그
+        # 실행이 정말 오늘까지 이어졌는지 알 수 없음(run_baseline.csv
+        # 에는 종료 시각 필드가 없어, 이미 며칠 전 정상 종료됐어도
+        # 여전히 "가장 최근"으로 잡힘 — 운영 둘째 날부터 거의 항상
+        # True가 되어 정상적인 날도 RESTARTED_PARTIAL로 오판정하는
+        # 원인이었음). signal_log.csv의 timestamp가 오늘 자체 시작보다
+        # 앞선 활동을 남겼는지로 실제 이월 여부를 좁혀 판정한다 —
+        # resolve_carried_over_touches_today() 주석 참고.
+        signal_rows_for_quality = _read_csv(work / f"signal_log_{day_compact}.csv")
+        carried_over_touches_today = resolve_carried_over_touches_today(
+            carried_over_present=carried_over is not None,
+            same_day_started_ats=[dt for _b, dt in same_day],
+            activity_timestamps=[
+                dt for dt in (
+                    parse_run_timestamp(r.get("timestamp"))
+                    for r in signal_rows_for_quality
+                )
+                if dt is not None
+            ],
+        )
         quality = build_collection_quality(
             target, log_lines, counts,
             _read_csv(work / f"entry_quality_shadow_{day_compact}.csv"),
             _read_csv(work / f"trades_{day_compact}.csv"),
-            _read_csv(work / f"signal_log_{day_compact}.csv"),
+            signal_rows_for_quality,
             same_day_run_count=len(same_day),
-            carried_over_run_present=carried_over is not None,
+            carried_over_run_present=carried_over_touches_today,
         )
         (work / "collection_quality.txt").write_text(quality, encoding="utf-8")
 
