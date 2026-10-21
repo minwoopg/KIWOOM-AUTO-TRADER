@@ -3679,3 +3679,107 @@ shadow는 계산·로그만 하는 순수 관측 단계(BUY/HOLD/SELL 어떤 결
   유지한 채 담음.
 
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 감시 대상 정리 1단계 — 설정상 영구 차단 종목을 compute_day_targets()에도 반영 (2026-10-21)
+
+### 배경
+
+민우님이 10/20·10/21(둘 다 매수·매도 0건) 번들을 비교 분석해 보내
+주신 내용 중 가장 크게 지적된 부분: `config/settings.yaml`의
+`excluded_symbols`(신규매수 영구 차단 종목, 114800·252670)가 두 날
+모두 전체 판단 횟수의 37.0%(10/20)·58.8%(10/21, 삼성전자까지
+합치면 92.7%)를 차지할 만큼 매 폴링마다 전부 분석되고 있었다는
+지적입니다. "51개 종목을 감시했지만 기회가 없었다"가 아니라
+"애초에 살 수 없는 소수 종목을 계속 재분석하고 있었다"는 결론이고,
+이번 번들 파일은 전달받지 못해 수치 자체를 다시 검증하지는
+못했지만, 코드를 직접 읽어 같은 메커니즘을 확인했습니다.
+
+### 원인
+
+- `domain/service/trading_service.py`의 `excluded_symbols`(영구
+  차단 목록) 체크는 `_try_buy()` 바로 앞, 주문을 실제로 넣기
+  직전 마지막 게이트 하나뿐이었습니다(`[EXCL] {symbol} |
+  excluded_symbols 차단` 로그).
+- 반면 실제 감시 대상(`self.targets`)을 정하는 `app/main.py`의
+  `on_symbols_changed()` → `app/target_selection.compute_day_targets()`
+  호출은 `trading_service.get_excluded_symbols()`만 넘겼는데, 이
+  값은 완전히 다른 **당일 동적** 집합(UNKNOWN 장세 3회 연속 또는
+  거래대금 부족 3회 연속일 때만 채워지고, 하루에 한 번만 비워짐)
+  이었습니다. 설정상 영구 차단 목록은 여기에 전혀 반영되지
+  않았습니다.
+- 그 결과 114800·252670처럼 절대 매수될 수 없는 종목이 감시
+  목록에서 한 번도 빠지지 않고, 분봉 분석·장세 판정·시그널
+  계산까지 매 폴링마다 전부 수행된 뒤 마지막 순간에만 막혔습니다.
+
+### 변경 내용
+
+- `app/target_selection.py`: `merge_excluded_symbols(dynamic_excluded,
+  permanent_excluded_symbols)` 신규 추가 — 당일 동적 제외 집합과
+  설정상 영구 제외 목록을 합집합으로 합칩니다. `None`/빈 리스트/
+  tuple 모두 안전 처리, 입력 집합을 변형하지 않음.
+- `app/main.py`: `on_symbols_changed()` 콜백에서 `excluded =
+  trading_service.get_excluded_symbols()` 한 줄을 `excluded =
+  merge_excluded_symbols(trading_service.get_excluded_symbols(),
+  getattr(settings.trading, "excluded_symbols", None))`로 교체.
+  `compute_day_targets()` 자체의 필터링 로직(`excluded_symbols &
+  set(day_symbols)`)은 전혀 바꾸지 않았습니다 — 호출부에서 넘기는
+  집합만 넓혔습니다.
+
+### 변경하지 않은 것 (중요)
+
+- **보유 종목 청산 감시는 영향 없음.** `trading_service.py`의
+  `cycle_targets = [*self.targets, *held_symbols]` 합집합이
+  `self.targets`에서 빠진 종목이라도 보유 중이면 계속 포함시킵니다.
+  영구 차단 종목을 이미 보유하고 있는 상태라면 청산 감시는 이번
+  수정 전후로 동일합니다(민우님이 명시적으로 요청하신 "보유 종목의
+  청산 감시는 유지" 조건을 코드 변경 없이 기존 메커니즘이 그대로
+  충족).
+- **BUY/HOLD/SELL 판단 로직 자체는 건드리지 않음.** 영구 차단
+  종목은 어차피 `_try_buy()`에서 막혀 매수될 수 없었던 종목이므로,
+  감시 대상에서 더 일찍 제외한다고 해서 매수/매도 결과가 바뀌지
+  않습니다 — 단지 그 종목을 분석하는 데 쓰이던 폴링 사이클이
+  줄어들 뿐입니다.
+- `settings.targets`(수동 고정 종목)는 여전히 영구 제외 필터를
+  거치지 않습니다(`compute_day_targets()`의 기존 동작 그대로) —
+  운영자가 수동으로 지정한 종목은 의도적 override로 간주해 이번
+  수정 범위 밖으로 둡니다.
+- "거래대금 부족 3회 연속" 제외가 당일 내내 재평가 없이 유지되는
+  문제, `skip_reason="BUY"`/`final_decision="BLOCKED"` raw CSV
+  표기 혼동 문제는 이번 커밋에 포함하지 않았습니다 — 전자는 재평가
+  방식(시간 기반 재확인 vs. 조건 재검색 재진입 시 재확인)에 대한
+  운영자 선택이 필요하고, 후자는 `analyze_signal_log.py`의 실제
+  생성 리포트가 이미 `final_decision` 기준으로 BUY/BLOCKED/HOLD를
+  정확히 구분하고 있어(`skip_reason 분포` 절도 "BUY 제외"로 명시)
+  raw CSV 컬럼 차원의 가독성 이슈에 그친다고 판단했습니다. 두
+  사항 모두 채팅으로 먼저 의견을 여쭙습니다.
+
+### 테스트 및 검증
+
+- `test_merge_excluded_symbols.py` 신규 추가(11건) — 동적/영구
+  집합 병합의 기본 동작(None·빈 리스트·tuple 처리, 중복 제거,
+  입력 불변) 8건에 더해, `compute_day_targets()`와 결합했을 때
+  영구 차단 종목이 실제로 `final_targets`에서 빠지고 보유 종목
+  union과 무관하게 `selection.blocked`에 올바르게 기록되는지
+  확인하는 종단 테스트, 그리고 "merge 없이 호출하면 수정 전
+  증상이 그대로 재현된다"는 대조군 테스트까지 포함.
+- GitHub `origin/main`(`0fb5952`) 기준 신선한 클론에 패치 적용 후
+  전체 회귀 스위트(45개 파일) 재실행 — 신규 회귀 없음. 기존에
+  보고된 사전 존재 실패 `test_broker_order_status.py`(로컬
+  fixture 없음, 코드와 무관) 외에, 이번 확인 중
+  `test_order_status_evidence_observation.py`의 `12-9` 케이스가
+  수정 전(origin/main 0fb5952, 제 변경 전혀 없는 상태)에도 동일하게
+  실패함을 `git stash`로 대조 확인했습니다 — 이번 변경과 무관한
+  별도의 사전 존재 실패이며, 다음 라운드에서 별도로 짚어드리겠습니다.
+
+### 전달 파일
+
+- 패치(0091~0097이 적용된 트리 기준으로 이어서 적용 — 10/15
+  전달본이 아직 미반영이라도, `origin/main`(`0fb5952`) 바로 위에도
+  `git am`으로 그대로 적용됩니다):
+  - `0098-feat-app-target-selection-merge-excluded-symbols.patch`
+    — `app/target_selection.py`, `app/main.py`,
+    `test_merge_excluded_symbols.py`
+  - `0099-docs-CHANGELOG_v1.7.md.patch` — 이 CHANGELOG
+- `kiwoom_auto_trader_watchlist_cleanup_excluded_symbols_20261021.zip`
+  — 실제 변경된 3개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
+  폴더 경로 유지한 채 담음.
