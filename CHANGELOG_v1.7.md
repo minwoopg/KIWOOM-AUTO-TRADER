@@ -3862,3 +3862,68 @@ shadow는 계산·로그만 하는 순수 관측 단계(BUY/HOLD/SELL 어떤 결
 - `kiwoom_auto_trader_collection_quality_false_positive_fix_20261021.zip`
   — 변경된 3개 파일(위 목록 그대로, 이 CHANGELOG 포함) 원래 경로
   유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 감시 대상 정리 2단계 — 수동 지정 종목도 영구 제외 필터 적용 (2026-10-21)
+
+### 배경
+
+민우님이 외부 LLM에 보낸 코드 검토 문서(섹션 3B)에서, 수동 지정
+종목(`settings.targets`)이 `excluded_symbols`(설정상 매수 제외
+목록) 필터를 우회하고 있다고 지적했습니다. 10/21 "감시 대상 정리
+1단계" 전달 때 저는 이 지점을 "운영자가 수동으로 지정한 종목은
+의도적 override로 간주해 범위 밖"이라 적어뒀는데, 민우님이 이번
+라운드에서 이 우회도 닫기로 결정하셔서(우선순위 1번) 반영합니다.
+
+### 원인
+
+`app/target_selection.py`의 `compute_day_targets()`는 조건검색
+유래 종목(`day_symbols`)만 `excluded_symbols`로 걸러내고
+(`filtered = [s for s in day_symbols if s not in excluded_symbols]`),
+그 뒤 `combined = manual_symbols + filtered`로 수동 지정 목록을
+그대로 합쳤습니다. `manual_symbols`는 이 필터를 전혀 거치지
+않았으므로, `settings.targets`에 설정상 매수 제외 종목이 들어있으면
+그 종목은 계속 감시 대상에 남았습니다.
+
+### 수정 내용
+
+- `manual_symbols`도 `day_symbols`와 동일하게 `excluded_symbols`로
+  걸러내도록 `combined` 조립 전에 필터를 추가했습니다
+  (`manual_filtered = [s for s in manual_symbols if s not in
+  excluded_symbols]`).
+- 제외된 수동 지정 종목도 `blocked`(재편입 차단 보고용 집합)에
+  함께 포함되도록 `blocked` 계산을 확장했습니다.
+
+### 변경하지 않은 것
+
+- **보유 종목 청산 감시는 영향 없음** — `trading_service.py`의
+  `cycle_targets = [*self.targets, *held_symbols]` 합집합이
+  `final_targets`에서 빠진 종목도 보유 중이면 계속 포함시킵니다.
+- 조건검색 유래 종목(`day_symbols`)의 기존 필터링 로직은 그대로.
+- `eligible_condition_count` 등 통계 집계에 쓰이는 `manual_set`은
+  필터 전 원본 `manual_symbols`를 그대로 씁니다 — 상한 집계
+  목적이라 이번 수정과 무관합니다.
+- 매매 로직(`trading_service.py`)은 전혀 건드리지 않았습니다 —
+  영구 제외 종목은 어차피 `_try_buy()`에서 막혀 매수될 수 없었던
+  종목이므로, 감시 대상에서 더 일찍 빼도 BUY/HOLD/SELL 결과는
+  바뀌지 않습니다.
+
+### 테스트 및 검증
+
+- `test_condition_target_selection.py`에 섹션 4-4~4-7 신규 추가
+  (4건) — 수동 지정 종목이 제외 목록에 있으면 최종 targets에서
+  빠지고 `blocked`에 포함됨을 확인, 제외되지 않은 수동 지정 종목은
+  그대로 포함됨을 함께 확인. 기존 77건과 합쳐 전체 77건 통과.
+- 전체 회귀 스위트(49개 파일) 재실행 — 신규 회귀 없음. 기존에
+  알려진 `test_broker_order_status.py`(로컬 fixture 부재, 무관)
+  외에는 전부 통과.
+
+### 전달 파일
+
+- `0102-fix-app-target-selection-manual-symbols-excluded.patch`
+  — `app/target_selection.py`, `test_condition_target_selection.py`
+- `0103-docs-CHANGELOG_v1.7.md.patch` — 이 CHANGELOG
+- `kiwoom_auto_trader_watchlist_cleanup_manual_symbols_20261021.zip`
+  — 변경된 3개 파일(위 목록 그대로, 이 CHANGELOG 포함) 원래 경로
+  유지한 채 담음.
