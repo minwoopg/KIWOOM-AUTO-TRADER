@@ -3783,3 +3783,82 @@ shadow는 계산·로그만 하는 순수 관측 단계(BUY/HOLD/SELL 어떤 결
 - `kiwoom_auto_trader_watchlist_cleanup_excluded_symbols_20261021.zip`
   — 실제 변경된 3개 파일(위 목록 그대로, 이 CHANGELOG 포함)을 원래
   폴더 경로 유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 collection_quality 재시작 교차 확인의 오탐 수정 (2026-10-21)
+
+### 배경
+
+민우님이 다른 LLM에 보낼 코드 검토 요청 문서를 작성하던 중,
+2026-10-14에 추가한 `collection_quality`의 run_baseline.csv 교차
+확인 기능이 "정상적인 날도 재시작으로 오탐할 수 있다"고 지적했고,
+코드를 추적해 실제로 재현되는 결함임을 확인했습니다. 10/15에
+제가 전달한 기능의 미확인 회귀입니다.
+
+### 원인
+
+`run_baseline.csv`(`RUN_BASELINE_FIELDS`)에는 **종료 시각 필드가
+전혀 없습니다** — `started_at`만 기록합니다. `export_daily_bundle.py`
+의 `carried_over` 판정은 "오늘 이전 가장 최근 실행"을 그냥
+`carried_over`로 간주했는데, 그 실행이 어제든 한 달 전이든 이미
+정상 종료됐는지 지금도 돌고 있는지 구분할 방법이 데이터에 없습니다.
+그 결과 시스템을 이틀째 운영하는 순간부터는 과거 실행 기록이
+항상 존재하므로 `carried_over_run_present`가 거의 항상 True가
+되고, `run_baseline_touch_count = same_day_run_count + 1`로
+매일 1씩 과대 집계되어 **"전날 정상 종료 → 오늘 개장 전 정상
+시작 → 재시작 없음"인 완전히 정상적인 날도 RESTARTED_PARTIAL로
+오판정**했습니다.
+
+### 수정 내용
+
+- `export_daily_bundle.py`에 `resolve_carried_over_touches_today()`
+  신규 추가 — "오늘 자체 시작보다 앞선 활동(signal_log.csv의
+  timestamp)이 실제로 있는지"로 좁혀 판정합니다.
+  - 오늘 자체 시작이 없으면(자정 넘겨 재시작 없이 계속 도는
+    경우) 기존처럼 True로 유지.
+  - 오늘 자체 시작이 있으면, `single_instance_lock` 전제상 그
+    새 실행 전에 이전 실행이 반드시 끝났어야 하므로, 오늘 자정
+    이후 그 새 실행이 시작되기 **전에** 실제 판단/신호 활동이
+    있었는지만 봅니다. 있으면 진짜 이월(10/14 장중 교체 패턴),
+    없으면 그냥 과거 어느 날의 기록일 뿐이므로 오탐 없이 제외.
+- `build()`의 `build_collection_quality()` 호출부에서 이 함수로
+  판정한 결과를 `carried_over_run_present`로 넘기도록 교체. 새
+  로그 태그나 종료 시각 기록을 추가하지 않고, 기존에 이미 수집
+  중인 신호(`signal_log.csv`)만 활용했습니다.
+
+### 변경하지 않은 것
+
+- `build_collection_quality()` 자체의 판정 로직(두 신호 중 더 큰
+  값을 쓰는 방식)은 그대로 — "진짜 이월 → 당일 장중 교체"(10/14
+  재현 사례)는 이번 수정 후에도 똑같이 재시작으로 잡아냅니다.
+- MANIFEST.txt의 "[ RAW — 실행 기준선 ]" 섹션(이월 추정 포함 표시,
+  best-effort 명시)은 건드리지 않았습니다 — 그쪽은 추적성을 위한
+  별도 목적이라 범위 밖으로 뒀습니다.
+- 매매 로직(`trading_service.py`)은 전혀 건드리지 않았습니다 —
+  순수 번들/진단 메타데이터 판정만 고쳤습니다.
+
+### 테스트
+
+- `test_carried_over_touches_today.py` 신규 9건:
+  - `resolve_carried_over_touches_today()` 순수 함수 단위 테스트
+    6건(이월 후보 없음/오늘 시작 없음/정상일 오탐 재현+수정 확인/
+    진짜 이월 유지 확인/경계값/복수 시작 시 최솟값 기준).
+  - `build()` 종단 테스트 3건 — "며칠 전 종료된 실행 + 오늘 정상
+    단일 시작"과 "이틀째 운영(어제 정상 종료 → 오늘 정상 시작)"
+    둘 다 더 이상 RESTARTED_PARTIAL로 오판정되지 않음을 확인, 동시에
+    10/14 재현 패턴(진짜 이월 → 당일 장중 교체)은 여전히
+    RESTARTED_PARTIAL로 잡힘을 회귀 테스트로 고정.
+- 전체 회귀 스위트(49개 파일) 재실행 — 신규 회귀 없음. 기존에
+  보고된 사전 존재 실패 `test_broker_order_status.py`(로컬 fixture
+  없음, 코드와 무관) 외에는 전부 통과.
+
+### 전달 파일
+
+- `0100-fix-export-carried-over-touches-today.patch` —
+  `export_daily_bundle.py`, `test_carried_over_touches_today.py`
+  (0091~0099가 적용된 트리 기준으로 이어서 적용)
+- `0101-docs-CHANGELOG_v1.7.md.patch` — 이 CHANGELOG
+- `kiwoom_auto_trader_collection_quality_false_positive_fix_20261021.zip`
+  — 변경된 3개 파일(위 목록 그대로, 이 CHANGELOG 포함) 원래 경로
+  유지한 채 담음.
