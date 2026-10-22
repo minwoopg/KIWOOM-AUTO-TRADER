@@ -3927,3 +3927,182 @@ shadow는 계산·로그만 하는 순수 관측 단계(BUY/HOLD/SELL 어떤 결
 - `kiwoom_auto_trader_watchlist_cleanup_manual_symbols_20261021.zip`
   — 변경된 3개 파일(위 목록 그대로, 이 CHANGELOG 포함) 원래 경로
   유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 감시 대상 정리 3단계 1차 — 거래대금 부족 종목 쿨다운 재평가 (2026-10-22)
+
+### 배경
+
+로드맵 우선순위 2번(거래대금 부족 종목 재평가)·3번(거래대금 완화
+비교 관측) 착수. 민우님이 초기 설계에 8개 보완 지시를 주셨고, 그중
+제가 잘못 설명했던 두 가지를 먼저 바로잡습니다: (1) "재검사에 별도
+API 호출이 추가되지 않는다"는 부정확한 설명이었습니다 — 제외된
+종목은 평소 폴링(`cycle_targets`)에서 완전히 빠져 있어, 재검사가
+그 종목의 최신 데이터를 가져오는 유일한 경로이며 실제로 `_get_
+market_price_with_cache()`/`_get_minute_analysis()` 호출을 새로
+발생시킵니다. (2) "패턴 분류 자체가 없다"도 부정확했습니다 — A/B/C/
+V/PR 패턴 감지는 기존에 이미 존재합니다(이번 라운드는 그 패턴을
+진입 유형별 거래량 기준에 연결하는 작업이 아니므로 건드리지
+않았습니다 — 이는 로드맵 4번의 범위).
+
+### 이번 1차 전달의 범위
+
+8개 보완 지시 중 아래를 이번 라운드에서 구현했습니다:
+
+1. **재평가 대상 한정** — 거래대금 부족 3회 연속으로 제외된 종목만
+   대상. `self._low_volume_excluded_at: dict[str, datetime]`를
+   신설해 그 사유로 제외된 시각만 별도 추적(`_excluded_symbols`는
+   여전히 사유를 구분하지 않는 단일 set이며 그대로 둠). UNKNOWN
+   3연속이나 `settings.trading.excluded_symbols`(영구 차단)로 제외된
+   종목은 이 dict에 들어오지 않아 재평가 대상이 아닙니다.
+2. **호출량 명시적 제한** — 사이클당 최대 1종목(`low_volume_
+   recheck_max_per_cycle`, 기본값), 가장 오래 기다린 종목부터. 호출
+   순서 자체로 "보유 종목·미체결 주문 처리 우선"을 만족(보유종목
+   루프와 entry_watch shadow 체크포인트가 끝난 뒤에만 재검사 시도).
+   조회 실패(통신 장애 등) 시 `low_volume_recheck_failure_backoff_
+   seconds`만큼 다음 시도를 추가로 늦춤(429류 반복 방지). 신규 진입
+   마감 시각(`low_volume_recheck_cutoff_hhmm`, 기본 15:00) 이후에는
+   재검사 자체를 중단. 호출 수/실패 수/소요시간은 메모리 카운터
+   (`_low_volume_recheck_call_count` 등)와 `low_volume_recheck.csv`
+   양쪽에 기록.
+3. **shadow에서도 최신 데이터 확보** — `LowVolumeRecheckLogger`
+   (append-only, `BalanceFreshnessLogger`와 동일 패턴) 신설. 호출
+   자체는 mode="shadow"/"enforce" 모두 동일하게 수행하고, 조회
+   실패는 `outcome="query_failed"`로 그대로 기록(성공으로 둔갑시키지
+   않음). mode="off"에서는 호출 자체가 일어나지 않음.
+4. **거래대금 3단계 비교의 1단계(임계값 통과만)** — 500/300/100억
+   (`low_volume_recheck_compare_thresholds`, `[0]`은 `market_regime.
+   min_trading_value`와 반드시 일치하도록 `Settings.__post_init__`
+   에서 검증)에 대해 각각 통과 여부(`pass_threshold_0/1/2`)를 독립
+   기록. 복귀 판단 자체는 `pass_threshold_0`(실거래 게이트)만 사용.
+   **전략 조건까지 가상으로 평가하는 2단계(진입 품질 early-return
+   bypass)와 가상 진입 이후 결과 추적(3단계)은 이번 라운드의 범위가
+   아닙니다** — 더 큰 설계가 필요해 후속 라운드로 분리합니다(지시
+   4·5번).
+5. **중복 표본 문제 없음** — 재검사 자체가 쿨다운(기본 30분)
+   간격으로만 발생해 "매 폴링을 독립 표본으로 세는" 문제가 구조적으로
+   생기지 않습니다(일반 폴링의 10초 간격 중복과는 다른 성격).
+6. **복귀 반영 경로** — mode="enforce"에서 복귀는 `_excluded_
+   symbols.discard()` + `_low_volume_count` 리셋으로, 다음 폴링
+   사이클부터 `cycle_targets` 필터(`if symbol in self._excluded_
+   symbols: continue`)를 그냥 통과하게 됩니다 — 별도의 "복귀 반영"
+   코드가 필요 없는 기존 구조를 그대로 재사용(`max_symbols`나
+   조건검색 자격은 원래부터 `self.targets`/`compute_day_targets()`가
+   결정하는 영역이라 이 재검사가 건드리지 않습니다).
+7. **모드 분리** — `experimental.low_volume_recheck_mode`를
+   `entry_quality_guard_mode`와 완전히 별도로 신설. `candidate_a_
+   guard_mode`와 같은 틀로 off/shadow/enforce를 코드 레벨에서 모두
+   구현했으나, **이번 승인 범위는 "off"→"shadow" 배포까지**입니다
+   (`settings.yaml` 기본값 "off"로 전달). shadow 관측 기간(2~3일)은
+   로깅 정확성·호출 부하 확인에만 쓰고, 수익성 결론이나 enforce
+   전환 판단에는 쓰지 않습니다(민우님 명시 지시) — enforce 전환은
+   그 기간 뒤 설정 파일을 사람이 직접 바꾸는 별도 승인 단계로만.
+8. **후속 작업 확인** — 패턴별 거래량 조건 분리(로드맵 4번)는 이번
+   범위에 포함하지 않았습니다. A/B/C/V/PR 패턴 감지 자체는 기존에
+   있으므로, 그 패턴을 진입 유형에 연결하고 유형별 거래량 기준을
+   정의하는 작업만 남습니다.
+
+### 변경 내용
+
+- `config/settings.py`
+  - `TradingConfig`에 `low_volume_recheck_cooldown_seconds`(1800)/
+    `low_volume_recheck_max_per_cycle`(1)/`low_volume_recheck_
+    cutoff_hhmm`("15:00")/`low_volume_recheck_failure_backoff_
+    seconds`(60)/`low_volume_recheck_compare_thresholds`(500/300/
+    100억) 신설 + `__post_init__` 검증(양의 정수/HH:MM 형식).
+  - `ExperimentalConfig`에 `low_volume_recheck_mode`("off") 신설,
+    유효값(off/shadow/enforce) 검증 목록에 추가.
+  - `StorageConfig`에 `low_volume_recheck_log_file` 신설.
+  - `Settings`에 `__post_init__` 신설(기존엔 없었음) —
+    `trading.low_volume_recheck_compare_thresholds[0]`과 `market_
+    regime.min_trading_value`가 반드시 일치해야 함을 검증(두 값이
+    서로 다른 dataclass에 있어 그 필드를 모두 가진 Settings
+    레벨에서만 검증 가능).
+- `infra/storage/logger.py` — `LOW_VOLUME_RECHECK_FIELDS`/
+  `LowVolumeRecheckLogger` 신설 (append-only, dedup 없음 —
+  `BalanceFreshnessLogger`와 동일한 이유).
+- `domain/service/trading_service.py`
+  - `__init__`에 `low_volume_recheck_logger` 선택적 인자 + fail-open
+    생성 패턴(다른 shadow 로거들과 동일), `_low_volume_excluded_at`/
+    `_low_volume_recheck_next_attempt_at`/호출·실패·소요시간 카운터
+    3종 신설.
+  - 거래대금 부족 3연속 자동제외 지점에 `_low_volume_excluded_at.
+    setdefault(symbol, now_kst())` 한 줄 추가(최초 제외 시각만 기록,
+    이미 있으면 덮어쓰지 않음).
+  - `run_once()` 맨 끝(보유종목 루프·entry_watch shadow 체크포인트
+    이후, `state_store.save()` 이전)에 `await self._recheck_low_
+    volume_exclusions()` 호출 추가.
+  - `_recheck_low_volume_exclusions()`/`_recheck_one_low_volume_
+    symbol()`/`_is_excluded_for_other_reason()`/`_is_past_low_
+    volume_recheck_cutoff()`/`_append_low_volume_recheck_row()`
+    신설.
+- `export_daily_bundle.py` — `LOG_TAGS` allowlist에 `[LOW_VOL_
+  RECHECK]` 추가(없으면 이 로그가 번들에 전혀 실리지 않음 — 이전
+  라운드들에서 반복 발견된 것과 같은 유형의 문제를 미리 예방).
+- `test_run_once_integration.py` — `build_minimal_settings()`의
+  `StorageConfig`에 `low_volume_recheck_log_file`을 tmpdir 기준으로
+  명시(안 하면 이 헬퍼를 재사용하는 모든 테스트가 실제 `logs/`에
+  CSV를 새게 됨 — 0.5단계 CSV 누출 사고와 동일 클래스, 미리 반영해
+  재현 없이 예방).
+
+### 변경하지 않은 것
+
+- 거래대금 부족 3회 연속 자동제외 로직 자체(언제 제외되는지)는
+  전혀 건드리지 않았습니다 — 그 지점에 제외 시각 기록 한 줄만
+  추가했습니다.
+- 신규 진입 게이트(`min_trading_value`, 500억)는 그대로입니다 —
+  `low_volume_recheck_compare_thresholds[0]`이 반드시 이 값과
+  같아야 한다는 불변조건을 추가해, 복귀 판단이 실거래 게이트와
+  어긋나는 별도 기준으로 이뤄지는 것을 막았습니다.
+- 다른 두 제외 사유(UNKNOWN 3연속, 영구 차단 목록)의 동작은 전혀
+  바뀌지 않았습니다 — 재검사가 거래대금 사유로 회복을 확인해도
+  이 두 사유 중 하나가 남아있으면 복귀시키지 않습니다
+  (`_is_excluded_for_other_reason()`).
+- `settings.yaml`에는 `low_volume_recheck_mode: "off"`로 전달합니다
+  — 이번 배포 자체로는 재검사 API 호출이 전혀 발생하지 않습니다.
+  shadow 관측을 시작하려면 이 값을 사람이 직접 "shadow"로 바꿔야
+  합니다.
+- `export_daily_bundle.py`에 호출 카운터(call_count/error_count/
+  elapsed_ms_total)를 리포트에 묶어 넣는 연동은 이번 라운드에
+  하지 않았습니다 — `low_volume_recheck.csv`를 직접 보거나 추후
+  별도 라운드에서 연동 가능합니다.
+
+### 테스트 및 검증
+
+- `test_low_volume_recheck.py` 신규 (13건) — off/shadow/enforce
+  모드별 분기, 쿨다운 미도달 시 스킵, 신규 진입 마감 시각 이후
+  중단, 사이클당 호출 수 제한(가장 오래 기다린 종목 우선), 조회
+  실패 시 백오프 연장 + 에러 기록, 다른 제외 사유(UNKNOWN 3연속)가
+  남아있으면 거래대금 회복에도 복귀시키지 않음, `Settings.__post_
+  init__`의 `compare_thresholds[0]`/`min_trading_value` 불일치
+  검증, `low_volume_recheck_cutoff_hhmm` 형식 검증, `low_volume_
+  recheck_mode` 유효값 검증을 각각 확인.
+- 실제 `config/settings.yaml`을 `load_settings()`로 직접 로드해
+  새 설정값들이 전부 정상 파싱·검증을 통과함을 확인(`low_volume_
+  recheck_mode="off"`, `compare_thresholds[0]`과 `min_trading_
+  value` 일치 포함).
+- 전체 회귀 스위트(51개 파일) 재실행 — 49건 통과, 2건 실패
+  (`test_broker_order_status.py`, `test_legacy_fixture_structure.py`)
+  모두 이 작업 트리에 로컬 fixture 파일이 아예 없어서 발생하는
+  사전 존재 실패로(`git ls-files`로 두 fixture 모두 추적되지 않음을
+  확인), 코드 변경과 무관 — `test_broker_order_status.py`는 이전
+  라운드에서도 동일하게 보고된 known failure이고, `test_legacy_
+  fixture_structure.py`는 이번 클론에서 같은 클래스(로컬 fixture
+  부재)로 추가 확인된 것입니다.
+- 테스트 실행이 커밋된 `reports/minute_bar_quality_20260907.txt`/
+  `reports/shadow_analysis_20260907.txt`를 (이 클론에 minute_bars
+  원본 데이터가 없어서) 덮어쓰는 기존 부작용을 발견 — 이 라운드의
+  변경과 무관하므로 `git checkout --`으로 커밋 전 원상복구했습니다.
+
+### 전달 파일
+
+- `0104-feat-low-volume-recheck-stage1.patch` —
+  `config/settings.py`, `config/settings.yaml`,
+  `domain/service/trading_service.py`, `infra/storage/logger.py`,
+  `export_daily_bundle.py`, `test_run_once_integration.py`,
+  `test_low_volume_recheck.py`(신규)
+- `0105-docs-CHANGELOG_v1.7.md.patch` — 이 CHANGELOG
+- `kiwoom_auto_trader_low_volume_recheck_stage1_20261022.zip` —
+  변경된 7개 파일(위 목록 그대로, 이 CHANGELOG 포함) 원래 경로
+  유지한 채 담음.
