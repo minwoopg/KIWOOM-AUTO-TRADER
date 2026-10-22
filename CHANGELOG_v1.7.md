@@ -4106,3 +4106,114 @@ V/PR 패턴 감지는 기존에 이미 존재합니다(이번 라운드는 그 �
 - `kiwoom_auto_trader_low_volume_recheck_stage1_20261022.zip` —
   변경된 7개 파일(위 목록 그대로, 이 CHANGELOG 포함) 원래 경로
   유지한 채 담음.
+
+<!-- 이후 작업은 여기부터 이어서 기록합니다. -->
+
+## 🔧 거래대금 부족 재평가 1차 재검토 반영 — 6개 결함 수정 (2026-10-22)
+
+### 배경
+
+민우님이 외부 LLM에 보내기 전 직접 1차 구현을 재검토해 6개 결함을
+지적하셨습니다. 전부 코드 추적으로 재현을 확인했고(추측이 아니라
+실제 경로를 따라가서 확인), 모두 실제 결함이었습니다. 별도 커밋으로
+정리합니다.
+
+### 수정 내용
+
+1. **복귀가 감시 목록에 반영 안 될 수 있음** — `update_targets()`는
+   조건검색 콜백이 올 때마다 `merged = list(symbols) + held_symbols`
+   로 완전히 교체합니다. 거래대금 부족으로 30분+ 제외돼 있던 종목은
+   그 사이 조건검색 결과에서 자연 탈락했을 가능성이 높습니다(거래
+   대금 부족은 보통 돌파/모멘텀 조건도 함께 약해진 상태). 이 경우
+   `_recheck_one_low_volume_symbol()`이 `_excluded_symbols.discard()`
+   로 복귀시켜도 `cycle_targets`에 그 종목이 아예 없어 복귀가 조용히
+   무효가 됩니다. **수정**: `update_targets()`에서 `_low_volume_
+   excluded_at`에 있는 종목도 `held_symbols`와 동일하게 강제
+   포함(API 비용 없음 — 메인 루프가 `_excluded_symbols` 검사로
+   바로 건너뛰므로 목록에 들어있다는 사실만으로는 아무 조회도
+   발생하지 않음).
+2. **날짜 변경 시 재검사 대기 상태 미초기화** — `reset_daily_loss_
+   counts()`는 `_excluded_symbols.clear()`로 매일 모든 제외를
+   풀지만, 신설한 `_low_volume_excluded_at`/`_low_volume_recheck_
+   next_attempt_at`는 그대로 남아있었습니다. 다음날 그 종목이 이미
+   정상 폴링 중인데도(제외 안 됨) 재검사 로직은 여전히 "쿨다운
+   지남"으로 보고 불필요한 API 호출을 추가로 발생시킵니다.
+   **수정**: 두 dict를 `reset_daily_loss_counts()`에서 함께 초기화.
+   추가로 `_recheck_low_volume_exclusions()` 시작부에 방어 코드
+   추가 — `_excluded_symbols`에 없는(고아) 추적 항목은 어떤 경로로
+   생기든 API 호출 없이 정리.
+3. **신규 매수 마감(14:50)과 재검사 마감(15:00) 불일치** —
+   `trading_service.py`에 하드코딩된 "14:50 이후 신규매수 차단"
+   게이트(`AFTER_1450`)를 이번 1차 구현 전엔 발견하지 못했습니다.
+   `low_volume_recheck_cutoff_hhmm` 기본값 "15:00"는 이 게이트보다
+   늦어, 14:50~15:00 구간엔 복귀시켜도 BUY 자체가 막혀 재검사
+   API 호출이 전부 무의미했습니다. **수정**: 기본값을 "14:50"으로
+   정확히 일치시킴(그 14:50은 설정값이 아니라 코드 리터럴이라
+   cross-validation은 불가능 — 바뀌면 이 기본값도 함께 바꿔야 함).
+4. **내부에서 처리된 조회 실패가 오류 집계·백오프에서 빠짐** —
+   `_get_market_price_with_cache()`는 기존 캐시가 있으면 조회
+   실패를 내부에서 삼키고 예외 없이 그 캐시값을 그대로 반환합니다
+   (그 메서드 자신의 docstring에 명시된 동작). 재검사 코드의
+   try/except만 봐서는 이게 "성공"처럼 보여, 오류 집계·백오프
+   연장이 전혀 반영되지 않고, 몇십 분 전 캐시된 거래대금으로
+   "회복"을 잘못 판단할 위험이 있었습니다. **수정**: 호출 직후
+   `self._market_price_fetch_outcome[symbol]`을 확인해
+   `"cache_after_failure"`/`"unavailable"`이면 예외가 없어도
+   `query_failed`와 동일하게 처리(오류 집계 + 백오프 연장 +
+   판단 중단).
+5. **재검사 소요 시간이 다음 사이클을 지연** — `app/main.py`의
+   `sleep_or_stop(poll)`은 `run_once()`가 실제로 얼마나 걸렸는지와
+   무관하게 고정된 `poll_interval_seconds`만큼만 잡니다 — 즉
+   `run_once()` 안에서 쓴 시간은 그대로 전체 사이클 길이에 더해져,
+   재검사가 추가한 시간만큼 다음 사이클(보유종목 포함)의 시작이
+   늦어집니다. **이번 사이클 안에서는** 재검사가 보유종목 루프
+   뒤에 오므로 이번 사이클의 손절 판단에는 영향이 없습니다 —
+   영향은 "다음" 사이클의 시작 시점뿐입니다. `max_per_cycle=1`과
+   쿨다운(30분) 간격으로 바운드돼 있어(한 사이클에 최대 1회
+   가격·분봉 조회 1쌍 추가, 30분에 한 번꼴) 이번 라운드에서는
+   추가 완화 로직을 넣지 않고 이 트레이드오프를 명시만 합니다 —
+   더 엄격한 보장이 필요하면 `max_per_cycle`을 낮추거나(이미
+   기본값 1) 완전히 별도 스케줄로 분리하는 설계가 필요합니다.
+6. **새 관측 CSV가 번들에서 빠짐** — `[LOW_VOL_RECHECK]`을
+   `LOG_TAGS`에 추가한 것은 `app.log` 라인 필터링용일 뿐이고,
+   `low_volume_recheck.csv` 파일 자체를 날짜별로 잘라 번들에
+   담는 것은 완전히 별개의 allowlist(`CSV_SOURCES`)입니다. 거기에
+   추가하지 않아 이 CSV는 번들에 전혀 실리지 않았습니다. **수정**:
+   `CSV_SOURCES`에 `("low_volume_recheck.csv", ("timestamp",))`
+   추가.
+
+### 변경하지 않은 것
+
+- mode="off" 기본값은 그대로입니다 — 이 수정 자체로도 재검사 API
+  호출은 발생하지 않습니다.
+- 거래대금 부족 3연속 자동제외/신규 매수 마감(14:50) 게이트 자체의
+  동작은 전혀 바꾸지 않았습니다 — 재검사 쪽 기본값을 그 게이트에
+  맞춰 일치시켰을 뿐입니다.
+- 5번(사이클 지연)은 코드를 바꾸지 않고 명시만 했습니다 — 더 큰
+  변경(예: 재검사를 별도 비동기 태스크로 분리)이 필요하면 후속
+  라운드 논의 대상입니다.
+
+### 테스트 및 검증
+
+- `test_low_volume_recheck.py`에 9건 추가(총 22건) — 조건검색
+  탈락에도 강제 포함 유지/복귀 후 강제 포함 해제, 날짜 변경 시
+  dict 초기화, 고아 항목 API 호출 없이 정리, 내부 조회 실패
+  (`cache_after_failure`)가 `query_failed`로 집계됨, 정상 `fetched`
+  outcome은 기존 로직대로 진행(회귀), cutoff 기본값이 "14:50"임,
+  `low_volume_recheck.csv`가 `CSV_SOURCES`/`LOG_TAGS` 양쪽에
+  모두 있음을 확인.
+- 실제 `config/settings.yaml`을 `load_settings()`로 재확인 —
+  `cutoff_hhmm="14:50"` 반영 확인.
+- 전체 회귀 스위트(51개 파일) 재실행 — 49건 통과, 사전 존재 실패
+  2건(로컬 fixture 부재, 코드와 무관) 외 신규 회귀 없음.
+
+### 전달 파일
+
+- `0106-fix-service-config-export-low-volume-recheck-review.patch`
+  — `config/settings.py`, `config/settings.yaml`,
+  `domain/service/trading_service.py`, `export_daily_bundle.py`,
+  `test_low_volume_recheck.py`
+- `0107-docs-CHANGELOG_v1.7.md.patch` — 이 CHANGELOG
+- `kiwoom_auto_trader_low_volume_recheck_stage1_review_20261022.zip`
+  — 변경된 6개 파일(위 목록 그대로, 이 CHANGELOG 포함) 원래 경로
+  유지한 채 담음.
