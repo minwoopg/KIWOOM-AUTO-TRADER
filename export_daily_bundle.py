@@ -135,6 +135,14 @@ CSV_SOURCES: list[tuple[str, tuple[str, ...]]] = [
     # bundle에는 실리지 않아, 장애 발생일 분석에서 핵심 자료가 누락됨.
     # 순수 관측이며 BUY/SELL/체결 확정 판정에는 관여하지 않음.
     ("exit_candidate_outage.csv", ("detected_at",)),
+    # 2026-10-22 (감시 대상 정리 3단계, 민우님 재검토 지적 6번 수정):
+    # 위와 동일한 이유 — [LOW_VOL_RECHECK] LOG_TAGS 추가는 app.log
+    # 라인 필터링용일 뿐, 이 CSV 파일 자체를 번들에 담는 것은 전혀
+    # 별개의 메커니즘(이 CSV_SOURCES allowlist)입니다. 여기 추가하지
+    # 않으면 low_volume_recheck.csv는 실시간으로는 쌓여도 daily
+    # bundle에는 전혀 실리지 않아, shadow 관측 기간 분석의 핵심
+    # 자료가 누락됩니다.
+    ("low_volume_recheck.csv", ("timestamp",)),
 ]
 
 # app.log에서 뽑아낼 태그 — **allowlist 전용**.

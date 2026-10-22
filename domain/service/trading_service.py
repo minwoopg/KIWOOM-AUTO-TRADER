@@ -673,6 +673,28 @@ class TradingService:
                     f"[TARGET] {sym} | 조건검색 편출됐으나 보유 중 → 모니터링 유지"
                 )
 
+        # 2026-10-22 (감시 대상 정리 3단계, 민우님 재검토 지적 1번
+        # 수정): 거래대금 부족으로 제외돼 쿨다운 재검사 추적 중인
+        # 종목도 held_symbols와 동일하게 조건검색 편출과 무관하게
+        # 강제로 포함합니다. 이게 없으면 `_recheck_one_low_volume_
+        # symbol()`이 mode="enforce"에서 `self._excluded_symbols.
+        # discard()`로 복귀시켜도, 쿨다운 30분+ 동안 조건검색이
+        # 그 종목을 더 이상 돌려주지 않으면(흔한 경우 — 거래대금
+        # 부족은 보통 돌파/모멘텀 조건도 함께 약해진 상태) merged에
+        # 그 종목이 아예 없어서 복귀가 조용히 무효가 됩니다(cycle_
+        # targets에 들어가지 않으니 _excluded_symbols 검사 자체에
+        # 도달하지도 못함). 이 추가 자체는 API 비용이 없습니다 —
+        # run_once()의 메인 루프가 `if symbol in self._excluded_
+        # symbols: continue`로 바로 건너뛰므로, merged에 들어있다는
+        # 사실만으로는 아무 조회도 발생하지 않습니다.
+        for sym in list(self._low_volume_excluded_at.keys()):
+            if sym not in merged:
+                merged.append(sym)
+                self.app_logger.info(
+                    f"[TARGET] {sym} | 거래대금 부족 재검사 추적 중(쿨다운) → "
+                    f"조건검색 편출과 무관하게 모니터링 유지(복귀 시 즉시 반영되도록)"
+                )
+
         self._dynamic_targets = merged
 
     def _representative_condition_name(self, symbol: str) -> str:
@@ -2426,6 +2448,21 @@ class TradingService:
         if self._is_past_low_volume_recheck_cutoff():
             return
 
+        # 2026-10-22 (민우님 재검토 지적 2번 관련 방어 코드): 날짜
+        # 변경 시 reset_daily_loss_counts()가 이 두 dict도 함께
+        # 비우지만, 혹시 다른 경로로 _excluded_symbols에서만 빠지고
+        # (예: 향후 코드 변경으로 새 제거 경로가 추가되는 경우) 이
+        # dict들이 고아 상태로 남는 것까지 방어합니다 — 재검사 대상
+        # 선정은 반드시 "지금도 실제로 제외돼 있는가"를 함께 확인해야
+        # 하며, 그렇지 않으면 이미 정상 폴링 중인 종목에 불필요한
+        # API 호출을 또 발생시킵니다.
+        for symbol in list(self._low_volume_excluded_at.keys()):
+            if symbol not in self._excluded_symbols:
+                self._low_volume_excluded_at.pop(symbol, None)
+                self._low_volume_recheck_next_attempt_at.pop(symbol, None)
+        if not self._low_volume_excluded_at:
+            return
+
         now = now_kst()
         cooldown = timedelta(seconds=self.settings.trading.low_volume_recheck_cooldown_seconds)
         candidates = [
@@ -2476,6 +2513,18 @@ class TradingService:
 
         try:
             market_price = self._get_market_price_with_cache(symbol)
+            # 2026-10-22 (민우님 재검토 지적 4번 수정): _get_market_
+            # price_with_cache()는 캐시가 있으면 조회 실패를 내부에서
+            # 삼키고 예외 없이 (오래된) 캐시값을 그대로 반환합니다
+            # (그 docstring 참고: "API 호출 실패 시, 기존 캐시가
+            # 있으면 그 값을 그대로 사용"). 이 바깥의 try/except만
+            # 봐서는 "성공"으로 보이지만, 실제로는 조회가 실패했을
+            # 수 있습니다 — 이 side-channel(self._market_price_fetch_
+            # outcome)을 직접 확인해야만 구분됩니다. 이걸 확인하지
+            # 않으면 내부에서 처리된 조회 실패가 재검사 오류 집계·
+            # 백오프에서 완전히 빠지고, 몇 주 전 캐시된 거래대금으로
+            # "복귀 가능"을 잘못 판단할 위험이 있습니다.
+            price_fetch_outcome = self._market_price_fetch_outcome.get(symbol)
             minute_result = self._get_minute_analysis(symbol, market_price.previous_close)
         except Exception as exc:
             elapsed_ms = (time.monotonic() - started) * 1000.0
@@ -2502,6 +2551,26 @@ class TradingService:
         self._low_volume_recheck_call_count += 1
         self._low_volume_recheck_elapsed_ms_total += elapsed_ms
         row["elapsed_ms"] = round(elapsed_ms, 1)
+
+        if price_fetch_outcome in ("cache_after_failure", "unavailable"):
+            # 예외는 안 올라왔지만(캐시로 대체돼서) 실제 조회는
+            # 실패했습니다 — "조회 실패"와 동일하게 오류 집계·백오프
+            # 연장에 반영하고, 오래된 캐시로 복귀 판단을 내리지
+            # 않도록 여기서 중단합니다.
+            self._low_volume_recheck_error_count += 1
+            self._low_volume_recheck_next_attempt_at[symbol] = now + timedelta(
+                seconds=cooldown_seconds + failure_backoff_seconds
+            )
+            row.update({
+                "outcome": "query_failed",
+                "error": f"내부적으로 처리된 시세 조회 실패(price_fetch_outcome={price_fetch_outcome}) — 캐시 대체값 사용, 재검사 중단",
+            })
+            self.app_logger.warning(
+                f"[LOW_VOL_RECHECK] {symbol} | 시세 조회가 내부에서 실패해 캐시로 대체됨"
+                f"(outcome={price_fetch_outcome}) — 다음 시도를 {failure_backoff_seconds}초 추가 연장"
+            )
+            self._append_low_volume_recheck_row(row)
+            return
 
         analysis = minute_result.analysis
         if analysis is None or not minute_result.entry_safe:
@@ -2977,6 +3046,17 @@ class TradingService:
         if hasattr(self, '_sold_today_qty_snapshot'):
             self._sold_today_qty_snapshot.clear()
         self._excluded_symbols.clear()  # 당일 제외 종목(매매제한 등) 초기화 — 익일 재시도 허용
+        # 2026-10-22 (감시 대상 정리 3단계, 민우님 재검토 지적 2번
+        # 수정): 위에서 _excluded_symbols는 매일 초기화되는데 이
+        # 두 dict는 그대로 두면, 전날 거래대금 부족으로 제외됐던
+        # 종목이 오늘은 이미 정상 감시 대상(_excluded_symbols에
+        # 없음)인데도 _low_volume_excluded_at에 어제 시각이 남아
+        # 쿨다운이 항상 "이미 지남"으로 계산돼, 정상 폴링 중인
+        # 종목을 매 사이클 쿨다운마다 또 재조회하는 낭비가 발생합니다
+        # (재검사 대상 선정이 _excluded_symbols가 아니라 이 dict
+        # 기준이라 서로 어긋남). 날짜 변경 시 함께 초기화.
+        self._low_volume_excluded_at.clear()
+        self._low_volume_recheck_next_attempt_at.clear()
         # 2026-07-28 (1C단계): 세션 누적 분봉도 날짜 변경 시 초기화 —
         # 전날 세션 데이터가 새 거래일의 session_vwap/session_high/
         # session_low 계산에 섞여 들어가면 안 되므로.

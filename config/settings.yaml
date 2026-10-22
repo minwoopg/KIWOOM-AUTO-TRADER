@@ -89,7 +89,11 @@ trading:
   # 쓰이지 않습니다.
   low_volume_recheck_cooldown_seconds: 1800   # 30분 — 거래대금 부족 3회 연속 제외 종목만 대상
   low_volume_recheck_max_per_cycle: 1          # 사이클당 재검사 호출 1종목 — 보유종목 처리 이후에만 시도
-  low_volume_recheck_cutoff_hhmm: "15:00"      # 이 시각 이후엔 복귀 목적 재검사 중단
+  # 2026-10-22 (민우님 재검토 지적 3번 수정): 기존 신규매수 마감
+  # 시각(trading_service.py에 하드코딩된 "14:50 이후 신규매수 차단")
+  # 과 정확히 일치시킴 — 15:00이면 14:50~15:00 구간에 복귀시켜도
+  # 신규 BUY가 애초에 막혀 있어 재검사 호출이 무의미했음.
+  low_volume_recheck_cutoff_hhmm: "14:50"      # 이 시각 이후엔 복귀 목적 재검사 중단
   low_volume_recheck_failure_backoff_seconds: 60  # 조회 실패 시 쿨다운 추가 연장
   low_volume_recheck_compare_thresholds:       # 500/300/100억 — [0]은 market_regime.min_trading_value와 일치해야 함
     - 50000000000

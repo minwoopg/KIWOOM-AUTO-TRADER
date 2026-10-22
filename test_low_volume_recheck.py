@@ -23,6 +23,28 @@
 이 테스트는 BUY/SELL 판단, 신규 진입 게이트(min_trading_value), 기존
 거래대금 부족 3연속 자동제외 로직 자체를 전혀 바꾸지 않았음도 함께
 확인합니다(회귀 고정).
+
+2026-10-22 재검토 반영 (민우님이 외부 LLM 검토 전 직접 지적한 6개
+결함, 전부 재현 확인 후 수정):
+  1. update_targets()가 조건검색 결과만으로 merged를 교체해, 쿨다운
+     동안 조건검색에서 자연 탈락한 종목은 discard() 복귀가 cycle_
+     targets에 반영되지 않았음 — held_symbols와 동일하게 강제 포함.
+  2. reset_daily_loss_counts()가 _excluded_symbols는 비우면서 두 신규
+     dict는 그대로 둬서, 날짜 변경 후 정상 폴링 중인 종목에 불필요한
+     재검사 API 호출이 발생했음 — 함께 초기화 + 방어적 고아 정리 추가.
+  3. low_volume_recheck_cutoff_hhmm 기본값 "15:00"이 실제 신규매수
+     마감(하드코딩된 "14:50 이후 신규매수 차단")보다 늦어, 그 구간엔
+     복귀시켜도 BUY 자체가 막혀 재검사가 무의미했음 — "14:50"으로 수정.
+  4. _get_market_price_with_cache()가 캐시 존재 시 조회 실패를 내부에서
+     삼키고 예외 없이 캐시를 반환해, 재검사 오류 집계·백오프가 전혀
+     반영되지 않았음 — self._market_price_fetch_outcome 확인 추가.
+  5. 재검사 소요 시간은 sleep_or_stop(poll)이 경과시간을 고려하지 않는
+     고정 슬립이라 다음 사이클 시작을 그만큼 늦춤 — max_per_cycle=1·
+     쿨다운 30분 간격으로 바운드돼 있어 이번 라운드는 완화 로직을
+     추가하지 않고 CHANGELOG에 명시만 함(의도적 트레이드오프).
+  6. export_daily_bundle.py의 CSV_SOURCES(날짜별 CSV 슬라이스 allowlist)
+     에 low_volume_recheck.csv를 추가하지 않아 LOG_TAGS와는 무관하게
+     이 CSV 자체가 번들에 전혀 실리지 않았음 — allowlist에 추가.
 """
 from __future__ import annotations
 
@@ -338,6 +360,150 @@ class TestLowVolumeRecheckSettingsValidation(unittest.TestCase):
     def test_invalid_mode_value_rejected(self):
         with self.assertRaises(ValueError):
             ExperimentalConfig(low_volume_recheck_mode="sometimes")
+
+
+class TestUpdateTargetsForceIncludesLowVolumeExcluded(unittest.TestCase):
+    """지적 1번 수정: 쿨다운 추적 중 종목은 조건검색 편출과 무관하게 모니터링 유지."""
+
+    def test_excluded_symbol_kept_even_when_condition_search_drops_it(self):
+        with __import__("tempfile").TemporaryDirectory() as tmpdir:
+            service = _make_service(tmpdir, low_volume_recheck_mode="shadow")
+            symbol = "080220"  # settings.targets에 없는 임의 종목
+            service._low_volume_excluded_at[symbol] = now_kst() - timedelta(seconds=10)
+
+            # 조건검색 결과에 이 종목이 전혀 없음(= 탈락) — 그래도
+            # 재검사 추적 중이면 merged에 강제 포함돼야 함.
+            service.update_targets(["005930", "000660"], sym_to_conditions={})
+
+            self.assertIn(symbol, service.targets)
+            self.assertIn("005930", service.targets)
+
+    def test_revived_symbol_no_longer_force_included(self):
+        """추적에서 빠지면(복귀 완료) 더 이상 강제 포함되지 않음 — 일반 종목과 동일하게 취급."""
+        with __import__("tempfile").TemporaryDirectory() as tmpdir:
+            service = _make_service(tmpdir, low_volume_recheck_mode="enforce")
+            symbol = "080220"
+            # 추적에 없는 상태(이미 복귀 완료라고 가정)에서 조건검색도 포함 안 함.
+            service.update_targets(["005930"], sym_to_conditions={})
+            self.assertNotIn(symbol, service.targets)
+
+
+class TestDailyResetClearsLowVolumeTracking(unittest.TestCase):
+    """지적 2번 수정: 날짜 변경 시 쿨다운 추적 dict도 함께 초기화."""
+
+    def test_reset_daily_loss_counts_clears_both_dicts(self):
+        with __import__("tempfile").TemporaryDirectory() as tmpdir:
+            service = _make_service(tmpdir)
+            symbol = "005930"
+            service._low_volume_excluded_at[symbol] = now_kst() - timedelta(days=1)
+            service._low_volume_recheck_next_attempt_at[symbol] = now_kst() - timedelta(hours=1)
+
+            service.reset_daily_loss_counts()
+
+            self.assertEqual(service._low_volume_excluded_at, {})
+            self.assertEqual(service._low_volume_recheck_next_attempt_at, {})
+
+
+class TestOrphanedTrackingEntryCleanedUpWithoutApiCall(unittest.IsolatedAsyncioTestCase):
+    """지적 2번 관련 방어 코드: _excluded_symbols에 없는(고아) 추적 항목은 API 호출 없이 정리."""
+
+    async def test_orphaned_entry_skipped_without_calling_recheck(self):
+        with __import__("tempfile").TemporaryDirectory() as tmpdir:
+            service = _make_service(
+                tmpdir, low_volume_recheck_mode="shadow",
+                low_volume_recheck_cooldown_seconds=1,
+            )
+            symbol = "005930"
+            # _excluded_symbols에는 없지만 추적 dict에만 남아있는 고아 상태
+            # (예: 날짜 변경이 아닌 다른 경로로 조만간 발생할 수 있는 상황을 모의).
+            service._low_volume_excluded_at[symbol] = now_kst() - timedelta(seconds=10)
+            self.assertNotIn(symbol, service._excluded_symbols)
+
+            called = []
+            service._recheck_one_low_volume_symbol = lambda *a, **k: called.append(1)
+            await service._recheck_low_volume_exclusions()
+
+            self.assertEqual(called, [])
+            self.assertNotIn(symbol, service._low_volume_excluded_at)
+
+
+class TestInternalPriceFetchFailureCountedAsError(unittest.IsolatedAsyncioTestCase):
+    """지적 4번 수정: 캐시로 대체된(예외 없는) 내부 조회 실패도 오류로 집계."""
+
+    async def test_cache_after_failure_outcome_treated_as_query_failed(self):
+        with __import__("tempfile").TemporaryDirectory() as tmpdir:
+            service = _make_service(
+                tmpdir, low_volume_recheck_mode="enforce",
+                low_volume_recheck_cooldown_seconds=1,
+                low_volume_recheck_failure_backoff_seconds=999,
+            )
+            symbol = "005930"
+            service._excluded_symbols.add(symbol)
+            service._low_volume_excluded_at[symbol] = now_kst() - timedelta(seconds=10)
+
+            # 예외는 던지지 않지만(캐시로 대체) outcome을 "cache_after_failure"로 남김 —
+            # 실제 _get_market_price_with_cache()가 캐시 존재+조회실패일 때 하는 동작.
+            def _stale_cache(sym):
+                service._market_price_fetch_outcome[sym] = "cache_after_failure"
+                return SimpleNamespace(previous_close=70000)
+            service._get_market_price_with_cache = _stale_cache
+            service._get_minute_analysis = lambda sym, prev_close: _fake_minute_result(60_000_000_000)
+
+            await service._recheck_low_volume_exclusions()
+
+            # 회복된 것처럼 보이는 거래대금(600억)이 와도 "성공"으로
+            # 처리돼 복귀시키면 안 됨 — query_failed로 집계돼야 함.
+            self.assertIn(symbol, service._excluded_symbols)
+            self.assertEqual(service._low_volume_recheck_error_count, 1)
+            rows = _read_csv_rows(service.low_volume_recheck_logger.file_path)
+            self.assertEqual(rows[-1]["outcome"], "query_failed")
+            next_attempt = service._low_volume_recheck_next_attempt_at[symbol]
+            self.assertGreater((next_attempt - now_kst()).total_seconds(), 900)
+
+    async def test_fetched_outcome_proceeds_normally(self):
+        """정상 outcome("fetched")이면 기존 로직 그대로 진행(회귀 확인)."""
+        with __import__("tempfile").TemporaryDirectory() as tmpdir:
+            service = _make_service(
+                tmpdir, low_volume_recheck_mode="enforce",
+                low_volume_recheck_cooldown_seconds=1,
+            )
+            symbol = "005930"
+            service._excluded_symbols.add(symbol)
+            service._low_volume_excluded_at[symbol] = now_kst() - timedelta(seconds=10)
+
+            def _fresh(sym):
+                service._market_price_fetch_outcome[sym] = "fetched"
+                return SimpleNamespace(previous_close=70000)
+            service._get_market_price_with_cache = _fresh
+            service._get_minute_analysis = lambda sym, prev_close: _fake_minute_result(60_000_000_000)
+
+            await service._recheck_low_volume_exclusions()
+
+            self.assertNotIn(symbol, service._excluded_symbols)
+            rows = _read_csv_rows(service.low_volume_recheck_logger.file_path)
+            self.assertEqual(rows[-1]["outcome"], "revived")
+
+
+class TestCutoffDefaultMatchesNewBuyCutoff(unittest.TestCase):
+    """지적 3번 수정: 기본 cutoff가 실제 신규매수 마감(14:50)과 일치."""
+
+    def test_default_cutoff_is_1450(self):
+        with __import__("tempfile").TemporaryDirectory() as tmpdir:
+            settings = build_minimal_settings(tmpdir)
+            self.assertEqual(settings.trading.low_volume_recheck_cutoff_hhmm, "14:50")
+
+
+class TestBundleCsvSourcesIncludesLowVolumeRecheck(unittest.TestCase):
+    """지적 6번 수정: LOG_TAGS와는 별개로 CSV_SOURCES allowlist에도 추가됐는지."""
+
+    def test_low_volume_recheck_csv_in_bundle_csv_sources(self):
+        import export_daily_bundle
+        names = [name for name, _cols in export_daily_bundle.CSV_SOURCES]
+        self.assertIn("low_volume_recheck.csv", names)
+
+    def test_low_volume_recheck_tag_in_log_tags(self):
+        import export_daily_bundle
+        self.assertIn("[LOW_VOL_RECHECK]", export_daily_bundle.LOG_TAGS)
 
 
 def _read_csv_rows(path) -> list[dict]:

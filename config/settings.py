@@ -141,10 +141,19 @@ class TradingConfig:
     # 감시를 밀어내지 않습니다.
     low_volume_recheck_max_per_cycle: int = 1
     # 이 시각(HH:MM, 장중 로컬시간) 이후에는 복귀 목적의 재검사를
-    # 중단합니다 — 복귀해도 신규 진입을 노릴 시간이 부족한 시점에
-    # 재검사 API 호출만 늘리는 것을 막기 위함. force_exit_before_
-    # market_close_minutes(기본 20분→15:10)보다 앞선 기본값을 둡니다.
-    low_volume_recheck_cutoff_hhmm: str = "15:00"
+    # 중단합니다.
+    #
+    # 2026-10-22 (민우님 재검토 지적 3번 수정): 초기값 "15:00"은
+    # domain/service/trading_service.py의 "14:50 이후 신규매수
+    # 차단"(하드코딩된 리터럴, 설정값이 아님 — _can_buy류 게이트,
+    # "AFTER_1450" 사유)과 어긋났습니다. 14:50~15:00 구간에는 복귀
+    # 시켜도 신규 BUY 자체가 애초에 막혀 있어 재검사 API 호출이
+    # 전부 무의미했습니다. 그 하드코딩된 14:50과 정확히 일치시킵니다
+    # — 그 리터럴이 바뀌면 이 기본값도 함께 바꿔야 합니다(cross-
+    # validation은 불가능합니다: 그 14:50은 설정 필드가 아니라 코드
+    # 리터럴이라 Settings가 참조할 수 없습니다). force_exit_before_
+    # market_close_minutes(기본 20분→15:10)보다도 앞섭니다.
+    low_volume_recheck_cutoff_hhmm: str = "14:50"
     # 재검사 조회가 예외(통신 장애 등)로 실패하면, 이 초만큼 쿨다운을
     # 추가로 늘려(= 다음 재검사 시도를 그만큼 더 늦춰) 429/장애 상황에서
     # 재검사가 짧은 간격으로 반복 재시도되지 않게 합니다.
