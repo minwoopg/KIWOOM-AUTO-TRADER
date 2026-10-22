@@ -54,6 +54,17 @@ create/update/orphan/terminal remove)을 남기는 로그 태그는 코드베이
 아직 없음 — 새로 만들지 않음(범위를 exporter allowlist 확장으로만
 좁힘, 민우님 지시). 매매 로직·journal 동작·로그 생성 호출 자체는
 전혀 건드리지 않음, LOG_TAGS 튜플만 확장.
+
+2026-10-22 (감시 대상 정리 3단계 — 거래대금 부족 재평가 shadow 관측)
+-----------------------------------------------------------------
+TradingService._recheck_low_volume_exclusions()가 새로 남기는
+`[LOW_VOL_RECHECK]` 로그 태그를 allowlist에 추가. low_volume_recheck_
+mode="off"(기본값)면 이 태그 자체가 전혀 찍히지 않으므로 bundle에는
+"off"였던 날과 "shadow"였던 날 모두 0건으로 보일 수 있음 — 이번에도
+같은 유형의 구분 문제를 피하려면 settings.yaml의 low_volume_recheck_
+mode 값을 함께 확인해야 함. symbol/거래대금(억 단위)/사유만 포함하고
+SENSITIVE_KEYS 대상 필드는 담지 않음. 매매 로직·로그 생성 호출 자체는
+전혀 건드리지 않음, LOG_TAGS 튜플만 확장.
 """
 from __future__ import annotations
 
@@ -180,6 +191,7 @@ LOG_TAGS: tuple[str, ...] = (
     "[ORDER_STATUS_OBS_QUEUE_FULL]", "[ORDER_STATUS_OBS_WRITE_FAILED]",
     "[ORDER_STATUS_OBS_RECOVERY]", "[ORDER_STATUS_OBS_SHUTDOWN_MARKER_FAILED]",
     "[ORDER_STATUS_OBS_FSYNC_FAILED]",
+    "[LOW_VOL_RECHECK]",
 )
 
 # ── 민감정보 마스킹 ─────────────────────────────────────────────

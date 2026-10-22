@@ -83,6 +83,18 @@ trading:
     - "252670"                   # KODEX 200선물인버스2X (2026-07-06: 레버리지 인버스 ETF, replay 238건 5분순수익 -0.33%)
     - "009150"                   # 2026-07-16: 전체 13건 중앙값-0.65%/총손익-603,000원(전 종목 중 최대 손실)
                                    # + NEUTRAL 장세 손실의 절반(5/10건)을 차지 — 두 각도에서 반복 확인됨
+  # 2026-10-22 (감시 대상 정리 3단계 — 거래대금 부족 재평가, 민우님
+  # 8개항 보완 반영). experimental.low_volume_recheck_mode="off"가
+  # 기본값이므로 아래 값들은 mode를 "shadow"로 바꾸기 전까지는 전혀
+  # 쓰이지 않습니다.
+  low_volume_recheck_cooldown_seconds: 1800   # 30분 — 거래대금 부족 3회 연속 제외 종목만 대상
+  low_volume_recheck_max_per_cycle: 1          # 사이클당 재검사 호출 1종목 — 보유종목 처리 이후에만 시도
+  low_volume_recheck_cutoff_hhmm: "15:00"      # 이 시각 이후엔 복귀 목적 재검사 중단
+  low_volume_recheck_failure_backoff_seconds: 60  # 조회 실패 시 쿨다운 추가 연장
+  low_volume_recheck_compare_thresholds:       # 500/300/100억 — [0]은 market_regime.min_trading_value와 일치해야 함
+    - 50000000000
+    - 30000000000
+    - 10000000000
 
 strategy:
   name: breakout
@@ -238,6 +250,7 @@ storage:
   balance_freshness_log_file: logs/balance_freshness.csv  # S01 관측 1단계 (순수 관측)
   delayed_eval_candidate_log_file: logs/delayed_eval_candidate.csv  # S02 관측 1단계 (순수 관측)
   exit_candidate_outage_log_file: logs/exit_candidate_outage.csv  # 180초 감시 공백 대응 3단계 (순수 관측)
+  low_volume_recheck_log_file: logs/low_volume_recheck.csv  # 감시 대상 정리 3단계 (순수 관측)
 
 # ── 카카오톡 알림 ──────────────────────────────────────────
 # .env 파일에 아래 키를 입력하세요 (.gitignore로 보호됨)
@@ -288,4 +301,12 @@ experimental:
   # 졸업/재심사 기준(actual blocks≥10, unique symbols≥5, independent
   # clusters≥3, clean days≥3) 충족 여부를 별도로 재검토합니다.
   candidate_a_guard_mode: "enforce"
+  # 2026-10-22 (감시 대상 정리 3단계 — 거래대금 부족 재평가, 민우님
+  # 8개항 보완 지시 7번): "off"로 배포합니다. 로깅 정확성·호출 부하
+  # 확인만을 목적으로 한 2~3일 shadow 관측을 시작할 준비가 되면 이
+  # 값을 "shadow"로 바꾸세요 — 이 기간에는 수익성 결론이나 enforce
+  # 전환 판단을 내리지 않습니다(민우님 명시 지시). "shadow"는 재검사
+  # API를 호출하고 low_volume_recheck.csv에 기록만 하며, 실제 종목
+  # 복귀(_excluded_symbols 제거)는 "enforce"로 바꾼 뒤에만 일어납니다.
+  low_volume_recheck_mode: "off"
 

@@ -129,6 +129,33 @@ class TradingConfig:
     # 기존 설정 파일은 호환 유지; 배포 YAML에서 명시적으로 활성화합니다.
     require_entry_above_vwap: bool = False
 
+    # 2026-10-22 (감시 대상 정리 3단계 — 거래대금 부족 재평가, 민우님
+    # 8개항 보완 반영): 거래대금 부족 3회 연속으로 제외된 종목만(다른
+    # 사유로 제외된 종목은 대상 아님) 이 쿨다운이 지나면 1회 재조회
+    # 대상이 됩니다. 재조회 자체가 매수/매도 판단을 바꾸지 않습니다
+    # (experimental.low_volume_recheck_mode가 "enforce"가 아니면).
+    low_volume_recheck_cooldown_seconds: int = 1800  # 30분
+    # 한 폴링 사이클당 재검사 API 호출을 몇 종목까지 허용할지 — 보유
+    # 종목·미체결 주문 처리가 전부 끝난 뒤에만(run_once() 루프 맨
+    # 끝에서) 이 한도 안에서 재검사를 시도하므로, 재검사가 보유종목
+    # 감시를 밀어내지 않습니다.
+    low_volume_recheck_max_per_cycle: int = 1
+    # 이 시각(HH:MM, 장중 로컬시간) 이후에는 복귀 목적의 재검사를
+    # 중단합니다 — 복귀해도 신규 진입을 노릴 시간이 부족한 시점에
+    # 재검사 API 호출만 늘리는 것을 막기 위함. force_exit_before_
+    # market_close_minutes(기본 20분→15:10)보다 앞선 기본값을 둡니다.
+    low_volume_recheck_cutoff_hhmm: str = "15:00"
+    # 재검사 조회가 예외(통신 장애 등)로 실패하면, 이 초만큼 쿨다운을
+    # 추가로 늘려(= 다음 재검사 시도를 그만큼 더 늦춰) 429/장애 상황에서
+    # 재검사가 짧은 간격으로 반복 재시도되지 않게 합니다.
+    low_volume_recheck_failure_backoff_seconds: int = 60
+    # 거래대금 완화 비교 관측(항목 3, 1단계: 임계값 통과 여부만 기록)에
+    # 쓰는 비교 기준 3종(원 단위). 첫 번째(500억)는 현재 실거래
+    # min_trading_value와 반드시 같아야 하며, 나머지 2개(300/100억)는
+    # "완화했다면 어땠을까"를 관측만 하는 용도로, 이번 단계에서는
+    # 실제 복귀 판단에 쓰지 않습니다.
+    low_volume_recheck_compare_thresholds: list = None
+
     def __post_init__(self):
         if type(self.require_entry_above_vwap) is not bool:
             raise ValueError("TradingConfig.require_entry_above_vwap must be a boolean")
@@ -139,6 +166,54 @@ class TradingConfig:
         # None 케이스가 실제로 발생한 적이 없었을 뿐이었음)
         if self.excluded_symbols is None:
             object.__setattr__(self, "excluded_symbols", [])
+
+        # 2026-10-22: 동일한 이유로 compare_thresholds=None 기본값을
+        # 안전하게 리스트로 치환. 500/300/100억 — 첫 값은 아래에서
+        # min_trading_value와 일치 검증합니다.
+        if self.low_volume_recheck_compare_thresholds is None:
+            object.__setattr__(
+                self, "low_volume_recheck_compare_thresholds",
+                [50_000_000_000, 30_000_000_000, 10_000_000_000],
+            )
+
+        if not isinstance(self.low_volume_recheck_cutoff_hhmm, str) or ":" not in self.low_volume_recheck_cutoff_hhmm:
+            raise ValueError(
+                'TradingConfig.low_volume_recheck_cutoff_hhmm는 "HH:MM" 형식의 '
+                f"문자열이어야 합니다 (받은 값: {self.low_volume_recheck_cutoff_hhmm!r})"
+            )
+        try:
+            _cutoff_h, _cutoff_m = (int(_p) for _p in self.low_volume_recheck_cutoff_hhmm.split(":", 1))
+            if not (0 <= _cutoff_h <= 23 and 0 <= _cutoff_m <= 59):
+                raise ValueError
+        except ValueError:
+            raise ValueError(
+                'TradingConfig.low_volume_recheck_cutoff_hhmm는 "HH:MM"(00:00~23:59) '
+                f"형식이어야 합니다 (받은 값: {self.low_volume_recheck_cutoff_hhmm!r})"
+            )
+
+        for field_name in (
+            "low_volume_recheck_cooldown_seconds", "low_volume_recheck_max_per_cycle",
+            "low_volume_recheck_failure_backoff_seconds",
+        ):
+            value = getattr(self, field_name)
+            if not (isinstance(value, int) and not isinstance(value, bool) and value > 0):
+                raise ValueError(
+                    f"TradingConfig.{field_name}는 양의 정수여야 합니다 (받은 값: {value!r})"
+                )
+
+        if (
+            not isinstance(self.low_volume_recheck_compare_thresholds, list)
+            or len(self.low_volume_recheck_compare_thresholds) != 3
+            or not all(isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in self.low_volume_recheck_compare_thresholds)
+        ):
+            raise ValueError(
+                "TradingConfig.low_volume_recheck_compare_thresholds는 양의 정수 "
+                f"3개짜리 리스트여야 합니다 (받은 값: {self.low_volume_recheck_compare_thresholds!r})"
+            )
+        # compare_thresholds[0]이 실거래 게이트(market_regime.min_trading_value)와
+        # 같아야 한다는 불변조건은 여기서는 검증하지 않습니다 — TradingConfig는
+        # MarketRegimeConfig를 모릅니다. 대신 Settings.__post_init__에서
+        # 두 설정을 모두 가진 지점에서 검증합니다.
 
         # 2026-09-15 (독립 잔고 재시도 설계, GPT 재검토 반영): "양수·
         # 유한값·최솟값≤최댓값 검증 추가" 지적 반영 — 잘못된 설정값이
@@ -411,6 +486,13 @@ class StorageConfig:
     # order_status_observation_store.py 참고. BUY/SELL/리스크 판정 어디에도
     # 관여하지 않습니다.
     order_status_observation_log_file: str = "logs/order_status_observations.jsonl"
+    # 2026-10-22 (감시 대상 정리 3단계 — 거래대금 부족 재평가 shadow
+    # 관측): 제외된 종목의 쿨다운 재검사 시도(성공/실패 모두) 전용
+    # append-only 로그. BalanceFreshnessLogger와 동일한 패턴(dedup
+    # 없음) — 각 행이 서로 다른 재검사 시점의 관측치라 중복 자체가
+    # 의미 있는 기록입니다. infra/storage/logger.py의
+    # LowVolumeRecheckLogger 참고.
+    low_volume_recheck_log_file: str = "logs/low_volume_recheck.csv"
 
 
 @dataclass(frozen=True)
@@ -460,6 +542,26 @@ class ExperimentalConfig:
     # 오해하지 마세요.
     candidate_a_guard_mode: str = "off"
 
+    # 2026-10-22 (감시 대상 정리 3단계 — 거래대금 부족 재평가, 민우님
+    # 8개항 보완 지시 7번): candidate_a_guard_mode와 같은 프레임워크를
+    # 쓰되, 완전히 별도의 독립된 플래그입니다 — entry_quality_guard_mode
+    # (off/shadow만 지원)와 혼동하지 마세요. 이 플래그는 off/shadow/
+    # enforce를 코드 레벨에서 모두 지원합니다:
+    #   off     : 쿨다운 추적도, 재검사 API 호출도 전혀 하지 않음
+    #   shadow  : 쿨다운 지난 제외 종목을 재조회해 거래대금 회복 여부를
+    #             low_volume_recheck.csv에만 기록. _excluded_symbols는
+    #             그대로 유지(실제 복귀 없음, API 호출량만 증가)
+    #   enforce : 회복이 확인되고(500억 기준) 다른 제외 사유가 없으면
+    #             실제로 _excluded_symbols에서 제거해 감시 복귀
+    # 이번 승인 범위는 "off"→"shadow" 배포까지입니다(민우님 지시:
+    # "shadow 모드로 먼저 배포하고, 2~3일은 로깅 정확성과 호출 부하
+    # 확인에만 사용하며 수익성 결론이나 enforce 전환 판단에는 쓰지
+    # 않는다"). "enforce"로의 전환은 이 shadow 관측 기간 뒤 settings.yaml
+    # 값을 사람이 직접 바꾸는 별도 승인 단계로만 이뤄집니다(candidate_a_
+    # guard_mode와 동일한 패턴 — 코드가 enforce를 막지는 않되, 운영
+    # 전환은 사람이 명시적으로 결정).
+    low_volume_recheck_mode: str = "off"
+
     def __post_init__(self) -> None:
         # 2026-07-27: YAML에서 off/on처럼 quote 없는 특정 단어는 YAML 1.1
         # 스펙상 boolean으로 자동 해석됨(off->False, on->True, yes/no 등도
@@ -471,6 +573,7 @@ class ExperimentalConfig:
             "session_metrics_mode", "decision_engine_mode", "position_lifecycle_mode",
             "reward_risk_guard_mode", "candidate_ranking_mode", "trailing_breakeven_mode",
             "entry_quality_guard_mode", "candidate_a_guard_mode",
+            "low_volume_recheck_mode",
         ):
             value = getattr(self, field_name)
             if not isinstance(value, str) or value not in valid:
@@ -519,6 +622,23 @@ class Settings:
     # 생성하든(직접 생성/테스트 fixture/load_settings) 항상
     # ExperimentalConfig()(전부 off)가 채워짐.
     experimental: ExperimentalConfig = field(default_factory=ExperimentalConfig)
+
+    def __post_init__(self) -> None:
+        # 2026-10-22 (감시 대상 정리 3단계, 민우님 8개항 보완 반영):
+        # 거래대금 완화 비교 관측의 첫 번째 기준(compare_thresholds[0])은
+        # 실거래 게이트(market_regime.min_trading_value)와 반드시 같아야
+        # 합니다 — 다르면 "재검사로 복귀시킬지" 판단이 실제 매매 게이트가
+        # 아닌 별도 숫자로 이뤄지는 불일치가 생깁니다. TradingConfig와
+        # MarketRegimeConfig는 서로의 필드를 모르는 별도 dataclass라, 둘
+        # 다 보유한 이 지점에서만 검증 가능합니다.
+        thresholds = self.trading.low_volume_recheck_compare_thresholds
+        if thresholds and thresholds[0] != self.market_regime.min_trading_value:
+            raise ValueError(
+                "trading.low_volume_recheck_compare_thresholds[0]은 "
+                "market_regime.min_trading_value와 반드시 같아야 합니다 "
+                f"(compare_thresholds[0]={thresholds[0]!r}, "
+                f"min_trading_value={self.market_regime.min_trading_value!r})"
+            )
 
 
 def _substitute_env(value: Any) -> Any:

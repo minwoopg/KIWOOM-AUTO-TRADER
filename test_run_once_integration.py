@@ -156,6 +156,13 @@ def build_minimal_settings(tmpdir: str) -> Settings:
             # 수정). 상태 스냅샷 파일(.status.json)은 이 경로에서
             # 파생되므로 별도 지정이 필요 없습니다.
             order_status_observation_log_file=f"{tmpdir}/order_status_observations.jsonl",
+            # 2026-10-22 (감시 대상 정리 3단계 — 거래대금 부족 재평가):
+            # 위와 동일한 이유로 반드시 tmpdir 기준 경로 명시 — 안 하면
+            # StorageConfig 기본값("logs/low_volume_recheck.csv")이 그대로
+            # 쓰여서 이 헬퍼를 재사용하는 모든 테스트가 프로젝트 루트의
+            # 실제 logs/ 에 CSV를 새게 됩니다(0.5단계 CSV 누출 사고와
+            # 동일 클래스 — 미리 반영해 재현 없이 예방).
+            low_volume_recheck_log_file=f"{tmpdir}/low_volume_recheck.csv",
         ),
         websocket=WebSocketConfig(
             enabled=False, url="", condition_seqs=[], max_symbols=10,

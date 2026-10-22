@@ -20,7 +20,7 @@ import asyncio
 import json
 import time
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from config.settings import Settings
@@ -43,6 +43,7 @@ from infra.storage.logger import (
     AppLogger, TradeCsvLogger, SignalCsvLogger, EntryWatchShadowLogger, PositionLifecycleLogger,
     EntryQualityShadowLogger, LowUpsideShadowLogger, MinProfitExtensionShadowLogger,
     BalanceFreshnessLogger, DelayedEvalCandidateLogger, ExitCandidateOutageLogger,
+    LowVolumeRecheckLogger,
 )
 from infra.storage.minute_bar_saver import MinuteBarSaver
 from infra.storage.skip_reason import classify_skip_reason, SkipReason
@@ -83,6 +84,7 @@ class TradingService:
         balance_freshness_logger: "BalanceFreshnessLogger | None" = None,
         delayed_eval_candidate_logger: "DelayedEvalCandidateLogger | None" = None,
         exit_candidate_outage_logger: "ExitCandidateOutageLogger | None" = None,
+        low_volume_recheck_logger: "LowVolumeRecheckLogger | None" = None,
     ) -> None:
         self.settings = settings
         self.broker = broker
@@ -200,6 +202,25 @@ class TradingService:
                 f"(잔고 조회·주문 판단에는 영향 없음): {type(exc).__name__}: {exc}"
             )
             self.exit_candidate_outage_logger = None
+
+        # 2026-10-22 (감시 대상 정리 3단계 — 거래대금 부족 재평가): 동일한
+        # fail-open 생성 패턴. low_volume_recheck_mode="off"면(기본값)
+        # _recheck_low_volume_exclusions()가 호출 자체를 건너뛰므로 이
+        # 로거가 None이어도, mode가 "off"가 아니어도 아무 영향이 없습니다
+        # (호출부가 로거 존재 여부와 무관하게 재검사를 막지는 않지만,
+        # append()가 없으면 관측 기록만 건너뜀 — BUY/SELL 판정 무관).
+        try:
+            self.low_volume_recheck_logger = (
+                low_volume_recheck_logger or LowVolumeRecheckLogger(
+                    settings.storage.low_volume_recheck_log_file
+                )
+            )
+        except Exception as exc:
+            self.app_logger.warning(
+                f"[LOW_VOL_RECHECK] 로거 생성 실패 — 이번 실행에서는 관측 기록을 건너뜁니다"
+                f"(BUY/SELL 판단에는 영향 없음): {type(exc).__name__}: {exc}"
+            )
+            self.low_volume_recheck_logger = None
 
         # 2026-09-18 (우선순위1 1차: 체결조회 증거 독립 저장): 순수 관측
         # 계층입니다 — BUY/HOLD/SELL·리스크 판정·PSM 상태 전이 어디에도
@@ -539,6 +560,34 @@ class TradingService:
         self._low_volume_count: dict[str, int] = {}   # 거래대금 부족 카운트
         # 자동 제외된 종목 목록
         self._excluded_symbols: set[str] = set()
+        # 2026-10-22 (감시 대상 정리 3단계 — 거래대금 부족 재평가, 민우님
+        # 8개항 보완 반영): _excluded_symbols는 "왜" 제외됐는지 구분하지
+        # 않는 단일 set이라, 거래대금 부족으로 제외된 종목만 쿨다운
+        # 재검사 대상으로 삼기 위해 그 사유로 제외된 시각을 별도로
+        # 추적합니다. UNKNOWN 3연속(self._unknown_count)이나
+        # settings.trading.excluded_symbols(영구 차단)로 제외된 종목은
+        # 여기 들어오지 않으므로 재검사 대상이 아닙니다. 복귀 시에도
+        # "다른 제외 사유가 남아있는지"는 이 dict가 아니라 그 두 소스를
+        # 직접 다시 확인합니다(_is_excluded_for_other_reason 참고) —
+        # 복귀 판단 시점의 최신 상태를 보기 위함이며, 이 dict 자체에
+        # 다른 사유 여부를 캐시하지 않습니다.
+        self._low_volume_excluded_at: dict[str, datetime] = {}
+        # 각 종목의 "다음 재검사 시도 가능 시각" — 최초값은 excluded_at +
+        # cooldown이지만, 시도마다(여전히 부족/조회 실패/shadow 관측)
+        # 다시 계산되어 여기 저장됩니다. _low_volume_excluded_at는 항상
+        # "최초 제외 시각"을 그대로 유지합니다(로그의 excluded_since와
+        # cooldown_elapsed_seconds가 매 시도마다 뒤로 밀리지 않도록) —
+        # 두 dict를 분리한 이유입니다.
+        self._low_volume_recheck_next_attempt_at: dict[str, datetime] = {}
+        # 재검사 호출/실패/소요시간 집계 — 2~3일 shadow 관측 기간 동안
+        # "호출 부하가 얼마나 늘었는가"를 코드 레벨에서도 확인하기 위함.
+        # low_volume_recheck.csv에도 시도별로 남지만, 이 카운터는 세션
+        # 전체 합계를 메모리에서 바로 참조할 수 있게 함(향후 리포트
+        # 연동 시 재사용 가능 — 이번 라운드에서는 export_daily_bundle.py
+        # 연동까지는 하지 않음).
+        self._low_volume_recheck_call_count: int = 0
+        self._low_volume_recheck_error_count: int = 0
+        self._low_volume_recheck_elapsed_ms_total: float = 0.0
 
     @property
     def targets(self) -> list[str]:
@@ -2297,7 +2346,230 @@ class TradingService:
                         f"[EW_SHADOW] {shadow_symbol} | 가격 조회 실패로 체크포인트 스킵: {exc}"
                     )
 
+        # ── 거래대금 부족 제외 종목 쿨다운 재검사 (2026-10-22) ──────
+        # 반드시 위의 보유종목 우선 처리 루프(ordered_targets)와 entry_
+        # watch shadow 체크포인트가 전부 끝난 뒤에만 실행 — 민우님 8개항
+        # 보완 지시 2번("보유 종목·미체결 주문 처리를 재검사보다 우선")을
+        # 이 호출 순서 자체로 만족시킵니다(재검사가 추가 API 호출을
+        # 만들어도 held_symbols 감시를 밀어내지 않음).
+        await self._recheck_low_volume_exclusions()
+
         self.state_store.save(self.state, self._highest_price)
+
+    def _is_past_low_volume_recheck_cutoff(self) -> bool:
+        """신규 진입 마감 재검사 중단 시각(low_volume_recheck_cutoff_hhmm)을 지났는지 확인합니다.
+
+        2026-10-22 (민우님 8개항 보완 지시 2번): 복귀해도 신규 진입을
+        노릴 시간이 부족한 시점에는 재검사 자체를 중단합니다(API 호출
+        절약). 제외 상태 자체는 그대로 유지됩니다 — 이 함수는 재검사
+        시도 여부만 결정하고, 기존 _excluded_symbols나 force_exit
+        로직에는 전혀 관여하지 않습니다.
+        """
+        cutoff_hhmm = self.settings.trading.low_volume_recheck_cutoff_hhmm
+        cutoff_h, cutoff_m = (int(part) for part in cutoff_hhmm.split(":", 1))
+        now = now_kst()
+        return (now.hour, now.minute) >= (cutoff_h, cutoff_m)
+
+    def _is_excluded_for_other_reason(self, symbol: str) -> str:
+        """거래대금 부족 외에 이 종목을 계속 제외해야 할 다른 사유가 있으면 그 이름을, 없으면 ""를 반환합니다.
+
+        2026-10-22 (민우님 8개항 보완 지시 1번): 거래대금이 회복돼도
+        UNKNOWN 장세 3연속이나 settings.trading.excluded_symbols(영구
+        차단)로도 제외된 상태라면 실제로 복귀시키지 않습니다. 이 함수는
+        호출 시점의 최신 상태를 직접 다시 조회합니다(캐시하지 않음) —
+        재검사는 쿨다운(최소 30분) 간격이라 매번 다시 확인하는 비용이
+        무시할 만합니다.
+        """
+        if self._unknown_count.get(symbol, 0) >= 3:
+            return "unknown_regime"
+        permanent = set(getattr(self.settings.trading, "excluded_symbols", None) or [])
+        if symbol in permanent:
+            return "permanent_config"
+        return ""
+
+    def _append_low_volume_recheck_row(self, row: dict) -> None:
+        if self.low_volume_recheck_logger is None:
+            return
+        try:
+            self.low_volume_recheck_logger.append(row)
+        except Exception as exc:
+            self.app_logger.warning(
+                f"[LOW_VOL_RECHECK] 로그 기록 실패(무시, 재검사 판단에는 영향 없음): "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    async def _recheck_low_volume_exclusions(self) -> None:
+        """거래대금 부족으로 제외된 종목 중 쿨다운이 지난 것을 재조회합니다.
+
+        2026-10-22 (감시 대상 정리 3단계, 민우님 8개항 보완 반영).
+
+        이 함수가 호출되는 시점(run_once() 맨 끝, held_symbols 처리와
+        entry_watch shadow 체크포인트 이후)부터가 이미 "보유 종목·
+        미체결 주문 처리를 재검사보다 우선"(지시 2번)을 만족시킵니다.
+
+        한 사이클에 최대 low_volume_recheck_max_per_cycle(기본 1)
+        종목만 시도합니다(지시 2번, 호출량 명시적 제한) — 가장 오래
+        기다린 종목부터. mode="off"면 이 함수 전체가 아무 일도 하지
+        않습니다(쿨다운 추적 자체는 _low_volume_excluded_at에 계속
+        쌓이지만 재조회 API는 전혀 호출되지 않음).
+
+        재검사 자체가 _get_market_price_with_cache()/_get_minute_
+        analysis() 호출을 새로 발생시킨다는 점(민우님이 명시적으로
+        정정한 부분 — "별도 API 호출이 추가되지 않는다"는 이전 설명은
+        정확하지 않았음)을 그대로 반영: 제외된 종목은 평소 폴링
+        대상(cycle_targets)에서 빠져 있으므로, 재검사가 유일하게 이
+        종목의 최신 데이터를 가져오는 경로입니다.
+        """
+        mode = getattr(self.settings.experimental, "low_volume_recheck_mode", "off")
+        if mode == "off" or not self._low_volume_excluded_at:
+            return
+        if self._is_past_low_volume_recheck_cutoff():
+            return
+
+        now = now_kst()
+        cooldown = timedelta(seconds=self.settings.trading.low_volume_recheck_cooldown_seconds)
+        candidates = [
+            symbol for symbol, excluded_at in self._low_volume_excluded_at.items()
+            if now >= self._low_volume_recheck_next_attempt_at.get(symbol, excluded_at + cooldown)
+        ]
+        if not candidates:
+            return
+        # 가장 오래 기다린(최초 제외가 가장 이른) 종목부터.
+        candidates.sort(key=lambda s: self._low_volume_excluded_at[s])
+
+        max_per_cycle = self.settings.trading.low_volume_recheck_max_per_cycle
+        for symbol in candidates[:max_per_cycle]:
+            await self._recheck_one_low_volume_symbol(symbol, mode=mode)
+
+    async def _recheck_one_low_volume_symbol(self, symbol: str, *, mode: str) -> None:
+        """거래대금 부족 제외 종목 1건을 재조회해 복귀 가능 여부를 판단·기록합니다.
+
+        이 함수가 실제로 _excluded_symbols를 변경하는 것은 mode="enforce"
+        이고 거래대금이 회복됐고(compare_thresholds[0] 기준) 다른 제외
+        사유가 없을 때뿐입니다. mode="shadow"면 판단은 동일하게
+        계산하지만 실제 복귀는 하지 않고 low_volume_recheck.csv에만
+        기록합니다(민우님 지시: shadow 기간에는 로깅 정확성·호출 부하
+        확인에만 쓰고 enforce 전환 판단에는 쓰지 않음).
+
+        threshold 비교(500/300/100억) 중 compare_thresholds[0](실거래
+        게이트, 1단계)만 이번 복귀 판단에 쓰입니다 — 나머지 2개는
+        "완화했다면 어땠을까"의 순수 관측(항목 3의 1단계)이며, 전략
+        조건까지 가상으로 평가하는 2단계(진입 품질까지 반영한 가상
+        진입·결과 추적)는 이번 라운드의 범위가 아닙니다(민우님 지시
+        4·5번은 더 큰 설계가 필요해 후속 라운드로 분리).
+        """
+        excluded_at = self._low_volume_excluded_at.get(symbol)
+        now = now_kst()
+        started = time.monotonic()
+        row: dict = {
+            "timestamp": now.isoformat(),
+            "symbol": symbol,
+            "excluded_since": excluded_at.isoformat() if excluded_at else "",
+            "cooldown_elapsed_seconds": (
+                int((now - excluded_at).total_seconds()) if excluded_at else ""
+            ),
+            "mode": mode,
+        }
+
+        cooldown_seconds = self.settings.trading.low_volume_recheck_cooldown_seconds
+        failure_backoff_seconds = self.settings.trading.low_volume_recheck_failure_backoff_seconds
+
+        try:
+            market_price = self._get_market_price_with_cache(symbol)
+            minute_result = self._get_minute_analysis(symbol, market_price.previous_close)
+        except Exception as exc:
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            self._low_volume_recheck_error_count += 1
+            self._low_volume_recheck_elapsed_ms_total += elapsed_ms
+            # 통신 장애 시 다음 시도를 cooldown + failure_backoff만큼
+            # 더 늦춤 (지시 2번: "429/통신 장애 시 재검사 대기시간 증가").
+            self._low_volume_recheck_next_attempt_at[symbol] = now + timedelta(
+                seconds=cooldown_seconds + failure_backoff_seconds
+            )
+            row.update({
+                "outcome": "query_failed",
+                "elapsed_ms": round(elapsed_ms, 1),
+                "error": f"{type(exc).__name__}: {exc}"[:300],
+            })
+            self.app_logger.warning(
+                f"[LOW_VOL_RECHECK] {symbol} | 재검사 조회 실패 — 다음 시도를 "
+                f"{failure_backoff_seconds}초 추가 연장: {type(exc).__name__}: {exc}"
+            )
+            self._append_low_volume_recheck_row(row)
+            return
+
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        self._low_volume_recheck_call_count += 1
+        self._low_volume_recheck_elapsed_ms_total += elapsed_ms
+        row["elapsed_ms"] = round(elapsed_ms, 1)
+
+        analysis = minute_result.analysis
+        if analysis is None or not minute_result.entry_safe:
+            # 데이터 미확보/비신선 — "여전히 부족"으로 단정하지 않고
+            # 다음 쿨다운에 다시 시도(2026-07-28 1B Safety Closure와
+            # 동일한 원칙: stale 데이터로 상태를 오염시키지 않음).
+            self._low_volume_recheck_next_attempt_at[symbol] = now + timedelta(seconds=cooldown_seconds)
+            row.update({"outcome": "data_unavailable", "error": (minute_result.reason or "")[:300]})
+            self.app_logger.info(
+                f"[LOW_VOL_RECHECK] {symbol} | 분봉 데이터 미확보/비신선"
+                f"({minute_result.reason}) — 판단 보류, 다음 쿨다운에 재시도"
+            )
+            self._append_low_volume_recheck_row(row)
+            return
+
+        thresholds = self.settings.trading.low_volume_recheck_compare_thresholds
+        trading_value = analysis.trading_value
+        row["trading_value"] = trading_value
+        pass_flags = [trading_value >= threshold for threshold in thresholds]
+        for idx, passed in enumerate(pass_flags):
+            row[f"pass_threshold_{idx}"] = passed
+
+        if not pass_flags[0]:
+            self._low_volume_recheck_next_attempt_at[symbol] = now + timedelta(seconds=cooldown_seconds)
+            row["outcome"] = "still_low"
+            self.app_logger.info(
+                f"[LOW_VOL_RECHECK] {symbol} | 재검사 결과 여전히 거래대금 부족 "
+                f"({trading_value // 100_000_000}억) — 다음 쿨다운에 재시도"
+            )
+            self._append_low_volume_recheck_row(row)
+            return
+
+        other_reason = self._is_excluded_for_other_reason(symbol)
+        row["other_exclusion_reason"] = other_reason
+        if other_reason:
+            # 거래대금은 회복됐지만 다른 사유가 남아있어 복귀시키지
+            # 않음 — 이 사유(거래대금 부족) 추적은 여기서 종료(다른
+            # 사유는 각자의 메커니즘이 계속 관리).
+            self._low_volume_excluded_at.pop(symbol, None)
+            self._low_volume_recheck_next_attempt_at.pop(symbol, None)
+            row["outcome"] = "blocked_other_reason"
+            self.app_logger.info(
+                f"[LOW_VOL_RECHECK] {symbol} | 거래대금 회복 확인"
+                f"({trading_value // 100_000_000}억)되었으나 다른 사유"
+                f"({other_reason})로 제외 유지"
+            )
+            self._append_low_volume_recheck_row(row)
+            return
+
+        if mode == "enforce":
+            self._excluded_symbols.discard(symbol)
+            self._low_volume_count[symbol] = 0
+            self._low_volume_excluded_at.pop(symbol, None)
+            self._low_volume_recheck_next_attempt_at.pop(symbol, None)
+            row["outcome"] = "revived"
+            self.app_logger.warning(
+                f"[LOW_VOL_RECHECK] {symbol} | 거래대금 회복 확인"
+                f"({trading_value // 100_000_000}억) — 감시 복귀(enforce)"
+            )
+        else:
+            # shadow: 판단은 동일하게 계산하지만 실제 복귀는 하지 않음.
+            self._low_volume_recheck_next_attempt_at[symbol] = now + timedelta(seconds=cooldown_seconds)
+            row["outcome"] = "shadow_would_revive"
+            self.app_logger.info(
+                f"[LOW_VOL_RECHECK] {symbol} | (shadow) 거래대금 회복 확인"
+                f"({trading_value // 100_000_000}억) — enforce였다면 복귀, 실제 제외는 유지"
+            )
+        self._append_low_volume_recheck_row(row)
 
     async def _process_symbol(self, symbol: str, balance) -> None:
         """종목 하나에 대해 시세 조회 → 장세/분봉분석 → 신호판단 → 주문을 수행합니다.
@@ -2619,6 +2891,14 @@ class TradingService:
                     self._low_volume_count[symbol] = self._low_volume_count.get(symbol, 0) + 1
                     if self._low_volume_count[symbol] >= 3:
                         self._excluded_symbols.add(symbol)
+                        # 2026-10-22 (감시 대상 정리 3단계): 이 사유로
+                        # 제외된 시각을 별도 기록 — 쿨다운 재검사 대상
+                        # 식별에 사용(_recheck_low_volume_exclusions).
+                        # 같은 종목이 이미 다른 이유로(혹은 과거 거래대금
+                        # 부족으로) 이 dict에 있어도 최초 제외 시각을
+                        # 덮어쓰지 않습니다 — setdefault로, 쿨다운이
+                        # 매 폴링마다 뒤로 밀리는 것을 방지합니다.
+                        self._low_volume_excluded_at.setdefault(symbol, now_kst())
                         self.app_logger.warning(
                             f"[EXCL] {symbol} | 거래대금 부족 3회 연속 "
                             f"({minute_analysis.trading_value//100_000_000}억) — 감시 대상에서 제외합니다"

@@ -1316,3 +1316,71 @@ class ExitCandidateOutageLogger:
             for field in EXIT_CANDIDATE_OUTAGE_FIELDS:
                 row.setdefault(field, "")
             writer.writerow(row)
+
+
+# ── low_volume_recheck.csv ───────────────────────────────────────────────────
+# 감시 대상 정리 3단계 (2026-10-22, 민우님 8개항 보완 반영): 거래대금
+# 부족 3회 연속으로 제외된 종목만(다른 사유 제외는 대상 아님) 쿨다운
+# (기본 30분)이 지나면 1회 재조회됩니다. 이 로그는 그 재조회 시도를
+# 성공/실패 모두 순수 관측으로 기록합니다 — experimental.
+# low_volume_recheck_mode="off"면 재조회 자체가 일어나지 않아 이 파일에
+# 행이 전혀 추가되지 않고(파일은 다른 shadow 로거들과 동일한 패턴으로
+# 항상 생성됨), "shadow"면 재조회·기록은 하되 실제 복귀는 하지 않고,
+# "enforce"일 때만 거래대금 회복이 확인된 종목이 실제로 _excluded_
+# symbols에서 제거됩니다.
+#
+# 각 행은 서로 다른 재검사 시도(최소 쿨다운 간격만큼 떨어진 서로 다른
+# 시점)의 관측치라 BalanceFreshnessLogger와 동일하게 dedup 없이 그냥
+# append합니다 — 같은 분봉을 10초마다 반복 폴링해 중복 기록되는
+# EntryQualityShadowLogger류의 문제가 구조적으로 없습니다(재검사
+# 자체가 쿨다운으로 이미 희소합니다).
+LOW_VOLUME_RECHECK_FIELDS = [
+    "timestamp",                  # 이 재검사 시도 시각(ISO)
+    "symbol",
+    "excluded_since",             # 거래대금 부족 사유로 제외된 시각(ISO)
+    "cooldown_elapsed_seconds",   # excluded_since 기준 경과 시간(초)
+    "mode",                       # 시도 당시 experimental.low_volume_recheck_mode 값
+    "outcome",                    # revived(enforce, 실제 복귀) /
+                                   # shadow_would_revive(shadow, 복귀 가능했음을 기록만) /
+                                   # still_low(거래대금 여전히 기준 미달) /
+                                   # query_failed(조회 예외) /
+                                   # blocked_other_reason(회복됐으나 다른 사유로 제외 유지)
+    "trading_value",              # 조회된 거래대금(원). 조회 실패 시 공백
+    "pass_threshold_0",           # compare_thresholds[0](500억, 실거래 게이트) 통과 여부
+    "pass_threshold_1",           # compare_thresholds[1](300억, 관측용) 통과 여부
+    "pass_threshold_2",           # compare_thresholds[2](100억, 관측용) 통과 여부
+    "other_exclusion_reason",     # unknown_regime / permanent_config / "" (없음)
+    "elapsed_ms",                 # 이 재검사 1회 시도(시세+분봉 조회 포함)에 걸린 시간(ms)
+    "error",                      # 예외 발생 시 메시지(요약), 없으면 공백
+]
+
+
+class LowVolumeRecheckLogger:
+    """거래대금 부족 재검사 시도를 append-only로 기록하는 로거입니다.
+
+    ExitCandidateOutageLogger/BalanceFreshnessLogger와 동일한 패턴
+    (dedup 없음) — 이유는 위 모듈 주석 참고. BUY/SELL/리스크 판정에는
+    관여하지 않으며, "enforce" 모드의 실제 복귀 여부 자체는 이 로거가
+    아니라 TradingService._recheck_low_volume_exclusions()가 결정합니다
+    — 이 로거는 그 결정을 기록만 합니다.
+    """
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.file_path.exists():
+            _migrate_csv_header_if_needed(
+                self.file_path, LOW_VOLUME_RECHECK_FIELDS, "LOW_VOLUME_RECHECK"
+            )
+        else:
+            with self.file_path.open("w", newline="", encoding="utf-8") as fp:
+                writer = csv.DictWriter(fp, fieldnames=LOW_VOLUME_RECHECK_FIELDS)
+                writer.writeheader()
+
+    def append(self, row: dict[str, Any]) -> None:
+        with self.file_path.open("a", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=LOW_VOLUME_RECHECK_FIELDS, extrasaction="ignore")
+            for field in LOW_VOLUME_RECHECK_FIELDS:
+                row.setdefault(field, "")
+            writer.writerow(row)
